@@ -1,17 +1,21 @@
-"""The "needs you" queue: what is waiting on the human, from Kanban, Bot Mode chats and live prompts.
-
-Three sources, one list:
+"""The "needs you" queue: everything waiting on the human, from four sources.
 
 - Kanban: a blocked card whose latest block asks the principal for something (an explicit
   ``needs_input`` block that names the principal, or a reason that is plainly a principal gate).
   Answering one writes back only through native ``hermes_cli.kanban_db`` calls: a comment by the
   principal, then ``unblock_task`` when asked to release it.
-- Bot Mode: a canonical Bot Chat whose last visible turn is the bot asking the human something,
-  with no human reply after it. Chats are read read-only; answering happens in the chat itself.
+- Chats: a chat on any platform a person types into (Desktop, CLI, TUI, Discord, Telegram, a
+  Bot Mode Bot Chat, ...) whose last visible turn is the bot asking the human something, with no
+  reply after it. In a shared channel the ask must name the principal. Read read-only; answering
+  happens in the chat itself.
 - Live prompts: an agent blocked right now on a human prompt (a clarify question, a dangerous-command
   approval, a sudo password), seen through Hermes' stock ``on_human_input_request`` /
-  ``on_human_input_resolved`` hooks. Each open wait is one small file; a wait whose process died is
-  dropped. The prompt text arrives already redacted by Hermes; answering happens where it was asked.
+  ``on_human_input_resolved`` hooks. Each open wait is one small owner-only file; a wait whose
+  process died, or that is older than a day, is dropped. The prompt text arrives already redacted
+  by Hermes; answering happens where it was asked.
+- Pairing requests: someone messaged a bot and is waiting for the human to approve them, read
+  read-only from the gateway's pending-pairing files. Approving happens on the dashboard's
+  Pairing page or with ``hermes pairing approve``.
 
 Nothing here generates, ranks or rewrites decisions, and nothing is accepted on silence. Items the
 human hides with "Not for me" stay hidden until the source changes (a new block or a new turn).
@@ -192,7 +196,9 @@ def _read_json(p: Path) -> dict[str, Any]:
 
 def _write_json(p: Path, data: dict[str, Any]) -> None:
     tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # waits hold prompt text
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(data, indent=1, sort_keys=True))
     tmp.replace(p)
 
 
@@ -200,10 +206,19 @@ def load_hidden(home: Optional[Path] = None) -> dict[str, str]:
     return _read_json(_hidden_path(home))
 
 
+_HIDDEN_KEEP = 1000
+
+
 def hide(item_id: str, version: str, home: Optional[Path] = None) -> None:
+    item_id, version = str(item_id or ""), str(version or "")
+    if not item_id or len(item_id) > 300 or len(version) > 200:
+        raise ValueError("item id and version must be short strings")
     with _STATE_LOCK:
         hidden = load_hidden(home)
+        hidden.pop(item_id, None)
         hidden[item_id] = version
+        if len(hidden) > _HIDDEN_KEEP:   # oldest hides first out; the store never grows unbounded
+            hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
         _write_json(_hidden_path(home), hidden)
 
 
@@ -490,7 +505,7 @@ def kanban_items(
     return items
 
 
-# --- Bot Mode source -----------------------------------------------------------------------
+# --- Chat source ---------------------------------------------------------------------------
 
 def _state_dbs(home: Path) -> list[tuple[str, Path]]:
     out = []
@@ -505,10 +520,11 @@ def _state_dbs(home: Path) -> list[tuple[str, Path]]:
 def _bot_name(home: Path, profile: str) -> str:
     """The name Bot Mode shows for a seat (profile.yaml ui_meta.hermes-bots.title).
     A line scan, not a YAML parser: the plugin host may not ship PyYAML."""
+    fallback = "Your agent" if profile == "default" else profile
     try:
         lines = (home / "profiles" / profile / "profile.yaml").read_text().splitlines()
     except OSError:
-        return profile
+        return fallback
     in_bots = False
     for line in lines:
         if re.match(r"^\s{2}hermes-bots:\s*$", line):
@@ -518,8 +534,38 @@ def _bot_name(home: Path, profile: str) -> str:
         elif in_bots:
             m = re.match(r"^\s{4}title:\s*['\"]?(.+?)['\"]?\s*$", line)
             if m:
-                return m.group(1)
-    return profile
+                return _clean(m.group(1), 60) or fallback
+    return fallback
+
+
+# Platforms that only you type into (this machine's own clients), as opposed to gateway
+# platforms where other people can message the bot too.
+LOCAL_PLATFORMS = ("desktop", "cli", "tui", "local", "gui")
+
+_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+
+
+def _clean(value: Any, n: int) -> str:
+    """One line of display text from a value someone else chose (a pairing name, a chat
+    title): no control or bidi-override characters, collapsed whitespace, bounded length."""
+    return " ".join(_UNSAFE_CHARS.sub(" ", str(value or "")).split())[:n]
+
+
+def chat_owner_ids(settings: Optional[dict[str, Any]] = None) -> set[str]:
+    """Your user ids on gateway platforms (setting ``owner_user_ids``, comma-separated). When
+    set, a Discord/Telegram/... chat with anyone else is not shown as asking you."""
+    raw = (settings if settings is not None else _settings()).get("owner_user_ids") or os.environ.get("UNBL0CK_OWNER_IDS", "")
+    if isinstance(raw, (list, tuple)):
+        raw = ",".join(map(str, raw))
+    return {x.strip() for x in str(raw).split(",") if x.strip()}
+
+
+def _chat_with(platform: str, display_name: Any, me: set[str]) -> str:
+    """Who a gateway chat is with, when that is not obviously you (empty for local clients)."""
+    if platform.lower() in LOCAL_PLATFORMS:
+        return ""
+    name = _clean(display_name, 60)
+    return "" if name.lower() in me else name
 
 
 # Sessions a person types into. Everything else (Kanban workers, cron, subagents, one-shot
@@ -544,9 +590,11 @@ def chat_items(
     since = time.time() - days * 86400
     items: list[dict[str, Any]] = []
     names = _patterns()["_NAMES"]
+    owners = chat_owner_ids()
+    me = {n.lower() for n in principal_names()}
     for profile, db in _state_dbs(home):
         try:
-            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
         except sqlite3.Error as exc:
             if errors is not None:
                 errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
@@ -576,7 +624,8 @@ def chat_items(
                 if "last_activity_at" in cols and "started_at" in cols:
                     where.append("COALESCE(s.last_activity_at, s.started_at, 0) >= ?")
                     args.append(since)
-                pick = ", ".join(f"s.{c}" if c in cols else "NULL" for c in ("source", "chat_type"))
+                pick = ", ".join(f"s.{c}" if c in cols else "NULL" for c in ("source", "chat_type", "user_id", "display_name"))
+                mcols = _columns(conn, "messages")
                 sessions = conn.execute(
                     f"SELECT s.id, s.title, {pick} FROM sessions s WHERE {' AND '.join(where) or '1'}", args
                 ).fetchall()
@@ -584,18 +633,24 @@ def chat_items(
                 if errors is not None and "no such" not in str(exc):
                     errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
                 continue
-            for sid, title, platform, chat_type in sessions:
+            # Only the columns this profile's schema has: an old schema must not fail per session.
+            last_sql = ("SELECT id, role, content, timestamp FROM messages WHERE session_id=? "
+                        "AND role IN ('user','assistant') AND content IS NOT NULL AND TRIM(content) != '' "
+                        + ("AND COALESCE(display_kind,'') != 'hidden' " if "display_kind" in mcols else "")
+                        + ("AND COALESCE(active,1)=1 " if "active" in mcols else "")
+                        + "ORDER BY timestamp DESC, id DESC LIMIT 1")
+            for sid, title, platform, chat_type, user_id, display_name in sessions:
+                platform = str(platform or "")
+                if (owners and platform.lower() not in LOCAL_PLATFORMS and user_id
+                        and str(user_id) not in owners):
+                    continue   # a gateway chat with someone other than you: its questions are theirs
                 try:
-                    row = conn.execute(
-                        "SELECT id, role, content, timestamp FROM messages WHERE session_id=? "
-                        "AND role IN ('user','assistant') AND COALESCE(display_kind,'') != 'hidden' "
-                        "AND COALESCE(active,1)=1 AND content IS NOT NULL AND TRIM(content) != '' "
-                        "ORDER BY timestamp DESC, id DESC LIMIT 1",
-                        (sid,),
-                    ).fetchone()
+                    row = conn.execute(last_sql, (sid,)).fetchone()
                 except sqlite3.Error as exc:
                     if errors is not None:
                         errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
+                    break   # same schema for every session: say it once
+                if not row:
                     continue
                 if not row:
                     continue
@@ -605,7 +660,6 @@ def chat_items(
                 if str(chat_type or "").lower() in CHAT_GROUP_TYPES and not names.search(str(content)[-900:]):
                     continue
                 bot_chat = title in CHAT_TITLES
-                platform = str(platform or "")
                 where_ = "Bot Chat" if bot_chat else (f"{_platform_label(platform)} chat" if platform else "chat")
                 items.append({
                     "id": f"chat:{profile}:{sid}",
@@ -615,7 +669,8 @@ def chat_items(
                     "session_id": sid,
                     "platform": platform,
                     "bot_chat": bot_chat,
-                    "chat_title": "" if bot_chat else str(title or "")[:120],
+                    "chat_title": "" if bot_chat else _clean(title, 120),
+                    "chat_with": _chat_with(platform, display_name, me),
                     "title": f"{_bot_name(home, profile)} is asking you",
                     "ask": _excerpt(content),
                     "why": f"Last turn in this {where_} is a question for you",
@@ -669,11 +724,19 @@ def pairing_items(home: Optional[Path] = None, errors: Optional[list[str]] = Non
                 continue
             for entry_id, info in data.items():
                 created = info.get("created_at") if isinstance(info, dict) else None
-                if not isinstance(created, (int, float)) or now - created > PAIRING_TTL:
-                    continue
-                who = str(info.get("user_name") or "").strip()[:60] or "Someone new"
+                if (not isinstance(created, (int, float)) or isinstance(created, bool)
+                        or now - created > PAIRING_TTL or created - now > 300):
+                    continue   # expired, or stamped in the future (clock skew or a forged file)
+                who = _clean(info.get("user_name"), 60) or "Someone new"
                 key = hashlib.sha256(f"{profile}:{platform}:{entry_id}".encode()).hexdigest()[:16]
                 bot = _bot_name(home, profile) if profile != "default" else "your bot"
+                minutes = max(1, int((created + PAIRING_TTL - now) // 60))
+                # A hashed entry's key is the admin-only request id that `hermes pairing approve`
+                # accepts (never the code they were sent). A legacy entry's key IS the code: never shown.
+                modern = (isinstance(info.get("hash"), str) and isinstance(info.get("salt"), str)
+                          and re.fullmatch(r"[0-9a-f]{16}", str(entry_id)) is not None)
+                approve = (f"hermes {'' if profile == 'default' else f'-p {profile} '}pairing approve {platform} {entry_id}"
+                           if modern else "")
                 items.append({
                     "id": f"pairing:{profile}:{platform}:{key}",
                     "version": key,
@@ -682,8 +745,9 @@ def pairing_items(home: Optional[Path] = None, errors: Optional[list[str]] = Non
                     "platform": platform,
                     "title": f"{who} wants to talk to {bot} on {_platform_label(platform)}",
                     "ask": ("They messaged the bot and got a pairing code. Nothing they send reaches an agent "
-                            f"until you approve them: the dashboard's Pairing page, or hermes pairing approve {platform} <code>."),
-                    "why": f"A pairing request expires {max(1, int((created + PAIRING_TTL - now) // 60))} min from now",
+                            "until you approve them on the dashboard's Pairing page or with hermes pairing approve."),
+                    "approve_command": approve,
+                    "why": f"The request expires in {minutes} min" if minutes > 1 else "The request expires within a minute",
                     "owner": profile,
                     "priority": 1,
                     "since": int(created),
@@ -699,6 +763,14 @@ _WAIT_KINDS = {
     "sudo": "needs your sudo password",
 }
 _SAFE_ID = re.compile(r"^[0-9a-f]{8,64}$")
+WAIT_MAX_AGE = 86400   # no human prompt legitimately stays open a day; a missed resolve hook does
+
+
+def _num(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _waits_dir(home: Optional[Path] = None) -> Path:
@@ -748,8 +820,8 @@ def record_wait(home: Optional[Path] = None, **payload: Any) -> None:
         pid = os.getpid()
         rec = {
             "request_id": rid,
-            "kind": str(payload.get("kind") or ""),
-            "prompt": str(payload.get("prompt") or ""),
+            "kind": str(payload.get("kind") or "")[:40],
+            "prompt": str(payload.get("prompt") or "")[:4000],
             "session_id": str(payload.get("session_id") or ""),
             "platform": str(payload.get("platform") or ""),
             "profile": _profile_of(home),
@@ -790,7 +862,12 @@ def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) 
             pid = int(rec.get("pid") or 0)
         except (TypeError, ValueError):
             pid = 0
-        if not rec or pid <= 0 or not _alive(pid, rec.get("proc_start")):
+        rid = str(rec.get("request_id") or "")
+        if (not rec or pid <= 0 or not _SAFE_ID.match(rid) or f.stem != rid
+                or time.time() - _num(rec.get("since")) > WAIT_MAX_AGE
+                or not _alive(pid, rec.get("proc_start"))):
+            # Dead waiter, malformed record, or a wait so old its resolved hook must have been
+            # missed: never show a prompt nobody is waiting on.
             f.unlink(missing_ok=True)
             continue
         kind = str(rec.get("kind") or "")
@@ -798,24 +875,28 @@ def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) 
         who = _bot_name(home, profile) if profile != "default" else "An agent"
         platform = str(rec.get("platform") or "")
         items.append({
-            "id": f"prompt:{rec['request_id']}",
-            "version": str(rec["request_id"]),
+            "id": f"prompt:{rid}",
+            "version": rid,
             "source": "prompt",
             "kind": kind,
             "profile": profile,
-            "session_id": rec.get("session_id") or "",
+            "session_id": str(rec.get("session_id") or ""),
             "platform": platform,
             "title": f"{who} {_WAIT_KINDS.get(kind, 'is waiting on you')}",
             "ask": _excerpt(str(rec.get("prompt") or "")) or "(prompt text withheld by Hermes)",
             "why": "Its run is paused until you answer" + (f" in {_platform_label(platform)}." if platform else "."),
             "owner": profile,
             "priority": 1,   # a live wait is holding a running agent
-            "since": int(rec.get("since") or 0),
+            "since": int(_num(rec.get("since"))),
         })
     return items
 
 
 # --- the queue -----------------------------------------------------------------------------
+
+SOURCE_ORDER = {"prompt": 0, "pairing": 1, "kanban": 2, "chat": 3}
+# Sources whose text is already one plain line; a model summary would only add latency and cost.
+NO_BLUF_SOURCES = ("prompt", "pairing")
 
 def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) -> dict[str, Any]:
     home = home or hermes_home()
@@ -841,8 +922,9 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
         errors.append(f"pairing: {type(exc).__name__}: {exc}")
     hidden = load_hidden(home)
     shown = [i for i in items if include_hidden or hidden.get(i["id"]) != i["version"]]
-    # Board priority first (higher is more urgent, as on the board), then newest.
-    shown.sort(key=lambda i: (-(i.get("priority") or 0), -(i.get("since") or 0)))
+    # Same order as the panel: live prompts (a run is paused), pairing requests (expire within
+    # the hour), Kanban, chats; inside a source, higher priority first (as on the board), then newest.
+    shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), -(_num(i.get("priority"))), -(_num(i.get("since")))))
     attach_blufs(shown, home)
     return {
         "generated_at": int(time.time()),
@@ -1129,7 +1211,5 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
 
 def write_pocket_pack(queue: dict[str, Any], home: Optional[Path] = None) -> Path:
     p = data_dir(home) / "pocket-pack.json"
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(pocket_pack(queue), indent=1))
-    tmp.replace(p)
+    _write_json(p, pocket_pack(queue))
     return p

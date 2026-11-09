@@ -1,7 +1,7 @@
 {
   "name": "unbl0ck",
   "label": "UNBL0CK",
-  "description": "Everything blocked on you: Kanban cards waiting for your answer and Bot Mode chats asking you something",
+  "description": "Everything blocked on you: Kanban cards, chats on any platform, live prompts and pairing requests",
   "icon": "Gem",
   "api": "plugin_api.py"
 }

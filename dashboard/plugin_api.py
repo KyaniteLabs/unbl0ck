@@ -1,7 +1,8 @@
 """UNBL0CK backend routes, mounted at /api/plugins/unbl0ck/.
 
-GET  /queue                  the queue (Kanban + Bot Mode asks)
+GET  /queue                  the queue (Kanban cards, chats, live prompts, pairing requests)
 GET  /card?id=               read-only context for one Kanban card
+GET  /card/ask/{job}         poll a running Ask
 POST /card/ask               ask the configured model about one card (multi-turn)
 POST /kanban/answer          {board, task_id, text, release}: comment as the principal, optionally unblock
 POST /hide                   {id, version}: "Not for me" until the source changes
@@ -128,7 +129,7 @@ def queue():
     ctx = _loaded_ctx()
     if q.get("bluf_enabled") and ctx is not None and hasattr(ctx, "llm"):
         for it in q["items"]:
-            if not it.get("bluf"):
+            if not it.get("bluf") and it.get("source") not in getattr(n, "NO_BLUF_SOURCES", ()):
                 _queue_bluf(n, ctx, it)
     return q
 
@@ -286,7 +287,10 @@ def answer(body: Answer):
 
 @router.post("/hide")
 def hide(body: Hide):
-    _needs().hide(body.id, body.version)
+    try:
+        _needs().hide(body.id, body.version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True}
 
 

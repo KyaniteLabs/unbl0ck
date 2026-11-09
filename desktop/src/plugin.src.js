@@ -111,6 +111,7 @@ ${Object.entries(FONTS)
 .ub-undo span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ub-undo b{font-weight:400;color:var(--text);margin-right:8px}
 .ub-hint{margin:2px 0 0;font-family:var(--mono);font-size:12.5px;line-height:1.5;letter-spacing:.04em;color:var(--amber)}
+.ub-cmd{font-family:var(--mono);color:var(--text);background:var(--panel2);padding:0 4px;user-select:all;overflow-wrap:anywhere}
 .ub-hint::before{content:'▲ ';}
 .ub-hazard{height:6px;margin-bottom:12px;background:repeating-linear-gradient(135deg,var(--hazard) 0 8px,transparent 8px 16px)}
 .ub-chip{background:none;border:0;cursor:pointer;padding:0 8px;font:400 12px/1 'UB ShareTechMono','Share Tech Mono','SF Mono',ui-monospace,monospace;letter-spacing:.1em;color:#f0a202}
@@ -1043,7 +1044,8 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           item.bot_chat ? 'BOT CHAT \\\\ ' : `${(platformName || 'CHAT').toUpperCase()} \\\\ `,
           jsx('em', { children: item.owner || item.profile }),
           item.profile && item.owner !== item.profile ? ` · ${item.profile}` : '',
-          item.chat_title ? ` · ${String(item.chat_title).toUpperCase()}` : ''
+          item.chat_title ? ` · ${String(item.chat_title).toUpperCase()}` : '',
+          item.chat_with ? ` · WITH ${String(item.chat_with).toUpperCase()}` : ''
         ]
       })
 
@@ -1094,7 +1096,13 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
       ]
     : isPairing
     ? [
-        jsx('div', { className: 'ub-hint', role: 'note', children: `Approve on the dashboard's Pairing page, or run hermes pairing approve ${item.platform} <code> with the code they were sent. Ignored requests expire within the hour.` }),
+        jsx('div', {
+          className: 'ub-hint',
+          role: 'note',
+          children: item.approve_command
+            ? ['Approve on the dashboard\'s Pairing page, or run ', jsx('code', { className: 'ub-cmd', children: item.approve_command }), '. Ignored requests expire within the hour.']
+            : `Approve on the dashboard's Pairing page, or run hermes pairing approve ${item.platform} <code> with the code they were sent. Ignored requests expire within the hour.`
+        }),
         jsxs('div', { className: 'ub-btns', children: [button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })] })
       ]
     : [
