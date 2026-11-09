@@ -47,7 +47,12 @@ Chamfers are cut corners, never rounded corners. Nothing in this language has a 
 - X55's `x55_pocket.py` is the origin. The values in `tokens.json` are a sample-exact port, so keep them identical everywhere: 22050 Hz mono, `move`/`ok`/`warn`/`err`.
 
 ## Logo
-- Not final. Read `tokens.json.logo.status`, and don't ship an icon until it says FINAL. The direction is Eight of Wands × tourmaline, and it must never be orange.
+- FINAL (v22, locked 2026-11-09). Eight of Wands × realistic tourmaline; never orange. Files live in `assets/logo/`:
+  - `alive-dark.webm` / `alive-dark.mp4`: animated logo (loop). `still-dark.png`: 1200² still and the video poster.
+  - `banner-dark.png`: 3600×1200 banner.
+  - `icon-512/128.png`: four wands; `icon-64/32.png` and `favicon.ico`: two-wand small mark.
+  - `apple-touch-icon.png` (180) and `icon-maskable-512.png` (art inside the 80% safe circle).
+- Don't retouch these by hand; changes go back through the source pipeline and need the maintainer's sign-off.
 
 ## Reference implementation
 - `desktop/src/plugin.src.js` covers the field renderer (`heightAt`/`paintField`), mascot renderer, ramps, SFX and the event bus. Port its behaviour, not its React.
