@@ -1,0 +1,24 @@
+name: unbl0ck
+label: UNBL0CK
+version: "0.1.0"
+description: >
+  UNBL0CK clears whatever is blocked on you. One queue of everything waiting on you: blocked Kanban cards that need your
+  answer, and Bot Mode chats whose last turn is a bot asking you something.
+  Answer a card in place and it is commented and unblocked through native
+  Kanban; open a chat straight from the queue. Desktop gets an /unblock page,
+  a status-bar count and "Needs you" badges on cards inside /kanban.
+author: KyaniteLabs
+license: MIT
+requires_hermes: ">=0.23.0"
+provides_tools: []
+provides_hooks: []
+provides_middleware: []
+config_schema:
+  principal_name:
+    type: str
+    default: ""
+    description: "Your name(s) as agents write them in block reasons and chats, comma-separated (e.g. \"Ada, Ada Lovelace\"). CEO, principal and human always count."
+  comment_author:
+    type: str
+    default: ""
+    description: "Author name used when UNBL0CK comments your answer on a Kanban card. Defaults to the first principal_name, else \"user\"."
