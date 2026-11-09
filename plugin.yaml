@@ -6,8 +6,8 @@ description: >
   answer, and Bot Mode chats whose last turn is a bot asking you something.
   Answer a card in place and it is commented and unblocked through native
   Kanban; read its full context; ask a read-only assistant about it and decide
-  without leaving the card; open a chat straight from the queue. Desktop gets an /unblock page,
-  a status-bar count and "Needs you" badges on cards inside /kanban.
+  without leaving the card; open a chat straight from the queue. Desktop gets an /unblock page
+  and a status-bar count.
 author: KyaniteLabs
 license: MIT
 requires_hermes: ">=0.23.0"

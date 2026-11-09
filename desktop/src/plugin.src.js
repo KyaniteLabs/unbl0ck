@@ -7,7 +7,6 @@ import {
   atom,
   host,
   useValue,
-  KANBAN_CARD_AREAS,
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
   STATUSBAR_AREAS
@@ -1320,22 +1319,6 @@ export default {
     style.textContent = CSS
     document.head.appendChild(style)
 
-    let lastKey = ''
-    const paintBadges = items => {
-      const ids = new Map(items.filter(i => i.source === 'kanban').map(i => [i.task_id, i.bluf || i.why]))
-      const key = [...ids].map(kv => kv.join('=')).sort().join('|')
-      if (key === lastKey) return
-      lastKey = key
-      ctx.register({
-        id: 'needs-you',
-        area: KANBAN_CARD_AREAS.badges,
-        data: {
-          decorate: card =>
-            card.status === 'blocked' && ids.has(card.id) ? { label: 'Needs you', tone: 'red', tooltip: ids.get(card.id) } : null
-        }
-      })
-    }
-
     let seen = null
     let follow = 0
     let lastErr = ''
@@ -1356,7 +1339,6 @@ export default {
         if (errKey && errKey !== lastErr) { sfx.play('err'); petEmit('err') }   // once per new fault, not every poll
         lastErr = errKey
         $queue.set({ ...q, fresh, fault: '', loading: false, at: Date.now() })
-        paintBadges(q.items || [])
       } catch (e) {
         // Keep the last good queue: a transient fetch fault must not wipe the list
         // or tell the user that nothing is blocked.
