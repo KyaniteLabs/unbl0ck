@@ -1,10 +1,10 @@
 name: unbl0ck
 label: UNBL0CK
-version: "0.4.1"
+version: "0.4.2"
 description: >
   UNBL0CK clears whatever is blocked on you. One queue of everything waiting on you: blocked Kanban cards that need your
   answer, chats on any platform whose last turn is a bot asking you something, agents paused right now on a
-  clarify question, command approval or sudo prompt, and new people waiting for you to approve their pairing request.
+  clarify question, command approval or admin password prompt, and new people waiting for you to approve their pairing request.
   Answer a card in place and it is commented and unblocked through native
   Kanban; read its full context; ask a read-only assistant about it and decide
   without leaving the card; open a chat straight from the queue. Desktop gets an /unblock page

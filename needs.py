@@ -9,7 +9,7 @@
   reply after it. In a shared channel the ask must name the principal. Read read-only; answering
   happens in the chat itself.
 - Live prompts: an agent blocked right now on a human prompt (a clarify question, a dangerous-command
-  approval, a sudo password), seen through Hermes' stock ``on_human_input_request`` /
+  approval, an admin password), seen through Hermes' stock ``on_human_input_request`` /
   ``on_human_input_resolved`` hooks. Each open wait is one small owner-only file; a wait whose
   process died, or that is older than a day, is dropped. The prompt text arrives already redacted
   by Hermes; answering happens where it was asked.
@@ -760,7 +760,7 @@ def pairing_items(home: Optional[Path] = None, errors: Optional[list[str]] = Non
 _WAIT_KINDS = {
     "clarify": "is asking you a question",
     "approval": "needs your approval to run a command",
-    "sudo": "needs your sudo password",
+    "sudo": "needs your admin password",
 }
 _SAFE_ID = re.compile(r"^[0-9a-f]{8,64}$")
 WAIT_MAX_AGE = 86400   # no human prompt legitimately stays open a day; a missed resolve hook does

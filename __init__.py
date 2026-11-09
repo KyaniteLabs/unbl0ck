@@ -62,7 +62,7 @@ def register(ctx):
     ctx.register_command("unbl0ck", slash_unbl0ck, description="What is blocked on you right now")
     ctx.register_cli_command("unbl0ck", "List what is blocked on you (Kanban, chats, live prompts, pairing)", _setup_cli, _cli)
     # Live prompts: stock observers for every point an agent blocks on a human (clarify,
-    # approval, sudo). Observers only; a failure here never touches the prompt.
+    # approval, admin password). Observers only; a failure here never touches the prompt.
     register_hook = getattr(ctx, "register_hook", None)
     if register_hook:
         register_hook("on_human_input_request", lambda **kw: _needs().record_wait(**kw))
