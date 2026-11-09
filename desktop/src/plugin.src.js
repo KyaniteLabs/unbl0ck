@@ -55,6 +55,7 @@ ${Object.entries(FONTS)
   clip-path:polygon(0 0,calc(100% - 18px) 0,100% 18px,100% 100%,18px 100%,0 calc(100% - 18px))}
 .ub-card>.in{background:var(--panel);padding:18px 22px 18px 18px;display:grid;grid-template-columns:56px 1fr;gap:4px 18px;
   clip-path:polygon(0 0,calc(100% - 17px) 0,100% 17px,100% 100%,17px 100%,0 calc(100% - 17px))}
+.ub-card>.in>:not(.ub-idx){grid-column:2}
 .ub-card:hover,.ub-card:focus-within{background:var(--amber)}
 .ub-idx{grid-row:1/span 4;width:52px;height:52px;display:grid;place-items:center;font-family:var(--mono);font-size:20px;color:var(--cyan);
   background:var(--base);border:1px solid var(--steel);clip-path:polygon(12px 0,100% 0,100% 100%,0 100%,0 12px)}
@@ -66,16 +67,21 @@ ${Object.entries(FONTS)
 .ub-meta{font-family:var(--mono);font-size:13.5px;letter-spacing:.06em;color:var(--dim);text-transform:uppercase}
 .ub-meta em{font-style:normal;color:var(--cyan)}
 .ub-ask{margin:8px 0 2px;font-size:18px;font-weight:500;line-height:1.45;color:var(--muted);white-space:pre-wrap;
-  max-height:5.8em;overflow:hidden;cursor:pointer;-webkit-mask-image:linear-gradient(#000 60%,transparent)}
-.ub-ask.open{max-height:none;-webkit-mask-image:none;cursor:default}
+  max-height:5.8em;overflow:hidden;cursor:pointer;-webkit-mask-image:linear-gradient(#000 3.6em,transparent 5.8em);mask-image:linear-gradient(#000 3.6em,transparent 5.8em)}
+.ub-ask.open{max-height:none;-webkit-mask-image:none;mask-image:none;cursor:default}
+.ub-bluf{margin:10px 0 4px;font-size:21px;font-weight:600;line-height:1.35;color:var(--text)}
+.ub-full{justify-self:start;background:none;border:0;padding:4px 0;font-family:var(--mono);font-size:13px;letter-spacing:.12em;color:var(--cyan);cursor:pointer}
+.ub-full:hover,.ub-full:focus-visible{color:var(--text)}
+.ub-pending{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--cyan);opacity:.8;animation:ub-blink2 1.06s steps(1) infinite}
 .ub-zero{font-family:var(--mono);color:var(--cyan);font-size:.92em}
 .ub-why{font-size:16px;font-weight:500;color:var(--muted)}.ub-why b{font-family:var(--mono);font-weight:400;color:var(--amber);letter-spacing:.12em;margin-right:8px}
 .ub-act{grid-column:2;display:flex;flex-direction:column;gap:10px;margin-top:10px}
-.ub-ta{width:100%;min-height:84px;resize:vertical;background:var(--base);color:var(--text);border:1px solid var(--steel);
+.ub-ta{width:100%;resize:vertical;background:var(--base);color:var(--text);border:1px solid var(--steel);
   padding:9px 12px;font:500 17px/1.4 var(--disp);outline:none;height:44px;min-height:44px;transition:height .15s}
 .ub-ta:focus,.ub-ta.has{height:110px}
 .ub-ta::placeholder{color:var(--dim)}.ub-ta:focus{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber)}
 .ub-btns{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.ub-btns.tools{gap:4px 6px;margin-left:-14px}.ub-btns.tools .ub-btn{padding:0 14px}
 .ub-btn{height:40px;padding:0 18px;border:1px solid var(--steel);background:var(--panel2);color:var(--text);cursor:pointer;
   font:700 16px/1 var(--disp);letter-spacing:.08em;text-transform:uppercase;
   clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px)}
@@ -92,10 +98,12 @@ ${Object.entries(FONTS)
 .ub-clear{margin-top:30px;padding:28px;border:1px solid var(--steeld);background:var(--panel);display:flex;gap:16px;align-items:center}
 .ub-clear b{font-family:var(--mono);font-weight:400;font-size:15px;letter-spacing:.14em;color:var(--green)}
 .ub-clear span{font-size:20px;font-weight:500;color:var(--muted)}
-.ub-err{margin-top:18px;font-family:var(--mono);font-size:13px;color:var(--mag);letter-spacing:.04em}
+.ub-err{margin:0 0 14px;padding:10px 14px;border:1px solid rgba(255,43,214,.45);border-left:3px solid var(--mag);background:rgba(107,19,87,.18);
+  font-family:var(--mono);font-size:13px;line-height:1.5;color:var(--mag);letter-spacing:.04em;overflow-wrap:anywhere}
+.ub-err b{font-weight:400;color:var(--text);margin-right:8px}
 .ub-hazard{height:6px;margin-bottom:12px;background:repeating-linear-gradient(135deg,var(--hazard) 0 8px,transparent 8px 16px)}
-.ub-chip{background:none;border:0;cursor:pointer;padding:0 8px;font-family:var(--mono);font-size:12px;letter-spacing:.1em;color:#f0a202}
-.ub-chip:hover{color:#00f5ff}
+.ub-chip{background:none;border:0;cursor:pointer;padding:0 8px;font:400 12px/1 'UB ShareTechMono','Share Tech Mono','SF Mono',ui-monospace,monospace;letter-spacing:.1em;color:#f0a202}
+.ub-chip:hover,.ub-chip:focus-visible{color:#00f5ff}
 /* ── card context + ask drawer ── */
 .ub-detail{grid-column:2;display:flex;flex-direction:column;gap:10px;margin-top:2px}
 .ub-dtoggle{align-self:flex-start;background:none;border:1px solid var(--steeld);color:var(--label);cursor:pointer;
@@ -212,7 +220,8 @@ ${Object.entries(FONTS)
 @keyframes ub-blink2{50%{opacity:0}}
 @media (max-width:760px){.ub-hero{grid-template-columns:1fr}.ub-pet{display:none}.ub-banner{font-size:9px}.ub-water{display:none}}
 @media (max-width:640px){.ub-wrap{padding:20px 16px 40px}
-  .ub-card>.in{grid-template-columns:1fr}.ub-idx{display:none}.ub-act{grid-column:1}}
+  .ub-card>.in{grid-template-columns:1fr}.ub-idx{display:none}.ub-card>.in>:not(.ub-idx){grid-column:1}
+  .ub-ta{height:72px}.ub-btns.tools{margin-left:-10px}.ub-btns.tools .ub-btn{padding:0 10px;height:34px;font-size:14px}}
 .ub.fx-off *,.ub.fx-off *::before,.ub.fx-off *::after{animation:none!important;transition:none!important}
 .ub.fx-off .ub-grain,.ub.fx-off .ub-banner .c,.ub.fx-off .ub-banner .m{display:none}
 .ub.fx-off .ub-ticker .run{position:static;flex-wrap:wrap}
@@ -981,13 +990,14 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           rows: 2,
           disabled: busy,
           placeholder: 'Your answer. It is posted on the card as you.',
+          'aria-label': `Answer for ${item.task_id}`,
           onChange: e => setAnswer(e.target.value),
           onKeyDown: e => {
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && ready) sendPrimary()
           }
         }),
         jsxs('div', { className: 'ub-btns', children: answerButtons }),
-        jsxs('div', { className: 'ub-btns', children: tools })
+        jsxs('div', { className: 'ub-btns tools', children: tools })
       ]
     : [
         jsxs('div', {
@@ -1065,8 +1075,18 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           ]
         }),
         meta,
-        jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: item.ask }),
-        item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null,
+        ...(item.bluf
+          ? [
+              jsx('p', { className: 'ub-bluf', children: item.bluf }),
+              item.bluf_why ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.bluf_why] }) : null,
+              open ? jsx('p', { className: 'ub-ask open', children: item.ask }) : null,
+              jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' })
+            ]
+          : [
+              item.bluf_pending ? jsx('div', { className: 'ub-pending', children: '◇ SUMMARIZING' }) : null,
+              jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: item.ask }),
+              item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null
+            ]),
         jsx('div', { className: 'ub-act', children: actions }),
         detailNode || askNode ? jsxs('div', { className: 'ub-detail', children: [detailNode, askNode] }) : null
       ]
@@ -1076,6 +1096,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
 
 function Page({ ctx, refresh }) {
   const q = useValue($queue)
+  useEffect(() => { if (Date.now() - (q.at || 0) > 10000) refresh() }, [])   // opening the page shows fresh data
   const fx = useValue($fxOn)
   const kanban = q.items.filter(i => i.source === 'kanban')
   const chats = q.items.filter(i => i.source === 'chat')
@@ -1128,9 +1149,11 @@ function Page({ ctx, refresh }) {
                         children: [
                           q.loading
                             ? 'Scanning the boards and Bot Chats'
-                            : (q.errors || []).length
-                              ? 'Queue refresh fault; showing the last known list.'
-                              : q.count
+                            : q.fault
+                              ? 'Cannot reach the queue; showing the last known list.'
+                              : (q.errors || []).length
+                                ? 'A source failed to load; the list may be incomplete.'
+                                : q.count
                                 ? 'Everything that is waiting on your word.'
                                 : 'Nothing is blocked on you.',
                           jsx('i', { className: 'ub-cursor' })
@@ -1144,8 +1167,8 @@ function Page({ ctx, refresh }) {
               jsxs('div', {
                 className: 'ub-strip',
                 children: [
-                  tile('KANBAN', pad(kanban.length)),
-                  tile('CHATS', pad(chats.length)),
+                  tile('KANBAN', q.loading ? '··' : pad(kanban.length)),
+                  tile('CHATS', q.loading ? '··' : pad(chats.length)),
                   tile('OLDEST', oldest ? ago(oldest) : '—', oldestH > 24 ? 'warn' : ''),
                   jsx('div', { style: { flex: 1 } }),
                   jsx('div', { style: { alignSelf: 'center' }, children: jsx(FxToggle, {}) }),
@@ -1156,13 +1179,14 @@ function Page({ ctx, refresh }) {
               jsx(Ticker, { items: q.items })
             ]
           }),
+          q.fault ? jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'LINK FAULT //' }), q.fault] }) : null,
+          ...(q.errors || []).map(err => jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'SOURCE FAULT //' }), err] }, err)),
           kanban.length ? jsx('div', { className: 'ub-hazard' }) : null,
           ...group('KANBAN.CARDS', kanban),
           ...group('BOT.CHATS', chats),
-          !q.loading && !q.count && !(q.errors || []).length
+          !q.loading && !q.count && !q.fault && !(q.errors || []).length
             ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card or chat is waiting on you.' })] })
-            : null,
-          ...(q.errors || []).map(err => jsx('div', { className: 'ub-err', children: `SOURCE FAULT // ${err}` }, err))
+            : null
         ]
       })
       ] })
@@ -1178,7 +1202,7 @@ function Chip() {
     className: q.fresh ? 'ub-chip new' : 'ub-chip',
     onClick: () => host.navigate(PATH),
     title: 'Open UNBL0CK',
-    children: `◆ ${q.count} NEED YOU`
+    children: `◆ ${q.count} ${q.count === 1 ? 'NEEDS' : 'NEED'} YOU`
   })
 }
 
@@ -1193,8 +1217,8 @@ export default {
 
     let lastKey = ''
     const paintBadges = items => {
-      const ids = new Map(items.filter(i => i.source === 'kanban').map(i => [i.task_id, i.why]))
-      const key = [...ids.keys()].sort().join(',')
+      const ids = new Map(items.filter(i => i.source === 'kanban').map(i => [i.task_id, i.bluf || i.why]))
+      const key = [...ids].map(kv => kv.join('=')).sort().join('|')
       if (key === lastKey) return
       lastKey = key
       ctx.register({
@@ -1208,23 +1232,32 @@ export default {
     }
 
     let seen = null
-    const refresh = async () => {
+    let follow = 0
+    let lastErr = ''
+    let inflight = null
+    const refresh = () => (inflight ||= load().finally(() => { inflight = null }))
+    const load = async () => {
+      clearTimeout(follow)
       try {
         const q = await ctx.rest('/queue')
+        // Summaries land a few seconds after a new item appears: look again soon instead of
+        // making the user wait a whole poll interval.
+        if ((q.items || []).some(i => i.bluf_pending)) follow = setTimeout(refresh, 6000)
         const ids = new Set((q.items || []).map(i => i.id))
         const fresh = seen !== null && [...ids].some(id => !seen.has(id))
         seen = ids
         if (fresh) { sfx.play('warn'); petEmit('new') }
-        if ((q.errors || []).length) { sfx.play('err'); petEmit('err') }
-        $queue.set({ ...q, fresh, loading: false, at: Date.now() })
+        const errKey = (q.errors || []).join('|')
+        if (errKey && errKey !== lastErr) { sfx.play('err'); petEmit('err') }   // once per new fault, not every poll
+        lastErr = errKey
+        $queue.set({ ...q, fresh, fault: '', loading: false, at: Date.now() })
         paintBadges(q.items || [])
       } catch (e) {
         // Keep the last good queue: a transient fetch fault must not wipe the list
         // or tell the user that nothing is blocked.
         const prev = $queue.get() || {}
-        sfx.play('err')
-        petEmit('err')
-        $queue.set({ ...prev, errors: [String(e?.message || e)], loading: false, at: Date.now() })
+        if (!prev.fault) { sfx.play('err'); petEmit('err') }
+        $queue.set({ ...prev, fault: String(e?.message || e), loading: false })
       }
     }
 
@@ -1235,9 +1268,14 @@ export default {
     ])
 
     refresh()
-    const timer = setInterval(refresh, POLL_MS)
+    const timer = setInterval(() => { if (!document.hidden) refresh() }, POLL_MS)
+    // Coming back to the window: refresh at once rather than showing a list up to 45 s old.
+    const onVisible = () => { if (!document.hidden && Date.now() - ($queue.get().at || 0) > 10000) refresh() }
+    document.addEventListener('visibilitychange', onVisible)
     ctx.onDispose(() => {
       clearInterval(timer)
+      clearTimeout(follow)
+      document.removeEventListener('visibilitychange', onVisible)
       sfx.close()
       style.remove()
     })

@@ -21,7 +21,8 @@ def _summary(limit: int = 12) -> str:
     lines = [f"{q['count']} thing(s) waiting on you:"]
     for it in q["items"][:limit]:
         where = f"{it['board']}:{it['task_id']}" if it["source"] == "kanban" else f"chat {it['profile']}"
-        lines.append(f"- [{where}] {it['title']}: {it['ask'][:140]}")
+        lead = it.get("bluf") or " ".join(str(it.get("ask") or "").split())[:140]
+        lines.append(f"- [{where}] {it['title']}: {lead}")
     if q["count"] > limit:
         lines.append(f"…and {q['count'] - limit} more. Open /unbl0ck in Desktop.")
     for err in q["errors"]:

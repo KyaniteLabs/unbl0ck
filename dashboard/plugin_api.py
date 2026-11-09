@@ -11,6 +11,7 @@ GET  /pack                   the queue as a Pocket-format card pack (also writte
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sys
 import time
 import uuid
@@ -22,6 +23,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
+log = logging.getLogger("unbl0ck")
 _PACKAGE = "hermes_unbl0ck_plugin"
 
 
@@ -120,7 +122,50 @@ def _checked_card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
 
 @router.get("/queue")
 def queue():
-    return _needs().build_queue()
+    n = _needs()
+    q = n.build_queue()
+    ctx = _loaded_ctx()
+    if q.get("bluf_enabled") and ctx is not None and hasattr(ctx, "llm"):
+        for it in q["items"]:
+            if not it.get("bluf"):
+                _queue_bluf(n, ctx, it)
+    return q
+
+
+# One model summary per item version, made in the background so the queue never waits.
+_BLUF_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="unbl0ck-bluf")
+_BLUF_STATE: dict[tuple[str, str], dict[str, Any]] = {}   # {"at": started, "error": str | None}
+_BLUF_RETRY = 600
+
+
+def _queue_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
+    key = (item["id"], item["version"])
+    st = _BLUF_STATE.get(key)
+    if st and time.time() - st["at"] < _BLUF_RETRY:
+        if st["error"] is None:
+            item["bluf_pending"] = True   # still running: keep saying so on every poll
+        return                            # failed recently: show the raw text, retry later
+    if len(_BLUF_STATE) > 500:
+        cutoff = time.time() - _BLUF_RETRY
+        for k in [k for k, v in list(_BLUF_STATE.items()) if v["at"] < cutoff]:
+            _BLUF_STATE.pop(k, None)
+    _BLUF_STATE[key] = {"at": time.time(), "error": None}
+    item["bluf_pending"] = True
+    _BLUF_POOL.submit(_run_bluf, n, ctx, dict(item))
+
+
+def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
+    key = (item["id"], item["version"])
+    try:
+        result = ctx.llm.complete(
+            n.bluf_messages(item), purpose="unbl0ck.bluf", temperature=0.1, max_tokens=200, timeout=90
+        )
+        bluf, why = n.parse_bluf(result.text)
+        n.save_bluf(item["id"], item["version"], bluf, why)
+        _BLUF_STATE.pop(key, None)
+    except Exception as exc:  # noqa: BLE001 - logged; the card keeps its raw text and retries later
+        log.warning("unbl0ck: summary for %s failed: %s: %s", item["id"], type(exc).__name__, exc)
+        _BLUF_STATE[key] = {"at": time.time(), "error": f"{type(exc).__name__}: {exc}"}
 
 
 @router.get("/card")

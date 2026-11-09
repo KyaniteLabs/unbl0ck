@@ -32,6 +32,7 @@
   clip-path:polygon(0 0,calc(100% - 18px) 0,100% 18px,100% 100%,18px 100%,0 calc(100% - 18px))}
 .ub-card>.in{background:var(--panel);padding:18px 22px 18px 18px;display:grid;grid-template-columns:56px 1fr;gap:4px 18px;
   clip-path:polygon(0 0,calc(100% - 17px) 0,100% 17px,100% 100%,17px 100%,0 calc(100% - 17px))}
+.ub-card>.in>:not(.ub-idx){grid-column:2}
 .ub-card:hover,.ub-card:focus-within{background:var(--amber)}
 .ub-idx{grid-row:1/span 4;width:52px;height:52px;display:grid;place-items:center;font-family:var(--mono);font-size:20px;color:var(--cyan);
   background:var(--base);border:1px solid var(--steel);clip-path:polygon(12px 0,100% 0,100% 100%,0 100%,0 12px)}
@@ -43,16 +44,21 @@
 .ub-meta{font-family:var(--mono);font-size:13.5px;letter-spacing:.06em;color:var(--dim);text-transform:uppercase}
 .ub-meta em{font-style:normal;color:var(--cyan)}
 .ub-ask{margin:8px 0 2px;font-size:18px;font-weight:500;line-height:1.45;color:var(--muted);white-space:pre-wrap;
-  max-height:5.8em;overflow:hidden;cursor:pointer;-webkit-mask-image:linear-gradient(#000 60%,transparent)}
-.ub-ask.open{max-height:none;-webkit-mask-image:none;cursor:default}
+  max-height:5.8em;overflow:hidden;cursor:pointer;-webkit-mask-image:linear-gradient(#000 3.6em,transparent 5.8em);mask-image:linear-gradient(#000 3.6em,transparent 5.8em)}
+.ub-ask.open{max-height:none;-webkit-mask-image:none;mask-image:none;cursor:default}
+.ub-bluf{margin:10px 0 4px;font-size:21px;font-weight:600;line-height:1.35;color:var(--text)}
+.ub-full{justify-self:start;background:none;border:0;padding:4px 0;font-family:var(--mono);font-size:13px;letter-spacing:.12em;color:var(--cyan);cursor:pointer}
+.ub-full:hover,.ub-full:focus-visible{color:var(--text)}
+.ub-pending{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--cyan);opacity:.8;animation:ub-blink2 1.06s steps(1) infinite}
 .ub-zero{font-family:var(--mono);color:var(--cyan);font-size:.92em}
 .ub-why{font-size:16px;font-weight:500;color:var(--muted)}.ub-why b{font-family:var(--mono);font-weight:400;color:var(--amber);letter-spacing:.12em;margin-right:8px}
 .ub-act{grid-column:2;display:flex;flex-direction:column;gap:10px;margin-top:10px}
-.ub-ta{width:100%;min-height:84px;resize:vertical;background:var(--base);color:var(--text);border:1px solid var(--steel);
+.ub-ta{width:100%;resize:vertical;background:var(--base);color:var(--text);border:1px solid var(--steel);
   padding:9px 12px;font:500 17px/1.4 var(--disp);outline:none;height:44px;min-height:44px;transition:height .15s}
 .ub-ta:focus,.ub-ta.has{height:110px}
 .ub-ta::placeholder{color:var(--dim)}.ub-ta:focus{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber)}
 .ub-btns{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.ub-btns.tools{gap:4px 6px;margin-left:-14px}.ub-btns.tools .ub-btn{padding:0 14px}
 .ub-btn{height:40px;padding:0 18px;border:1px solid var(--steel);background:var(--panel2);color:var(--text);cursor:pointer;
   font:700 16px/1 var(--disp);letter-spacing:.08em;text-transform:uppercase;
   clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px)}
@@ -69,10 +75,12 @@
 .ub-clear{margin-top:30px;padding:28px;border:1px solid var(--steeld);background:var(--panel);display:flex;gap:16px;align-items:center}
 .ub-clear b{font-family:var(--mono);font-weight:400;font-size:15px;letter-spacing:.14em;color:var(--green)}
 .ub-clear span{font-size:20px;font-weight:500;color:var(--muted)}
-.ub-err{margin-top:18px;font-family:var(--mono);font-size:13px;color:var(--mag);letter-spacing:.04em}
+.ub-err{margin:0 0 14px;padding:10px 14px;border:1px solid rgba(255,43,214,.45);border-left:3px solid var(--mag);background:rgba(107,19,87,.18);
+  font-family:var(--mono);font-size:13px;line-height:1.5;color:var(--mag);letter-spacing:.04em;overflow-wrap:anywhere}
+.ub-err b{font-weight:400;color:var(--text);margin-right:8px}
 .ub-hazard{height:6px;margin-bottom:12px;background:repeating-linear-gradient(135deg,var(--hazard) 0 8px,transparent 8px 16px)}
-.ub-chip{background:none;border:0;cursor:pointer;padding:0 8px;font-family:var(--mono);font-size:12px;letter-spacing:.1em;color:#f0a202}
-.ub-chip:hover{color:#00f5ff}
+.ub-chip{background:none;border:0;cursor:pointer;padding:0 8px;font:400 12px/1 'UB ShareTechMono','Share Tech Mono','SF Mono',ui-monospace,monospace;letter-spacing:.1em;color:#f0a202}
+.ub-chip:hover,.ub-chip:focus-visible{color:#00f5ff}
 /* ── card context + ask drawer ── */
 .ub-detail{grid-column:2;display:flex;flex-direction:column;gap:10px;margin-top:2px}
 .ub-dtoggle{align-self:flex-start;background:none;border:1px solid var(--steeld);color:var(--label);cursor:pointer;
@@ -189,7 +197,8 @@
 @keyframes ub-blink2{50%{opacity:0}}
 @media (max-width:760px){.ub-hero{grid-template-columns:1fr}.ub-pet{display:none}.ub-banner{font-size:9px}.ub-water{display:none}}
 @media (max-width:640px){.ub-wrap{padding:20px 16px 40px}
-  .ub-card>.in{grid-template-columns:1fr}.ub-idx{display:none}.ub-act{grid-column:1}}
+  .ub-card>.in{grid-template-columns:1fr}.ub-idx{display:none}.ub-card>.in>:not(.ub-idx){grid-column:1}
+  .ub-ta{height:72px}.ub-btns.tools{margin-left:-10px}.ub-btns.tools .ub-btn{padding:0 10px;height:34px;font-size:14px}}
 .ub.fx-off *,.ub.fx-off *::before,.ub.fx-off *::after{animation:none!important;transition:none!important}
 .ub.fx-off .ub-grain,.ub.fx-off .ub-banner .c,.ub.fx-off .ub-banner .m{display:none}
 .ub.fx-off .ub-ticker .run{position:static;flex-wrap:wrap}

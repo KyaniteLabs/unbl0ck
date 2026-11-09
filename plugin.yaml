@@ -26,4 +26,8 @@ config_schema:
   ask_enabled:
     type: bool
     default: true
-    description: "Show the in-panel 'Ask about this card' chat. When used, the card's content and your question go to the model provider configured in Hermes through its plugin LLM API; nothing is sent unless you press Ask."
+    description: "Show the in-panel 'Ask about this card' chat. When you press Send, the card's content and your question go to the model provider configured in Hermes through its plugin LLM API."
+  bluf_enabled:
+    type: bool
+    default: true
+    description: "Lead each card with a one-line model-written summary. Each new or changed item's title and text are sent once to the model provider configured in Hermes (through its plugin LLM API) and the summary is cached in plugin-data. Set false to send nothing automatically."
