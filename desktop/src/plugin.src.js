@@ -623,7 +623,7 @@ function Pet({ count, oldestH, loading, fx }) {
       jsxs('div', {
         className: 'bar',
         children: [
-          jsxs('span', { children: ['NOUS // ', jsx('b', { style: { color: mood === 'worried' ? '#f0a202' : mood === 'happy' ? '#45b280' : '#00f5ff' }, children: MOOD_LABEL[mood] })] }),
+          jsxs('span', { children: ['NOUS \\\\ ', jsx('b', { style: { color: mood === 'worried' ? '#f0a202' : mood === 'happy' ? '#45b280' : '#00f5ff' }, children: MOOD_LABEL[mood] })] }),
           jsx('span', { className: 'hearts', children: '♥'.repeat(hearts) + '♡'.repeat(4 - hearts) }),
           jsxs('span', { children: ['XP ', jsx('b', { style: { color: '#f0a202' }, children: pad(xp) })] })
         ]
@@ -755,7 +755,7 @@ const seedDraft = (item, data) => {
 
 function CardDetail({ data, loading, error }) {
   if (loading && !data) return jsx('div', { className: 'ub-note', children: 'Loading card context…' })
-  if (error && !data) return jsx('div', { className: 'ub-fault', children: `CONTEXT FAULT // ${error}` })
+  if (error && !data) return jsx('div', { className: 'ub-fault', children: `CONTEXT FAULT \\\\ ${error}` })
   if (!data) return null
   const block = data.block || {}
   const ws = data.workspace || {}
@@ -786,7 +786,7 @@ function CardDetail({ data, loading, error }) {
           block.reason
         ]
       }) : null,
-      error ? jsx('div', { className: 'ub-fault', children: `CONTEXT REFRESH FAULT // ${error}` }) : null,
+      error ? jsx('div', { className: 'ub-fault', children: `CONTEXT REFRESH FAULT \\\\ ${error}` }) : null,
       data.body ? jsxs('div', {
         children: [jsx('div', { className: 'ub-subhead', children: 'DESCRIPTION' }), jsx('p', { className: 'ub-body', children: data.body })]
       }) : null,
@@ -1009,7 +1009,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     ? jsxs('div', {
         className: 'ub-meta',
         children: [
-          'SOURCE // ', jsx('em', { children: item.task_id }), ` · ${item.board}`,
+          'SOURCE \\\\ ', jsx('em', { children: item.task_id }), ` · ${item.board}`,
           item.owner ? ` · FROM ${item.owner}` : '',
           item.priority != null ? ` · P${item.priority}` : '',
           item.block_kind ? ` · ${String(item.block_kind).toUpperCase()}` : '',
@@ -1019,7 +1019,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
       })
     : jsxs('div', {
         className: 'ub-meta',
-        children: ['BOT CHAT // ', jsx('em', { children: item.owner || item.profile }), item.profile && item.owner !== item.profile ? ` · ${item.profile}` : '']
+        children: ['BOT CHAT \\\\ ', jsx('em', { children: item.owner || item.profile }), item.profile && item.owner !== item.profile ? ` · ${item.profile}` : '']
       })
 
   const answerButtons = triage
@@ -1098,7 +1098,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
             ? jsxs('div', {
                 style: { padding: '0 12px 8px', display: 'flex', gap: 12, alignItems: 'baseline', flexWrap: 'wrap' },
                 children: [
-                  jsx('div', { className: 'ub-fault', style: { flex: '1 1 240px' }, children: `ASK FAULT // ${askError}` }),
+                  jsx('div', { className: 'ub-fault', style: { flex: '1 1 240px' }, children: `ASK FAULT \\\\ ${askError}` }),
                   button({ kind: 'ghost', disabled: askBusy, onClick: () => askSend(true), children: 'Retry' })
                 ]
               })
@@ -1202,7 +1202,7 @@ function Page({ ctx, refresh }) {
       ? [
           jsxs('div', {
             className: 'ub-sec',
-            children: [jsx('span', { className: 'ub-eyebrow', children: `// ${label} · ${pad(items.length)}` }), jsx('hr', {})]
+            children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
           }),
           jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false }, item.id)) })
         ]
@@ -1236,7 +1236,7 @@ function Page({ ctx, refresh }) {
                     children: [
                       jsx(Watermark, {}),
                       jsx('div', { className: 'ub-ticks', children: ['#00f5ff', '#ff2bd6', '#f0a202', '#45b280'].map(c => jsx('i', { style: { background: c } }, c)) }),
-                      jsxs('div', { className: 'ub-eyebrow', children: ['// NEEDS.YOU  /  LIVE QUEUE', q.at ? jsx('span', { style: { whiteSpace: 'nowrap' }, children: ` · SYNC ${new Date(q.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` }) : null] }),
+                      jsxs('div', { className: 'ub-eyebrow', children: ['\\\\ NEEDS.YOU  \\  LIVE QUEUE', q.at ? jsx('span', { style: { whiteSpace: 'nowrap' }, children: ` · SYNC ${new Date(q.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` }) : null] }),
                       jsx(Banner, {}),
                       jsxs('div', {
                         className: 'ub-sub',
