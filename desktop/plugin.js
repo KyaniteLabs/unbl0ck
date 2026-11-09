@@ -97,6 +97,53 @@ ${Object.entries(FONTS)
 .ub-hazard{height:6px;margin-bottom:12px;background:repeating-linear-gradient(135deg,var(--hazard) 0 8px,transparent 8px 16px)}
 .ub-chip{background:none;border:0;cursor:pointer;padding:0 8px;font-family:var(--mono);font-size:12px;letter-spacing:.1em;color:#f0a202}
 .ub-chip:hover{color:#00f5ff}
+/* ── card context + ask drawer ── */
+.ub-detail{grid-column:2;display:flex;flex-direction:column;gap:10px;margin-top:2px}
+.ub-dtoggle{align-self:flex-start;background:none;border:1px solid var(--steeld);color:var(--label);cursor:pointer;
+  padding:5px 12px;font:400 12.5px var(--mono);letter-spacing:.12em;text-transform:uppercase;
+  clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px)}
+.ub-dtoggle:hover,.ub-dtoggle[aria-expanded="true"]{border-color:var(--cyan);color:var(--cyan)}
+.ub-panel{border:1px solid var(--steeld);background:rgba(5,7,10,.55);padding:14px 16px;
+  clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));
+  display:flex;flex-direction:column;gap:12px}
+.ub-block{margin:0;padding:10px 12px;border-left:3px solid var(--amber);background:rgba(240,162,2,.08);
+  font-size:16px;line-height:1.45;color:var(--text);white-space:pre-wrap}
+.ub-block b{display:block;font-family:var(--mono);font-weight:400;font-size:11.5px;letter-spacing:.14em;
+  color:var(--amber);margin-bottom:4px}
+.ub-body{margin:0;font-size:16px;font-weight:500;line-height:1.5;color:var(--muted);white-space:pre-wrap}
+.ub-kvs{display:grid;grid-template-columns:max-content 1fr;gap:5px 14px;font-size:15px;color:var(--muted);margin:0}
+.ub-kvs dt{font-family:var(--mono);font-size:12px;letter-spacing:.1em;color:var(--label);text-transform:uppercase;padding-top:2px}
+.ub-kvs dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.ub-kvs dd em{font-style:normal;color:var(--cyan)}
+.ub-subhead{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--label);text-transform:uppercase;
+  border-bottom:1px solid var(--steeld);padding-bottom:5px;margin:2px 0 0}
+.ub-cmt{padding:8px 0;border-bottom:1px solid rgba(89,110,135,.28)}
+.ub-cmt:last-child{border-bottom:0}
+.ub-cmt .h{font-family:var(--mono);font-size:11.5px;letter-spacing:.1em;color:var(--dim);text-transform:uppercase;margin-bottom:3px}
+.ub-cmt .h em{font-style:normal;color:var(--cyan)}
+.ub-cmt p{margin:0;font-size:15.5px;line-height:1.45;color:var(--muted);white-space:pre-wrap}
+.ub-ev{display:flex;gap:10px;font-family:var(--mono);font-size:12px;line-height:1.5;color:var(--dim);text-transform:uppercase}
+.ub-ev em{font-style:normal;color:var(--cyan);min-width:160px}
+.ub-note{font-family:var(--mono);font-size:12px;line-height:1.5;color:var(--dim);letter-spacing:.04em}
+.ub-fault{font-family:var(--mono);font-size:12.5px;line-height:1.5;color:var(--mag);white-space:pre-wrap}
+.ub-askwrap{border:1px solid var(--steeld);background:rgba(5,7,10,.55);display:flex;flex-direction:column}
+.ub-askwrap .hd{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 12px;
+  border-bottom:1px solid var(--steeld);font-family:var(--mono);font-size:12px;letter-spacing:.12em;color:var(--label);text-transform:uppercase}
+.ub-msgs{display:flex;flex-direction:column;gap:9px;padding:12px;max-height:300px;overflow-y:auto}
+.ub-msg{max-width:92%;padding:8px 11px;border:1px solid var(--steeld);background:var(--panel2);
+  clip-path:polygon(0 0,calc(100% - 8px) 0,100% 8px,100% 100%,8px 100%,0 calc(100% - 8px))}
+.ub-msg.user{align-self:flex-end;border-color:rgba(0,245,255,.45);background:rgba(0,245,255,.06)}
+.ub-msg.assistant{align-self:flex-start;border-color:rgba(240,162,2,.35)}
+.ub-msg .who{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;color:var(--label);text-transform:uppercase;margin-bottom:3px}
+.ub-msg p{margin:0;font-size:15.5px;line-height:1.48;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}
+.ub-msg .use{margin-top:7px}
+.ub-chatbar{display:flex;gap:8px;align-items:flex-end;padding:10px 12px;border-top:1px solid var(--steeld)}
+.ub-chatbar textarea{flex:1;min-height:40px;max-height:120px;resize:vertical;background:var(--base);color:var(--text);
+  border:1px solid var(--steel);padding:8px 10px;font:500 15.5px/1.4 var(--disp);outline:none}
+.ub-chatbar textarea:focus{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber)}
+.ub-chatbar textarea::placeholder{color:var(--dim)}
+.ub-thinking{font-family:var(--mono);font-size:12.5px;letter-spacing:.1em;color:var(--cyan)}
+.ub-thinking::after{content:'…';animation:ub-blink2 1s steps(2) infinite}
 /* ── layers: ASCII contour field (canvas) → tints/scanlines/grain → scrolling content ── */
 .ub-field{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .ub-fx{position:absolute;inset:0;pointer-events:none;
@@ -624,29 +671,206 @@ const button = ({ kind = '', keycap, children, ...rest }) =>
     children: [keycap ? jsx('span', { className: 'ub-key', children: keycap }) : null, children]
   })
 
-function Item({ ctx, item, n, refresh }) {
+const ts = value => {
+  if (!value) return ''
+  try { return new Date(value * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) } catch { return '' }
+}
+const bytes = n => {
+  if (!n) return '0 B'
+  if (n > 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
+  if (n > 1024) return `${Math.round(n / 1024)} KB`
+  return `${n} B`
+}
+
+const seedDraft = (item, data) => {
+  const d = data || {}
+  const parts = [
+    'Help me decide about this Kanban card. Do not change anything without asking me first.',
+    '',
+    `Board: ${item.board}`,
+    `Card: ${item.task_id} — ${item.title}`
+  ]
+  if (item.ask) parts.push(`Blocked because: ${item.ask}`)
+  if (d.body) parts.push('', 'Description:', d.body)
+  const comments = (d.comments || []).slice(-5)
+  if (comments.length) parts.push('', 'Recent comments:', ...comments.map(c => `- ${c.author}: ${c.body}`))
+  parts.push('', 'My question: ')
+  return parts.join('\n')
+}
+
+function CardDetail({ data, loading, error }) {
+  if (loading && !data) return jsx('div', { className: 'ub-note', children: 'Loading card context…' })
+  if (error && !data) return jsx('div', { className: 'ub-fault', children: `CONTEXT FAULT // ${error}` })
+  if (!data) return null
+  const block = data.block || {}
+  const ws = data.workspace || {}
+  const graph = data.graph || {}
+  const run = data.last_run
+  const rows = [
+    ['STATUS', data.status],
+    ['PRIORITY', data.priority != null ? String(data.priority) : ''],
+    ['BLOCK KIND', block.kind],
+    ['RECURRENCES', block.recurrences != null ? String(block.recurrences) : ''],
+    ['ASSIGNEE', data.assignee],
+    ['CREATED BY', data.created_by],
+    ['SESSION', data.session_id],
+    ['CREATED', ts(data.created_at)],
+    ['WORKSPACE', ws.kind],
+    ['PATH', ws.path],
+    ['BRANCH', ws.branch],
+    ['PROJECT', ws.project_id],
+    ['PR', data.pr ? (data.pr.reference || data.pr.classification || '') : '']
+  ].filter(([, value]) => value !== null && value !== undefined && value !== '')
+  return jsxs('div', {
+    className: 'ub-panel',
+    children: [
+      block.reason ? jsxs('div', {
+        className: 'ub-block',
+        children: [
+          jsx('b', { children: `LATEST BLOCK${block.kind ? ` · ${String(block.kind).toUpperCase()}` : ''}${block.recurrences > 1 ? ` · LOOP ${block.recurrences}` : ''}` }),
+          block.reason
+        ]
+      }) : null,
+      error ? jsx('div', { className: 'ub-fault', children: `CONTEXT REFRESH FAULT // ${error}` }) : null,
+      data.body ? jsxs('div', {
+        children: [jsx('div', { className: 'ub-subhead', children: 'DESCRIPTION' }), jsx('p', { className: 'ub-body', children: data.body })]
+      }) : null,
+      rows.length ? jsx('dl', {
+        className: 'ub-kvs',
+        children: rows.map(([key, value]) => jsxs('div', {
+          style: { display: 'contents' },
+          children: [jsx('dt', { children: key }), jsx('dd', { children: String(value) })]
+        }, key))
+      }) : null,
+      (graph.parents?.length || graph.children?.length) ? jsxs('div', {
+        children: [
+          jsx('div', { className: 'ub-subhead', children: 'GRAPH' }),
+          jsx('div', {
+            className: 'ub-note',
+            children: [
+              graph.parents?.length ? `Parents: ${graph.parents.map(x => `${x.id} ${x.title} (${x.status})`).join(' · ')}` : '',
+              graph.parents?.length && graph.children?.length ? '\n' : '',
+              graph.children?.length ? `Children: ${graph.children.map(x => `${x.id} ${x.title} (${x.status})`).join(' · ')}` : ''
+            ].join('')
+          })
+        ]
+      }) : null,
+      run ? jsxs('div', {
+        children: [
+          jsx('div', { className: 'ub-subhead', children: `LAST RUN · ${String(run.outcome || run.status || '').toUpperCase()}` }),
+          jsx('div', { className: 'ub-note', children: [run.summary, run.error].filter(Boolean).join('\n') || 'No summary.' })
+        ]
+      }) : null,
+      data.attachments?.length ? jsxs('div', {
+        children: [
+          jsx('div', { className: 'ub-subhead', children: `ATTACHMENTS · ${data.attachments.length}` }),
+          jsx('div', { className: 'ub-note', children: data.attachments.map(a => `${a.filename} (${bytes(a.size)})`).join('\n') })
+        ]
+      }) : null,
+      data.comments?.length ? jsxs('div', {
+        children: [
+          jsx('div', { className: 'ub-subhead', children: `COMMENTS · ${data.comments.length}` }),
+          ...data.comments.slice(-12).map(c => jsxs('div', {
+            className: 'ub-cmt',
+            children: [
+              jsxs('div', { className: 'h', children: [jsx('em', { children: c.author }), ` · ${ts(c.created_at)}`] }),
+              jsx('p', { children: c.body })
+            ]
+          }, c.id))
+        ]
+      }) : null,
+      data.events?.length ? jsxs('div', {
+        children: [
+          jsx('div', { className: 'ub-subhead', children: 'RECENT EVENTS' }),
+          ...data.events.slice(-8).map(e => jsxs('div', {
+            className: 'ub-ev',
+            children: [
+              jsx('em', { children: e.kind }),
+              jsx('span', { children: [ts(e.created_at), e.payload?.reason ? ` · ${String(e.payload.reason).slice(0, 180)}` : ''].join('') })
+            ]
+          }, e.id))
+        ]
+      }) : null
+    ]
+  })
+}
+
+function Item({ ctx, item, n, refresh, askEnabled }) {
   const [answer, setAnswer] = useState('')
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState(false)
   const [done, setDone] = useState(false)
+  const [detailOpen, setDetailOpen] = useState(false)
+  const [detail, setDetail] = useState(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [detailError, setDetailError] = useState('')
+  const [askOpen, setAskOpen] = useState(false)
+  const [askMsgs, setAskMsgs] = useState([])
+  const [askInput, setAskInput] = useState('')
+  const [askBusy, setAskBusy] = useState(false)
+  const [askError, setAskError] = useState('')
+  const askEnd = useRef(null)
   const isKanban = item.source === 'kanban'
+  const triage = isKanban && item.status === 'triage'
 
-  const run = async (fn, okMsg, cue = 'ok') => {
+  useEffect(() => {
+    if (!detailOpen) return
+    if (detail && detail.__version === item.version) return
+    let alive = true
+    setDetailLoading(true)
+    setDetailError('')
+    ctx.rest(`/card?id=${encodeURIComponent(item.id)}`)
+      .then(d => { if (alive) setDetail({ ...d, __version: item.version }) })
+      .catch(e => { if (alive) setDetailError(String(e?.message || e)) })
+      .finally(() => setDetailLoading(false))
+    return () => { alive = false }
+  }, [item.version, detailOpen])
+  useEffect(() => {
+    if (askEnd.current) askEnd.current.scrollIntoView({ block: 'nearest' })
+  }, [askMsgs, askBusy])
+
+  const loadDetail = async () => {
+    if (detail && detail.__version === item.version) return detail
+    if (detailLoading) return null
+    setDetailLoading(true)
+    setDetailError('')
+    try {
+      const d = await ctx.rest(`/card?id=${encodeURIComponent(item.id)}`)
+      const full = { ...d, __version: item.version }
+      setDetail(full)
+      return full
+    } catch (e) {
+      setDetailError(String(e?.message || e))
+      return null
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+  const toggleDetail = () => setDetailOpen(!detailOpen)
+  const toggleAsk = () => {
+    const next = !askOpen
+    setAskOpen(next)
+    if (next && !detailOpen) loadDetail()
+  }
+
+  const run = async (fn, okFor, cue = 'ok') => {
     setBusy(true)
     try {
-      await fn()
+      const r = await fn()
       sfx.play(cue)
-      if (okMsg) petEmit('joy')
-      if (okMsg) {
+      if (okFor) {
+        petEmit('joy')
         setDone(true)
-        host.notify({ kind: 'success', message: okMsg })
-        await new Promise(r => setTimeout(r, reducedMotion() ? 0 : 650))
+        host.notify({ kind: 'success', message: okFor(r) })
+        await new Promise(res => setTimeout(res, reducedMotion() ? 0 : 650))
       }
       await refresh()
+      return r
     } catch (e) {
       sfx.play('err')
       petEmit('err')
       host.notifyError(e, 'UNBL0CK: that did not go through')
+      return null
     } finally {
       setBusy(false)
     }
@@ -657,14 +881,92 @@ function Item({ ctx, item, n, refresh }) {
         method: 'POST',
         body: { board: item.board, task_id: item.task_id, text: answer, release }
       }),
-      release ? `Answered and unblocked ${item.task_id}` : `Answered ${item.task_id}`
+      r => (triage
+        ? `Answered ${item.task_id} (triage)`
+        : r && r.released
+          ? `Answered and unblocked ${item.task_id}`
+          : `Answered ${item.task_id} (kept blocked)`)
     )
+  const sendPrimary = () => send(!triage)
   const hide = () => run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
   const ready = !busy && answer.trim().length > 0
 
+  const askSend = async () => {
+    const q = askInput.trim()
+    if (!q || askBusy) return
+    const next = [...askMsgs, { role: 'user', content: q }]
+    setAskMsgs(next)
+    setAskInput('')
+    setAskBusy(true)
+    setAskError('')
+    try {
+      const r = await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next } })
+      const reply = String(r?.reply || '').trim()
+      if (!reply) throw new Error('The model returned an empty answer')
+      setAskMsgs([...next, { role: 'assistant', content: reply }])
+      sfx.play('ok')
+    } catch (e) {
+      sfx.play('err')
+      setAskError(String(e?.message || e))
+    } finally {
+      setAskBusy(false)
+    }
+  }
+  const lastAssistant = askMsgs.reduce((index, m, i) => (m.role === 'assistant' ? i : index), -1)
+  const lastSuggestion = lastAssistant >= 0 ? askMsgs[lastAssistant].content : ''
+  const useAsAnswer = () => {
+    if (!lastSuggestion) return
+    setAnswer(prev => (prev.trim() ? `${prev.trim()}\n\n${lastSuggestion}` : lastSuggestion))
+    sfx.play('move')
+  }
+  const discussInChat = async () => {
+    try {
+      const d = detail || await loadDetail()
+      const draft = seedDraft(item, d)
+      host.newChat(null)
+      await new Promise(res => setTimeout(res, reducedMotion() ? 0 : 200))
+      let ok = false
+      if (host.composer?.setDraft) {
+        ok = await host.composer.setDraft('new', draft)
+        if (!ok) ok = await host.composer.setDraft(null, draft)
+      }
+      if (!ok) throw new Error('the new chat did not accept the draft')
+      sfx.play('move')
+    } catch (e) {
+      host.notifyError(e, 'UNBL0CK: could not open chat')
+    }
+  }
+
   const meta = isKanban
-    ? jsxs('div', { className: 'ub-meta', children: ['SOURCE // ', jsx('em', { children: item.task_id }), ` · ${item.board}${item.owner ? ` · FROM ${item.owner}` : ''}`] })
-    : jsxs('div', { className: 'ub-meta', children: ['BOT CHAT // ', jsx('em', { children: item.owner || item.profile }), item.profile && item.owner !== item.profile ? ` · ${item.profile}` : ''] })
+    ? jsxs('div', {
+        className: 'ub-meta',
+        children: [
+          'SOURCE // ', jsx('em', { children: item.task_id }), ` · ${item.board}`,
+          item.owner ? ` · FROM ${item.owner}` : '',
+          item.priority != null ? ` · P${item.priority}` : '',
+          item.block_kind ? ` · ${String(item.block_kind).toUpperCase()}` : '',
+          item.block_recurrences > 1 ? ` · LOOP ${item.block_recurrences}` : '',
+          triage ? ' · TRIAGE' : ''
+        ]
+      })
+    : jsxs('div', {
+        className: 'ub-meta',
+        children: ['BOT CHAT // ', jsx('em', { children: item.owner || item.profile }), item.profile && item.owner !== item.profile ? ` · ${item.profile}` : '']
+      })
+
+  const answerButtons = triage
+    ? [button({ kind: 'primary', keycap: '⏎', disabled: !ready, onClick: sendPrimary, title: '⌘/Ctrl + Enter · triage cards stay in triage', children: 'Answer (stays in triage)' })]
+    : [
+        button({ kind: 'primary', keycap: '⏎', disabled: !ready, onClick: sendPrimary, title: '⌘/Ctrl + Enter', children: 'Answer + unbl0ck' }),
+        button({ disabled: !ready, onClick: () => send(false), children: 'Answer, keep blocked' })
+      ]
+  const tools = [
+    button({ kind: 'ghost', disabled: busy, onClick: toggleDetail, 'aria-expanded': detailOpen, children: detailOpen ? 'Hide context' : 'Context' }),
+    askEnabled ? button({ kind: 'ghost', disabled: busy, onClick: toggleAsk, 'aria-expanded': askOpen, children: askOpen ? 'Hide ask' : 'Ask about this card' }) : null,
+    button({ kind: 'ghost', disabled: busy, onClick: discussInChat, children: 'Discuss in chat' }),
+    button({ kind: 'ghost', disabled: busy, onClick: () => host.navigate('/kanban'), children: 'Open board' }),
+    button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
+  ].filter(Boolean)
 
   const actions = isKanban
     ? [
@@ -676,18 +978,11 @@ function Item({ ctx, item, n, refresh }) {
           placeholder: 'Your answer. It is posted on the card as you.',
           onChange: e => setAnswer(e.target.value),
           onKeyDown: e => {
-            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && ready) send(true)
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && ready) sendPrimary()
           }
         }),
-        jsxs('div', {
-          className: 'ub-btns',
-          children: [
-            button({ kind: 'primary', keycap: '⏎', disabled: !ready, onClick: () => send(true), title: '⌘/Ctrl + Enter', children: 'Answer + unbl0ck' }),
-            button({ disabled: !ready, onClick: () => send(false), children: 'Answer, keep blocked' }),
-            button({ kind: 'ghost', disabled: busy, onClick: () => host.navigate('/kanban'), children: 'Open board' }),
-            button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
-          ]
-        })
+        jsxs('div', { className: 'ub-btns', children: answerButtons }),
+        jsxs('div', { className: 'ub-btns', children: tools })
       ]
     : [
         jsxs('div', {
@@ -698,6 +993,55 @@ function Item({ ctx, item, n, refresh }) {
           ]
         })
       ]
+
+  const detailNode = detailOpen
+    ? jsx(CardDetail, { data: detail, loading: detailLoading, error: detailError })
+    : null
+  const askNode = askOpen && askEnabled
+    ? jsxs('div', {
+        className: 'ub-askwrap',
+        children: [
+          jsxs('div', {
+            className: 'hd',
+            children: [jsx('span', { children: 'ASK ABOUT THIS CARD' }), jsx('span', { children: 'READ-ONLY · NEVER ACTS' })]
+          }),
+          jsxs('div', {
+            className: 'ub-msgs',
+            children: [
+              askMsgs.length
+                ? askMsgs.map((m, i) => jsxs('div', {
+                    className: `ub-msg ${m.role}`,
+                    children: [
+                      jsx('div', { className: 'who', children: m.role === 'user' ? 'YOU' : 'UNBL0CK' }),
+                      jsx('p', { children: m.content }),
+                      m.role === 'assistant' && i === lastAssistant
+                        ? jsx('div', { className: 'use', children: button({ kind: 'ghost', onClick: useAsAnswer, children: 'Use as answer' }) })
+                        : null
+                    ]
+                  }, i))
+                : jsx('div', { className: 'ub-note', children: 'Ask what the card means, what is being asked, or what to pick. The model sees this card only; it cannot change anything.' }),
+              askBusy ? jsx('div', { className: 'ub-thinking', children: 'Thinking' }) : null,
+              jsx('div', { ref: askEnd })
+            ]
+          }),
+          askError ? jsx('div', { className: 'ub-fault', style: { padding: '0 12px 8px' }, children: `ASK FAULT // ${askError}` }) : null,
+          jsxs('div', {
+            className: 'ub-chatbar',
+            children: [
+              jsx('textarea', {
+                value: askInput,
+                rows: 1,
+                disabled: askBusy,
+                placeholder: 'Ask about this card… (Enter sends, Shift+Enter adds a line)',
+                onChange: e => setAskInput(e.target.value),
+                onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askSend() } }
+              }),
+              button({ kind: 'primary', disabled: askBusy || !askInput.trim(), onClick: askSend, children: 'Send' })
+            ]
+          })
+        ]
+      })
+    : null
 
   return jsx('section', {
     className: `ub-card ${isKanban ? 'kanban' : 'chat'}${done ? ' done' : ''}`,
@@ -718,7 +1062,8 @@ function Item({ ctx, item, n, refresh }) {
         meta,
         jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: item.ask }),
         item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null,
-        jsx('div', { className: 'ub-act', children: actions })
+        jsx('div', { className: 'ub-act', children: actions }),
+        detailNode || askNode ? jsxs('div', { className: 'ub-detail', children: [detailNode, askNode] }) : null
       ]
     })
   })
@@ -739,7 +1084,7 @@ function Page({ ctx, refresh }) {
             className: 'ub-sec',
             children: [jsx('span', { className: 'ub-eyebrow', children: `// ${label} · ${pad(items.length)}` }), jsx('hr', {})]
           }),
-          jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh }, `${item.id}:${item.version}`)) })
+          jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false }, item.id)) })
         ]
       : []
 
@@ -775,7 +1120,16 @@ function Page({ ctx, refresh }) {
                       jsx(Banner, {}),
                       jsxs('div', {
                         className: 'ub-sub',
-                        children: [q.loading ? 'Scanning the boards and Bot Chats' : q.count ? 'Everything that is waiting on your word.' : 'Nothing is blocked on you.', jsx('i', { className: 'ub-cursor' })]
+                        children: [
+                          q.loading
+                            ? 'Scanning the boards and Bot Chats'
+                            : (q.errors || []).length
+                              ? 'Queue refresh fault; showing the last known list.'
+                              : q.count
+                                ? 'Everything that is waiting on your word.'
+                                : 'Nothing is blocked on you.',
+                          jsx('i', { className: 'ub-cursor' })
+                        ]
                       })
                     ]
                   }),
@@ -800,7 +1154,7 @@ function Page({ ctx, refresh }) {
           kanban.length ? jsx('div', { className: 'ub-hazard' }) : null,
           ...group('KANBAN.CARDS', kanban),
           ...group('BOT.CHATS', chats),
-          !q.loading && !q.count
+          !q.loading && !q.count && !(q.errors || []).length
             ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card or chat is waiting on you.' })] })
             : null,
           ...(q.errors || []).map(err => jsx('div', { className: 'ub-err', children: `SOURCE FAULT // ${err}` }, err))
@@ -860,7 +1214,12 @@ export default {
         $queue.set({ ...q, fresh, loading: false, at: Date.now() })
         paintBadges(q.items || [])
       } catch (e) {
-        $queue.set({ items: [], count: 0, errors: [String(e?.message || e)], loading: false, at: Date.now() })
+        // Keep the last good queue: a transient fetch fault must not wipe the list
+        // or tell the user that nothing is blocked.
+        const prev = $queue.get() || {}
+        sfx.play('err')
+        petEmit('err')
+        $queue.set({ ...prev, errors: [String(e?.message || e)], loading: false, at: Date.now() })
       }
     }
 

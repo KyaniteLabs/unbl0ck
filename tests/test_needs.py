@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import os
 import sqlite3
 import sys
 import tempfile
@@ -12,6 +14,55 @@ spec = importlib.util.spec_from_file_location("unbl0ck_needs", ROOT / "needs.py"
 needs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(needs)
 needs._settings = lambda: {"principal_name": "Simon", "comment_author": "simon"}
+
+
+@contextlib.contextmanager
+def fake_hermes(kanban_db, kanban_db_connect):
+    pkg = types.ModuleType("hermes_cli")
+    pkg.kanban_db, pkg.kanban_db_connect = kanban_db, kanban_db_connect
+    names = ("hermes_cli", "hermes_cli.kanban_db", "hermes_cli.kanban_db_connect")
+    saved = {name: sys.modules.get(name) for name in names}
+    sys.modules.update({
+        "hermes_cli": pkg,
+        "hermes_cli.kanban_db": kanban_db,
+        "hermes_cli.kanban_db_connect": kanban_db_connect,
+    })
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def fake_db(**overrides):
+    module = types.ModuleType("hermes_cli.kanban_db")
+    defaults = {
+        "get_task": lambda conn, task_id: None,
+        "list_tasks": lambda conn, status=None: [],
+        "list_events": lambda conn, task_id: [],
+        "list_comments": lambda conn, task_id: [],
+        "add_comment": lambda conn, task_id, author, body: 1,
+        "unblock_task": lambda conn, task_id: True,
+        "latest_run": lambda conn, task_id: None,
+        "task_graph_context": lambda conn, task_id: {"parents": [], "children": []},
+        "list_attachments": lambda conn, task_id: [],
+    }
+    defaults.update(overrides)
+    for key, value in defaults.items():
+        setattr(module, key, value)
+    module.write_txn = contextlib.contextmanager(
+        lambda conn, allow_nested=False: (yield conn)
+    )
+    return module
+
+
+def fake_connect(**overrides):
+    module = types.ModuleType("hermes_cli.kanban_db_connect")
+    module.connect = overrides.pop("connect", lambda board=None: sqlite3.connect(":memory:"))
+    return module
 
 
 class Classify(unittest.TestCase):
@@ -31,6 +82,32 @@ class Classify(unittest.TestCase):
         self.assertIsNone(needs.kanban_needs_you(
             "Simon 18:07 PT: Claude Code supervisor owns this repair; needs Simon later", None))
 
+    def test_live_false_positives_drop(self):
+        cases = [
+            ("Superseded. Dead card. Do not retry. Path /home/simon/workspaces/demo/app", "needs_input"),
+            ("Ask Liam in simon/fleet", "needs_input"),
+            ("Simon-reserved slot", "needs_input"),
+            ("no new Simon approval requested", None),
+            ("Owner-domain input, not a principal gate", "needs_input"),
+        ]
+        for reason, kind in cases:
+            self.assertIsNone(needs.kanban_needs_you(reason, kind), reason)
+
+    def test_second_person_forms_detected(self):
+        for reason in [
+            "Waiting for your approval",
+            "Needs your sign-off before deploy",
+            "Waiting on your decision: A or B",
+            "needs your input on the credentials",
+            "blocked pending your go",
+            "Which option do you prefer",
+        ]:
+            self.assertTrue(needs.kanban_needs_you(reason, None), reason)
+
+    def test_negated_second_person_forms_drop(self):
+        self.assertIsNone(needs.kanban_needs_you("not waiting on your approval", None))
+        self.assertIsNone(needs.kanban_needs_you("your approval is not needed", None))
+
     def test_chat_asks(self):
         self.assertTrue(needs.chat_asks_you("Done drafting. Your call: ship A or B?"))
         self.assertTrue(needs.chat_asks_you("Should I open the PR now?"))
@@ -38,6 +115,11 @@ class Classify(unittest.TestCase):
         long_packet = "Four picks for the CEO:\n1. Ship A.\n2. Park B.\n" + "Detail line. " * 120
         self.assertTrue(needs.chat_asks_you(long_packet))
         self.assertFalse(needs.chat_asks_you("Is the build green? Yes."[:0]))
+
+    def test_chat_status_report_with_gate_idiom_is_not_an_ask(self):
+        report = ("Tonight it worked at machine speed. The only open item is that's an "
+                  "allowlist change — Platform's, on your word.")
+        self.assertFalse(needs.chat_asks_you(report))
 
 
 def make_home(tmp: Path, last_role="assistant", last_text="Want me to merge it?", age=60):
@@ -61,6 +143,12 @@ def make_home(tmp: Path, last_role="assistant", last_text="Want me to merge it?"
 
 
 class Chats(unittest.TestCase):
+    def setUp(self):
+        self._kanban_items = needs.kanban_items
+
+    def tearDown(self):
+        needs.kanban_items = self._kanban_items
+
     def test_bot_chat_question_is_queued(self):
         with tempfile.TemporaryDirectory() as d:
             items = needs.chat_items(make_home(Path(d)))
@@ -78,7 +166,7 @@ class Chats(unittest.TestCase):
     def test_hide_until_changed(self):
         with tempfile.TemporaryDirectory() as d:
             home = make_home(Path(d))
-            needs.kanban_items = lambda boards=None: []
+            needs.kanban_items = lambda boards=None, errors=None: []
             q = needs.build_queue(home)
             self.assertEqual(q["count"], 1)
             needs.hide(q["items"][0]["id"], q["items"][0]["version"], home)
@@ -89,7 +177,7 @@ class Chats(unittest.TestCase):
     def test_pocket_pack_shape(self):
         with tempfile.TemporaryDirectory() as d:
             home = make_home(Path(d))
-            needs.kanban_items = lambda boards=None: []
+            needs.kanban_items = lambda boards=None, errors=None: []
             pack = needs.pocket_pack(needs.build_queue(home))
             self.assertEqual(pack["mode"], "unblock")
             card = pack["cards"][0]
@@ -99,29 +187,42 @@ class Chats(unittest.TestCase):
             self.assertEqual(p.parent.name, "unbl0ck")  # never the gadget plugin's pack
 
 
+def block_event(reason="needs Simon to decide", kind="needs_input", recurrences=1, created_at=100):
+    return types.SimpleNamespace(
+        id=11, kind="blocked", created_at=created_at,
+        payload={"reason": reason, "kind": kind, "recurrences": recurrences},
+    )
+
+
+def task(status="blocked", task_id="t_1", **overrides):
+    values = dict(
+        id=task_id, title="Fix it", status=status, priority=3, created_at=100,
+        assignee=None, block_kind="needs_input", block_recurrences=1,
+    )
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
 class FakeKanban(unittest.TestCase):
     """answer_card writes only through native kanban_db calls."""
 
     def setUp(self):
         self.calls = []
-        task = types.SimpleNamespace(id="t_1", status="blocked")
-        kdb = types.ModuleType("hermes_cli.kanban_db")
-        kdb.get_task = lambda c, t: task if t == "t_1" else None
-        kdb.add_comment = lambda c, t, author, body: self.calls.append(("comment", t, author, body)) or 7
-        kdb.unblock_task = lambda c, t: self.calls.append(("unblock", t)) or True
-        kbc = types.ModuleType("hermes_cli.kanban_db_connect")
-        kbc.connect = lambda board=None: sqlite3.connect(":memory:")
-        pkg = types.ModuleType("hermes_cli")
-        pkg.kanban_db, pkg.kanban_db_connect = kdb, kbc
-        self._saved = {k: sys.modules.get(k) for k in ("hermes_cli", "hermes_cli.kanban_db", "hermes_cli.kanban_db_connect")}
-        sys.modules.update({"hermes_cli": pkg, "hermes_cli.kanban_db": kdb, "hermes_cli.kanban_db_connect": kbc})
+        self.task = task()
+        self.events = [block_event()]
+        self.comments = []
+        kdb = fake_db(
+            get_task=lambda c, t: self.task if t == "t_1" else None,
+            list_events=lambda c, t: self.events,
+            list_comments=lambda c, t: self.comments,
+            add_comment=lambda c, t, author, body: self.calls.append(("comment", t, author, body)) or 7,
+            unblock_task=lambda c, t: self.calls.append(("unblock", t)) or True,
+        )
+        self.stack = fake_hermes(kdb, fake_connect())
+        self.stack.__enter__()
 
     def tearDown(self):
-        for k, v in self._saved.items():
-            if v is None:
-                sys.modules.pop(k, None)
-            else:
-                sys.modules[k] = v
+        self.stack.__exit__(None, None, None)
 
     def test_answer_and_release(self):
         r = needs.answer_card("factory", "t_1", "Go with A", release=True)
@@ -138,6 +239,166 @@ class FakeKanban(unittest.TestCase):
         with self.assertRaises(LookupError):
             needs.answer_card("factory", "t_9", "x", release=True)
 
+    def test_double_submit_is_rejected_before_a_second_comment(self):
+        self.comments = [types.SimpleNamespace(author="simon", created_at=150, body="already")]
+        with self.assertRaises(RuntimeError):
+            needs.answer_card("factory", "t_1", "again", release=False)
+        self.assertEqual(self.calls, [])
+
+    def test_failed_unblock_is_not_reported_as_success(self):
+        kdb = sys.modules["hermes_cli.kanban_db"]
+        kdb.unblock_task = lambda c, t: self.calls.append(("unblock", t)) or False
+        # rebuild the module with the new unblock
+        with self.assertRaises(needs.UnblockFailed) as ctx:
+            needs.answer_card("factory", "t_1", "Go", release=True)
+        self.assertIn("comment 7", str(ctx.exception))
+        self.assertEqual([c[0] for c in self.calls], ["comment", "unblock"])
+
+    def test_triage_cannot_be_released(self):
+        self.task = task(status="triage")
+        with self.assertRaises(ValueError):
+            needs.answer_card("factory", "t_1", "answer", release=True)
+        self.assertEqual(self.calls, [])
+        needs.answer_card("factory", "t_1", "answer", release=False)
+        self.assertEqual([c[0] for c in self.calls], ["comment"])
+
+
+class QueueKanban(unittest.TestCase):
+    def test_per_board_failure_is_surfaced(self):
+        good_task = task(task_id="t_ok", priority=5, block_recurrences=2)
+        kdb = fake_db(
+            list_tasks=lambda conn, status=None: [good_task] if status == "blocked" else [],
+            list_events=lambda conn, task_id: [block_event(recurrences=2)],
+        )
+
+        def connect(board=None):
+            if board == "bad":
+                raise sqlite3.OperationalError("no such table: tasks")
+            return sqlite3.connect(":memory:")
+
+        errors = []
+        with fake_hermes(kdb, fake_connect(connect=connect)):
+            items = needs.kanban_items(["bad", "good"], errors=errors)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["board"], "good")
+        self.assertEqual(items[0]["priority"], 5)
+        self.assertEqual(items[0]["block_kind"], "needs_input")
+        self.assertEqual(items[0]["block_recurrences"], 2)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("kanban[bad]", errors[0])
+
+    def test_block_loop_triage_card_is_queued(self):
+        triage = task(status="triage", task_id="t_triage", block_recurrences=2)
+        triage_event = types.SimpleNamespace(
+            id=12, kind="block_loop_detected", created_at=200,
+            payload={"reason": "needs Simon to choose a path", "kind": "needs_input", "recurrences": 2, "limit": 2},
+        )
+        kdb = fake_db(
+            list_tasks=lambda conn, status=None: [triage] if status == "triage" else [],
+            list_events=lambda conn, task_id: [triage_event],
+        )
+        with fake_hermes(kdb, fake_connect()):
+            items = needs.kanban_items(["factory"])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["status"], "triage")
+        self.assertEqual(items[0]["id"], "kanban:factory:t_triage")
+        self.assertEqual(items[0]["block_recurrences"], 2)
+        self.assertTrue(needs.kanban_needs_you(items[0]["ask"], "needs_input"))
+
+    def test_plain_triage_card_without_ask_is_skipped(self):
+        triage = task(status="triage", task_id="t_plain")
+        event = types.SimpleNamespace(
+            id=13, kind="block_loop_detected", created_at=200,
+            payload={"reason": "repeated transient CI failure", "kind": "transient", "recurrences": 2},
+        )
+        kdb = fake_db(
+            list_tasks=lambda conn, status=None: [triage] if status == "triage" else [],
+            list_events=lambda conn, task_id: [event],
+        )
+        with fake_hermes(kdb, fake_connect()):
+            self.assertEqual(needs.kanban_items(["factory"]), [])
+
+
+class CardContext(unittest.TestCase):
+    def test_context_shape(self):
+        ctx_task = task(
+            task_id="t_ctx", priority=4, created_by="simon", session_id="sess-1",
+            body="Do the thing", assignee="liam", workspace_kind="git",
+            workspace_path="/tmp/wt", branch_name="feat/x", project_id="proj",
+            completion_contract="owner/repo#7", last_failure_error="boom",
+            consecutive_failures=2, result=None, started_at=110, completed_at=None,
+        )
+        block = block_event(created_at=120, recurrences=2)
+        pr_event = types.SimpleNamespace(
+            id=14, kind="pr_acceptance", created_at=130,
+            payload={"ok": True, "classification": "green", "detail": ""}, run_id=3,
+        )
+        comment = types.SimpleNamespace(id=4, author="liam", body="Which option?", created_at=121)
+        run = types.SimpleNamespace(
+            id=3, profile="liam", status="blocked", outcome="blocked", summary="waiting on you",
+            error=None, started_at=110, ended_at=120,
+        )
+        attachment = types.SimpleNamespace(
+            id=1, filename="evidence.txt", content_type="text/plain", size=12,
+            uploaded_by="liam", created_at=115,
+        )
+        kdb = fake_db(
+            get_task=lambda conn, task_id: ctx_task if task_id == "t_ctx" else None,
+            list_events=lambda conn, task_id: [block, pr_event],
+            list_comments=lambda conn, task_id: [comment],
+            task_graph_context=lambda conn, task_id: {
+                "parents": [{"id": "t_0", "title": "Parent", "status": "done"}],
+                "children": [{"id": "t_2", "title": "Child", "status": "todo"}],
+            },
+            list_attachments=lambda conn, task_id: [attachment],
+            latest_run=lambda conn, task_id: run,
+        )
+        with fake_hermes(kdb, fake_connect()):
+            data = needs.card_context("factory", "t_ctx")
+        self.assertEqual(data["id"], "kanban:factory:t_ctx")
+        self.assertEqual(data["body"], "Do the thing")
+        self.assertEqual(data["created_by"], "simon")
+        self.assertEqual(data["workspace"]["branch"], "feat/x")
+        self.assertEqual(data["pr"]["reference"], "owner/repo#7")
+        self.assertTrue(data["pr"]["ok"])
+        self.assertEqual(data["block"]["reason"], "needs Simon to decide")
+        self.assertEqual(data["block"]["recurrences"], 2)
+        self.assertEqual(data["comments"][0]["body"], "Which option?")
+        self.assertEqual(data["graph"]["parents"][0]["id"], "t_0")
+        self.assertEqual(data["last_run"]["outcome"], "blocked")
+        self.assertEqual(data["attachments"][0]["filename"], "evidence.txt")
+        self.assertNotIn("stored_path", data["attachments"][0])
+
+    def test_missing_card_raises(self):
+        with fake_hermes(fake_db(), fake_connect()):
+            with self.assertRaises(LookupError):
+                needs.card_context("factory", "nope")
+
+
+class Ask(unittest.TestCase):
+    def test_messages_are_marked_untrusted_and_keep_turns(self):
+        card = {"id": "kanban:factory:t_1", "title": "T", "body": "Body", "comments": []}
+        history = [
+            {"role": "user", "content": "What should I do?"},
+            {"role": "tool", "content": "ignored"},
+            {"role": "assistant", "content": "Ship A."},
+        ]
+        messages = needs.build_ask_messages(card, history)
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("untrusted", messages[0]["content"].lower())
+        self.assertIn("never claim to have acted", messages[0]["content"].lower())
+        self.assertIn("CARD DATA", messages[1]["content"])
+        self.assertIn("Body", messages[1]["content"])
+        self.assertEqual(messages[-1], {"role": "assistant", "content": "Ship A."})
+        self.assertEqual([m["role"] for m in messages], ["system", "user", "user", "assistant"])
+
+    def test_ask_enabled_setting(self):
+        self.assertTrue(needs.ask_enabled({}))
+        self.assertTrue(needs.ask_enabled({"ask_enabled": True}))
+        self.assertTrue(needs.ask_enabled({"ask_enabled": "true"}))
+        self.assertFalse(needs.ask_enabled({"ask_enabled": False}))
+        self.assertFalse(needs.ask_enabled({"ask_enabled": "off"}))
+        self.assertFalse(needs.ask_enabled({"ask_enabled": "0"}))
 
 
 class PrincipalName(unittest.TestCase):
@@ -156,6 +417,28 @@ class PrincipalName(unittest.TestCase):
         self.assertEqual(needs.principal_names({}), [])
         self.assertEqual(needs.principal_author({}), "user")
         self.assertTrue(needs._patterns([])["_GATE"].search("needs human approval"))
+
+    def test_author_env_var_is_spelled_correctly(self):
+        orig = needs._settings
+        saved = {k: os.environ.get(k) for k in ("UNBL0CK_AUTHOR", "UNBL0CK_AUTHOr")}
+        needs._settings = lambda: {}
+        try:
+            for key in saved:
+                os.environ.pop(key, None)
+            os.environ["UNBL0CK_AUTHOR"] = "from-env"
+            self.assertEqual(needs.principal_author(), "from-env")
+            os.environ.pop("UNBL0CK_AUTHOR", None)
+            os.environ["UNBL0CK_AUTHOr"] = "typo"
+            self.assertEqual(needs.principal_author(), "user")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            needs._settings = orig
+
+
 
 
 if __name__ == "__main__":

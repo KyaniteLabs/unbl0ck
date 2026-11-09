@@ -6,7 +6,7 @@ To answer a card, type into the queue. UNBL0CK posts your answer as a comment th
 
 ## What you get
 
-- **Desktop:** an `/unblock` page showing the live queue, plus a "Needs you" count. Each card has **Answer + unblock**, **Answer, keep blocked**, **Open board** and **Not for me**. Hidden items come back when the source changes: a new block, or a new chat turn.
+- **Desktop:** an `/unblock` page showing the live queue, plus a "Needs you" count. Each Kanban card has **Answer + unblock**, **Answer, keep blocked**, **Open board** and **Not for me**, plus a lazy **Context** panel with the description, comments, parent/child cards, workspace and branch, recent events, last run outcome and attachments. **Ask about this card** opens a small read-only side chat that explains the card and recommends an option; **Use as answer** copies its last reply into the answer box, and **Discuss in chat** opens a normal Hermes chat with the card pre-seeded. The model never acts: you still click Answer. Hidden items come back when the source changes: a new block, or a new chat turn.
 - **Slash command:** `/unbl0ck` lists what is waiting on you, inside any Hermes chat.
 - **CLI:** `hermes unbl0ck` prints the queue. Add `--json` for the raw queue, or `--pack` to write a small card-format JSON pack for other displays to read.
 
@@ -24,6 +24,8 @@ hermes config set plugins.entries.unbl0ck.settings.principal_name "Ada, Ada Love
 
 `principal_name` is comma-separated: list the names your agents use for you. "CEO", "principal" and "human" always count. Your answers are posted under the first name, unless you set `comment_author`. If no name is set, only those generic words are detected.
 
+**Ask about this card** is on by default. Turn it off with `ask_enabled: false` in the same settings block (or `hermes config set plugins.entries.unbl0ck.settings.ask_enabled false`). The Context panel and **Discuss in chat** keep working when Ask is off.
+
 Requires Hermes `>= 0.23.0`.
 
 ## How detection works
@@ -35,13 +37,14 @@ Requires Hermes `>= 0.23.0`.
 
 The things you would want to know before installing:
 
-- **No network calls.** UNBL0CK does not contact any outside service, and it sends no telemetry or usage data. The Desktop page talks only to this plugin's own backend, through the plugin SDK.
+- **No background network calls.** UNBL0CK sends no telemetry or usage data. The Desktop page talks only to this plugin's own backend, through the plugin SDK.
+- **Ask sends card content to your model provider, only when you ask.** Pressing **Ask about this card** sends that card's context and your question to the model provider configured in Hermes, through Hermes's own plugin LLM API, and logs the call in Hermes's plugin audit log. Nothing is sent until you press Ask. **Discuss in chat** only types a draft into a normal Hermes chat; the chat you then start makes its own model calls. Turn Ask off with `ask_enabled: false`.
 - **No credentials.** It neither reads nor stores secrets.
 - **Reads outside its own data:**
   - Kanban boards, through Hermes's Kanban modules (`hermes_cli.kanban_db`).
   - The `state.db` chat history of the root Hermes home and of every profile under it, opened **read-only**, so it can find Bot Chats that end with a question for you.
 - **Writes:**
-  - Only when you click Answer: one comment on the card, under your configured author name, and an unblock if you chose **Answer + unblock**. Nothing else is ever written to Kanban.
+  - Only when you click Answer: one comment on the card, under your configured author name, and an unblock if you chose **Answer + unblock**. Nothing else is ever written to Kanban. The Context panel and Ask never write to the card.
   - Its own files under `<HERMES_HOME>/plugin-data/unbl0ck/`: `hidden.json` ("Not for me" items) and `pocket-pack.json` (only when you ask for the pack).
   - In Desktop, two display toggles (effects and sound) in `localStorage`.
 - **No shell commands, no subprocesses, no background processes, and no self-updating.**

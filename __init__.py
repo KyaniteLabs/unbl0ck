@@ -1,7 +1,11 @@
 """UNBL0CK: one queue of everything blocked on you (Kanban cards + Bot Mode chats).
 
-register() is pure: it only registers a slash command and a CLI command. Everything that
-touches Kanban or chat history is imported lazily when a command runs."""
+register() registers a slash command, a CLI command, and stashes its context so the
+dashboard backend can use the host-owned LLM for "Ask about this card". Everything that
+touches Kanban or chat history is imported lazily when a command or route runs."""
+
+# Set by register(ctx); read by dashboard/plugin_api.py through the loaded module.
+_PLUGIN_CTX = None
 
 
 def _needs():
@@ -49,5 +53,7 @@ def _cli(args):
 
 
 def register(ctx):
+    global _PLUGIN_CTX
+    _PLUGIN_CTX = ctx
     ctx.register_command("unbl0ck", slash_unbl0ck, description="What is blocked on you right now")
     ctx.register_cli_command("unbl0ck", "List what is blocked on you (Kanban + Bot Mode)", _setup_cli, _cli)

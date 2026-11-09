@@ -3,7 +3,9 @@
 This folder is the single source of truth for how UNBL0CK looks, sounds and behaves on every surface: Hermes Desktop, the X55 handheld and the Bravia TV. `tokens.json` holds the values; this file explains the rules. When a surface disagrees with this folder, the surface changes, not the canon. Proposed changes to the canon go to the UNBL0CK owner, the Claude Code session that builds the Desktop plugin.
 
 ## Data contract: read it, never re-derive it
-- `GET /api/plugins/unbl0ck/queue` returns `{generated_at, count, hidden, items[], errors[]}`. Each item has `source` (`kanban`|`chat`), `id`, `version`, `title`, `ask`, `why`, `since`, `owner`; kanban items add `board` and `task_id`, chat items add `profile`.
+- `GET /api/plugins/unbl0ck/queue` returns `{generated_at, count, hidden, items[], errors[], ask_enabled}`. Each item has `source` (`kanban`|`chat`), `id`, `version`, `title`, `ask`, `why`, `since`, `owner`; kanban items add `board`, `task_id`, `priority`, `status`, `block_kind`, `block_recurrences`; chat items add `profile`.
+- `GET /api/plugins/unbl0ck/card?id=kanban:<board>:<task>` (or `?board=&task_id=`) returns the read-only card context: body, comments, parent/child graph, workspace/branch/PR, recent events, last run outcome, attachments and `created_by`.
+- `POST /api/plugins/unbl0ck/card/ask {id, messages[]}` asks the configured model about one card and returns `{reply}`. The card context is injected server-side and marked untrusted; the model never acts. Disabled when `ask_enabled` is false.
 - `GET /api/plugins/unbl0ck/pack` returns the same queue as a Liam Pocket pack (`version: 1`, `mode: "unblock"`, up to 6 `decide` cards with `options[]`). It also writes `<data_dir>/pocket-pack.json`, which is UNBL0CK's own file and never the gadget plugin's `pocket-pack.json`.
 - `POST /api/plugins/unbl0ck/kanban/answer {board, task_id, text, release}` comments as you (the configured principal) and unblocks the card. `POST .../hide {id, version}` hides an item until its version changes.
 - A gadget never writes Kanban directly and never decides what "needs you". It renders these endpoints.

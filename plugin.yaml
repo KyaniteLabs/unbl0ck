@@ -1,11 +1,12 @@
 name: unbl0ck
 label: UNBL0CK
-version: "0.1.0"
+version: "0.2.0"
 description: >
   UNBL0CK clears whatever is blocked on you. One queue of everything waiting on you: blocked Kanban cards that need your
   answer, and Bot Mode chats whose last turn is a bot asking you something.
   Answer a card in place and it is commented and unblocked through native
-  Kanban; open a chat straight from the queue. Desktop gets an /unblock page,
+  Kanban; read its full context; ask a read-only assistant about it and decide
+  without leaving the card; open a chat straight from the queue. Desktop gets an /unblock page,
   a status-bar count and "Needs you" badges on cards inside /kanban.
 author: KyaniteLabs
 license: MIT
@@ -22,3 +23,7 @@ config_schema:
     type: str
     default: ""
     description: "Author name used when UNBL0CK comments your answer on a Kanban card. Defaults to the first principal_name, else \"user\"."
+  ask_enabled:
+    type: bool
+    default: true
+    description: "Show the in-panel 'Ask about this card' chat. When used, the card's content and your question go to the model provider configured in Hermes through its plugin LLM API; nothing is sent unless you press Ask."

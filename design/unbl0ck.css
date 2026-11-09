@@ -73,6 +73,53 @@
 .ub-hazard{height:6px;margin-bottom:12px;background:repeating-linear-gradient(135deg,var(--hazard) 0 8px,transparent 8px 16px)}
 .ub-chip{background:none;border:0;cursor:pointer;padding:0 8px;font-family:var(--mono);font-size:12px;letter-spacing:.1em;color:#f0a202}
 .ub-chip:hover{color:#00f5ff}
+/* ── card context + ask drawer ── */
+.ub-detail{grid-column:2;display:flex;flex-direction:column;gap:10px;margin-top:2px}
+.ub-dtoggle{align-self:flex-start;background:none;border:1px solid var(--steeld);color:var(--label);cursor:pointer;
+  padding:5px 12px;font:400 12.5px var(--mono);letter-spacing:.12em;text-transform:uppercase;
+  clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px)}
+.ub-dtoggle:hover,.ub-dtoggle[aria-expanded="true"]{border-color:var(--cyan);color:var(--cyan)}
+.ub-panel{border:1px solid var(--steeld);background:rgba(5,7,10,.55);padding:14px 16px;
+  clip-path:polygon(0 0,calc(100% - 12px) 0,100% 12px,100% 100%,12px 100%,0 calc(100% - 12px));
+  display:flex;flex-direction:column;gap:12px}
+.ub-block{margin:0;padding:10px 12px;border-left:3px solid var(--amber);background:rgba(240,162,2,.08);
+  font-size:16px;line-height:1.45;color:var(--text);white-space:pre-wrap}
+.ub-block b{display:block;font-family:var(--mono);font-weight:400;font-size:11.5px;letter-spacing:.14em;
+  color:var(--amber);margin-bottom:4px}
+.ub-body{margin:0;font-size:16px;font-weight:500;line-height:1.5;color:var(--muted);white-space:pre-wrap}
+.ub-kvs{display:grid;grid-template-columns:max-content 1fr;gap:5px 14px;font-size:15px;color:var(--muted);margin:0}
+.ub-kvs dt{font-family:var(--mono);font-size:12px;letter-spacing:.1em;color:var(--label);text-transform:uppercase;padding-top:2px}
+.ub-kvs dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.ub-kvs dd em{font-style:normal;color:var(--cyan)}
+.ub-subhead{font-family:var(--mono);font-size:12px;letter-spacing:.14em;color:var(--label);text-transform:uppercase;
+  border-bottom:1px solid var(--steeld);padding-bottom:5px;margin:2px 0 0}
+.ub-cmt{padding:8px 0;border-bottom:1px solid rgba(89,110,135,.28)}
+.ub-cmt:last-child{border-bottom:0}
+.ub-cmt .h{font-family:var(--mono);font-size:11.5px;letter-spacing:.1em;color:var(--dim);text-transform:uppercase;margin-bottom:3px}
+.ub-cmt .h em{font-style:normal;color:var(--cyan)}
+.ub-cmt p{margin:0;font-size:15.5px;line-height:1.45;color:var(--muted);white-space:pre-wrap}
+.ub-ev{display:flex;gap:10px;font-family:var(--mono);font-size:12px;line-height:1.5;color:var(--dim);text-transform:uppercase}
+.ub-ev em{font-style:normal;color:var(--cyan);min-width:160px}
+.ub-note{font-family:var(--mono);font-size:12px;line-height:1.5;color:var(--dim);letter-spacing:.04em}
+.ub-fault{font-family:var(--mono);font-size:12.5px;line-height:1.5;color:var(--mag);white-space:pre-wrap}
+.ub-askwrap{border:1px solid var(--steeld);background:rgba(5,7,10,.55);display:flex;flex-direction:column}
+.ub-askwrap .hd{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 12px;
+  border-bottom:1px solid var(--steeld);font-family:var(--mono);font-size:12px;letter-spacing:.12em;color:var(--label);text-transform:uppercase}
+.ub-msgs{display:flex;flex-direction:column;gap:9px;padding:12px;max-height:300px;overflow-y:auto}
+.ub-msg{max-width:92%;padding:8px 11px;border:1px solid var(--steeld);background:var(--panel2);
+  clip-path:polygon(0 0,calc(100% - 8px) 0,100% 8px,100% 100%,8px 100%,0 calc(100% - 8px))}
+.ub-msg.user{align-self:flex-end;border-color:rgba(0,245,255,.45);background:rgba(0,245,255,.06)}
+.ub-msg.assistant{align-self:flex-start;border-color:rgba(240,162,2,.35)}
+.ub-msg .who{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;color:var(--label);text-transform:uppercase;margin-bottom:3px}
+.ub-msg p{margin:0;font-size:15.5px;line-height:1.48;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}
+.ub-msg .use{margin-top:7px}
+.ub-chatbar{display:flex;gap:8px;align-items:flex-end;padding:10px 12px;border-top:1px solid var(--steeld)}
+.ub-chatbar textarea{flex:1;min-height:40px;max-height:120px;resize:vertical;background:var(--base);color:var(--text);
+  border:1px solid var(--steel);padding:8px 10px;font:500 15.5px/1.4 var(--disp);outline:none}
+.ub-chatbar textarea:focus{border-color:var(--amber);box-shadow:0 0 0 1px var(--amber)}
+.ub-chatbar textarea::placeholder{color:var(--dim)}
+.ub-thinking{font-family:var(--mono);font-size:12.5px;letter-spacing:.1em;color:var(--cyan)}
+.ub-thinking::after{content:'…';animation:ub-blink2 1s steps(2) infinite}
 /* ── layers: ASCII contour field (canvas) → tints/scanlines/grain → scrolling content ── */
 .ub-field{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .ub-fx{position:absolute;inset:0;pointer-events:none;
