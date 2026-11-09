@@ -1,6 +1,6 @@
 # UNBL0CK
 
-Agents get stuck waiting on you, and those questions end up scattered across Kanban boards and chats. UNBL0CK gathers them into one queue: every blocked Kanban card waiting on your answer, and every Bot Mode chat whose last turn is the bot asking you something.
+Agents get stuck waiting on you, and those questions end up scattered across Kanban boards and chats. UNBL0CK gathers them into one queue: every blocked Kanban card waiting on your answer, every Bot Mode chat whose last turn is the bot asking you something, and every agent paused right now on a clarify question, a command approval or a sudo prompt.
 
 To answer a card, type into the queue. UNBL0CK posts your answer as a comment through native Kanban and, if you choose, unblocks the card. A chat opens straight from the queue. Each card leads with a one-line summary of what you must decide, and the original text is one click away. Nothing is decided for you and silence never counts as a yes. UNBL0CK adds no ranking of its own: cards keep their board priority, newest first within it.
 
@@ -34,6 +34,9 @@ Requires Hermes `>= 0.23.0`.
 
 - **Kanban:** a card counts when its latest block is clearly waiting on you. Either the block reason names a decision for you ("Awaiting Ada's approval", "human gate: credentials"), or it is a `needs_input` block that names you. Blocks that only report an order ("Ada said stop") are skipped. So are cards you have already answered since the block.
 - **Bot Mode:** a canonical Bot Chat from the last 14 days counts when the bot's final visible turn asks you something and you have not replied after it.
+- **Live prompts:** when any agent pauses on a clarify question, a dangerous-command approval or a sudo password prompt, Hermes fires its stock `on_human_input_request` hook and UNBL0CK lists it under **LIVE.PROMPTS** until `on_human_input_resolved` fires. Answer it where it was asked; UNBL0CK shows the prompt (already redacted by Hermes) and the platform it is waiting in. A prompt whose process has exited is dropped on the next poll, so a crash never leaves a ghost behind. Hooks load when the gateway starts, so a newly installed UNBL0CK picks up live prompts after the next gateway restart.
+
+What it cannot see: a chat outside Bot Mode that asks you something in plain text without using the clarify tool, and a card that is waiting on you without saying so in its block reason.
 
 ## Disclosure
 
@@ -46,9 +49,10 @@ The things you would want to know before installing:
 - **Reads outside its own data:**
   - Kanban boards, through Hermes's Kanban modules (`hermes_cli.kanban_db`).
   - The `state.db` chat history of the root Hermes home and of every profile under it, opened **read-only**, so it can find Bot Chats that end with a question for you.
+  - Hermes's `on_human_input_request` / `on_human_input_resolved` hook payloads (kind, redacted prompt, session id, platform).
 - **Writes:**
   - Only when you click Answer: one comment on the card, under your configured author name, and an unblock if you chose **Answer + unblock**. Nothing else is ever written to Kanban. The Context panel and Ask never write to the card.
-  - Its own files under `<HERMES_HOME>/plugin-data/unbl0ck/`: `hidden.json` ("Not for me" items), `bluf.json` (cached summaries, capped at 300) and `pocket-pack.json` (only when you ask for the pack).
+  - Its own files under `<HERMES_HOME>/plugin-data/unbl0ck/`: `hidden.json` ("Not for me" items), `waits/<id>.json` (one small file per live prompt, deleted when it is answered), `bluf.json` (cached summaries, capped at 300) and `pocket-pack.json` (only when you ask for the pack).
   - In Desktop, two display toggles (effects and sound) in `localStorage`.
 - **No shell commands, no subprocesses and no self-updating.** Summaries and Ask replies run in small in-process thread pools inside the Hermes backend.
 - **Sound:** the Desktop page plays short synthesized UI sounds through Web Audio. Turn them off with **SFX**.

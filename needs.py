@@ -1,6 +1,6 @@
-"""The "needs you" queue: what is waiting on the human, from Kanban and from Bot Mode chats.
+"""The "needs you" queue: what is waiting on the human, from Kanban, Bot Mode chats and live prompts.
 
-Two sources, one list:
+Three sources, one list:
 
 - Kanban: a blocked card whose latest block asks the principal for something (an explicit
   ``needs_input`` block that names the principal, or a reason that is plainly a principal gate).
@@ -8,6 +8,10 @@ Two sources, one list:
   principal, then ``unblock_task`` when asked to release it.
 - Bot Mode: a canonical Bot Chat whose last visible turn is the bot asking the human something,
   with no human reply after it. Chats are read read-only; answering happens in the chat itself.
+- Live prompts: an agent blocked right now on a human prompt (a clarify question, a dangerous-command
+  approval, a sudo password), seen through Hermes' stock ``on_human_input_request`` /
+  ``on_human_input_resolved`` hooks. Each open wait is one small file; a wait whose process died is
+  dropped. The prompt text arrives already redacted by Hermes; answering happens where it was asked.
 
 Nothing here generates, ranks or rewrites decisions, and nothing is accepted on silence. Items the
 human hides with "Not for me" stay hidden until the source changes (a new block or a new turn).
@@ -578,6 +582,122 @@ def chat_items(
     return items
 
 
+# --- Live prompt source (stock human-input hooks) ------------------------------------------
+
+_WAIT_KINDS = {
+    "clarify": "is asking you a question",
+    "approval": "needs your approval to run a command",
+    "sudo": "needs your sudo password",
+}
+_SAFE_ID = re.compile(r"^[0-9a-f]{8,64}$")
+
+
+def _waits_dir(home: Optional[Path] = None) -> Path:
+    d = data_dir(home) / "waits"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _proc_start(pid: int) -> Optional[str]:
+    """Kernel start time of *pid* (Linux), so a recycled PID is not mistaken for the waiter."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return stat.rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def _alive(pid: int, start: Optional[str]) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    return start is None or _proc_start(pid) in (None, start)
+
+
+def _profile_of(home: Path) -> str:
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+
+        own = Path(get_hermes_home())
+    except Exception:  # noqa: BLE001
+        own = Path(os.environ.get("HERMES_HOME") or home)
+    return own.name if own.parent.name == "profiles" else "default"
+
+
+def record_wait(home: Optional[Path] = None, **payload: Any) -> None:
+    """``on_human_input_request``: remember an open wait. Never raises (observer contract)."""
+    try:
+        rid = str(payload.get("request_id") or "")
+        if not _SAFE_ID.match(rid):
+            return
+        home = home or hermes_home()
+        pid = os.getpid()
+        rec = {
+            "request_id": rid,
+            "kind": str(payload.get("kind") or ""),
+            "prompt": str(payload.get("prompt") or ""),
+            "session_id": str(payload.get("session_id") or ""),
+            "platform": str(payload.get("platform") or ""),
+            "profile": _profile_of(home),
+            "pid": pid,
+            "proc_start": _proc_start(pid),
+            "since": int(time.time()),
+        }
+        _write_json(_waits_dir(home) / f"{rid}.json", rec)
+    except Exception as exc:  # noqa: BLE001 - observability must never break a human prompt
+        log.debug("unbl0ck: could not record wait: %s", exc)
+
+
+def clear_wait(home: Optional[Path] = None, **payload: Any) -> None:
+    """``on_human_input_resolved``: the wait ended (answered, timed out or failed)."""
+    try:
+        rid = str(payload.get("request_id") or "")
+        if _SAFE_ID.match(rid):
+            (_waits_dir(home or hermes_home()) / f"{rid}.json").unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("unbl0ck: could not clear wait: %s", exc)
+
+
+def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) -> list[dict[str, Any]]:
+    """Open live prompts. A wait whose process is gone is deleted, not shown."""
+    home = home or hermes_home()
+    items: list[dict[str, Any]] = []
+    for f in sorted(_waits_dir(home).glob("*.json")):
+        rec = _read_json(f)
+        try:
+            pid = int(rec.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if not rec or pid <= 0 or not _alive(pid, rec.get("proc_start")):
+            f.unlink(missing_ok=True)
+            continue
+        kind = str(rec.get("kind") or "")
+        profile = str(rec.get("profile") or "default")
+        who = _bot_name(home, profile) if profile != "default" else "An agent"
+        platform = str(rec.get("platform") or "")
+        items.append({
+            "id": f"prompt:{rec['request_id']}",
+            "version": str(rec["request_id"]),
+            "source": "prompt",
+            "kind": kind,
+            "profile": profile,
+            "session_id": rec.get("session_id") or "",
+            "platform": platform,
+            "title": f"{who} {_WAIT_KINDS.get(kind, 'is waiting on you')}",
+            "ask": _excerpt(str(rec.get("prompt") or "")) or "(prompt text withheld by Hermes)",
+            "why": f"An agent is paused on this {kind or 'prompt'} right now" + (f" in {platform}" if platform else ""),
+            "owner": profile,
+            "priority": 1,   # a live wait is holding a running agent
+            "since": int(rec.get("since") or 0),
+        })
+    return items
+
+
 # --- the queue -----------------------------------------------------------------------------
 
 def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) -> dict[str, Any]:
@@ -594,6 +714,10 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
         items.extend(chat_items(home, errors=errors))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"chat: {type(exc).__name__}: {exc}")
+    try:
+        items.extend(wait_items(home, errors=errors))
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"prompt: {type(exc).__name__}: {exc}")
     hidden = load_hidden(home)
     shown = [i for i in items if include_hidden or hidden.get(i["id"]) != i["version"]]
     # Board priority first (higher is more urgent, as on the board), then newest.

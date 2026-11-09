@@ -37,6 +37,7 @@
 .ub-idx{grid-row:1/span 4;width:52px;height:52px;display:grid;place-items:center;font-family:var(--mono);font-size:20px;color:var(--cyan);
   background:var(--base);border:1px solid var(--steel);clip-path:polygon(12px 0,100% 0,100% 100%,0 100%,0 12px)}
 .ub-card.chat .ub-idx{color:var(--green)}
+.ub-card.prompt .ub-idx{color:var(--amber)}
 .ub-top{display:flex;justify-content:space-between;align-items:baseline;gap:14px}
 .ub-h{font-weight:700;font-size:22px;line-height:1.15;letter-spacing:.01em;text-transform:uppercase;color:var(--text);margin:0}
 .ub-age{flex:none;font-family:var(--mono);font-size:14px;letter-spacing:.08em;color:var(--dim)}
@@ -185,7 +186,7 @@
   font-family:var(--mono);font-size:13.5px;letter-spacing:.1em;color:var(--label);animation:ub-tick linear infinite}
 .ub-ticker .run span{padding-right:44px}.ub-ticker em{font-style:normal;color:var(--cyan)}.ub-ticker b{font-weight:400;color:var(--amber)}
 @keyframes ub-tick{from{transform:translateX(0)}to{transform:translateX(-50%)}}
-/* ── card motion: staggered boot-in, unbl0cked flash ── */
+/* ── card motion: staggered boot-in, hover scan, unbl0cked flash ── */
 .ub-card{animation:ub-in .42s cubic-bezier(.2,.7,.2,1) both;animation-delay:calc(var(--i,0) * 55ms)}
 @keyframes ub-in{0%{opacity:0;transform:translateX(-14px)}55%{opacity:1;transform:translateX(2px)}
   62%{transform:translateX(-3px) skewX(-2deg)}70%{transform:translateX(1px)}100%{opacity:1;transform:none}}

@@ -64,6 +64,7 @@ ${Object.entries(FONTS)
 .ub-idx{grid-row:1/span 4;width:52px;height:52px;display:grid;place-items:center;font-family:var(--mono);font-size:20px;color:var(--cyan);
   background:var(--base);border:1px solid var(--steel);clip-path:polygon(12px 0,100% 0,100% 100%,0 100%,0 12px)}
 .ub-card.chat .ub-idx{color:var(--green)}
+.ub-card.prompt .ub-idx{color:var(--amber)}
 .ub-top{display:flex;justify-content:space-between;align-items:baseline;gap:14px}
 .ub-h{font-weight:700;font-size:22px;line-height:1.15;letter-spacing:.01em;text-transform:uppercase;color:var(--text);margin:0}
 .ub-age{flex:none;font-family:var(--mono);font-size:14px;letter-spacing:.08em;color:var(--dim)}
@@ -632,7 +633,7 @@ function Ticker({ items }) {
   if (!items.length) return null
   const runs = items.map(i =>
     jsxs('span', {
-      children: [jsx('b', { children: '◆ ' }), jsx('em', { children: i.source === 'kanban' ? i.task_id : (i.owner || i.profile || 'CHAT').toUpperCase() }), ` · ${String(i.title || '').toUpperCase()} · ${ago(i.since)}`]
+      children: [jsx('b', { children: '◆ ' }), jsx('em', { children: i.source === 'kanban' ? i.task_id : i.source === 'prompt' ? `${String(i.kind || 'PROMPT').toUpperCase()} · LIVE` : (i.owner || i.profile || 'CHAT').toUpperCase() }), ` · ${String(i.title || '').toUpperCase()} · ${ago(i.since)}`]
     }, `${i.id}`)
   )
   const chars = items.reduce((n, i) => n + String(i.title || '').length + 24, 0)
@@ -863,6 +864,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const [askError, setAskError] = useState('')
   const askEnd = useRef(null)
   const isKanban = item.source === 'kanban'
+  const isPrompt = item.source === 'prompt'
   const triage = isKanban && item.status === 'triage'
 
   useEffect(() => {
@@ -1014,6 +1016,11 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           triage ? ' · TRIAGE' : ''
         ]
       })
+    : isPrompt
+    ? jsxs('div', {
+        className: 'ub-meta',
+        children: ['LIVE PROMPT \\\\ ', jsx('em', { children: String(item.kind || 'prompt').toUpperCase() }), ` · ${item.profile}`, item.platform ? ` · ${String(item.platform).toUpperCase()}` : '']
+      })
     : jsxs('div', {
         className: 'ub-meta',
         children: ['BOT CHAT \\\\ ', jsx('em', { children: item.owner || item.profile }), item.profile && item.owner !== item.profile ? ` · ${item.profile}` : '']
@@ -1050,6 +1057,19 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
         saysKeep ? jsx('div', { className: 'ub-hint', role: 'status', children: 'Your answer says to keep it blocked. Did you mean ANSWER, KEEP BLOCKED?' }) : null,
         jsxs('div', { className: 'ub-btns', children: answerButtons }),
         jsxs('div', { className: 'ub-btns tools', children: tools })
+      ]
+    : isPrompt
+    ? [
+        jsx('div', { className: 'ub-hint', role: 'note', children: `An agent is paused on this right now. Answer it where it was asked${item.platform ? ` (${item.platform})` : ''}; it leaves this list the moment it is answered.` }),
+        jsxs('div', {
+          className: 'ub-btns',
+          children: [
+            item.session_id && (!item.platform || item.platform === 'desktop' || item.platform === 'cli' || item.platform === 'tui')
+              ? button({ kind: 'primary', keycap: '→', disabled: busy, onClick: () => host.openSession(item.session_id, { profile: item.profile }), children: 'Open session' })
+              : null,
+            button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
+          ].filter(Boolean)
+        })
       ]
     : [
         jsxs('div', {
@@ -1119,7 +1139,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     : null
 
   return jsx('section', {
-    className: `ub-card ${isKanban ? 'kanban' : 'chat'}${done ? ' done' : ''}${done === 'kept' ? ' kept' : ''}`,
+    className: `ub-card ${isKanban ? 'kanban' : isPrompt ? 'prompt' : 'chat'}${done ? ' done' : ''}${done === 'kept' ? ' kept' : ''}`,
     style: { '--i': n - 1 },
     tabIndex: -1,
     onPointerEnter: () => sfx.play('move'),
@@ -1191,6 +1211,7 @@ function Page({ ctx, refresh }) {
   }
   const kanban = q.items.filter(i => i.source === 'kanban')
   const chats = q.items.filter(i => i.source === 'chat')
+  const prompts = q.items.filter(i => i.source === 'prompt')
   const oldest = q.items.reduce((m, i) => (i.since && (!m || i.since < m) ? i.since : m), 0)
   const oldestH = oldest ? (Date.now() / 1000 - oldest) / 3600 : 0
   let n = 0
@@ -1239,7 +1260,7 @@ function Page({ ctx, refresh }) {
                         className: 'ub-sub',
                         children: [
                           q.loading
-                            ? 'Scanning the boards and Bot Chats'
+                            ? 'Scanning boards, Bot Chats and live prompts'
                             : q.fault
                               ? 'Cannot reach the queue; showing the last known list.'
                               : (q.errors || []).length
@@ -1260,6 +1281,7 @@ function Page({ ctx, refresh }) {
                 children: [
                   tile('KANBAN', q.loading ? '··' : pad(kanban.length)),
                   tile('CHATS', q.loading ? '··' : pad(chats.length)),
+                  tile('LIVE', q.loading ? '··' : pad(prompts.length), prompts.length ? 'warn' : ''),
                   tile('OLDEST', oldest ? ago(oldest) : '—', oldestH > 24 ? 'warn' : ''),
                   jsx('div', { style: { flex: 1 } }),
                   jsx('div', { style: { alignSelf: 'center' }, children: jsx(FxToggle, {}) }),
@@ -1270,23 +1292,24 @@ function Page({ ctx, refresh }) {
               jsx(Ticker, { items: q.items })
             ]
           }),
-          q.fault ? jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'LINK FAULT //' }), q.fault] }) : null,
-          ...(q.errors || []).map(err => jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'SOURCE FAULT //' }), err] }, err)),
+          q.fault ? jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'LINK FAULT \\\\ ' }), q.fault] }) : null,
+          ...(q.errors || []).map(err => jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'SOURCE FAULT \\\\ ' }), err] }, err)),
           undo
             ? jsxs('div', {
                 className: 'ub-undo',
                 role: 'status',
                 children: [
-                  jsxs('span', { children: [jsx('b', { children: 'HIDDEN //' }), undo.title] }),
+                  jsxs('span', { children: [jsx('b', { children: 'HIDDEN \\\\ ' }), undo.title] }),
                   button({ kind: 'ghost', onClick: undoHide, children: 'Undo' })
                 ]
               }, undo.at)
             : null,
           kanban.length ? jsx('div', { className: 'ub-hazard' }) : null,
+          ...group('LIVE.PROMPTS', prompts),
           ...group('KANBAN.CARDS', kanban),
           ...group('BOT.CHATS', chats),
           !q.loading && !q.count && !q.fault && !(q.errors || []).length
-            ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card or chat is waiting on you.' })] })
+            ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, chat or prompt is waiting on you.' })] })
             : null
         ]
       })
