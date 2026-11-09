@@ -154,6 +154,7 @@ ${Object.entries(FONTS)
 .ub-msg.assistant{align-self:flex-start;border-color:rgba(240,162,2,.35)}
 .ub-msg .who{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;color:var(--label);text-transform:uppercase;margin-bottom:3px}
 .ub-msg p{margin:0;font-size:15.5px;line-height:1.48;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}
+.ub-msg p strong{font-weight:700;color:#fff}
 .ub-msg .use{margin-top:7px}
 .ub-chatbar{display:flex;gap:8px;align-items:flex-end;padding:10px 12px;border-top:1px solid var(--steeld)}
 .ub-chatbar textarea{flex:1;min-height:40px;max-height:120px;resize:vertical;background:var(--base);color:var(--text);
@@ -686,6 +687,39 @@ const ageClass = sec => {
 }
 const pad = n => String(n).padStart(2, '0')
 
+// Models often answer in markdown. The panel shows plain text, so turn tables into
+// "label: value" lines, drop heading marks and rules, and keep **bold** as <strong>.
+function cleanReply(text) {
+  const src = String(text || '').split('\n')
+  const isRule = l => /^[\s|:\-]+$/.test(l) && /-{2,}/.test(l)
+  const out = []
+  src.forEach((raw, i) => {
+    let line = raw.replace(/\s+$/, '')
+    if (isRule(line)) return
+    if (/^\s*\|.*\|\s*$/.test(line)) {
+      if (i + 1 < src.length && isRule(src[i + 1])) return   // table header row
+      const cells = line.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim()).filter(Boolean)
+      line = cells.length > 1 ? `• ${cells[0]}: ${cells.slice(1).join(' · ')}` : cells.join('')
+    }
+    line = line.replace(/^\s*#{1,6}\s+/, '').replace(/^\s*[-*]\s+/, '• ').replace(/^\s*-{3,}\s*$/, '')
+    out.push(line.replace(/`([^`\n]+)`/g, '$1'))
+  })
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+// Desktop's Kanban page is a bundled plugin that ships off. Without it the
+// router quietly falls back to Home, so say how to turn it on.
+function openBoard() {
+  host.navigate('/kanban')
+  setTimeout(() => {
+    if (!/^#\/kanban\b/.test(String(window.location.hash || ''))) {
+      host.notify({ kind: 'info', message: 'Turn on the bundled Kanban plugin (Capabilities → Plugins → Kanban) to open the board here.' })
+    }
+  }, 400)
+}
+const replyPlain = text => cleanReply(text).replace(/\*\*(.+?)\*\*/g, '$1')
+const replyParts = text =>
+  cleanReply(text).split(/\*\*(.+?)\*\*/g).map((s, i) => (i % 2 ? jsx('strong', { children: s }, i) : s))
+
 const button = ({ kind = '', keycap, children, ...rest }) =>
   jsxs('button', {
     type: 'button',
@@ -949,7 +983,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     }
   }
   const lastAssistant = askMsgs.reduce((index, m, i) => (m.role === 'assistant' ? i : index), -1)
-  const lastSuggestion = lastAssistant >= 0 ? askMsgs[lastAssistant].content : ''
+  const lastSuggestion = lastAssistant >= 0 ? replyPlain(askMsgs[lastAssistant].content) : ''
   const useAsAnswer = () => {
     if (!lastSuggestion) return
     setAnswer(prev => (prev.trim() ? `${prev.trim()}\n\n${lastSuggestion}` : lastSuggestion))
@@ -1000,7 +1034,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     button({ kind: 'ghost', disabled: busy, onClick: toggleDetail, 'aria-expanded': detailOpen, children: detailOpen ? 'Hide context' : 'Context' }),
     askEnabled ? button({ kind: 'ghost', disabled: busy, onClick: toggleAsk, 'aria-expanded': askOpen, children: askOpen ? 'Hide ask' : 'Ask about this card' }) : null,
     button({ kind: 'ghost', disabled: busy, onClick: discussInChat, children: 'Discuss in chat' }),
-    button({ kind: 'ghost', disabled: busy, onClick: () => host.navigate('/kanban'), children: 'Open board' }),
+    button({ kind: 'ghost', disabled: busy, onClick: openBoard, children: 'Open board' }),
     button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
   ].filter(Boolean)
 
@@ -1051,7 +1085,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
                     className: `ub-msg ${m.role}`,
                     children: [
                       jsx('div', { className: 'who', children: m.role === 'user' ? 'YOU' : 'UNBL0CK' }),
-                      jsx('p', { children: m.content }),
+                      jsx('p', { children: m.role === 'assistant' ? replyParts(m.content) : m.content }),
                       m.role === 'assistant' && i === lastAssistant
                         ? jsx('div', { className: 'use', children: button({ kind: 'ghost', onClick: useAsAnswer, children: 'Use as answer' }) })
                         : null

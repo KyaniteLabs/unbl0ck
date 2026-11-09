@@ -126,6 +126,7 @@
 .ub-msg.assistant{align-self:flex-start;border-color:rgba(240,162,2,.35)}
 .ub-msg .who{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;color:var(--label);text-transform:uppercase;margin-bottom:3px}
 .ub-msg p{margin:0;font-size:15.5px;line-height:1.48;color:var(--text);white-space:pre-wrap;overflow-wrap:anywhere}
+.ub-msg p strong{font-weight:700;color:#fff}
 .ub-msg .use{margin-top:7px}
 .ub-chatbar{display:flex;gap:8px;align-items:flex-end;padding:10px 12px;border-top:1px solid var(--steeld)}
 .ub-chatbar textarea{flex:1;min-height:40px;max-height:120px;resize:vertical;background:var(--base);color:var(--text);
