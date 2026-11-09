@@ -23,6 +23,13 @@ class DesktopContract(unittest.TestCase):
         self.assertIn("Discuss in chat", src)
         self.assertIn("host.composer.setDraft", src)
         self.assertIn("Ask about this card", src)
+        # Undo for "Not for me" must call the backend route that exists.
+        self.assertIn("'/unhide'", src)
+        api = (ROOT / "dashboard" / "plugin_api.py").read_text()
+        self.assertIn('@router.post("/unhide")', api)
+        # A kept-blocked answer must not stamp the card UNBL0CKED.
+        self.assertIn("'■ ANSWERED'", src)
+        self.assertIn("'■ ANSWERED'", built)
 
 
 if __name__ == "__main__":

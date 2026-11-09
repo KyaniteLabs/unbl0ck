@@ -18,6 +18,10 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PATH = '/unblock'
 const POLL_MS = 45000
 const $queue = atom({ items: [], count: 0, errors: [], loading: true, at: 0 })
+const $undo = atom(null)   // the last "Not for me": { id, title } while it can be undone
+const UNDO_MS = 12000
+// An answer that says to keep the card blocked, sent with the unblocking button.
+const KEEP_BLOCKED = /\b(keep|leave|stay|remain)s?\b[^.]{0,24}\bblocked\b|\b(do not|don't|dont|never)\s+(unblock|release)/i
 
 const FONTS = /*@@FONTS@@*/ {}
 
@@ -101,6 +105,12 @@ ${Object.entries(FONTS)
 .ub-err{margin:0 0 14px;padding:10px 14px;border:1px solid rgba(255,43,214,.45);border-left:3px solid var(--mag);background:rgba(107,19,87,.18);
   font-family:var(--mono);font-size:13px;line-height:1.5;color:var(--mag);letter-spacing:.04em;overflow-wrap:anywhere}
 .ub-err b{font-weight:400;color:var(--text);margin-right:8px}
+.ub-card:focus{outline:none}
+.ub-undo{display:flex;align-items:center;gap:12px;margin:0 0 14px;padding:8px 8px 8px 14px;border:1px solid var(--steeld);border-left:3px solid var(--steel);background:rgba(10,14,20,.7);font-family:var(--mono);font-size:13px;letter-spacing:.04em;color:var(--label)}
+.ub-undo span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ub-undo b{font-weight:400;color:var(--text);margin-right:8px}
+.ub-hint{margin:2px 0 0;font-family:var(--mono);font-size:12.5px;line-height:1.5;letter-spacing:.04em;color:var(--amber)}
+.ub-hint::before{content:'▲ ';}
 .ub-hazard{height:6px;margin-bottom:12px;background:repeating-linear-gradient(135deg,var(--hazard) 0 8px,transparent 8px 16px)}
 .ub-chip{background:none;border:0;cursor:pointer;padding:0 8px;font:400 12px/1 'UB ShareTechMono','Share Tech Mono','SF Mono',ui-monospace,monospace;letter-spacing:.1em;color:#f0a202}
 .ub-chip:hover,.ub-chip:focus-visible{color:#00f5ff}
@@ -213,12 +223,16 @@ ${Object.entries(FONTS)
 .ub-card.done{background:var(--green)!important}
 .ub-card.done>.in::before{content:'■ UNBL0CKED';position:absolute;inset:0;display:grid;place-items:center;z-index:2;
   font:400 26px var(--mono);letter-spacing:.3em;color:var(--green);background:rgba(5,7,10,.88);animation:ub-done .5s steps(4) both}
+/* answered but still blocked (keep-blocked or triage): no false UNBL0CKED */
+.ub-card.done.kept>.in::before{content:'■ ANSWERED'}
 @keyframes ub-done{0%{opacity:0;letter-spacing:1.2em}100%{opacity:1;letter-spacing:.3em}}
 .ub-chip.new{animation:ub-blink .5s steps(2) 6}
 @keyframes ub-blink{50%{color:#ff2bd6}}
 .ub-cursor{display:inline-block;width:.6em;height:1em;margin-left:4px;vertical-align:-2px;background:var(--amber);animation:ub-blink2 1.06s steps(1) infinite}
 @keyframes ub-blink2{50%{opacity:0}}
+@media (min-width:761px) and (max-width:1100px){.ub-pet,.ub-pet canvas{width:300px}.ub-pet canvas{height:327px}.ub-hero{gap:20px}.ub-banner{font-size:clamp(9.5px,1.34vw,11px)}}
 @media (max-width:760px){.ub-hero{grid-template-columns:1fr}.ub-pet{display:none}.ub-banner{font-size:9px}.ub-water{display:none}}
+@media (max-width:380px){.ub-banner{font-size:8px}}
 @media (max-width:640px){.ub-wrap{padding:20px 16px 40px}
   .ub-card>.in{grid-template-columns:1fr}.ub-idx{display:none}.ub-card>.in>:not(.ub-idx){grid-column:1}
   .ub-ta{height:72px}.ub-btns.tools{margin-left:-10px}.ub-btns.tools .ub-btn{padding:0 10px;height:34px;font-size:14px}}
@@ -868,7 +882,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
       sfx.play(cue)
       if (okFor) {
         petEmit('joy')
-        setDone(true)
+        setDone(r && r.released ? 'up' : 'kept')
         host.notify({ kind: 'success', message: okFor(r) })
         await new Promise(res => setTimeout(res, reducedMotion() ? 0 : 650))
       }
@@ -896,15 +910,20 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           : `Answered ${item.task_id} (kept blocked)`)
     )
   const sendPrimary = () => send(!triage)
-  const hide = () => run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
+  const hide = async () => {
+    const r = await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
+    if (r) $undo.set({ id: item.id, title: item.title, at: Date.now() })
+  }
   const ready = !busy && answer.trim().length > 0
+  const saysKeep = !triage && KEEP_BLOCKED.test(answer)
 
-  const askSend = async () => {
+  const askSend = async (retry = false) => {
     const q = askInput.trim()
-    if (!q || askBusy) return
-    const next = [...askMsgs, { role: 'user', content: q }]
+    if (askBusy || (!retry && !q)) return
+    const next = retry ? askMsgs : [...askMsgs, { role: 'user', content: q }]
+    if (!next.length || next[next.length - 1].role !== 'user') return
     setAskMsgs(next)
-    setAskInput('')
+    if (!retry) setAskInput('')
     setAskBusy(true)
     setAskError('')
     try {
@@ -921,7 +940,9 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
       sfx.play('ok')
     } catch (e) {
       sfx.play('err')
-      setAskError(String(e?.message || e))
+      const msg = String(e?.message || e)
+      // An unknown job means the gateway restarted mid-answer: the work is gone, not slow.
+      setAskError(/unknown or expired ask job/.test(msg) ? 'The gateway restarted while the model was answering. Retry to ask again.' : msg)
     } finally {
       setAskBusy(false)
     }
@@ -971,7 +992,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const answerButtons = triage
     ? [button({ kind: 'primary', keycap: '⏎', disabled: !ready, onClick: sendPrimary, title: '⌘/Ctrl + Enter · triage cards stay in triage', children: 'Answer (stays in triage)' })]
     : [
-        button({ kind: 'primary', keycap: '⏎', disabled: !ready, onClick: sendPrimary, title: '⌘/Ctrl + Enter', children: 'Answer + unbl0ck' }),
+        button({ kind: 'primary', keycap: '⏎', disabled: !ready, onClick: sendPrimary, title: saysKeep ? 'Your answer says to keep it blocked' : '⌘/Ctrl + Enter', children: 'Answer + unbl0ck' }),
         button({ disabled: !ready, onClick: () => send(false), children: 'Answer, keep blocked' })
       ]
   const tools = [
@@ -993,9 +1014,10 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           'aria-label': `Answer for ${item.task_id}`,
           onChange: e => setAnswer(e.target.value),
           onKeyDown: e => {
-            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && ready) sendPrimary()
+            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && ready) { e.preventDefault(); saysKeep ? send(false) : sendPrimary() }
           }
         }),
+        saysKeep ? jsx('div', { className: 'ub-hint', role: 'status', children: 'Your answer says to keep it blocked. Did you mean ANSWER, KEEP BLOCKED?' }) : null,
         jsxs('div', { className: 'ub-btns', children: answerButtons }),
         jsxs('div', { className: 'ub-btns tools', children: tools })
       ]
@@ -1039,7 +1061,15 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
               jsx('div', { ref: askEnd })
             ]
           }),
-          askError ? jsx('div', { className: 'ub-fault', style: { padding: '0 12px 8px' }, children: `ASK FAULT // ${askError}` }) : null,
+          askError
+            ? jsxs('div', {
+                style: { padding: '0 12px 8px', display: 'flex', gap: 12, alignItems: 'baseline', flexWrap: 'wrap' },
+                children: [
+                  jsx('div', { className: 'ub-fault', style: { flex: '1 1 240px' }, children: `ASK FAULT // ${askError}` }),
+                  button({ kind: 'ghost', disabled: askBusy, onClick: () => askSend(true), children: 'Retry' })
+                ]
+              })
+            : null,
           jsxs('div', {
             className: 'ub-chatbar',
             children: [
@@ -1051,7 +1081,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
                 onChange: e => setAskInput(e.target.value),
                 onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askSend() } }
               }),
-              button({ kind: 'primary', disabled: askBusy || !askInput.trim(), onClick: askSend, children: 'Send' })
+              button({ kind: 'primary', disabled: askBusy || !askInput.trim(), onClick: () => askSend(), children: 'Send' })
             ]
           })
         ]
@@ -1059,9 +1089,23 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     : null
 
   return jsx('section', {
-    className: `ub-card ${isKanban ? 'kanban' : 'chat'}${done ? ' done' : ''}`,
+    className: `ub-card ${isKanban ? 'kanban' : 'chat'}${done ? ' done' : ''}${done === 'kept' ? ' kept' : ''}`,
     style: { '--i': n - 1 },
+    tabIndex: -1,
     onPointerEnter: () => sfx.play('move'),
+    onKeyDown: e => {
+      if (e.key !== 'Escape') return
+      if (askOpen) setAskOpen(false)
+      else if (detailOpen) setDetailOpen(false)
+      else if (open) setOpen(false)
+      else return
+      e.stopPropagation()
+      // The focused control is about to unmount: move focus to the card now, so the next
+      // Escape lands here even when pressed before the next frame.
+      const card = e.currentTarget
+      if (e.target !== card && e.target.closest('.ub-askwrap, .ub-detail, .ub-full')) card.focus({ preventScroll: true })
+      requestAnimationFrame(() => { if (!card.contains(document.activeElement)) card.focus({ preventScroll: true }) })
+    },
     onFocus: e => { if (e.target === e.currentTarget.querySelector('textarea, button')) sfx.play('move') },
     children: jsxs('div', {
       className: 'in',
@@ -1098,6 +1142,23 @@ function Page({ ctx, refresh }) {
   const q = useValue($queue)
   useEffect(() => { if (Date.now() - (q.at || 0) > 10000) refresh() }, [])   // opening the page shows fresh data
   const fx = useValue($fxOn)
+  const undo = useValue($undo)
+  useEffect(() => {
+    if (!undo) return
+    const t = setTimeout(() => $undo.set(null), Math.max(0, UNDO_MS - (Date.now() - undo.at)))
+    return () => clearTimeout(t)
+  }, [undo])
+  const undoHide = async () => {
+    const u = undo
+    $undo.set(null)
+    try {
+      await ctx.rest('/unhide', { method: 'POST', body: { id: u.id } })
+      sfx.play('move')
+      await refresh()
+    } catch (e) {
+      host.notifyError(e, 'UNBL0CK: could not undo')
+    }
+  }
   const kanban = q.items.filter(i => i.source === 'kanban')
   const chats = q.items.filter(i => i.source === 'chat')
   const oldest = q.items.reduce((m, i) => (i.since && (!m || i.since < m) ? i.since : m), 0)
@@ -1142,7 +1203,7 @@ function Page({ ctx, refresh }) {
                     children: [
                       jsx(Watermark, {}),
                       jsx('div', { className: 'ub-ticks', children: ['#00f5ff', '#ff2bd6', '#f0a202', '#45b280'].map(c => jsx('i', { style: { background: c } }, c)) }),
-                      jsx('div', { className: 'ub-eyebrow', children: `// NEEDS.YOU  /  LIVE QUEUE${q.at ? ` · SYNC ${new Date(q.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : ''}` }),
+                      jsxs('div', { className: 'ub-eyebrow', children: ['// NEEDS.YOU  /  LIVE QUEUE', q.at ? jsx('span', { style: { whiteSpace: 'nowrap' }, children: ` · SYNC ${new Date(q.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` }) : null] }),
                       jsx(Banner, {}),
                       jsxs('div', {
                         className: 'ub-sub',
@@ -1181,6 +1242,16 @@ function Page({ ctx, refresh }) {
           }),
           q.fault ? jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'LINK FAULT //' }), q.fault] }) : null,
           ...(q.errors || []).map(err => jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'SOURCE FAULT //' }), err] }, err)),
+          undo
+            ? jsxs('div', {
+                className: 'ub-undo',
+                role: 'status',
+                children: [
+                  jsxs('span', { children: [jsx('b', { children: 'HIDDEN //' }), undo.title] }),
+                  button({ kind: 'ghost', onClick: undoHide, children: 'Undo' })
+                ]
+              }, undo.at)
+            : null,
           kanban.length ? jsx('div', { className: 'ub-hazard' }) : null,
           ...group('KANBAN.CARDS', kanban),
           ...group('BOT.CHATS', chats),

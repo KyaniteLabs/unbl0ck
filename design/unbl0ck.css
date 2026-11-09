@@ -78,6 +78,12 @@
 .ub-err{margin:0 0 14px;padding:10px 14px;border:1px solid rgba(255,43,214,.45);border-left:3px solid var(--mag);background:rgba(107,19,87,.18);
   font-family:var(--mono);font-size:13px;line-height:1.5;color:var(--mag);letter-spacing:.04em;overflow-wrap:anywhere}
 .ub-err b{font-weight:400;color:var(--text);margin-right:8px}
+.ub-card:focus{outline:none}
+.ub-undo{display:flex;align-items:center;gap:12px;margin:0 0 14px;padding:8px 8px 8px 14px;border:1px solid var(--steeld);border-left:3px solid var(--steel);background:rgba(10,14,20,.7);font-family:var(--mono);font-size:13px;letter-spacing:.04em;color:var(--label)}
+.ub-undo span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ub-undo b{font-weight:400;color:var(--text);margin-right:8px}
+.ub-hint{margin:2px 0 0;font-family:var(--mono);font-size:12.5px;line-height:1.5;letter-spacing:.04em;color:var(--amber)}
+.ub-hint::before{content:'▲ ';}
 .ub-hazard{height:6px;margin-bottom:12px;background:repeating-linear-gradient(135deg,var(--hazard) 0 8px,transparent 8px 16px)}
 .ub-chip{background:none;border:0;cursor:pointer;padding:0 8px;font:400 12px/1 'UB ShareTechMono','Share Tech Mono','SF Mono',ui-monospace,monospace;letter-spacing:.1em;color:#f0a202}
 .ub-chip:hover,.ub-chip:focus-visible{color:#00f5ff}
@@ -190,12 +196,16 @@
 .ub-card.done{background:var(--green)!important}
 .ub-card.done>.in::before{content:'■ UNBL0CKED';position:absolute;inset:0;display:grid;place-items:center;z-index:2;
   font:400 26px var(--mono);letter-spacing:.3em;color:var(--green);background:rgba(5,7,10,.88);animation:ub-done .5s steps(4) both}
+/* answered but still blocked (keep-blocked or triage): no false UNBL0CKED */
+.ub-card.done.kept>.in::before{content:'■ ANSWERED'}
 @keyframes ub-done{0%{opacity:0;letter-spacing:1.2em}100%{opacity:1;letter-spacing:.3em}}
 .ub-chip.new{animation:ub-blink .5s steps(2) 6}
 @keyframes ub-blink{50%{color:#ff2bd6}}
 .ub-cursor{display:inline-block;width:.6em;height:1em;margin-left:4px;vertical-align:-2px;background:var(--amber);animation:ub-blink2 1.06s steps(1) infinite}
 @keyframes ub-blink2{50%{opacity:0}}
+@media (min-width:761px) and (max-width:1100px){.ub-pet,.ub-pet canvas{width:300px}.ub-pet canvas{height:327px}.ub-hero{gap:20px}.ub-banner{font-size:clamp(9.5px,1.34vw,11px)}}
 @media (max-width:760px){.ub-hero{grid-template-columns:1fr}.ub-pet{display:none}.ub-banner{font-size:9px}.ub-water{display:none}}
+@media (max-width:380px){.ub-banner{font-size:8px}}
 @media (max-width:640px){.ub-wrap{padding:20px 16px 40px}
   .ub-card>.in{grid-template-columns:1fr}.ub-idx{display:none}.ub-card>.in>:not(.ub-idx){grid-column:1}
   .ub-ta{height:72px}.ub-btns.tools{margin-left:-10px}.ub-btns.tools .ub-btn{padding:0 10px;height:34px;font-size:14px}}

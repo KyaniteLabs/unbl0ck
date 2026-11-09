@@ -5,6 +5,7 @@ GET  /card?id=               read-only context for one Kanban card
 POST /card/ask               ask the configured model about one card (multi-turn)
 POST /kanban/answer          {board, task_id, text, release}: comment as the principal, optionally unblock
 POST /hide                   {id, version}: "Not for me" until the source changes
+POST /unhide                 {id}: undo "Not for me"
 GET  /pack                   the queue as a Pocket-format card pack (also written to plugin-data/unbl0ck)
 """
 
@@ -157,8 +158,13 @@ def _queue_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
 def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
     key = (item["id"], item["version"])
     try:
+        try:
+            comments = n.recent_comments(item)
+        except Exception as exc:  # noqa: BLE001 - the summary still works from the card text
+            log.info("unbl0ck: comments for %s unavailable: %s", item["id"], exc)
+            comments = []
         result = ctx.llm.complete(
-            n.bluf_messages(item), purpose="unbl0ck.bluf", temperature=0.1, max_tokens=200, timeout=90
+            n.bluf_messages(item, comments), purpose="unbl0ck.bluf", temperature=0.1, max_tokens=200, timeout=90
         )
         bluf, why = n.parse_bluf(result.text)
         n.save_bluf(item["id"], item["version"], bluf, why)
@@ -282,6 +288,15 @@ def answer(body: Answer):
 def hide(body: Hide):
     _needs().hide(body.id, body.version)
     return {"ok": True}
+
+
+class Unhide(BaseModel):
+    id: str
+
+
+@router.post("/unhide")
+def unhide(body: Unhide):
+    return {"ok": True, "restored": _needs().unhide(body.id)}
 
 
 @router.get("/pack")
