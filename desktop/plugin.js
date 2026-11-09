@@ -900,7 +900,13 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     setAskBusy(true)
     setAskError('')
     try {
-      const r = await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next } })
+      let r = await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next } })
+      const t0 = Date.now()   // the model can outlast the desktop's 30 s request limit: poll the background job
+      while (r && r.pending && r.job) {
+        if (Date.now() - t0 > 150000) throw new Error('The model took too long (over 150 s)')
+        await new Promise(res => setTimeout(res, 1500))
+        r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job))
+      }
       const reply = String(r?.reply || '').trim()
       if (!reply) throw new Error('The model returned an empty answer')
       setAskMsgs([...next, { role: 'assistant', content: reply }])

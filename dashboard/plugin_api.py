@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -155,25 +158,59 @@ def card_ask(body: CardAsk):
             status_code=503,
             detail="Ask is unavailable: the plugin host LLM is not reachable",
         )
+    # The model often needs longer than the desktop's 30 s request limit, so run it in the
+    # background and let the client poll GET /card/ask/{job}.
+    _prune_jobs()
+    job = uuid.uuid4().hex
+    _ASK_JOBS[job] = {"status": "pending", "started": time.time()}
+    _ASK_POOL.submit(_run_ask, job, ctx, messages)
+    return {"ok": True, "pending": True, "job": job}
+
+
+_ASK_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unbl0ck-ask")
+_ASK_JOBS: dict[str, dict[str, Any]] = {}
+_ASK_TTL = 900
+
+
+def _prune_jobs() -> None:
+    cutoff = time.time() - _ASK_TTL
+    for k in [k for k, v in list(_ASK_JOBS.items()) if v.get("started", 0) < cutoff]:
+        _ASK_JOBS.pop(k, None)
+
+
+def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
     try:
         result = ctx.llm.complete(
             messages,
             purpose="unbl0ck.card_ask",
             temperature=0.2,
             max_tokens=900,
-            timeout=90,
+            timeout=120,
         )
+        out = {
+            "status": "done",
+            "ok": True,
+            "reply": result.text,
+            "provider": getattr(result, "provider", None),
+            "model": getattr(result, "model", None),
+        }
     except Exception as exc:  # noqa: BLE001 - surface the host error honestly
-        raise HTTPException(
-            status_code=502,
-            detail=f"model call failed: {type(exc).__name__}: {exc}",
-        )
-    return {
-        "ok": True,
-        "reply": result.text,
-        "provider": getattr(result, "provider", None),
-        "model": getattr(result, "model", None),
-    }
+        out = {"status": "error", "ok": False, "detail": f"model call failed: {type(exc).__name__}: {exc}"}
+    if job in _ASK_JOBS:
+        _ASK_JOBS[job].update(out)
+
+
+@router.get("/card/ask/{job}")
+def card_ask_result(job: str):
+    st = _ASK_JOBS.get(job)
+    if st is None:
+        raise HTTPException(status_code=404, detail="unknown or expired ask job")
+    if st["status"] == "pending":
+        return {"ok": True, "pending": True, "job": job, "elapsed": round(time.time() - st["started"], 1)}
+    _ASK_JOBS.pop(job, None)
+    if st["status"] == "error":
+        raise HTTPException(status_code=502, detail=st["detail"])
+    return {k: st[k] for k in ("ok", "reply", "provider", "model")}
 
 
 @router.post("/kanban/answer")
