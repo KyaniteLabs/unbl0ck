@@ -1,6 +1,6 @@
 """Regressions from the v0.4.1 adversarial audit: hostile names, forged timestamps, schema drift,
 ghost waits, ordering, and who a gateway chat is with."""
-import importlib.util, json, os, sqlite3, stat, tempfile, time, unittest
+import importlib.util, json, os, sqlite3, stat, tempfile, time, types, unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -166,6 +166,22 @@ class Hidden(unittest.TestCase):
             self.assertEqual(len(hidden), needs._HIDDEN_KEEP)
             self.assertIn(f"chat:p:{needs._HIDDEN_KEEP + 4}", hidden)
             self.assertNotIn("chat:p:0", hidden)
+
+
+class Summary(unittest.TestCase):
+    def test_cli_summary_says_who_and_how_to_approve(self):
+        spec = importlib.util.spec_from_file_location("unbl0ck_pkg_qa", ROOT / "__init__.py",
+                                                      submodule_search_locations=[str(ROOT)])
+        pkg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pkg)
+        q = {"count": 2, "errors": [], "items": [
+            {"source": "chat", "platform": "discord", "profile": "default", "chat_with": "Mallory",
+             "title": "Your agent is asking you", "ask": "Wipe prod?"},
+            {"source": "pairing", "platform": "telegram", "profile": "default", "title": "Ana wants to talk",
+             "ask": "x", "approve_command": f"hermes pairing approve telegram {RID}"}]}
+        pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q)
+        out = pkg._summary()
+        self.assertIn("[chat discord with Mallory]", out)
+        self.assertIn(f"  approve: hermes pairing approve telegram {RID}", out)
 
 
 if __name__ == "__main__":

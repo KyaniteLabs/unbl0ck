@@ -23,9 +23,12 @@ def _summary(limit: int = 12) -> str:
         where = (f"{it['board']}:{it['task_id']}" if it["source"] == "kanban"
                  else f"{it.get('kind') or 'prompt'} {it['profile']}" if it["source"] == "prompt"
                  else f"pairing {it.get('platform')}" if it["source"] == "pairing"
-                 else f"chat {it.get('platform') or it['profile']}")
+                 else f"chat {it.get('platform') or it['profile']}"
+                 + (f" with {it['chat_with']}" if it.get("chat_with") else ""))
         lead = it.get("bluf") or " ".join(str(it.get("ask") or "").split())[:140]
         lines.append(f"- [{where}] {it['title']}: {lead}")
+        if it.get("approve_command"):
+            lines.append(f"  approve: {it['approve_command']}")
     if q["count"] > limit:
         lines.append(f"…and {q['count'] - limit} more. Open /unbl0ck in Desktop.")
     for err in q["errors"]:
