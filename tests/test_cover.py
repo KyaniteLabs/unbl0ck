@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("unbl0ck_needs_c", ROOT / "needs.py")
 needs = importlib.util.module_from_spec(spec); spec.loader.exec_module(needs)
-needs._settings = lambda: {"principal_name": "Simon", "comment_author": "simon"}
+needs._settings = lambda: {"principal_name": "Ada", "comment_author": "ada"}
 
 ASK = "Want me to merge it?"
 
@@ -54,7 +54,7 @@ class AllPlatformChats(unittest.TestCase):
 
     def test_group_chat_must_name_you(self):
         rows = [("g1", "", "discord", "group", None, "assistant", ASK),
-                ("g2", "", "discord", "thread", None, "assistant", "Simon, want me to merge it?")]
+                ("g2", "", "discord", "thread", None, "assistant", "Ada, want me to merge it?")]
         self.assertEqual(self.ids(rows), ["g2"])
 
     def test_platform_and_wording(self):

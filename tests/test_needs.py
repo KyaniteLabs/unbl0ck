@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("unbl0ck_needs", ROOT / "needs.py")
 needs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(needs)
-needs._settings = lambda: {"principal_name": "Simon", "comment_author": "simon"}
+needs._settings = lambda: {"principal_name": "Ada", "comment_author": "ada"}
 
 
 @contextlib.contextmanager
@@ -67,27 +67,27 @@ def fake_connect(**overrides):
 
 class Classify(unittest.TestCase):
     def test_gate_reasons_need_you(self):
-        for r in ["Awaiting Simon's approval to publish", "CEO-gated: repo publication",
-                  "needs Simon to pick option A or B", "human gate: credentials"]:
+        for r in ["Awaiting Ada's approval to publish", "CEO-gated: repo publication",
+                  "needs Ada to pick option A or B", "human gate: credentials"]:
             self.assertTrue(needs.kanban_needs_you(r, None), r)
 
     def test_needs_input_naming_principal(self):
-        self.assertTrue(needs.kanban_needs_you("Which port should Simon want here", "needs_input"))
+        self.assertTrue(needs.kanban_needs_you("Which port should Ada want here", "needs_input"))
         self.assertIsNone(needs.kanban_needs_you("Which port", "needs_input"))
 
     def test_not_asks(self):
         self.assertIsNone(needs.kanban_needs_you("waiting on CI", None))
         self.assertIsNone(needs.kanban_needs_you("", "needs_input"))
-        # a stop order that names Simon is not a question for Simon
+        # a stop order that names Ada is not a question for Ada
         self.assertIsNone(needs.kanban_needs_you(
-            "Simon 18:07 PT: Claude Code supervisor owns this repair; needs Simon later", None))
+            "Ada 18:07 PT: Claude Code supervisor owns this repair; needs Ada later", None))
 
     def test_live_false_positives_drop(self):
         cases = [
-            ("Superseded. Dead card. Do not retry. Path /home/simon/workspaces/demo/app", "needs_input"),
-            ("Ask Liam in simon/fleet", "needs_input"),
-            ("Simon-reserved slot", "needs_input"),
-            ("no new Simon approval requested", None),
+            ("Superseded. Dead card. Do not retry. Path /home/ada/workspaces/demo/app", "needs_input"),
+            ("Ask Liam in ada/fleet", "needs_input"),
+            ("Ada-reserved slot", "needs_input"),
+            ("no new Ada approval requested", None),
             ("Owner-domain input, not a principal gate", "needs_input"),
         ]
         for reason, kind in cases:
@@ -187,7 +187,7 @@ class Chats(unittest.TestCase):
             self.assertEqual(p.parent.name, "unbl0ck")  # never the gadget plugin's pack
 
 
-def block_event(reason="needs Simon to decide", kind="needs_input", recurrences=1, created_at=100):
+def block_event(reason="needs Ada to decide", kind="needs_input", recurrences=1, created_at=100):
     return types.SimpleNamespace(
         id=11, kind="blocked", created_at=created_at,
         payload={"reason": reason, "kind": kind, "recurrences": recurrences},
@@ -227,7 +227,7 @@ class FakeKanban(unittest.TestCase):
     def test_answer_and_release(self):
         r = needs.answer_card("factory", "t_1", "Go with A", release=True)
         self.assertEqual(r, {"ok": True, "comment_id": 7, "released": True})
-        self.assertEqual(self.calls, [("comment", "t_1", "simon", "Go with A"), ("unblock", "t_1")])
+        self.assertEqual(self.calls, [("comment", "t_1", "ada", "Go with A"), ("unblock", "t_1")])
 
     def test_answer_only(self):
         needs.answer_card("factory", "t_1", "noted", release=False)
@@ -240,7 +240,7 @@ class FakeKanban(unittest.TestCase):
             needs.answer_card("factory", "t_9", "x", release=True)
 
     def test_double_submit_is_rejected_before_a_second_comment(self):
-        self.comments = [types.SimpleNamespace(author="simon", created_at=150, body="already")]
+        self.comments = [types.SimpleNamespace(author="ada", created_at=150, body="already")]
         with self.assertRaises(RuntimeError):
             needs.answer_card("factory", "t_1", "again", release=False)
         self.assertEqual(self.calls, [])
@@ -291,7 +291,7 @@ class QueueKanban(unittest.TestCase):
         triage = task(status="triage", task_id="t_triage", block_recurrences=2)
         triage_event = types.SimpleNamespace(
             id=12, kind="block_loop_detected", created_at=200,
-            payload={"reason": "needs Simon to choose a path", "kind": "needs_input", "recurrences": 2, "limit": 2},
+            payload={"reason": "needs Ada to choose a path", "kind": "needs_input", "recurrences": 2, "limit": 2},
         )
         kdb = fake_db(
             list_tasks=lambda conn, status=None: [triage] if status == "triage" else [],
@@ -322,7 +322,7 @@ class QueueKanban(unittest.TestCase):
 class CardContext(unittest.TestCase):
     def test_context_shape(self):
         ctx_task = task(
-            task_id="t_ctx", priority=4, created_by="simon", session_id="sess-1",
+            task_id="t_ctx", priority=4, created_by="ada", session_id="sess-1",
             body="Do the thing", assignee="liam", workspace_kind="git",
             workspace_path="/tmp/wt", branch_name="feat/x", project_id="proj",
             completion_contract="owner/repo#7", last_failure_error="boom",
@@ -357,11 +357,11 @@ class CardContext(unittest.TestCase):
             data = needs.card_context("factory", "t_ctx")
         self.assertEqual(data["id"], "kanban:factory:t_ctx")
         self.assertEqual(data["body"], "Do the thing")
-        self.assertEqual(data["created_by"], "simon")
+        self.assertEqual(data["created_by"], "ada")
         self.assertEqual(data["workspace"]["branch"], "feat/x")
         self.assertEqual(data["pr"]["reference"], "owner/repo#7")
         self.assertTrue(data["pr"]["ok"])
-        self.assertEqual(data["block"]["reason"], "needs Simon to decide")
+        self.assertEqual(data["block"]["reason"], "needs Ada to decide")
         self.assertEqual(data["block"]["recurrences"], 2)
         self.assertEqual(data["comments"][0]["body"], "Which option?")
         self.assertEqual(data["graph"]["parents"][0]["id"], "t_0")
@@ -402,14 +402,14 @@ class Ask(unittest.TestCase):
 
 
 class PrincipalName(unittest.TestCase):
-    def test_other_name_detected_and_simon_not_hardcoded(self):
+    def test_other_name_detected_and_default_name_not_hardcoded(self):
         orig = needs._settings
-        needs._settings = lambda: {"principal_name": "Ada"}
+        needs._settings = lambda: {"principal_name": "Grace"}
         try:
-            self.assertTrue(needs.kanban_needs_you("Awaiting Ada's approval to publish", None))
-            self.assertIsNone(needs.kanban_needs_you("Awaiting Simon's approval to publish", None))
+            self.assertTrue(needs.kanban_needs_you("Awaiting Grace's approval to publish", None))
+            self.assertIsNone(needs.kanban_needs_you("Awaiting Ada's approval to publish", None))
             self.assertTrue(needs.kanban_needs_you("CEO-gated: repo publication", None))
-            self.assertEqual(needs.principal_author(), "Ada")
+            self.assertEqual(needs.principal_author(), "Grace")
         finally:
             needs._settings = orig
 

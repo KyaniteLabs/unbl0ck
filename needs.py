@@ -322,7 +322,7 @@ def recent_comments(item: dict[str, Any], limit: int = 6) -> list[dict[str, Any]
 
 # --- classification (pure) -----------------------------------------------------------------
 
-# Negation words that turn a gate phrase into "not a gate" ("no new Simon approval
+# Negation words that turn a gate phrase into "not a gate" ("no new Ada approval
 # requested", "not a principal gate", "approval is not needed").
 _NEGATION = re.compile(
     r"\b(?:no|not|never|without|nothing|none|neither|nor|"
@@ -332,7 +332,7 @@ _NEGATION = re.compile(
     re.I,
 )
 # Characters that make a name part of a path, slug, env var or email instead of a
-# standalone word: /home/simon/..., simon/fleet, Simon-reserved, simon@example.com.
+# standalone word: /home/ada/..., ada/fleet, Ada-reserved, ada@example.com.
 _TOKEN_GLUE = "/\\-_@"
 
 

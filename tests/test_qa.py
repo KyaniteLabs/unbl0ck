@@ -6,7 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("unbl0ck_needs_qa", ROOT / "needs.py")
 needs = importlib.util.module_from_spec(spec); spec.loader.exec_module(needs)
-SETTINGS = {"principal_name": "Simon"}
+SETTINGS = {"principal_name": "Ada"}
 needs._settings = lambda: SETTINGS
 
 ASK = "Want me to merge it?"
@@ -90,13 +90,13 @@ class Chats(unittest.TestCase):
 
     def test_gateway_chat_says_who_it_is_with_and_owner_ids_filter(self):
         with tempfile.TemporaryDirectory() as d:
-            chat_db(Path(d) / "state.db", [("me", "discord", "111", "simon"), ("them", "discord", "222", "Mallory‮"),
+            chat_db(Path(d) / "state.db", [("me", "discord", "111", "ada"), ("them", "discord", "222", "Mallory‮"),
                                            ("local", "desktop", "999", "ignored")])
             items = {i["session_id"]: i for i in needs.chat_items(Path(d))}
             self.assertEqual(sorted(items), ["local", "me", "them"])
             self.assertEqual(items["them"]["chat_with"], "Mallory")
             self.assertEqual(items["local"]["chat_with"], "")
-            self.assertEqual(items["me"]["chat_with"], "")   # "simon" is the principal: not worth saying
+            self.assertEqual(items["me"]["chat_with"], "")   # "ada" is the principal: not worth saying
             SETTINGS["owner_user_ids"] = "111, 333"
             try:
                 self.assertEqual(sorted(i["session_id"] for i in needs.chat_items(Path(d))), ["local", "me"])
@@ -118,7 +118,7 @@ class Waits(unittest.TestCase):
         self.d.cleanup()
 
     def test_wait_file_is_owner_only(self):
-        needs.record_wait(self.home, request_id=RID, kind="sudo", prompt="password for simon")
+        needs.record_wait(self.home, request_id=RID, kind="sudo", prompt="password for ada")
         f = needs._waits_dir(self.home) / f"{RID}.json"
         self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
 
