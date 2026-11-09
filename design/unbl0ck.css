@@ -38,6 +38,7 @@
   background:var(--base);border:1px solid var(--steel);clip-path:polygon(12px 0,100% 0,100% 100%,0 100%,0 12px)}
 .ub-card.chat .ub-idx{color:var(--green)}
 .ub-card.prompt .ub-idx{color:var(--amber)}
+.ub-card.pairing .ub-idx{color:var(--mag)}
 .ub-top{display:flex;justify-content:space-between;align-items:baseline;gap:14px}
 .ub-h{font-weight:700;font-size:22px;line-height:1.15;letter-spacing:.01em;text-transform:uppercase;color:var(--text);margin:0}
 .ub-age{flex:none;font-family:var(--mono);font-size:14px;letter-spacing:.08em;color:var(--dim)}

@@ -1,4 +1,4 @@
-"""UNBL0CK: one queue of everything blocked on you (Kanban cards, Bot Mode chats, live prompts).
+"""UNBL0CK: one queue of everything blocked on you (Kanban cards, chats, live prompts, pairing requests).
 
 register() registers a slash command, a CLI command, and stashes its context so the
 dashboard backend can use the host-owned LLM for "Ask about this card". Everything that
@@ -22,7 +22,8 @@ def _summary(limit: int = 12) -> str:
     for it in q["items"][:limit]:
         where = (f"{it['board']}:{it['task_id']}" if it["source"] == "kanban"
                  else f"{it.get('kind') or 'prompt'} {it['profile']}" if it["source"] == "prompt"
-                 else f"chat {it['profile']}")
+                 else f"pairing {it.get('platform')}" if it["source"] == "pairing"
+                 else f"chat {it.get('platform') or it['profile']}")
         lead = it.get("bluf") or " ".join(str(it.get("ask") or "").split())[:140]
         lines.append(f"- [{where}] {it['title']}: {lead}")
     if q["count"] > limit:
@@ -59,7 +60,7 @@ def register(ctx):
     global _PLUGIN_CTX
     _PLUGIN_CTX = ctx
     ctx.register_command("unbl0ck", slash_unbl0ck, description="What is blocked on you right now")
-    ctx.register_cli_command("unbl0ck", "List what is blocked on you (Kanban, Bot Mode, live prompts)", _setup_cli, _cli)
+    ctx.register_cli_command("unbl0ck", "List what is blocked on you (Kanban, chats, live prompts, pairing)", _setup_cli, _cli)
     # Live prompts: stock observers for every point an agent blocks on a human (clarify,
     # approval, sudo). Observers only; a failure here never touches the prompt.
     register_hook = getattr(ctx, "register_hook", None)

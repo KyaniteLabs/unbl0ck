@@ -20,6 +20,7 @@ This module imports Hermes lazily so it can be unit-tested without a Hermes inst
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -521,15 +522,28 @@ def _bot_name(home: Path, profile: str) -> str:
     return profile
 
 
+# Sessions a person types into. Everything else (Kanban workers, cron, subagents, one-shot
+# runs, agent-to-agent calls) is agents talking to agents, so its questions are not for you.
+CHAT_MACHINE_SOURCES = ("kanban", "cron", "subagent", "oneshot", "tool", "batch", "a2a", "delegate", "delegation")
+# In a shared channel the bot may be asking someone else; there the ask must name you.
+CHAT_GROUP_TYPES = ("group", "channel", "thread", "supergroup", "forum")
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def chat_items(
     home: Optional[Path] = None,
     days: int = CHAT_WINDOW_DAYS,
     errors: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
+    """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
+    last visible turn is the bot asking you something you have not answered."""
     home = home or hermes_home()
     since = time.time() - days * 86400
     items: list[dict[str, Any]] = []
-    marks = ",".join("?" * len(CHAT_TITLES))
+    names = _patterns()["_NAMES"]
     for profile, db in _state_dbs(home):
         try:
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
@@ -539,16 +553,38 @@ def chat_items(
             continue
         with closing(conn):
             try:
+                cols = _columns(conn, "sessions")
+                if not cols:
+                    continue   # a profile that never chatted has no sessions table yet
+                where = ["COALESCE(s.archived,0)=0"] if "archived" in cols else []
+                args: list[Any] = []
+                if "hidden" in cols:
+                    where.append("COALESCE(s.hidden,0)=0")
+                if "source" in cols:
+                    where.append(f"COALESCE(s.source,'') NOT IN ({','.join('?' * len(CHAT_MACHINE_SOURCES))})")
+                    args += CHAT_MACHINE_SOURCES
+                else:   # an old schema: only Bot Mode chats can be told apart
+                    where.append(f"s.title IN ({','.join('?' * len(CHAT_TITLES))})")
+                    args += CHAT_TITLES
+                if "parent_session_id" in cols:
+                    # A compressed chat continues in a child session; only the newest link counts.
+                    where.append("NOT EXISTS (SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id"
+                                 + (f" AND COALESCE(c.source,'') NOT IN ({','.join('?' * len(CHAT_MACHINE_SOURCES))})" if "source" in cols else "")
+                                 + ")")
+                    if "source" in cols:
+                        args += CHAT_MACHINE_SOURCES
+                if "last_activity_at" in cols and "started_at" in cols:
+                    where.append("COALESCE(s.last_activity_at, s.started_at, 0) >= ?")
+                    args.append(since)
+                pick = ", ".join(f"s.{c}" if c in cols else "NULL" for c in ("source", "chat_type"))
                 sessions = conn.execute(
-                    f"SELECT id, title FROM sessions WHERE title IN ({marks}) AND COALESCE(archived,0)=0",
-                    CHAT_TITLES,
+                    f"SELECT s.id, s.title, {pick} FROM sessions s WHERE {' AND '.join(where) or '1'}", args
                 ).fetchall()
             except sqlite3.Error as exc:
-                # A profile without Bot Mode chats has no such columns yet; anything else is a fault.
                 if errors is not None and "no such" not in str(exc):
                     errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
                 continue
-            for sid, title in sessions:
+            for sid, title, platform, chat_type in sessions:
                 try:
                     row = conn.execute(
                         "SELECT id, role, content, timestamp FROM messages WHERE session_id=? "
@@ -566,18 +602,91 @@ def chat_items(
                 mid, role, content, ts = row
                 if role != "assistant" or (ts or 0) < since or not chat_asks_you(content):
                     continue
+                if str(chat_type or "").lower() in CHAT_GROUP_TYPES and not names.search(str(content)[-900:]):
+                    continue
+                bot_chat = title in CHAT_TITLES
+                platform = str(platform or "")
+                where_ = "Bot Chat" if bot_chat else (f"{_platform_label(platform)} chat" if platform else "chat")
                 items.append({
                     "id": f"chat:{profile}:{sid}",
                     "version": str(mid),
                     "source": "chat",
                     "profile": profile,
                     "session_id": sid,
+                    "platform": platform,
+                    "bot_chat": bot_chat,
+                    "chat_title": "" if bot_chat else str(title or "")[:120],
                     "title": f"{_bot_name(home, profile)} is asking you",
                     "ask": _excerpt(content),
-                    "why": "Last turn in this Bot Chat is a question for you",
+                    "why": f"Last turn in this {where_} is a question for you",
                     "owner": profile,
                     "priority": 0,
                     "since": int(ts or 0),
+                })
+    return items
+
+
+# --- Pairing source (stock gateway pairing store) ------------------------------------------
+
+PAIRING_TTL = 3600   # gateway/pairing.py CODE_TTL_SECONDS: a code is dead after an hour
+
+
+def _pairing_dirs(home: Path) -> list[tuple[str, Path]]:
+    seen: set[Path] = set()
+    out = []
+    cands = [("default", home / "platforms" / "pairing"), ("default", home / "pairing")]
+    for prof in sorted((home / "profiles").glob("*/")):
+        cands += [(prof.name, prof / "platforms" / "pairing"), (prof.name, prof / "pairing")]
+    for profile, d in cands:
+        try:
+            real = d.resolve()
+        except OSError:
+            continue
+        if d.is_dir() and real not in seen:
+            seen.add(real)
+            out.append((profile, d))
+    return out
+
+
+def pairing_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) -> list[dict[str, Any]]:
+    """People who messaged a bot and are waiting for you to let them in. Read-only: the
+    files are read, never pruned or written (the gateway owns them)."""
+    home = home or hermes_home()
+    now = time.time()
+    items: list[dict[str, Any]] = []
+    for profile, d in _pairing_dirs(home):
+        for f in sorted(d.glob("*-pending.json")):
+            platform = f.name[: -len("-pending.json")]
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", platform):
+                continue
+            try:
+                data = json.loads(f.read_text() or "{}")
+            except (OSError, ValueError) as exc:
+                if errors is not None:
+                    errors.append(f"pairing[{profile}/{platform}]: {type(exc).__name__}")
+                continue
+            if not isinstance(data, dict):
+                continue
+            for entry_id, info in data.items():
+                created = info.get("created_at") if isinstance(info, dict) else None
+                if not isinstance(created, (int, float)) or now - created > PAIRING_TTL:
+                    continue
+                who = str(info.get("user_name") or "").strip()[:60] or "Someone new"
+                key = hashlib.sha256(f"{profile}:{platform}:{entry_id}".encode()).hexdigest()[:16]
+                bot = _bot_name(home, profile) if profile != "default" else "your bot"
+                items.append({
+                    "id": f"pairing:{profile}:{platform}:{key}",
+                    "version": key,
+                    "source": "pairing",
+                    "profile": profile,
+                    "platform": platform,
+                    "title": f"{who} wants to talk to {bot} on {_platform_label(platform)}",
+                    "ask": ("They messaged the bot and got a pairing code. Nothing they send reaches an agent "
+                            f"until you approve them: the dashboard's Pairing page, or hermes pairing approve {platform} <code>."),
+                    "why": f"A pairing request expires {max(1, int((created + PAIRING_TTL - now) // 60))} min from now",
+                    "owner": profile,
+                    "priority": 1,
+                    "since": int(created),
                 })
     return items
 
@@ -726,6 +835,10 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
         items.extend(wait_items(home, errors=errors))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"prompt: {type(exc).__name__}: {exc}")
+    try:
+        items.extend(pairing_items(home, errors=errors))
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"pairing: {type(exc).__name__}: {exc}")
     hidden = load_hidden(home)
     shown = [i for i in items if include_hidden or hidden.get(i["id"]) != i["version"]]
     # Board priority first (higher is more urgent, as on the board), then newest.
@@ -978,8 +1091,16 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
                 {"label": "Answer + unblock", "send": f"Answer and unblock {it['task_id']}", "effect": "Card resumes", "tone": "primary"},
                 {"label": "Keep hold", "send": f"Keep {it['task_id']} blocked", "effect": "No change", "tone": "neutral"},
             ]
-        else:
+        elif it["source"] == "pairing":
+            options = [{"label": "Review request", "send": "Open pairing requests", "effect": "Approve or ignore on the Pairing page", "tone": "primary"}]
+        elif it["source"] == "prompt":
+            where = _platform_label(it.get("platform") or "") if it.get("platform") else "the session"
+            options = [{"label": "Answer there", "send": f"Answer the prompt in {where}", "effect": "The run resumes", "tone": "primary"}]
+        elif it["source"] == "chat" and it.get("bot_chat"):
             options = [{"label": "Open chat", "send": f"Open {it['profile']} Bot Chat", "effect": "Reply in the chat", "tone": "primary"}]
+        else:
+            where = _platform_label(it.get("platform") or "") if it.get("platform") else "the chat"
+            options = [{"label": "Answer there", "send": f"Answer in {where}", "effect": f"Reply in {where}", "tone": "primary"}]
         cards.append({
             "id": it["id"],
             "kind": "decide",

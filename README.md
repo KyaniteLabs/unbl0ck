@@ -1,6 +1,6 @@
 # UNBL0CK
 
-Agents get stuck waiting on you, and those questions end up scattered across Kanban boards and chats. UNBL0CK gathers them into one queue: every blocked Kanban card waiting on your answer, every Bot Mode chat whose last turn is the bot asking you something, and every agent paused right now on a clarify question, a command approval or a sudo prompt.
+Agents get stuck waiting on you, and those questions end up scattered across Kanban boards and chats. UNBL0CK gathers them into one queue: every blocked Kanban card waiting on your answer, every chat on any platform (Desktop, CLI, TUI, Telegram, Discord and the rest) whose last turn is the bot asking you something, every agent paused right now on a clarify question, a command approval or a sudo prompt, and every new person waiting for you to approve their pairing request.
 
 To answer a card, type into the queue. UNBL0CK posts your answer as a comment through native Kanban and, if you choose, unblocks the card. A chat opens straight from the queue. Each card leads with a one-line summary of what you must decide, and the original text is one click away. Nothing is decided for you and silence never counts as a yes. UNBL0CK adds no ranking of its own: cards keep their board priority, newest first within it.
 
@@ -33,10 +33,11 @@ Requires Hermes `>= 0.23.0`.
 ## How detection works
 
 - **Kanban:** a card counts when its latest block is clearly waiting on you. Either the block reason names a decision for you ("Awaiting Ada's approval", "human gate: credentials"), or it is a `needs_input` block that names you. Blocks that only report an order ("Ada said stop") are skipped. So are cards you have already answered since the block.
-- **Bot Mode:** a canonical Bot Chat from the last 14 days counts when the bot's final visible turn asks you something and you have not replied after it.
+- **Chats:** any chat a person uses, on any platform, from the last 14 days counts when the bot's final visible turn asks you something and you have not replied after it. Agent-to-agent sessions (Kanban workers, cron, subagents, one-shot runs) are skipped. A long chat that Hermes compressed into a continuation is checked only at its newest link. In a group, channel or thread the ask must name you, because there the bot may be talking to someone else. Desktop, CLI and TUI chats open in place; for Telegram, Discord and other platforms the card tells you where to reply.
+- **Pairing requests:** when someone new messages a bot and gets a pairing code, they wait under **ACCESS.REQUESTS** until you approve them (the dashboard's Pairing page, or `hermes pairing approve <platform> <code>`) or the code expires after an hour. UNBL0CK reads the gateway's pending-pairing files read-only and never shows the person's platform user id or code.
 - **Live prompts:** when any agent pauses on a clarify question, a dangerous-command approval or a sudo password prompt, Hermes fires its stock `on_human_input_request` hook and UNBL0CK lists it under **LIVE.PROMPTS** until `on_human_input_resolved` fires. Answer it where it was asked; UNBL0CK shows the prompt (already redacted by Hermes) and the platform it is waiting in. A prompt whose process has exited is dropped on the next poll, so a crash never leaves a ghost behind. Hooks load when the gateway starts, so a newly installed UNBL0CK picks up live prompts after the next gateway restart.
 
-What it cannot see: a chat outside Bot Mode that asks you something in plain text without using the clarify tool, and a card that is waiting on you without saying so in its block reason.
+What it cannot see: a card that is waiting on you without saying so in its block reason, and a chat question so indirect that it does not read as a question for you.
 
 ## Disclosure
 
@@ -48,7 +49,8 @@ The things you would want to know before installing:
 - **No credentials.** It neither reads nor stores secrets.
 - **Reads outside its own data:**
   - Kanban boards, through Hermes's Kanban modules (`hermes_cli.kanban_db`).
-  - The `state.db` chat history of the root Hermes home and of every profile under it, opened **read-only**, so it can find Bot Chats that end with a question for you.
+  - The `state.db` chat history of the root Hermes home and of every profile under it, opened **read-only**, so it can find chats that end with a question for you.
+  - The gateway's `*-pending.json` pairing files under the Hermes home and each profile, read-only: only the display name, platform and request time are used.
   - Hermes's `on_human_input_request` / `on_human_input_resolved` hook payloads (kind, redacted prompt, session id, platform).
 - **Writes:**
   - Only when you click Answer: one comment on the card, under your configured author name, and an unblock if you chose **Answer + unblock**. Nothing else is ever written to Kanban. The Context panel and Ask never write to the card.

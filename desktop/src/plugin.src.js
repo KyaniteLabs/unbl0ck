@@ -64,6 +64,7 @@ ${Object.entries(FONTS)
   background:var(--base);border:1px solid var(--steel);clip-path:polygon(12px 0,100% 0,100% 100%,0 100%,0 12px)}
 .ub-card.chat .ub-idx{color:var(--green)}
 .ub-card.prompt .ub-idx{color:var(--amber)}
+.ub-card.pairing .ub-idx{color:var(--mag)}
 .ub-top{display:flex;justify-content:space-between;align-items:baseline;gap:14px}
 .ub-h{font-weight:700;font-size:22px;line-height:1.15;letter-spacing:.01em;text-transform:uppercase;color:var(--text);margin:0}
 .ub-age{flex:none;font-family:var(--mono);font-size:14px;letter-spacing:.08em;color:var(--dim)}
@@ -632,7 +633,7 @@ function Ticker({ items }) {
   if (!items.length) return null
   const runs = items.map(i =>
     jsxs('span', {
-      children: [jsx('b', { children: '◆ ' }), jsx('em', { children: i.source === 'kanban' ? i.task_id : i.source === 'prompt' ? `${String(i.kind || 'PROMPT').toUpperCase()} · LIVE` : (i.owner || i.profile || 'CHAT').toUpperCase() }), ` · ${String(i.title || '').toUpperCase()} · ${ago(i.since)}`]
+      children: [jsx('b', { children: '◆ ' }), jsx('em', { children: i.source === 'kanban' ? i.task_id : i.source === 'prompt' ? `${String(i.kind || 'PROMPT').toUpperCase()} · LIVE` : i.source === 'pairing' ? `PAIRING · ${String(i.platform || '').toUpperCase()}` : (i.owner || i.profile || 'CHAT').toUpperCase() }), ` · ${String(i.title || '').toUpperCase()} · ${ago(i.since)}`]
     }, `${i.id}`)
   )
   const chars = items.reduce((n, i) => n + String(i.title || '').length + 24, 0)
@@ -703,6 +704,12 @@ function cleanReply(text) {
 }
 // Desktop's Kanban page is a bundled plugin that ships off. Without it the
 // router quietly falls back to Home, so say how to turn it on.
+const LOCAL_PLATFORMS = ['desktop', 'cli', 'tui', 'local', 'gui']
+const PLATFORM_LABELS = { desktop: 'Hermes Desktop', cli: 'the Hermes CLI', tui: 'the Hermes TUI', api_server: 'the API' }
+function platformLabel(p) {
+  p = String(p || '')
+  return PLATFORM_LABELS[p] || p.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+}
 function openBoard() {
   host.navigate('/kanban')
   setTimeout(() => {
@@ -864,6 +871,11 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const askEnd = useRef(null)
   const isKanban = item.source === 'kanban'
   const isPrompt = item.source === 'prompt'
+  const isPairing = item.source === 'pairing'
+  const platformName = platformLabel(item.platform)
+  // Desktop can open its own sessions (and CLI/TUI ones, which share the store). A Telegram or
+  // Discord chat is answered in Telegram or Discord.
+  const opensHere = !!item.session_id && (item.bot_chat || LOCAL_PLATFORMS.includes(String(item.platform || '')))
   const triage = isKanban && item.status === 'triage'
 
   useEffect(() => {
@@ -1020,9 +1032,19 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
         className: 'ub-meta',
         children: ['LIVE PROMPT \\\\ ', jsx('em', { children: String(item.kind || 'prompt').toUpperCase() }), ` · ${item.profile}`, item.platform ? ` · ${String(item.platform).toUpperCase()}` : '']
       })
+    : isPairing
+    ? jsxs('div', {
+        className: 'ub-meta',
+        children: ['PAIRING \\\\ ', jsx('em', { children: platformName.toUpperCase() }), ` · ${item.profile}`]
+      })
     : jsxs('div', {
         className: 'ub-meta',
-        children: ['BOT CHAT \\\\ ', jsx('em', { children: item.owner || item.profile }), item.profile && item.owner !== item.profile ? ` · ${item.profile}` : '']
+        children: [
+          item.bot_chat ? 'BOT CHAT \\\\ ' : `${(platformName || 'CHAT').toUpperCase()} \\\\ `,
+          jsx('em', { children: item.owner || item.profile }),
+          item.profile && item.owner !== item.profile ? ` · ${item.profile}` : '',
+          item.chat_title ? ` · ${String(item.chat_title).toUpperCase()}` : ''
+        ]
       })
 
   const answerButtons = triage
@@ -1063,22 +1085,30 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
         jsxs('div', {
           className: 'ub-btns',
           children: [
-            item.session_id && (!item.platform || item.platform === 'desktop' || item.platform === 'cli' || item.platform === 'tui')
+            item.session_id && (!item.platform || LOCAL_PLATFORMS.includes(String(item.platform)))
               ? button({ kind: 'primary', keycap: '→', disabled: busy, onClick: () => host.openSession(item.session_id, { profile: item.profile }), children: 'Open session' })
               : null,
             button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
           ].filter(Boolean)
         })
       ]
+    : isPairing
+    ? [
+        jsx('div', { className: 'ub-hint', role: 'note', children: `Approve on the dashboard's Pairing page, or run hermes pairing approve ${item.platform} <code> with the code they were sent. Ignored requests expire within the hour.` }),
+        jsxs('div', { className: 'ub-btns', children: [button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })] })
+      ]
     : [
+        opensHere ? null : jsx('div', { className: 'ub-hint', role: 'note', children: `Reply in ${platformName || 'the chat'}. It leaves this list once you answer.` }),
         jsxs('div', {
           className: 'ub-btns',
           children: [
-            button({ kind: 'primary', keycap: '→', disabled: busy, onClick: () => host.openSession(item.session_id, { profile: item.profile }), children: 'Open chat + reply' }),
+            opensHere
+              ? button({ kind: 'primary', keycap: '→', disabled: busy, onClick: () => host.openSession(item.session_id, { profile: item.profile }), children: 'Open chat + reply' })
+              : null,
             button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
-          ]
+          ].filter(Boolean)
         })
-      ]
+      ].filter(Boolean)
 
   const detailNode = detailOpen
     ? jsx(CardDetail, { data: detail, loading: detailLoading, error: detailError })
@@ -1138,7 +1168,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     : null
 
   return jsx('section', {
-    className: `ub-card ${isKanban ? 'kanban' : isPrompt ? 'prompt' : 'chat'}${done ? ' done' : ''}${done === 'kept' ? ' kept' : ''}`,
+    className: `ub-card ${isKanban ? 'kanban' : isPrompt ? 'prompt' : isPairing ? 'pairing' : 'chat'}${done ? ' done' : ''}${done === 'kept' ? ' kept' : ''}`,
     style: { '--i': n - 1 },
     tabIndex: -1,
     onPointerEnter: () => sfx.play('move'),
@@ -1211,6 +1241,7 @@ function Page({ ctx, refresh }) {
   const kanban = q.items.filter(i => i.source === 'kanban')
   const chats = q.items.filter(i => i.source === 'chat')
   const prompts = q.items.filter(i => i.source === 'prompt')
+  const pairing = q.items.filter(i => i.source === 'pairing')
   const oldest = q.items.reduce((m, i) => (i.since && (!m || i.since < m) ? i.since : m), 0)
   const oldestH = oldest ? (Date.now() / 1000 - oldest) / 3600 : 0
   let n = 0
@@ -1259,7 +1290,7 @@ function Page({ ctx, refresh }) {
                         className: 'ub-sub',
                         children: [
                           q.loading
-                            ? 'Scanning boards, Bot Chats and live prompts'
+                            ? 'Scanning boards, chats, live prompts and pairing requests'
                             : q.fault
                               ? 'Cannot reach the queue; showing the last known list.'
                               : (q.errors || []).length
@@ -1281,6 +1312,7 @@ function Page({ ctx, refresh }) {
                   tile('KANBAN', q.loading ? '··' : pad(kanban.length)),
                   tile('CHATS', q.loading ? '··' : pad(chats.length)),
                   tile('LIVE', q.loading ? '··' : pad(prompts.length), prompts.length ? 'warn' : ''),
+                  pairing.length ? tile('ACCESS', pad(pairing.length), 'warn') : null,
                   tile('OLDEST', oldest ? ago(oldest) : '—', oldestH > 24 ? 'warn' : ''),
                   jsx('div', { style: { flex: 1 } }),
                   jsx('div', { style: { alignSelf: 'center' }, children: jsx(FxToggle, {}) }),
@@ -1305,10 +1337,11 @@ function Page({ ctx, refresh }) {
             : null,
           kanban.length ? jsx('div', { className: 'ub-hazard' }) : null,
           ...group('LIVE.PROMPTS', prompts),
+          ...group('ACCESS.REQUESTS', pairing),
           ...group('KANBAN.CARDS', kanban),
-          ...group('BOT.CHATS', chats),
+          ...group('CHATS', chats),
           !q.loading && !q.count && !q.fault && !(q.errors || []).length
-            ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, chat or prompt is waiting on you.' })] })
+            ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, chat, prompt or pairing request is waiting on you.' })] })
             : null
         ]
       })
