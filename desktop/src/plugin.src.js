@@ -216,10 +216,6 @@ ${Object.entries(FONTS)
 @keyframes ub-in{0%{opacity:0;transform:translateX(-14px)}55%{opacity:1;transform:translateX(2px)}
   62%{transform:translateX(-3px) skewX(-2deg)}70%{transform:translateX(1px)}100%{opacity:1;transform:none}}
 .ub-card>.in{position:relative}
-.ub-card>.in::after{content:'';position:absolute;top:0;bottom:0;left:-30%;width:30%;pointer-events:none;opacity:0;
-  background:linear-gradient(90deg,transparent,rgba(240,162,2,.07) 80%,rgba(240,162,2,.35) 99%,transparent)}
-.ub-card:hover>.in::after{animation:ub-scan .7s ease-out}
-@keyframes ub-scan{0%{left:-30%;opacity:1}100%{left:100%;opacity:1}}
 .ub-card.done{background:var(--green)!important}
 .ub-card.done>.in::before{content:'■ UNBL0CKED';position:absolute;inset:0;display:grid;place-items:center;z-index:2;
   font:400 26px var(--mono);letter-spacing:.3em;color:var(--green);background:rgba(5,7,10,.88);animation:ub-done .5s steps(4) both}
