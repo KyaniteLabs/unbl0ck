@@ -1059,7 +1059,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
       ]
     : isPrompt
     ? [
-        jsx('div', { className: 'ub-hint', role: 'note', children: `An agent is paused on this right now. Answer it where it was asked${item.platform ? ` (${item.platform})` : ''}; it leaves this list the moment it is answered.` }),
+        jsx('div', { className: 'ub-hint', role: 'note', children: 'Answer it where it was asked. It leaves this list the moment it is answered.' }),
         jsxs('div', {
           className: 'ub-btns',
           children: [

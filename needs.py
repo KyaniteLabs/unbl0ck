@@ -663,6 +663,14 @@ def clear_wait(home: Optional[Path] = None, **payload: Any) -> None:
         log.debug("unbl0ck: could not clear wait: %s", exc)
 
 
+_PLATFORM_LABELS = {"desktop": "Hermes Desktop", "cli": "the Hermes CLI", "tui": "the Hermes TUI", "api_server": "the API"}
+
+
+def _platform_label(platform: str) -> str:
+    p = platform.strip().lower()
+    return _PLATFORM_LABELS.get(p) or p.replace("_", " ").title()
+
+
 def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) -> list[dict[str, Any]]:
     """Open live prompts. A wait whose process is gone is deleted, not shown."""
     home = home or hermes_home()
@@ -690,7 +698,7 @@ def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) 
             "platform": platform,
             "title": f"{who} {_WAIT_KINDS.get(kind, 'is waiting on you')}",
             "ask": _excerpt(str(rec.get("prompt") or "")) or "(prompt text withheld by Hermes)",
-            "why": f"An agent is paused on this {kind or 'prompt'} right now" + (f" in {platform}" if platform else ""),
+            "why": "Its run is paused until you answer" + (f" in {_platform_label(platform)}." if platform else "."),
             "owner": profile,
             "priority": 1,   # a live wait is holding a running agent
             "since": int(rec.get("since") or 0),

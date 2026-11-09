@@ -21,7 +21,7 @@ class LivePrompts(unittest.TestCase):
         self.assertEqual(len(items), 1)
         it = items[0]
         self.assertEqual((it["source"], it["kind"], it["id"]), ("prompt", "approval", f"prompt:{RID}"))
-        self.assertIn("approval", it["title"]); self.assertIn("telegram", it["why"])
+        self.assertIn("approval", it["title"]); self.assertIn("in Telegram.", it["why"])
         needs.clear_wait(self.home, request_id=RID, outcome="once")
         self.assertEqual(needs.wait_items(self.home), [])
 
