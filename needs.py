@@ -14,7 +14,7 @@
   process died, or that is older than a day, is dropped. The prompt text arrives already redacted
   by Hermes; answering happens where it was asked.
 - Pairing requests: someone messaged a bot and is waiting for the human to approve them, read
-  read-only from the gateway's pending-pairing files. Approving happens on the dashboard's
+  through the gateway's own PairingStore.list_pending() (never the codes). Approving happens on the dashboard's
   Pairing page or with ``hermes pairing approve``.
 
 Nothing here generates, ranks or rewrites decisions, and nothing is accepted on silence. Items the
@@ -686,9 +686,11 @@ def chat_items(
 PAIRING_TTL = 3600   # gateway/pairing.py CODE_TTL_SECONDS: a code is dead after an hour
 
 
-def _pairing_dirs(home: Path) -> list[tuple[str, Path]]:
+def _pairing_profiles(home: Path) -> list[str]:
+    """Profiles that have a pairing store on disk. Only existence is checked here: the
+    files themselves are read by the gateway's own PairingStore, never by us."""
     seen: set[Path] = set()
-    out = []
+    out: list[str] = []
     cands = [("default", home / "platforms" / "pairing"), ("default", home / "pairing")]
     for prof in sorted((home / "profiles").glob("*/")):
         cands += [(prof.name, prof / "platforms" / "pairing"), (prof.name, prof / "pairing")]
@@ -699,59 +701,69 @@ def _pairing_dirs(home: Path) -> list[tuple[str, Path]]:
             continue
         if d.is_dir() and real not in seen:
             seen.add(real)
-            out.append((profile, d))
+            if profile not in out:
+                out.append(profile)
     return out
 
 
-def pairing_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) -> list[dict[str, Any]]:
-    """People who messaged a bot and are waiting for you to let them in. Read-only: the
-    files are read, never pruned or written (the gateway owns them)."""
+def _stock_pairing_store(profile: str):
+    from gateway.pairing import PairingStore   # stock Hermes; present wherever the plugin runs
+    return PairingStore(profile=profile)
+
+
+def pairing_items(home: Optional[Path] = None, errors: Optional[list[str]] = None,
+                  store=None) -> list[dict[str, Any]]:
+    """People who messaged a bot and are waiting for you to let them in.
+
+    Goes through the gateway's public ``PairingStore.list_pending()``, which returns a
+    request id, a name and an age, and never the pairing code. The store prunes expired
+    requests as it lists them, exactly as ``hermes pairing list`` does."""
     home = home or hermes_home()
+    store = store or _stock_pairing_store
     now = time.time()
     items: list[dict[str, Any]] = []
-    for profile, d in _pairing_dirs(home):
-        for f in sorted(d.glob("*-pending.json")):
-            platform = f.name[: -len("-pending.json")]
-            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", platform):
+    for profile in _pairing_profiles(home):
+        try:
+            pending = store(profile).list_pending()
+        except Exception as exc:   # an old Hermes without the API, or a locked store: skip, say so
+            if errors is not None:
+                errors.append(f"pairing[{profile}]: {type(exc).__name__}")
+            continue
+        for info in pending if isinstance(pending, list) else []:
+            if not isinstance(info, dict):
                 continue
-            try:
-                data = json.loads(f.read_text() or "{}")
-            except (OSError, ValueError) as exc:
-                if errors is not None:
-                    errors.append(f"pairing[{profile}/{platform}]: {type(exc).__name__}")
-                continue
-            if not isinstance(data, dict):
-                continue
-            for entry_id, info in data.items():
-                created = info.get("created_at") if isinstance(info, dict) else None
-                if (not isinstance(created, (int, float)) or isinstance(created, bool)
-                        or now - created > PAIRING_TTL or created - now > 300):
-                    continue   # expired, or stamped in the future (clock skew or a forged file)
-                who = _clean(info.get("user_name"), 60) or "Someone new"
-                key = hashlib.sha256(f"{profile}:{platform}:{entry_id}".encode()).hexdigest()[:16]
-                bot = _bot_name(home, profile) if profile != "default" else "your bot"
-                minutes = max(1, int((created + PAIRING_TTL - now) // 60))
-                # A hashed entry's key is the admin-only request id that `hermes pairing approve`
-                # accepts (never the code they were sent). A legacy entry's key IS the code: never shown.
-                modern = (isinstance(info.get("hash"), str) and isinstance(info.get("salt"), str)
-                          and re.fullmatch(r"[0-9a-f]{16}", str(entry_id)) is not None)
-                approve = (f"hermes {'' if profile == 'default' else f'-p {profile} '}pairing approve {platform} {entry_id}"
-                           if modern else "")
-                items.append({
-                    "id": f"pairing:{profile}:{platform}:{key}",
-                    "version": key,
-                    "source": "pairing",
-                    "profile": profile,
-                    "platform": platform,
-                    "title": f"{who} wants to talk to {bot} on {_platform_label(platform)}",
-                    "ask": ("They messaged the bot and got a pairing code. Nothing they send reaches an agent "
-                            "until you approve them on the dashboard's Pairing page or with hermes pairing approve."),
-                    "approve_command": approve,
-                    "why": f"The request expires in {minutes} min" if minutes > 1 else "The request expires within a minute",
-                    "owner": profile,
-                    "priority": 1,
-                    "since": int(created),
-                })
+            platform = str(info.get("platform") or "")
+            age = info.get("age_minutes")
+            if (not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", platform)
+                    or not isinstance(age, int) or isinstance(age, bool)
+                    or age * 60 > PAIRING_TTL or age < -5):
+                continue   # expired, or stamped in the future (clock skew or a forged file)
+            rid = str(info.get("request_id") or "")
+            modern = re.fullmatch(r"[0-9a-f]{16}", rid) is not None
+            who = _clean(info.get("user_name"), 60) or "Someone new"
+            ident = rid if modern else f"legacy:{info.get('user_id', '')}:{who}"
+            key = hashlib.sha256(f"{profile}:{platform}:{ident}".encode()).hexdigest()[:16]
+            bot = _bot_name(home, profile) if profile != "default" else "your bot"
+            minutes = max(1, PAIRING_TTL // 60 - max(age, 0))
+            # A modern request id is the admin-only handle `hermes pairing approve` accepts.
+            # A legacy entry has no id (its key was the code), so it gets no command.
+            approve = (f"hermes {'' if profile == 'default' else f'-p {profile} '}pairing approve {platform} {rid}"
+                       if modern else "")
+            items.append({
+                "id": f"pairing:{profile}:{platform}:{key}",
+                "version": key,
+                "source": "pairing",
+                "profile": profile,
+                "platform": platform,
+                "title": f"{who} wants to talk to {bot} on {_platform_label(platform)}",
+                "ask": ("They messaged the bot and got a pairing code. Nothing they send reaches an agent "
+                        "until you approve them on the dashboard's Pairing page or with hermes pairing approve."),
+                "approve_command": approve,
+                "why": f"The request expires in {minutes} min" if minutes > 1 else "The request expires within a minute",
+                "owner": profile,
+                "priority": 1,
+                "since": int(now - max(age, 0) * 60),
+            })
     return items
 
 

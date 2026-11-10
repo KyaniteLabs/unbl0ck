@@ -36,8 +36,25 @@ def _summary(limit: int = 12) -> str:
     return "\n".join(lines)
 
 
-def slash_unbl0ck(raw_args: str = "") -> str:
-    return _summary()
+# Surfaces only the machine's owner sits at. Anywhere else (Telegram, Discord, Slack, ...)
+# any admitted sender can type /unbl0ck, so it gets a count, never the cross-profile queue
+# with its approval commands and prompt text. An unknown or missing platform counts as remote.
+LOCAL_SURFACES = frozenset({"cli", "tui", "desktop", "local"})
+
+
+def _count_only() -> str:
+    q = _needs().build_queue()
+    if not q["count"]:
+        return "Nothing is blocked on you."
+    return (f"{q['count']} thing(s) waiting on you. Open UNBL0CK in Hermes Desktop or run "
+            "hermes unbl0ck on the machine to see them.")
+
+
+def slash_unbl0ck(raw_args: str = "", *, platform: str | None = None) -> str:
+    """Stock Hermes passes ``platform`` to handlers that declare it."""
+    if str(platform or "").lower() in LOCAL_SURFACES:
+        return _summary()
+    return _count_only()
 
 
 def _setup_cli(parser):

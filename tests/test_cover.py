@@ -1,6 +1,8 @@
 """Every human chat platform and pending pairing requests reach the queue; agent traffic does not."""
-import importlib.util, json, os, sqlite3, tempfile, time, unittest
+import importlib.util, json, os, sqlite3, tempfile, time, types, unittest
 from pathlib import Path
+import sys; sys.path.insert(0, str(Path(__file__).parent))
+import stock_pairing
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("unbl0ck_needs_c", ROOT / "needs.py")
@@ -91,7 +93,7 @@ class Pairing(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             home, f = pairing_home(Path(d), {"ABCD1234": {"user_id": "998877", "user_name": "Ana", "created_at": time.time() - 60, "hash": "h", "salt": "s"}})
             before = f.stat().st_mtime_ns, f.read_bytes()
-            it, = needs.pairing_items(home)
+            it, = needs.pairing_items(home, store=stock_pairing.factory(home))
             self.assertEqual(it["source"], "pairing")
             self.assertIn("Ana", it["title"]); self.assertIn("Telegram", it["title"])
             blob = json.dumps(it)
@@ -102,12 +104,37 @@ class Pairing(unittest.TestCase):
     def test_expired_and_malformed_are_skipped(self):
         with tempfile.TemporaryDirectory() as d:
             home, _ = pairing_home(Path(d), {"a": {"created_at": time.time() - 4000}, "b": {"created_at": "x"}, "c": "junk", "d": {}})
-            self.assertEqual(needs.pairing_items(home), [])
+            self.assertEqual(needs.pairing_items(home, store=stock_pairing.factory(home)), [])
         with tempfile.TemporaryDirectory() as d:
-            home, _ = pairing_home(Path(d), "{not json")
+            home, _ = pairing_home(Path(d), "{not json")   # the stock store reads it as empty
+            self.assertEqual(needs.pairing_items(home, store=stock_pairing.factory(home)), [])
+        with tempfile.TemporaryDirectory() as d:
+            home, _ = pairing_home(Path(d), {})
             errors = []
-            self.assertEqual(needs.pairing_items(home, errors), [])
-            self.assertTrue(errors and errors[0].startswith("pairing["))
+
+            def broken(profile):
+                raise ImportError("no gateway.pairing")
+            self.assertEqual(needs.pairing_items(home, errors, store=broken), [])
+            self.assertEqual(errors, ["pairing[default]: ImportError"])
+
+    def test_never_reads_the_pending_files_itself(self):
+        # The pending files hold the pairing codes; only the gateway's store may open them.
+        src = (ROOT / "needs.py").read_text()
+        self.assertNotIn("-pending.json", src)
+        with tempfile.TemporaryDirectory() as d:
+            home, f = pairing_home(Path(d), {"0123456789abcdef": {"created_at": time.time(), "hash": "h", "salt": "s"}})
+            f.chmod(0)   # unreadable: listing still works because the store is asked, not the file
+            calls = []
+
+            def store(profile):
+                calls.append(profile)
+                return types.SimpleNamespace(list_pending=lambda: [
+                    {"platform": "telegram", "request_id": "0123456789abcdef", "user_id": "9", "user_name": "Ana", "age_minutes": 2}])
+            it, = needs.pairing_items(home, store=store)
+            f.chmod(0o600)
+            self.assertEqual(calls, ["default"])
+            self.assertEqual(it["approve_command"], "hermes pairing approve telegram 0123456789abcdef")
+            self.assertIn("58 min", it["why"])
 
     def test_profiles_and_legacy_dir_dedupe(self):
         with tempfile.TemporaryDirectory() as d:
@@ -115,14 +142,15 @@ class Pairing(unittest.TestCase):
             pairing_home(home, {"e": {"created_at": time.time()}}, "discord", ("profiles", "ops", "pairing"))
             (home / "platforms").mkdir()
             os.symlink(home / "profiles" / "ops" / "pairing", home / "platforms" / "pairing")
-            self.assertEqual(len(needs.pairing_items(home)), 1)
+            self.assertEqual(len(needs.pairing_items(home, store=stock_pairing.factory(home))), 1)
 
     def test_in_queue_and_pocket(self):
         with tempfile.TemporaryDirectory() as d:
             home, _ = pairing_home(Path(d), {"e": {"user_name": "Bo", "created_at": time.time()}})
             needs.kanban_items, saved = (lambda boards=None, errors=None: []), needs.kanban_items
             try:
-                q = needs.build_queue(home)
+                with stock_pairing.patched(needs, home):
+                    q = needs.build_queue(home)
             finally:
                 needs.kanban_items = saved
             self.assertEqual([i["source"] for i in q["items"]], ["pairing"])

@@ -2,6 +2,8 @@
 ghost waits, ordering, and who a gateway chat is with."""
 import importlib.util, json, os, sqlite3, stat, tempfile, time, types, unittest
 from pathlib import Path
+import sys; sys.path.insert(0, str(Path(__file__).parent))
+import stock_pairing
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("unbl0ck_needs_qa", ROOT / "needs.py")
@@ -38,7 +40,7 @@ class Pairing(unittest.TestCase):
     def test_hostile_name_is_one_clean_line(self):
         with tempfile.TemporaryDirectory() as d:
             pairing(Path(d), {RID: {"user_name": "Eve‮\n\x1b[31mgnp.exe​ " + "x" * 200, "created_at": time.time(), "hash": "h", "salt": "s"}})
-            it, = needs.pairing_items(Path(d))
+            it, = needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d)))
             for bad in ("‮", "\n", "\x1b", "​"):
                 self.assertNotIn(bad, it["title"])
             self.assertLess(len(it["title"]), 120)
@@ -46,14 +48,14 @@ class Pairing(unittest.TestCase):
     def test_future_timestamp_and_bool_are_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             pairing(Path(d), {"a": {"created_at": time.time() + 86400 * 365}, "b": {"created_at": True}})
-            self.assertEqual(needs.pairing_items(Path(d)), [])
+            self.assertEqual(needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d))), [])
 
     def test_approve_command_only_for_hashed_request_ids(self):
         with tempfile.TemporaryDirectory() as d:
             now = time.time()
             pairing(Path(d), {RID: {"user_name": "Ana", "created_at": now, "hash": "h", "salt": "s"},
                               "ABCD2345": {"user_name": "Old", "created_at": now}})
-            items = {i["title"].split()[0]: i for i in needs.pairing_items(Path(d))}
+            items = {i["title"].split()[0]: i for i in needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d)))}
             self.assertEqual(items["Ana"]["approve_command"], f"hermes pairing approve telegram {RID}")
             self.assertEqual(items["Old"]["approve_command"], "")   # a legacy key IS the code
             self.assertNotIn("ABCD2345", json.dumps(list(items.values())))
@@ -63,7 +65,7 @@ class Pairing(unittest.TestCase):
     def test_profile_command_targets_the_profile(self):
         with tempfile.TemporaryDirectory() as d:
             pairing(Path(d), {RID: {"created_at": time.time(), "hash": "h", "salt": "s"}}, "discord", "ops")
-            it, = needs.pairing_items(Path(d))
+            it, = needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d)))
             self.assertEqual(it["approve_command"], f"hermes -p ops pairing approve discord {RID}")
 
 
@@ -145,7 +147,8 @@ class Ordering(unittest.TestCase):
             saved = needs.kanban_items
             needs.kanban_items = lambda boards=None, errors=None: [card]
             try:
-                q = needs.build_queue(home)
+                with stock_pairing.patched(needs, home):
+                    q = needs.build_queue(home)
             finally:
                 needs.kanban_items = saved
             self.assertEqual([i["source"] for i in q["items"]], ["prompt", "pairing", "kanban", "chat"])
@@ -182,6 +185,25 @@ class Summary(unittest.TestCase):
         out = pkg._summary()
         self.assertIn("[chat discord with Mallory]", out)
         self.assertIn(f"  approve: hermes pairing approve telegram {RID}", out)
+
+    def test_slash_shows_the_queue_only_on_local_surfaces(self):
+        spec = importlib.util.spec_from_file_location("unbl0ck_pkg_qa2", ROOT / "__init__.py",
+                                                      submodule_search_locations=[str(ROOT)])
+        pkg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pkg)
+        q = {"count": 1, "errors": [], "items": [
+            {"source": "prompt", "kind": "approval", "profile": "ops", "title": "ops needs your approval",
+             "ask": "rm -rf /srv/secret-thing", "approve_command": f"hermes -p ops pairing approve telegram {RID}"}]}
+        pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q)
+        for surface in ("cli", "tui", "desktop", "local", "CLI"):
+            self.assertIn("rm -rf", pkg.slash_unbl0ck("", platform=surface))
+        for surface in ("telegram", "discord", "slack", "api_server", "webhook", "", None, "cli "):
+            out = pkg.slash_unbl0ck("", platform=surface)
+            self.assertEqual(out, "1 thing(s) waiting on you. Open UNBL0CK in Hermes Desktop or run "
+                                  "hermes unbl0ck on the machine to see them.")
+            self.assertNotIn(RID, out)
+        self.assertNotIn("rm -rf", pkg.slash_unbl0ck(""))   # an old host that passes no platform
+        pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: {"count": 0, "errors": [], "items": []})
+        self.assertEqual(pkg.slash_unbl0ck("", platform="telegram"), "Nothing is blocked on you.")
 
 
 if __name__ == "__main__":
