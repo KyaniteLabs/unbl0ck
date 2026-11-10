@@ -28,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import collections
 import re
 import sqlite3
 import threading
@@ -125,7 +126,11 @@ def _patterns(names: Optional[list[str]] = None) -> dict[str, re.Pattern[str]]:
         r"(approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
         r"|({P}|CEO) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
         r"|(which|what) (one|option|choice) do you (prefer|want|choose)"
-        r"|human[- ]gate)\b",
+        r"|human[- ]gate"
+        r"|([A-Za-z]+/)?(operator|owner|CEO|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
+        r"|({P}|CEO|principal) (approved|authorized|authorised|signed off)"
+        r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,20}(route|access|path|executor)"
+        r"|(credentials?|api[- ]?keys?|tokens?) (are |is )?(dead|expired|missing|needed|required|revoked))\b",
         re.I,
     )
     # Weaker cue, trusted only together with an explicit needs_input kind.
@@ -448,6 +453,20 @@ def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, since:
         )
 
 
+def stuck_reason(reason: str, kind: Optional[str], block: Any) -> str:
+    """One plain line for a blocked card whose block names no ask for the principal."""
+    reason = (reason or "").strip()
+    if block is None:
+        return "Blocked with no block record (crashed or retry limit); needs an owner to resume"
+    if reason == "initial_status":
+        return "Held on creation; an owner must claim and release it"
+    if kind == "capability":
+        return "Missing a capability (access, credential or host); route to Platform"
+    if kind == "dependency":
+        return "Waiting on another card"
+    return "Blocked with no ask for you recorded; route to its owner"
+
+
 def kanban_items(
     boards: Optional[Iterable[str]] = None,
     errors: Optional[list[str]] = None,
@@ -478,10 +497,14 @@ def kanban_items(
                     payload = (block.payload or {}) if block else {}
                     reason = str(payload.get("reason") or "")
                     why = kanban_needs_you(reason, payload.get("kind"))
+                    tier = "ask"
                     if not why:
-                        continue
+                        # Anything blocked is a NEED to unblock. No ask for the principal was
+                        # recorded, so say why it is stuck instead of dropping it silently.
+                        tier = "stuck"
+                        why = stuck_reason(reason, payload.get("kind") or getattr(task, "block_kind", None), block)
                     since = block.created_at if block else task.created_at
-                    if _answered_since(conn, kanban_db, task.id, author, since):
+                    if tier == "ask" and _answered_since(conn, kanban_db, task.id, author, since):
                         continue
                     items.append({
                         "id": f"kanban:{board}:{task.id}",
@@ -492,6 +515,7 @@ def kanban_items(
                         "title": task.title,
                         "ask": reason,
                         "why": why,
+                        "tier": tier,
                         "owner": task.assignee,
                         "priority": task.priority,
                         "status": task.status,
@@ -936,11 +960,16 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
     shown = [i for i in items if include_hidden or hidden.get(i["id"]) != i["version"]]
     # Same order as the panel: live prompts (a run is paused), pairing requests (expire within
     # the hour), Kanban, chats; inside a source, higher priority first (as on the board), then newest.
-    shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), -(_num(i.get("priority"))), -(_num(i.get("since")))))
+    shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), i.get("tier") == "stuck", -(_num(i.get("priority"))), -(_num(i.get("since")))))
     attach_blufs(shown, home)
     return {
         "generated_at": int(time.time()),
         "count": len(shown),
+        "counts": {
+            "asks": sum(1 for i in shown if i.get("tier") != "stuck"),
+            "stuck": sum(1 for i in shown if i.get("tier") == "stuck"),
+            "stuck_by_why": dict(collections.Counter(i["why"] for i in shown if i.get("tier") == "stuck")),
+        },
         "hidden": len(items) - len(shown),
         "items": shown,
         "errors": errors,
