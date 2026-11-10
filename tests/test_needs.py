@@ -305,7 +305,7 @@ class QueueKanban(unittest.TestCase):
         self.assertEqual(items[0]["block_recurrences"], 2)
         self.assertTrue(needs.kanban_needs_you(items[0]["ask"], "needs_input"))
 
-    def test_plain_triage_card_without_ask_is_skipped(self):
+    def test_plain_triage_card_without_ask_is_queued_as_stuck(self):
         triage = task(status="triage", task_id="t_plain")
         event = types.SimpleNamespace(
             id=13, kind="block_loop_detected", created_at=200,
@@ -316,7 +316,24 @@ class QueueKanban(unittest.TestCase):
             list_events=lambda conn, task_id: [event],
         )
         with fake_hermes(kdb, fake_connect()):
-            self.assertEqual(needs.kanban_items(["factory"]), [])
+            items = needs.kanban_items(["factory"])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["tier"], "stuck")
+
+    def test_stuck_reasons_are_plain(self):
+        ev = types.SimpleNamespace(id=1, kind="blocked", created_at=1, payload={})
+        self.assertIn("no block record", needs.stuck_reason("", None, None))
+        self.assertIn("Held on creation", needs.stuck_reason("initial_status", None, ev))
+        self.assertIn("capability", needs.stuck_reason("x", "capability", ev))
+
+    def test_operator_and_credential_phrasing_detected(self):
+        for reason in [
+            "Liam/operator input is needed to reconcile the judge",
+            "Ada approved this last week",
+            "npm credentials are dead",
+            "needs an authorized host route",
+        ]:
+            self.assertTrue(needs.kanban_needs_you(reason, None), reason)
 
 
 class CardContext(unittest.TestCase):
