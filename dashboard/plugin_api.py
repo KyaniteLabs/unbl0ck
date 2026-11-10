@@ -47,6 +47,25 @@ def _needs():
     return importlib.import_module(_PACKAGE + ".needs")
 
 
+def _load_jobs():
+    """jobs.py by file path: pure stdlib, so it loads without the plugin package."""
+    name = _PACKAGE + "_jobs"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, PLUGIN_DIR / "jobs.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return module
+
+
+jobs = _load_jobs()
+
+
 def _loaded_ctx():
     """The plugin context stashed by ``register(ctx)``, if this process loaded it.
 
@@ -135,25 +154,19 @@ def queue():
 
 
 # One model summary per item version, made in the background so the queue never waits.
+# Lifecycle (pending / failed / retry) is jobs.BlufJobs; see the diagram there.
 _BLUF_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="unbl0ck-bluf")
-_BLUF_STATE: dict[tuple[str, str], dict[str, Any]] = {}   # {"at": started, "error": str | None}
-_BLUF_RETRY = 600
+_BLUF_JOBS = jobs.BlufJobs()
 
 
 def _queue_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
     key = (item["id"], item["version"])
-    st = _BLUF_STATE.get(key)
-    if st and time.time() - st["at"] < _BLUF_RETRY:
-        if st["error"] is None:
-            item["bluf_pending"] = True   # still running: keep saying so on every poll
-        return                            # failed recently: show the raw text, retry later
-    if len(_BLUF_STATE) > 500:
-        cutoff = time.time() - _BLUF_RETRY
-        for k in [k for k, v in list(_BLUF_STATE.items()) if v["at"] < cutoff]:
-            _BLUF_STATE.pop(k, None)
-    _BLUF_STATE[key] = {"at": time.time(), "error": None}
-    item["bluf_pending"] = True
-    _BLUF_POOL.submit(_run_bluf, n, ctx, dict(item))
+    if _BLUF_JOBS.start(key):
+        item["bluf_pending"] = True
+        _BLUF_POOL.submit(_run_bluf, n, ctx, dict(item))
+    elif _BLUF_JOBS.is_pending(key):
+        item["bluf_pending"] = True   # still running: keep saying so on every poll
+    # else failed recently: show the raw text, retry later
 
 
 def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
@@ -169,10 +182,10 @@ def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
         )
         bluf, why = n.parse_bluf(result.text)
         n.save_bluf(item["id"], item["version"], bluf, why)
-        _BLUF_STATE.pop(key, None)
+        _BLUF_JOBS.succeed(key)
     except Exception as exc:  # noqa: BLE001 - logged; the card keeps its raw text and retries later
         log.warning("unbl0ck: summary for %s failed: %s: %s", item["id"], type(exc).__name__, exc)
-        _BLUF_STATE[key] = {"at": time.time(), "error": f"{type(exc).__name__}: {exc}"}
+        _BLUF_JOBS.fail(key, f"{type(exc).__name__}: {exc}")
 
 
 @router.get("/card")
@@ -212,22 +225,15 @@ def card_ask(body: CardAsk):
         )
     # The model often needs longer than the desktop's 30 s request limit, so run it in the
     # background and let the client poll GET /card/ask/{job}.
-    _prune_jobs()
     job = uuid.uuid4().hex
-    _ASK_JOBS[job] = {"status": "pending", "started": time.time()}
+    _ASK_JOBS.create(job)
     _ASK_POOL.submit(_run_ask, job, ctx, messages)
     return {"ok": True, "pending": True, "job": job}
 
 
+# Lifecycle (pending -> done | error -> consumed, or expired) is jobs.AskJobs.
 _ASK_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unbl0ck-ask")
-_ASK_JOBS: dict[str, dict[str, Any]] = {}
-_ASK_TTL = 900
-
-
-def _prune_jobs() -> None:
-    cutoff = time.time() - _ASK_TTL
-    for k in [k for k, v in list(_ASK_JOBS.items()) if v.get("started", 0) < cutoff]:
-        _ASK_JOBS.pop(k, None)
+_ASK_JOBS = jobs.AskJobs()
 
 
 def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
@@ -239,17 +245,10 @@ def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
             max_tokens=900,
             timeout=120,
         )
-        out = {
-            "status": "done",
-            "ok": True,
-            "reply": result.text,
-            "provider": getattr(result, "provider", None),
-            "model": getattr(result, "model", None),
-        }
     except Exception as exc:  # noqa: BLE001 - surface the host error honestly
-        out = {"status": "error", "ok": False, "detail": f"model call failed: {type(exc).__name__}: {exc}"}
-    if job in _ASK_JOBS:
-        _ASK_JOBS[job].update(out)
+        _ASK_JOBS.fail(job, f"model call failed: {type(exc).__name__}: {exc}")
+        return
+    _ASK_JOBS.finish(job, result.text, getattr(result, "provider", None), getattr(result, "model", None))
 
 
 @router.get("/card/ask/{job}")
@@ -257,10 +256,13 @@ def card_ask_result(job: str):
     st = _ASK_JOBS.get(job)
     if st is None:
         raise HTTPException(status_code=404, detail="unknown or expired ask job")
-    if st["status"] == "pending":
+    if st["status"] is jobs.AskState.PENDING:
         return {"ok": True, "pending": True, "job": job, "elapsed": round(time.time() - st["started"], 1)}
-    _ASK_JOBS.pop(job, None)
-    if st["status"] == "error":
+    try:
+        st = _ASK_JOBS.consume(job)
+    except KeyError:   # a concurrent poll consumed it first
+        raise HTTPException(status_code=404, detail="unknown or expired ask job")
+    if st["status"] is jobs.AskState.ERROR:
         raise HTTPException(status_code=502, detail=st["detail"])
     return {k: st[k] for k in ("ok", "reply", "provider", "model")}
 
