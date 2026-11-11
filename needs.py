@@ -771,14 +771,32 @@ def normalize_board_slug(slug: Any) -> Optional[str]:
     return s
 
 
+_BOT_NAME_CACHE: dict[str, tuple[tuple[int, int], str]] = {}   # profile.yaml path -> ((mtime_ns, size), title or "")
+
+
 def _bot_name(home: Path, profile: str) -> str:
     """The name Bot Mode shows for a seat (profile.yaml ui_meta.hermes-bots.title).
-    A line scan, not a YAML parser: the plugin host may not ship PyYAML."""
+    A line scan, not a YAML parser: the plugin host may not ship PyYAML. The file is re-read only
+    when its mtime or size changes, so the 45 s poll does not open every profile each time."""
     fallback = "Your agent" if profile == "default" else profile
+    path = home / "profiles" / profile / "profile.yaml"
+    key = str(path)
     try:
-        lines = (home / "profiles" / profile / "profile.yaml").read_text().splitlines()
+        st = path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+        hit = _BOT_NAME_CACHE.get(key)
+        if hit and hit[0] == sig:
+            return hit[1] or fallback
+        lines = path.read_text().splitlines()
     except OSError:
+        _BOT_NAME_CACHE.pop(key, None)
         return fallback
+    title = _scan_bot_title(lines)
+    _BOT_NAME_CACHE[key] = (sig, title)
+    return title or fallback
+
+
+def _scan_bot_title(lines: list[str]) -> str:
     in_bots = False
     for line in lines:
         if re.match(r"^\s{2}hermes-bots:\s*$", line):
@@ -788,8 +806,8 @@ def _bot_name(home: Path, profile: str) -> str:
         elif in_bots:
             m = re.match(r"^\s{4}title:\s*['\"]?(.+?)['\"]?\s*$", line)
             if m:
-                return _clean(m.group(1), 60) or fallback
-    return fallback
+                return _clean(m.group(1), 60)
+    return ""
 
 
 # Platforms that only you type into (this machine's own clients), as opposed to gateway

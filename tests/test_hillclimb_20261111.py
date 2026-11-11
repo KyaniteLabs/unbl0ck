@@ -124,3 +124,44 @@ def test_vendored_slug_normalizer_matches_hermes_when_importable():
     from hermes_cli import kanban_db
     for v in SLUG_INPUTS:
         assert _outcome(needs.normalize_board_slug, v) == _outcome(kanban_db._normalize_board_slug, v), v
+
+
+# --- F31: profile.yaml is read once per change, not once per poll
+
+def _profile(home, name, title):
+    f = home / "profiles" / name / "profile.yaml"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(f"ui_meta:\n  hermes-bots:\n    title: {title}\n")
+    return f
+
+
+def test_bot_name_is_cached_until_the_file_changes(tmp_path, monkeypatch):
+    needs._BOT_NAME_CACHE.clear()
+    f = _profile(tmp_path, "ada", "Ada")
+    other = _profile(tmp_path, "bo", "Bo")
+    reads = []
+    real = type(f).read_text
+    monkeypatch.setattr(type(f), "read_text", lambda self, *a, **k: (reads.append(self.parent.name), real(self, *a, **k))[1])
+
+    assert needs._bot_name(tmp_path, "ada") == "Ada"
+    assert needs._bot_name(tmp_path, "bo") == "Bo"
+    assert sorted(reads) == ["ada", "bo"]
+    for _ in range(5):                                   # five more polls: nothing is re-read
+        assert needs._bot_name(tmp_path, "ada") == "Ada" and needs._bot_name(tmp_path, "bo") == "Bo"
+    assert sorted(reads) == ["ada", "bo"]
+
+    _profile(tmp_path, "ada", "Ada Prime")                # touched: only that profile is re-read
+    st = f.stat()
+    os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+    assert needs._bot_name(tmp_path, "ada") == "Ada Prime"
+    assert needs._bot_name(tmp_path, "bo") == "Bo"
+    assert sorted(reads) == ["ada", "ada", "bo"]
+
+
+def test_bot_name_falls_back_when_the_file_is_missing_or_removed(tmp_path):
+    needs._BOT_NAME_CACHE.clear()
+    assert needs._bot_name(tmp_path, "ghost") == "ghost" and needs._bot_name(tmp_path, "default") == "Your agent"
+    f = _profile(tmp_path, "ada", "Ada")
+    assert needs._bot_name(tmp_path, "ada") == "Ada"
+    f.unlink()
+    assert needs._bot_name(tmp_path, "ada") == "ada"
