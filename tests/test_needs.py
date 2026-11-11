@@ -323,6 +323,36 @@ class FakeKanban(unittest.TestCase):
         self.assertEqual(r, {"ok": True, "comment_id": None, "released": True})
         self.assertEqual([c[0] for c in self.calls], ["comment", "unblock", "unblock"])
         self.assertEqual(needs.load_pending_releases(), {})
+        kdb.list_tasks = lambda c, status=None: []   # the release moved it out of blocked
+        self.assertEqual(needs.kanban_items(boards=["factory"]), [])
+
+    def test_answered_and_kept_blocked_stays_listed_and_can_be_released(self):
+        """Roast U2: "Answer, keep blocked" used to drop the card with no way back (409)."""
+        kdb = sys.modules["hermes_cli.kanban_db"]
+        kdb.list_tasks = lambda c, status=None: [self.task] if status == "blocked" else []
+        needs.answer_card("factory", "t_1", "Hold until Friday", release=False, version="11")
+        self.comments = [types.SimpleNamespace(author="ada", created_at=150, body="Hold until Friday")]
+        it, = needs.kanban_items(boards=["factory"])
+        self.assertEqual(it["tier"], "answered")
+        # A second answer is still refused; a release with no text goes ahead, with no new comment.
+        with self.assertRaises(RuntimeError):
+            needs.answer_card("factory", "t_1", "again", release=False)
+        r = needs.answer_card("factory", "t_1", "", release=True, version="11")
+        self.assertEqual(r, {"ok": True, "comment_id": None, "released": True})
+        self.assertEqual([c[0] for c in self.calls], ["comment", "unblock"])
+
+    def test_empty_text_still_needs_an_answer_on_an_unanswered_card(self):
+        with self.assertRaises(ValueError):
+            needs.answer_card("factory", "t_1", "", release=True)
+        with self.assertRaises(ValueError):
+            needs.answer_card("factory", "t_1", "  ", release=False)
+        self.assertEqual(self.calls, [])
+
+    def test_an_answered_triage_card_leaves_the_queue(self):
+        self.task = task(status="triage")
+        kdb = sys.modules["hermes_cli.kanban_db"]
+        kdb.list_tasks = lambda c, status=None: [self.task] if status == "triage" else []
+        self.comments = [types.SimpleNamespace(author="ada", created_at=150, body="noted")]
         self.assertEqual(needs.kanban_items(boards=["factory"]), [])
 
     def test_triage_cannot_be_released(self):

@@ -152,7 +152,7 @@ def queue():
     if q.get("bluf_enabled") and ctx is not None and hasattr(ctx, "llm"):
         for it in q["items"]:
             if (not it.get("bluf") and it.get("source") not in getattr(n, "NO_BLUF_SOURCES", ())
-                    and it.get("tier") != "stuck"):   # stuck cards are not asks: no model call each
+                    and it.get("tier") not in ("stuck", "answered")):   # not asks: no model call each
                 _queue_bluf(n, ctx, it)
     return q
 
