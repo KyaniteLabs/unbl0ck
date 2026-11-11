@@ -1,3 +1,4 @@
+import re
 import unittest
 import subprocess
 from pathlib import Path
@@ -127,6 +128,16 @@ if (since !== 30) throw new Error(`oldest ask timestamp was ${since}`);
 '''
         subprocess.run(["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
                        check=True, capture_output=True, text=True)
+
+    def test_every_answer_post_sends_the_card_version(self):
+        # A stricter static check than the substrings above (not a render test; see F20 notes): each
+        # /kanban/answer call's body, in the source and the built file, must carry `version`.
+        for name in ("src/plugin.src.js", "plugin.js"):
+            text = (ROOT / "desktop" / name).read_text()
+            calls = re.findall(r"ctx\.rest\('/kanban/answer',\s*\{(.*?)\n\s*\}\)", text, re.S)
+            self.assertGreaterEqual(len(calls), 2, name)   # answer and release
+            for body in calls:
+                self.assertRegex(body, r"body:\s*\{[^}]*\bversion:\s*item\.version\b", name)
 
 
 if __name__ == "__main__":
