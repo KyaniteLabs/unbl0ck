@@ -1026,12 +1026,30 @@ def _waits_dir(home: Optional[Path] = None) -> Path:
 
 
 def _proc_start(pid: int) -> Optional[str]:
-    """Kernel start time of *pid* (Linux), so a recycled PID is not mistaken for the waiter."""
+    """Start time of *pid*, so a recycled PID is not mistaken for the waiter.
+
+    Linux reads the kernel start tick from /proc. Elsewhere (macOS, the BSDs) it asks
+    ``ps -o lstart=``. Recording and checking always go through this function, so
+    both sides use the same source. None means unknown, and the caller treats that as alive.
+    """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         return stat.rsplit(")", 1)[1].split()[19]
     except (OSError, IndexError):
+        pass
+    if os.name != "posix" or Path("/proc/self/stat").exists():
         return None
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(int(pid))],
+            capture_output=True, text=True, timeout=2, check=False,
+            env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"},
+        ).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return out or None
 
 
 def _alive(pid: int, start: Optional[str]) -> bool:
