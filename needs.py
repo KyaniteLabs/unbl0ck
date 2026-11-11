@@ -375,36 +375,38 @@ def bluf_messages(item: dict[str, Any], comments: Optional[list[dict[str, Any]]]
         card["recent_comments"] = [
             {"author": str(c.get("author") or ""), "text": str(c.get("body") or "")[:600]} for c in comments[-6:]
         ]
+    card = _ask_card_view(card)  # same redaction as Ask: no home dir, no secrets (F4)
     return [
         {"role": "system", "content": BLUF_SYSTEM},
         {"role": "user", "content": "CARD (untrusted):\n```json\n" + json.dumps(card, ensure_ascii=False) + "\n```"},
     ]
 
 
+_BLUF_THINK_RE = re.compile(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", re.S | re.I)
+
+
 def parse_bluf(text: str) -> tuple[str, str]:
-    """Pull ``bluf``/``why`` out of a model reply; tolerate code fences and stray prose."""
-    text = re.sub(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", "", text or "", flags=re.S | re.I)
+    """Pull ``bluf``/``why`` out of a model reply; tolerate code fences, stray prose,
+    reasoning blocks (closed or cut off) and extra JSON objects. The answer is the first
+    object outside any reasoning block that has a ``bluf`` key and is not introduced as
+    an example."""
+    text = _BLUF_THINK_RE.sub("", text or "")
     decoder = json.JSONDecoder()
     data = None
-    i = 0
-    while i < len(text):
-        if text[i] != "{":
-            i += 1
-            continue
+    i = text.find("{")
+    while i != -1:
         try:
-            candidate, end = decoder.raw_decode(text, i)
-        except json.JSONDecodeError:
-            i += 1
+            obj, end = decoder.raw_decode(text, i)
+        except ValueError:
+            i = text.find("{", i + 1)
             continue
-        if isinstance(candidate, dict):
-            prefix = text[:i]
-            is_example = re.search(r"\b(?:example\s+format|for example)\s*:\s*$", prefix, re.I)
-            if not is_example:
-                data = candidate
-        # Skip nested objects inside a successfully decoded top-level object.
-        i = end
+        if isinstance(obj, dict) and "bluf" in obj:
+            if not re.search(r"\b(?:example\s+format|for example)\s*:\s*$", text[:i], re.I):
+                data = obj
+                break
+        i = text.find("{", end)
     if data is None:
-        raise ValueError("no JSON object in reply")
+        raise ValueError("no JSON object with a bluf in reply")
     bluf = re.sub(r"\s+", " ", str(data.get("bluf") or "")).strip()
     if not bluf:
         raise ValueError("empty bluf")
@@ -1662,9 +1664,55 @@ ASK_SYSTEM = (
 )
 
 
+_ASK_SECRET_PATTERNS = (
+    # URL userinfo: scheme://user:pass@host
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[redacted]@"),
+    # Authorization headers
+    (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [redacted]"),
+    # key=value / key: value for secret-looking keys
+    (re.compile(r"(?i)\b([a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)s?)(\s*[=:]\s*)[\"']?[^\s\"',;]+"),
+     r"\1\2[redacted]"),
+    # Well-known token shapes
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"), "[redacted]"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"), "[redacted]"),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "[redacted]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[redacted]"),
+)
+
+
+def _ask_redact(text: str) -> str:
+    home = os.path.expanduser("~")
+    if home and home not in ("/", "~"):
+        text = text.replace(home, "~")
+    for pattern, repl in _ASK_SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def _ask_card_view(value: Any, _key: str = "") -> Any:
+    """A copy of the card fit to send to an LLM: no workspace path, no home dir, no secrets.
+
+    The operator asked about the card, not about their filesystem or credentials, so the Ask
+    payload keeps the decision context (title, body, block reason, comments, branch, errors)
+    and drops or redacts what could leak (F4)."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if _key == "workspace" and k == "path":
+                continue
+            out[k] = _ask_card_view(v, str(k))
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_ask_card_view(v, _key) for v in value]
+    if isinstance(value, str):
+        return _ask_redact(value)
+    return value
+
+
 def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
-    """System prompt + card data (untrusted) + the client's prior turns."""
-    context = json.dumps(card, ensure_ascii=False, default=str)
+    """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns."""
+    context = json.dumps(_ask_card_view(card), ensure_ascii=False, default=str)
     if len(context) > 24000:
         context = context[:24000] + "…[truncated]"
     messages: list[dict[str, str]] = [

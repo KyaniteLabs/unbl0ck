@@ -1,0 +1,58 @@
+"""F4: the Ask payload sent to the LLM must not carry the workspace path, the operator's
+home directory, or secret-looking strings from run/failure errors, comments or events."""
+import json
+import os
+
+import needs
+
+HOME = os.path.expanduser("~")
+SENTINEL_KEY = "sk-" + "A" * 40
+GH = "ghp_" + "b" * 36
+
+
+def _card():
+    return {
+        "id": "kanban:b:t1", "title": "Deploy", "body": "please ship",
+        "last_failure_error": f"Traceback in {HOME}/work/app/run.py: auth failed token={SENTINEL_KEY}",
+        "workspace": {"kind": "worktree", "path": f"{HOME}/work/app", "branch": "feat/x",
+                      "project_id": "p1", "completion_contract": None},
+        "comments": [{"id": 1, "author": "a", "body": f"use Authorization: Bearer {GH}", "created_at": 1}],
+        "events": [{"id": 2, "kind": "x", "payload": {"cmd": "git push https://user:hunter2@example.com/r.git"}}],
+        "last_run": {"summary": "ok", "error": f"password=hunter2 at {HOME}/.config/x"},
+        "block": {"reason": "needs a decision"},
+    }
+
+
+def _payload():
+    msgs = needs.build_ask_messages(_card(), [])
+    return msgs[1]["content"]
+
+
+def test_workspace_path_not_sent():
+    p = _payload()
+    assert f"{HOME}/work/app" not in p
+    assert '"path"' not in p
+
+
+def test_home_dir_never_sent():
+    assert HOME not in _payload()
+
+
+def test_secrets_redacted():
+    p = _payload()
+    for s in (SENTINEL_KEY, GH, "hunter2"):
+        assert s not in p, s
+    assert "[redacted]" in p
+
+
+def test_useful_context_kept():
+    p = _payload()
+    for s in ("Deploy", "please ship", "needs a decision", "feat/x", "auth failed"):
+        assert s in p, s
+
+
+def test_caller_card_not_mutated():
+    c = _card()
+    before = json.dumps(c, sort_keys=True)
+    needs.build_ask_messages(c, [])
+    assert json.dumps(c, sort_keys=True) == before
