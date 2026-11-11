@@ -181,14 +181,18 @@ class AnswerCardStatuses(unittest.TestCase):
         kbc.connect = lambda board=None: sqlite3.connect(":memory:")
         pkg = types.ModuleType("hermes_cli")
         pkg.kanban_db, pkg.kanban_db_connect = kdb, kbc
+        def fake_release(conn, db, task_id, version):
+            calls.append("unblock")
+            return unblock
         with mock.patch.dict(sys.modules, {"hermes_cli": pkg, "hermes_cli.kanban_db": kdb,
                                            "hermes_cli.kanban_db_connect": kbc}):
-            with tempfile.TemporaryDirectory() as home:   # the pending-release marker lands here
-                try:
-                    return needs.answer_card("b", "t", "go", release=release,
-                                             version="1" if release else None, home=Path(home)), calls
-                except Exception as exc:  # noqa: BLE001
-                    return exc, calls
+            with mock.patch.object(needs, "_unblock_task_at_version", fake_release):
+                with tempfile.TemporaryDirectory() as home:   # the pending-release marker lands here
+                    try:
+                        return needs.answer_card("b", "t", "go", release=release,
+                                                 version="1" if release else None, home=Path(home)), calls
+                    except Exception as exc:  # noqa: BLE001
+                        return exc, calls
 
     def test_every_status(self):
         for status in [s.value for s in needs.CardStatus] + ["todo", "running", "done"]:
