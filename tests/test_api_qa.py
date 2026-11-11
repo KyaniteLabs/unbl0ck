@@ -31,6 +31,7 @@ class ApiQA(unittest.TestCase):
                 raise ValueError("bad id")
         self.needs = types.SimpleNamespace(
             NO_BLUF_SOURCES=real.NO_BLUF_SOURCES, hide=hide, StaleAnswer=real.StaleAnswer,
+            normalize_board_slug=real.normalize_board_slug,
             pocket_pack=lambda q: {"cards": len(q["items"])},
             write_pocket_pack=lambda q: self.written.append(q),
             answer_card=self._answer,

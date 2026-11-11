@@ -202,6 +202,7 @@ def _hidden_path(home: Optional[Path]) -> Path:
     return data_dir(home) / "hidden.json"
 
 
+STATE_LOCK_TIMEOUT = 5.0   # seconds to wait for the state lock before giving up
 _STATE_LOCK = threading.Lock()   # shared state, including filed outside items, is read-modify-write
 
 
@@ -209,15 +210,27 @@ _STATE_LOCK = threading.Lock()   # shared state, including filed outside items, 
 def _state_lock(home: Optional[Path]):
     """Serialise a read-modify-write of UNBL0CK's state files across threads AND processes
     (the dashboard backend, the agent plugin and a plugin host can all write them)."""
-    with _STATE_LOCK:
+    deadline = time.monotonic() + STATE_LOCK_TIMEOUT
+    if not _STATE_LOCK.acquire(timeout=STATE_LOCK_TIMEOUT):
+        raise TimeoutError("unbl0ck: state lock busy (another thread holds it)")
+    try:
         d = data_dir(home)
         fd = os.open(d / ".state.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("unbl0ck: state lock busy (another process holds it)")
+                        time.sleep(0.02)
             yield
         finally:
             os.close(fd)   # closing the descriptor drops the flock
+    finally:
+        _STATE_LOCK.release()
 
 
 def _read_json(p: Path) -> dict[str, Any]:
@@ -1746,6 +1759,10 @@ def _ask_card_view(value: Any, _key: str = "") -> Any:
     return value
 
 
+# Whole-prompt cap for Ask (system + card context + history), in characters.
+ASK_PROMPT_BUDGET = 40000
+
+
 def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
     """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns."""
     context = json.dumps(_ask_card_view(card), ensure_ascii=False, default=str)
@@ -1761,14 +1778,24 @@ def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]]) 
             ),
         },
     ]
-    for item in list(history)[-20:]:
+    used = sum(len(m["content"]) for m in messages)
+    kept: list[dict[str, str]] = []
+    for item in reversed(list(history)[-20:]):   # newest first: the latest turns win the budget
         role = item.get("role") if isinstance(item, dict) else None
         content = item.get("content") if isinstance(item, dict) else None
         if role not in ("user", "assistant") or not isinstance(content, str):
             continue
-        content = content.strip()
-        if content:
-            messages.append({"role": role, "content": content[:8000]})
+        content = content.strip()[:8000]
+        if not content:
+            continue
+        room = ASK_PROMPT_BUDGET - used
+        if len(content) > room:
+            if kept or room <= 0:
+                break
+            content = content[:room]   # the newest turn is always sent, trimmed to fit
+        kept.append({"role": role, "content": content})
+        used += len(content)
+    messages.extend(reversed(kept))
     return messages
 
 
