@@ -377,10 +377,20 @@ def bluf_messages(item: dict[str, Any], comments: Optional[list[dict[str, Any]]]
 
 def parse_bluf(text: str) -> tuple[str, str]:
     """Pull ``bluf``/``why`` out of a model reply; tolerate code fences and stray prose."""
-    m = re.search(r"\{.*\}", text or "", re.S)
-    if not m:
+    text = re.sub(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", "", text or "", flags=re.S | re.I)
+    decoder = json.JSONDecoder()
+    data = None
+    for i, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            data = candidate
+    if data is None:
         raise ValueError("no JSON object in reply")
-    data = json.loads(m.group(0))
     bluf = re.sub(r"\s+", " ", str(data.get("bluf") or "")).strip()
     if not bluf:
         raise ValueError("empty bluf")
@@ -423,7 +433,7 @@ _TOKEN_GLUE = "/\\-_@"
 
 # A clause ends at sentence or clause punctuation; negation never reaches across it
 # ("Cannot proceed: needs CEO approval" is an ask).
-_CLAUSE_END = re.compile(r"[.;:!?\n]|\s[-–—]\s")
+_CLAUSE_END = re.compile(r"[,.;:!?\n]|\s[-–—]\s")
 # After the phrase, only "... is not needed/required" undoes it; any other negation
 # there ("Needs your approval. Not urgent.") belongs to something else.
 _POST_NEGATION = re.compile(
@@ -1170,15 +1180,16 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
     # the hour), Kanban, chats; inside a source, higher priority first (as on the board), then newest.
     shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), i.get("tier") in ("stuck", "answered"), -(_num(i.get("priority"))), -(_num(i.get("since")))))
     attach_blufs(shown, home)
+    counts = {
+        "asks": sum(1 for i in shown if i.get("tier") not in ("stuck", "answered")),
+        "answered": sum(1 for i in shown if i.get("tier") == "answered"),
+        "stuck": sum(1 for i in shown if i.get("tier") == "stuck"),
+        "stuck_by_why": dict(collections.Counter(i["why"] for i in shown if i.get("tier") == "stuck")),
+    }
     return {
         "generated_at": int(time.time()),
-        "count": len(shown),
-        "counts": {
-            "asks": sum(1 for i in shown if i.get("tier") not in ("stuck", "answered")),
-            "answered": sum(1 for i in shown if i.get("tier") == "answered"),
-            "stuck": sum(1 for i in shown if i.get("tier") == "stuck"),
-            "stuck_by_why": dict(collections.Counter(i["why"] for i in shown if i.get("tier") == "stuck")),
-        },
+        "count": counts["asks"],
+        "counts": counts,
         "hidden": len(items) - len(shown),
         "items": shown,
         "errors": errors,
@@ -1201,16 +1212,16 @@ class UnblockFailed(RuntimeError):
 
 
 class StaleAnswer(RuntimeError):
-    """The card was blocked again after the human read it; the answer was not posted."""
+    """The card was blocked again after the human read it."""
 
 
 def answer_card(board: str, task_id: str, text: str, *, release: bool,
                 version: Optional[str] = None, home: Optional[Path] = None) -> dict[str, Any]:
     """Comment as the principal through native Kanban, then unblock if asked.
 
-    *version* is the queue item's version the human read (the block event id). When given, the
-    answer is refused if the card has been blocked again since, so an answer to an old question
-    never releases a new one. The check and the comment share one write transaction, so a double
+    *version* is the queue item's version the human read (the block event id). It is required to
+    release; an answer is refused if the card has been blocked again since, so an answer to an old
+    question never releases a new one. The check and the comment share one write transaction, so a double
     submit cannot post two comments. A failed unblock raises and is remembered: the card stays
     in the queue, and answering it again with ``release`` retries the release without posting
     the answer twice. Triage cards (``block_loop_detected``) accept the answer but cannot be
@@ -1222,6 +1233,8 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
     text = (text or "").strip()
     if not text and not release:
         raise ValueError("answer text is required")
+    if release and version is None:
+        raise ValueError("queue version is required to release a card")
     author = principal_author()
     item_id = f"kanban:{board}:{task_id}"
     comment_id: Optional[int] = None
@@ -1245,23 +1258,46 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
             # shows is exactly a card that accepts an answer.
             if _answered_since(conn, kanban_db, task_id, author, since):
                 # Already answered: a release (a retry, or a card kept blocked earlier) goes
-                # ahead without posting the answer twice; a second answer is refused.
+                # ahead; a changed answer is posted, but an identical retry is not duplicated.
                 if not release:
                     raise RuntimeError(f"card {task_id} was already answered since it was blocked")
+                if text:
+                    prior = kanban_db.list_comments(conn, task_id)
+                    duplicate = any(
+                        str(getattr(c, "author", "")).casefold() == author.casefold()
+                        and str(getattr(c, "body", "")).strip() == text
+                        for c in prior
+                    )
+                    if not duplicate:
+                        comment_id = kanban_db.add_comment(conn, task_id, author=author, body=text)
             elif not text:
                 raise ValueError("answer text is required")
             else:
                 comment_id = kanban_db.add_comment(conn, task_id, author=author, body=text)
         released = False
         if release:
-            if kanban_db.unblock_task(conn, task_id):
-                released = True
-            else:
-                latest = kanban_db.get_task(conn, task_id)
-                if latest is None or str(getattr(latest.status, "value", latest.status)) in HELD_STATUSES:
-                    _set_pending_release(item_id, current_version, home)
-                    raise UnblockFailed(task_id, comment_id)
-                released = True  # another actor released it in the race; do not claim it was ours
+            release_failed = False
+            with kanban_db.write_txn(conn, allow_nested=True):
+                # The answer transaction has committed. Recheck under the release transaction
+                # so an intervening block cannot be released using the older answer.
+                latest_block = _latest_block(conn, kanban_db, task_id)
+                latest_since = _block_since(latest_block, current)
+                latest_version = str(latest_block.id if latest_block else latest_since)
+                if latest_version != current_version:
+                    raise StaleAnswer(
+                        f"card {task_id} has a newer block; your answer was posted, but the new question "
+                        "remains blocked; refresh to see it")
+                if kanban_db.unblock_task(conn, task_id):
+                    released = True
+                else:
+                    latest = kanban_db.get_task(conn, task_id)
+                    if latest is None or str(getattr(latest.status, "value", latest.status)) in HELD_STATUSES:
+                        release_failed = True
+                    else:
+                        released = True  # another actor released it; do not claim it was ours
+            if release_failed:
+                _set_pending_release(item_id, current_version, home)
+                raise UnblockFailed(task_id, comment_id)
             _set_pending_release(item_id, None, home)
     return {"ok": True, "comment_id": comment_id, "released": released}
 
@@ -1435,7 +1471,8 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     plugin's data, never over the gadget plugin's own pocket-pack.json."""
     now = int(time.time())
     cards = []
-    for it in queue["items"][:limit]:
+    asks = [it for it in queue["items"] if it.get("tier") not in ("stuck", "answered")]
+    for it in asks[:limit]:
         if it["source"] == "kanban":
             options = [
                 {"label": "Answer + unblock", "send": f"Answer and unblock {it['task_id']}", "effect": "Card resumes", "tone": "primary"},

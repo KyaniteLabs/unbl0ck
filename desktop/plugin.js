@@ -18,6 +18,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const PATH = '/unblock'
 const POLL_MS = 45000
 const $queue = atom({ items: [], count: 0, errors: [], loading: true, at: 0 })
+function askCount(q) { return q.counts?.asks ?? q.count ?? 0 }
 const $undo = atom(null)   // the last "Not for me": { id, title } while it can be undone
 const UNDO_MS = 12000
 // An answer that says to keep the card blocked, sent with the unblocking button.
@@ -1268,20 +1269,36 @@ function Page({ ctx, refresh }) {
     }
   }
   const kanban = q.items.filter(i => i.source === 'kanban')
+  const kanbanAsks = kanban.filter(i => i.tier !== 'stuck' && i.tier !== 'answered')
+  const kanbanStuck = kanban.filter(i => i.tier === 'stuck')
+  const kanbanAnswered = kanban.filter(i => i.tier === 'answered')
   const chats = q.items.filter(i => i.source === 'chat')
   const prompts = q.items.filter(i => i.source === 'prompt')
   const pairing = q.items.filter(i => i.source === 'pairing')
   const oldest = q.items.reduce((m, i) => (i.since && (!m || i.since < m) ? i.since : m), 0)
   const oldestH = oldest ? (Date.now() / 1000 - oldest) / 3600 : 0
   let n = 0
-  const group = (label, items) =>
+  const group = (label, items, collapsed = false) =>
     items.length
       ? [
-          jsxs('div', {
-            className: 'ub-sec',
-            children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
-          }),
-          jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false }, item.id)) })
+          collapsed
+            ? jsx('details', {
+                className: 'ub-group',
+                children: [jsx('summary', {
+                  className: 'ub-sec',
+                  style: { cursor: 'pointer', listStyle: 'none' },
+                  children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
+                }), jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false }, item.id)) })]
+              })
+            : jsxs('div', {
+                children: [
+                  jsxs('div', {
+                    className: 'ub-sec',
+                    children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
+                  }),
+                  jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false }, item.id)) })
+                ]
+              })
         ]
       : []
 
@@ -1324,7 +1341,7 @@ function Page({ ctx, refresh }) {
                               ? 'Cannot reach the queue; showing the last known list.'
                               : (q.errors || []).length
                                 ? 'A source failed to load; the list may be incomplete.'
-                                : q.count
+                                : askCount(q)
                                 ? 'Everything that is waiting on your word.'
                                 : 'Nothing is blocked on you.',
                           jsx('i', { className: 'ub-cursor' })
@@ -1332,7 +1349,7 @@ function Page({ ctx, refresh }) {
                       })
                     ]
                   }),
-                  jsx(Pet, { count: q.count, oldestH, loading: q.loading, fx })
+                  jsx(Pet, { count: askCount(q), oldestH, loading: q.loading, fx })
                 ]
               }),
               jsxs('div', {
@@ -1367,9 +1384,11 @@ function Page({ ctx, refresh }) {
           kanban.length ? jsx('div', { className: 'ub-hazard' }) : null,
           ...group('LIVE.PROMPTS', prompts),
           ...group('ACCESS.REQUESTS', pairing),
-          ...group('KANBAN.CARDS', kanban),
+          ...group('KANBAN.CARDS', kanbanAsks),
+          ...group('KANBAN.STUCK', kanbanStuck, true),
+          ...group('KANBAN.ANSWERED', kanbanAnswered, true),
           ...group('CHATS', chats),
-          !q.loading && !q.count && !q.fault && !(q.errors || []).length
+          !q.loading && !askCount(q) && !q.fault && !(q.errors || []).length
             ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, chat, prompt or pairing request is waiting on you.' })] })
             : null
         ]
@@ -1381,13 +1400,14 @@ function Page({ ctx, refresh }) {
 
 function Chip() {
   const q = useValue($queue)
-  if (!q.count) return null
+  const count = askCount(q)
+  if (!count) return null
   return jsx('button', {
     type: 'button',
     className: q.fresh ? 'ub-chip new' : 'ub-chip',
     onClick: () => host.navigate(PATH),
     title: 'Open UNBL0CK',
-    children: `◆ ${q.count} ${q.count === 1 ? 'NEEDS' : 'NEED'} YOU`
+    children: `◆ ${count} ${count === 1 ? 'NEEDS' : 'NEED'} YOU`
   })
 }
 

@@ -185,7 +185,8 @@ class AnswerCardStatuses(unittest.TestCase):
                                            "hermes_cli.kanban_db_connect": kbc}):
             with tempfile.TemporaryDirectory() as home:   # the pending-release marker lands here
                 try:
-                    return needs.answer_card("b", "t", "go", release=release, home=Path(home)), calls
+                    return needs.answer_card("b", "t", "go", release=release,
+                                             version="1" if release else None, home=Path(home)), calls
                 except Exception as exc:  # noqa: BLE001
                     return exc, calls
 

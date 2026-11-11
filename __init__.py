@@ -18,8 +18,9 @@ def _summary(limit: int = 12) -> str:
     q = _needs().build_queue()
     if not q["count"]:
         return "Nothing is blocked on you."
+    asks = [it for it in q["items"] if it.get("tier") not in ("stuck", "answered")]
     lines = [f"{q['count']} thing(s) waiting on you:"]
-    for it in q["items"][:limit]:
+    for it in asks[:limit]:
         where = (f"{it['board']}:{it['task_id']}" if it["source"] == "kanban"
                  else f"{it.get('kind') or 'prompt'} {it['profile']}" if it["source"] == "prompt"
                  else f"pairing {it.get('platform')}" if it["source"] == "pairing"
