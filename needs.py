@@ -127,7 +127,11 @@ def _patterns(names: Optional[list[str]] = None) -> dict[str, re.Pattern[str]]:
     pats["_GATE"] = _c(
         r"\b(CEO[- ](gate|gated|word|decision|approval|call|sign[- ]?off)"
         r"|({P}|CEO|principal)(['’]s)? (approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
-        r"|(awaiting|waiting (on|for)|needs?|requires?|blocked on|blocked pending|pending) ({P}|the CEO|CEO|principal|human)"
+        r"|(awaiting|waiting (on|for)|needs?|requires?|blocked on|blocked pending|pending) ({P}|the CEO|CEO|principal|(the )?human)"
+        r"|(approval|decision|sign[- ]?off|input|answer|reply|go|ok) from ({P}|the CEO|CEO|(the )?principal|(the )?human|you)"
+        r"|(can['’]?t|cannot) \w+( \w+)? without (your|({P}|the CEO|CEO|(the )?principal)(['’]s)?) "
+        r"(approval|decision|sign[- ]?off|input|answer|go|ok)"
+        r"|^\W*please (approve|decide|choose|pick|confirm|sign)"
         r"|(awaiting|waiting (on|for)|needs?|requires?|blocked (on|pending)|pending) your "
         r"(approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
         r"|({P}|CEO) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
@@ -157,7 +161,8 @@ def _patterns(names: Optional[list[str]] = None) -> dict[str, re.Pattern[str]]:
     # Asks that do not need a question mark to be an ask (decision packets, option lists).
     pats["_ASK_PACKET"] = _c(
         r"\b((picks?|options?|choices?|decisions?|questions?) for (you|the CEO|{P})"
-        r"|decision packet|reply needed|which (one|option|choice)|waiting (on|for) your (call|decision|word))\b",
+        r"|decision packet(?! (?:was |is )?(?:archived|closed|resolved|answered|sent|done))"
+        r"|reply needed|which (one|option|choice) (do|would|should) (you|I|we)|waiting (on|for) your (call|decision|word))\b",
         re.I,
     )
     pats["_YOU"] = _c(r"\b(you|your|{P}|CEO)\b", re.I)
@@ -416,10 +421,27 @@ _NEGATION = re.compile(
 _TOKEN_GLUE = "/\\-_@"
 
 
+# A clause ends at sentence or clause punctuation; negation never reaches across it
+# ("Cannot proceed: needs CEO approval" is an ask).
+_CLAUSE_END = re.compile(r"[.;:!?\n]|\s[-–—]\s")
+# After the phrase, only "... is not needed/required" undoes it; any other negation
+# there ("Needs your approval. Not urgent.") belongs to something else.
+_POST_NEGATION = re.compile(
+    r"^\s*(?:is|are|was|were)?\s*(?:not|no longer|n['’]t)\s+(?:needed|required|necessary|wanted)\b", re.I
+)
+
+
 def _match_is_negated(text: str, match: re.Match[str]) -> bool:
-    before = text[max(0, match.start() - 48):match.start()]
-    after = text[match.end():match.end() + 24]
-    return bool(_NEGATION.search(before) or _NEGATION.search(after))
+    """Does a negation govern this gate phrase? Same clause only; before it, only
+    the three words right in front ("not waiting on", "no new Ada")."""
+    head = text[:match.start()]
+    cuts = list(_CLAUSE_END.finditer(head))
+    clause = head[cuts[-1].end():] if cuts else head
+    near = " ".join(clause.split()[-3:])
+    after = text[match.end():]
+    end = _CLAUSE_END.search(after)
+    after = after[:end.start()] if end else after
+    return bool(_NEGATION.search(near) or _POST_NEGATION.search(after))
 
 
 def _match_is_standalone(text: str, match: re.Match[str]) -> bool:
@@ -442,17 +464,37 @@ def _any_name(reason: str, pats: dict[str, re.Pattern[str]]) -> bool:
     )
 
 
+_YOUR_GATE = re.compile(
+    r"\b(?:need|needs|awaiting|waiting (?:on|for)|requires?|pending) your "
+    r"(?:approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)\b",
+    re.I,
+)
+
+
 def kanban_needs_you(reason: str, kind: Optional[str]) -> Optional[str]:
     """Why a blocked card's latest block is waiting on the principal, or None."""
     reason = (reason or "").strip()
     pats = _patterns()
-    if not reason or pats["_ORDER"].match(reason):
+    if not reason:
         return None
+    if pats["_ORDER"].match(reason):
+        # A relayed order is a stop, not a question, unless it asks *you* for something
+        # ("CEO says: need your approval for the spend").
+        return "Block reason names a decision for you" if _YOUR_GATE.search(reason) else None
     if _any_gate(reason, pats):
         return "Block reason names a decision for you"
     if (kind or "") == "needs_input" and _any_name(reason, pats):
         return "Blocked for your input"
     return None
+
+
+_URL = re.compile(r"\bhttps?://\S+", re.I)
+_CLOSER = re.compile(
+    r"(?:\s|^)(?:anything else(?: (?:you need|I can (?:do|help with)))?|is there anything else[^?]*"
+    r"|(?:let me know|hope (?:this|that) helps)[^?.!]*)[?.!]?\s*$",
+    re.I,
+)
+_ANSWERED = re.compile(r"(?:because|answer:|a:|it was|the answer)\b", re.I)
 
 
 def chat_asks_you(text: str) -> bool:
@@ -461,7 +503,9 @@ def chat_asks_you(text: str) -> bool:
     Anchored to the tail of the turn: a gate idiom inside an earlier status report
     ("…Platform's, on your word.") is not an ask. Packet/option-list shapes are
     exempt from the question mark; other cues need a ``?`` after the cue."""
-    text = (text or "").strip()
+    # URLs carry "?" query strings; a polite sign-off ("Anything else you need?") asks nothing.
+    text = _URL.sub(" ", text or "")
+    text = _CLOSER.sub("", text.strip()).strip()
     tail = text[-900:]
     if not tail:
         return False
@@ -471,7 +515,11 @@ def chat_asks_you(text: str) -> bool:
     for match in pats["_ASK_STRONG"].finditer(tail):
         if "?" in tail[match.end():match.end() + 300]:
             return True
-    return "?" in tail[-400:] and bool(pats["_YOU"].search(tail[-400:]))
+    if "?" not in tail[-400:] or not pats["_YOU"].search(tail[-400:]):
+        return False
+    # A question the turn goes on to answer ("Why did it fail? Because ...") is not an ask.
+    rest = tail[tail.rfind("?") + 1:].strip()
+    return len(rest) <= 120 and not _ANSWERED.match(rest)
 
 
 def _excerpt(text: str, n: int = 480) -> str:

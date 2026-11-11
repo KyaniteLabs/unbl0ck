@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Real asks stop vanishing from the queue.** A negation now counts only in the same clause and only in the three words right before the ask, so "Cannot proceed: needs CEO approval to merge" and "Needs your approval. Not urgent." are listed. After the ask, only "is not needed/required" cancels it. New phrasings are recognised: "approval from Ada", "can't deploy without your approval", "Please approve…", "need the human to…". A relayed order ("CEO says: …") still counts as a stop unless it asks for *your* approval or decision. On the live board, 16 of 209 blocked cards are now listed, up from 10.
+- **Fewer false chat asks.** Question marks inside URLs, sign-offs like "Anything else you need?", questions the turn answers itself ("Why did it fail? Because…"), "which option was faster" and an archived decision packet no longer count as asks.
+
 ## 0.4.6 (2026-11-11)
 
 Fixes from the hackathon roast (two independent audits).
