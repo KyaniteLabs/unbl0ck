@@ -1,4 +1,4 @@
-"""Wave 2 (Simon: fix all): sound is off for a fresh profile (U9) and org role words live only in
+"""Wave 2: sound is off for a fresh profile (U9) and org role words live only in
 one config default (U8)."""
 import json
 import re

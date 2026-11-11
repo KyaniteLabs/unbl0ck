@@ -33,11 +33,12 @@ jobs:
           cd plugin
           HERMES_HOME="$RUNNER_TEMP/hermes-test-home" ../.hermes-runtime/.venv/bin/python -m pytest -q -rs -p no:cacheprovider tests 2>&1 | tee ../test.log
           # Hermes is installed in this job, so the Hermes-equivalence test runs here: any skip is a failure.
-          if grep -q "^SKIPPED" ../test.log; then echo "::error::tests were skipped; the gate needs every test to run"; exit 1; fi
+          if grep -q "^SKIPPED" ../test.log; then grep "^SKIPPED" ../test.log; echo "::error::tests were skipped; the gate needs every test to run"; exit 1; fi
       - name: Real validator receipt (no credentials)
         run: |
           mkdir -p receipts
           HERMES_HOME="$RUNNER_TEMP/hermes-home" .hermes-runtime/.venv/bin/hermes plugins validate plugin --json > receipts/validate.json
+          python3 -c 'import json,sys; d=json.load(open("receipts/validate.json")); sys.exit(0 if d.get("ok") is True else "validator did not report ok: %s" % d)'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:

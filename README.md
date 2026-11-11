@@ -86,7 +86,7 @@ State files (`hidden.json`, `bluf.json`, `pending-release.json`) are guarded by 
 ## Develop
 
 ```
-python -m unittest discover -s tests -v
+python -m pytest -rs tests
 hermes plugins validate .
 ```
 
