@@ -8,6 +8,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("unbl0ck_needs", ROOT / "needs.py")
@@ -150,6 +151,29 @@ class Classify(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertIsNone(needs.kanban_needs_you(reason, None), reason)
 
+    def test_without_until_gate_requires_a_prohibition_in_the_same_clause(self):
+        cases = [
+            ("Won't merge without explicit CEO approval", "needs_input", True),
+            ("Blocked: won't merge without CEO approval", None, True),
+            ("Blocked on CI flake; can ship without CEO approval", "needs_input", False),
+            ("Can proceed without CEO approval once CI is green", "needs_input", False),
+            ("Proceeded without CEO approval", "needs_input", False),
+            ("Works without CEO input", "needs_input", False),
+            ("No change needed until CEO review next quarter", "needs_input", False),
+            ("Not urgent; can merge without approval", "needs_input", False),
+        ]
+        for reason, kind, expected in cases:
+            with self.subTest(reason=reason):
+                actual = needs.kanban_needs_you(reason, kind) is not None
+                self.assertEqual(actual, expected)
+        with mock.patch.object(needs, "_settings", lambda: {"principal_name": "operator"}):
+            for reason in [
+                "Can't start until the operator gives the go",
+                "Not proceeding without the operator's explicit decision",
+            ]:
+                with self.subTest(reason=reason):
+                    self.assertTrue(needs.kanban_needs_you(reason, "needs_input"), reason)
+
     def test_chat_non_asks_drop(self):
         for text in [
             "Done. The file is saved at /tmp/out.txt. Anything else you need?",
@@ -269,13 +293,14 @@ def task(status="blocked", task_id="t_1", **overrides):
 
 
 class FakeKanban(unittest.TestCase):
-    """answer_card writes only through native kanban_db calls."""
+    """answer_card queue behavior is tested separately from its real-Hermes release helper."""
 
     def setUp(self):
         self.calls = []
         self.task = task()
         self.events = [block_event()]
         self.comments = []
+        self.release_behavior = lambda conn, db, task_id, version: True
         kdb = fake_db(
             get_task=lambda c, t: self.task if t == "t_1" else None,
             list_events=lambda c, t: self.events,
@@ -285,12 +310,18 @@ class FakeKanban(unittest.TestCase):
         )
         self.stack = fake_hermes(kdb, fake_connect())
         self.stack.__enter__()
+        def release(conn, db, task_id, version):
+            self.calls.append(("unblock", task_id))
+            return self.release_behavior(conn, db, task_id, version)
+        self.release_patcher = mock.patch.object(needs, "_unblock_task_at_version", release)
+        self.release_patcher.start()
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name)
         self.saved_home = os.environ.get("HERMES_HOME")
         os.environ["HERMES_HOME"] = str(self.home)   # the pending-release marker lands here
 
     def tearDown(self):
+        self.release_patcher.stop()
         self.stack.__exit__(None, None, None)
         if self.saved_home is None:
             os.environ.pop("HERMES_HOME", None)
@@ -320,9 +351,7 @@ class FakeKanban(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_failed_unblock_is_not_reported_as_success(self):
-        kdb = sys.modules["hermes_cli.kanban_db"]
-        kdb.unblock_task = lambda c, t: self.calls.append(("unblock", t)) or False
-        # rebuild the module with the new unblock
+        self.release_behavior = lambda *args: False
         with self.assertRaises(needs.UnblockFailed) as ctx:
             needs.answer_card("factory", "t_1", "Go", release=True, version="11")
         self.assertIn("comment 7", str(ctx.exception))
@@ -338,30 +367,23 @@ class FakeKanban(unittest.TestCase):
         r = needs.answer_card("factory", "t_1", "Go with B", release=True, version="12")
         self.assertTrue(r["released"])
 
-    def test_answer_release_does_not_unblock_a_newer_block_after_answer_commit(self):
-        kdb = sys.modules["hermes_cli.kanban_db"]
-        txns = 0
-
-        @contextlib.contextmanager
-        def write_txn(conn, allow_nested=False):
-            nonlocal txns
-            txns += 1
-            yield conn
-            if txns == 1:
-                # Another actor blocks the card after the answer transaction commits.
-                self.events.append(types.SimpleNamespace(
-                    id=12, kind="blocked", created_at=130,
-                    payload={"reason": "new question", "kind": "needs_input"}))
-
-        kdb.write_txn = write_txn
+    def test_stale_release_error_keeps_the_posted_answer(self):
+        def stale_after_comment(conn, db, task_id, version):
+            self.events.append(types.SimpleNamespace(
+                id=12, kind="blocked", created_at=130,
+                payload={"reason": "new question", "kind": "needs_input"}))
+            raise needs.StaleAnswer("newer block")
+        self.release_behavior = stale_after_comment
         with self.assertRaises(needs.StaleAnswer):
             needs.answer_card("factory", "t_1", "Go with A", release=True, version="11")
-        self.assertEqual(self.calls, [("comment", "t_1", "ada", "Go with A")])
+        self.assertEqual(self.calls, [
+            ("comment", "t_1", "ada", "Go with A"), ("unblock", "t_1")
+        ])
         self.assertEqual([event.id for event in self.events], [11, 12])
 
     def test_failed_release_stays_in_queue_and_retries_without_a_second_comment(self):
         kdb = sys.modules["hermes_cli.kanban_db"]
-        kdb.unblock_task = lambda c, t: self.calls.append(("unblock", t)) or False
+        self.release_behavior = lambda *args: False
         with self.assertRaises(needs.UnblockFailed):
             needs.answer_card("factory", "t_1", "Go", release=True, version="11")
         self.assertEqual(needs.load_pending_releases(), {"kanban:factory:t_1": "11"})
@@ -373,7 +395,7 @@ class FakeKanban(unittest.TestCase):
         # Answer-only on an answered card is still refused; a release retry is allowed once.
         with self.assertRaises(RuntimeError):
             needs.answer_card("factory", "t_1", "Go", release=False)
-        kdb.unblock_task = lambda c, t: self.calls.append(("unblock", t)) or True
+        self.release_behavior = lambda *args: True
         r = needs.answer_card("factory", "t_1", "Go", release=True, version="11")
         self.assertEqual(r, {"ok": True, "comment_id": None, "released": True})
         self.assertEqual([c[0] for c in self.calls], ["comment", "unblock", "unblock"])
@@ -413,10 +435,10 @@ class FakeKanban(unittest.TestCase):
         kdb = sys.modules["hermes_cli.kanban_db"]
         self.task.status = "blocked"
         def external_release(c, t):
-            self.calls.append(("unblock", t))
             self.task.status = "open"
             return False
         kdb.unblock_task = external_release
+        self.release_behavior = lambda *args: external_release(args[0], args[2])
         result = needs.answer_card("factory", "t_1", "", release=True, version="11", home=self.home)
         self.assertTrue(result["released"])
         self.assertEqual(needs.load_pending_releases(self.home), {})

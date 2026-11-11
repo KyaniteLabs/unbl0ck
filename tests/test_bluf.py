@@ -43,6 +43,25 @@ class BlufTest(unittest.TestCase):
             with self.subTest(reply=reply):
                 self.assertEqual(needs.parse_bluf(reply), expected)
 
+    def test_parse_uses_last_nonempty_bluf_and_ignores_labeled_examples(self):
+        cases = [
+            ('{"bluf":"Approve the merge","why":"tests pass"} '
+             'Alternatively: {"alt":1}', ("Approve the merge", "tests pass")),
+            ('{"bluf":"First","why":"one"} '
+             '{"bluf":"  ","why":"empty"}', ("First", "one")),
+            ('{"bluf":"Real","why":"ready"}\nExample:\n'
+             '{"bluf":"Example value","why":"illustrative"}', ("Real", "ready")),
+            ('{"bluf":"Real","why":"ready"}\nSchema: '
+             '{"bluf":"Schema value","why":"illustrative"}', ("Real", "ready")),
+            ('{"bluf":"Real","why":"ready"}\nExample format: '
+             '{"bluf":"Example value","why":"illustrative"}', ("Real", "ready")),
+        ]
+        for reply, expected in cases:
+            with self.subTest(reply=reply):
+                self.assertEqual(needs.parse_bluf(reply), expected)
+        with self.assertRaises(ValueError):
+            needs.parse_bluf('Example: {"bluf":"Example only","why":"illustrative"}')
+
     def test_background_bluf_uses_reasoning_model_token_budget(self):
         spec = importlib.util.spec_from_file_location("unbl0ck_plugin_api_bluf_test", ROOT / "dashboard" / "plugin_api.py")
         api = importlib.util.module_from_spec(spec)
