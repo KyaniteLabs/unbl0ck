@@ -116,6 +116,37 @@ class Classify(unittest.TestCase):
         self.assertTrue(needs.chat_asks_you(long_packet))
         self.assertFalse(needs.chat_asks_you("Is the build green? Yes."[:0]))
 
+    def test_negation_in_another_clause_keeps_the_ask(self):
+        # Audit probe: 13 of 14 real asks were dropped by a negation window that
+        # reached across clauses and looked after the gate phrase.
+        for reason, kind in [
+            ("Cannot proceed: needs CEO approval to merge", None),
+            ("Blocked: can't deploy without your approval", None),
+            ("Waiting on Ada's decision; no rush", None),
+            ("Needs your approval. Not urgent.", "needs_input"),
+            ("Tests don't pass on main; awaiting Ada to pick option A or B", "needs_input"),
+            ("I could not log in. Ada must sign in to the registry", "needs_input"),
+            ("Finish needs a decision only a human can give: no model credentials on this host", "needs_input"),
+            ("CEO says: need your approval for the spend", "needs_input"),
+            ("Need the human to approve", None),
+            ("Please approve the release", "needs_input"),
+            ("Waiting for approval from Ada", None),
+            ("Requires sign-off from the CEO", None),
+        ]:
+            self.assertTrue(needs.kanban_needs_you(reason, kind), reason)
+
+    def test_chat_non_asks_drop(self):
+        for text in [
+            "Done. The file is saved at /tmp/out.txt. Anything else you need?",
+            "Here is your link: https://example.com/search?q=1",
+            "I compared which option was faster and went with B. All tests pass.",
+            "Summary: decision packet archived last week. Nothing pending.",
+            "Why did the build fail? Because your lockfile was stale. Fixed.",
+        ]:
+            self.assertFalse(needs.chat_asks_you(text), text)
+        self.assertTrue(needs.chat_asks_you("Should I delete the production database?"))
+        self.assertTrue(needs.chat_asks_you("Decision packet for you: ship A or park B."))
+
     def test_chat_status_report_with_gate_idiom_is_not_an_ask(self):
         report = ("Tonight it worked at machine speed. The only open item is that's an "
                   "allowlist change — Platform's, on your word.")
