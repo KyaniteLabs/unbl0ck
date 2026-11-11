@@ -13,8 +13,8 @@ sys.modules["ub_needs_lfm3"] = needs
 spec.loader.exec_module(needs)
 
 
-@pytest.mark.parametrize("value", ["...", "…", "tbd", "Pick A.", "   ....  "])
-def test_placeholder_and_short_blufs_are_rejected(value):
+@pytest.mark.parametrize("value", ["...", "…", "tbd", "TODO", "<bluf>", "n/a", "   ....  "])
+def test_placeholder_blufs_are_rejected(value):
     reply = '{"bluf": "%s", "why": "because the release waits"}' % value
     with pytest.raises(ValueError):
         needs.parse_bluf(reply)
@@ -44,3 +44,9 @@ def test_bluf_token_budget_floor():
     assert ask >= 3500  # LFM3 at 2048 fails ~3 of 12: reasoning eats the budget
     m = re.search(r"^BLUF_MAX_TOKENS\s*=\s*(\w+)", src, re.M)
     assert m.group(1) == "ASK_MAX_TOKENS" or int(m.group(1)) >= 3500
+
+
+@pytest.mark.parametrize("value", ["Merge PR.", "Pick A.", "Real"])
+def test_short_real_blufs_are_accepted(value):
+    reply = '{"bluf": "%s", "why": "because the release waits"}' % value
+    assert needs.parse_bluf(reply)[0] == value

@@ -415,20 +415,26 @@ def bluf_messages(item: dict[str, Any], comments: Optional[list[dict[str, Any]]]
 _BLUF_THINK_RE = re.compile(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", re.S | re.I)
 
 
-BLUF_MIN_CHARS = 10
+_BLUF_PLACEHOLDERS = frozenset({
+    "tbd", "todo", "n/a", "na", "none", "null", "placeholder", "bluf", "summary", "answer",
+    "your answer", "one sentence", "example", "value", "string", "text",
+})
 
 
 def _real_bluf(value: Any) -> bool:
-    """A BLUF is a sentence: not the "..." format placeholder, and not a stub."""
+    """A BLUF is real text: not the "..." format placeholder or a template word.
+    Short answers such as "Merge PR." are real."""
     text = re.sub(r"\s+", " ", str(value or "")).strip()
-    return len(text) >= BLUF_MIN_CHARS and bool(re.search(r"[A-Za-z0-9]", text))
+    if not re.search(r"[A-Za-z0-9]", text):
+        return False
+    return text.strip(" .…!?:;<>[]{}()\"'`").lower() not in _BLUF_PLACEHOLDERS
 
 
 def parse_bluf(text: str) -> tuple[str, str]:
     """Pull ``bluf``/``why`` out of a model reply; tolerate code fences, stray prose,
-    reasoning blocks (closed or cut off) and extra JSON objects. The answer is the first
-    object outside any reasoning block that has a ``bluf`` key and is not introduced as
-    an example."""
+    reasoning blocks (closed or cut off) and extra JSON objects. The answer is the last
+    object outside any reasoning block whose ``bluf`` is a real sentence and that is not
+    introduced as an example or schema."""
     text = _BLUF_THINK_RE.sub("", text or "")
     decoder = json.JSONDecoder()
     data = None
@@ -439,14 +445,21 @@ def parse_bluf(text: str) -> tuple[str, str]:
         except ValueError:
             i = text.find("{", i + 1)
             continue
-        if isinstance(obj, dict) and "bluf" in obj and _real_bluf(obj["bluf"]):
-            if not re.search(r"\b(?:example\s+format|for example)\s*:\s*$", text[:i], re.I):
+        if isinstance(obj, dict):
+            prefix = text[:i]
+            is_example = re.search(
+                r"(?:(?:^|\n)\s*(?:example(?:\s+format)?|schema|for example)|\b(?:example\s+format|for example))\s*:\s*$",
+                prefix, re.I,
+            )
+            raw_bluf = obj.get("bluf")
+            # Keep the last real answer: a model may restate or correct itself.
+            if not is_example and isinstance(raw_bluf, str) and _real_bluf(raw_bluf):
                 data = obj
-                break
+        # Skip nested objects inside a successfully decoded top-level object.
         i = text.find("{", end)
     if data is None:
         raise ValueError("no JSON object with a real bluf in reply")
-    bluf = re.sub(r"\s+", " ", str(data.get("bluf") or "")).strip()
+    bluf = re.sub(r"\s+", " ", data["bluf"]).strip()
     return bluf[:200], re.sub(r"\s+", " ", str(data.get("why") or "")).strip()[:240]
 
 
@@ -473,12 +486,18 @@ def recent_comments(item: dict[str, Any], limit: int = 6) -> list[dict[str, Any]
 # Negation words that turn a gate phrase into "not a gate" ("no new Ada approval
 # requested", "not a principal gate", "approval is not needed").
 _NEGATION = re.compile(
-    r"\b(?:no|not|never|without|nothing|none|neither|nor|"
+    r"\b(?:no|not|never|without|until|nothing|none|neither|nor|"
     r"isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
     r"don['’]?t|doesn['’]?t|didn['’]?t|won['’]?t|"
     r"can['’]?t|cannot|no longer|no new)\b",
     re.I,
 )
+_PROHIBITION = re.compile(
+    r"\b(?:will\s+not|do\s+not|does\s+not|did\s+not|won['’]?t|"
+    r"can['’]?t|cannot|don['’]?t|blocked|not|never)\b",
+    re.I,
+)
+_CONDITIONAL_GATE = re.compile(r"\b(?:without|until)\b", re.I)
 # Characters that make a name part of a path, slug, env var or email instead of a
 # standalone word: /home/ada/..., ada/fleet, Ada-reserved, ada@example.com.
 _TOKEN_GLUE = "/\\-_@"
@@ -495,16 +514,22 @@ _POST_NEGATION = re.compile(
 
 
 def _match_is_negated(text: str, match: re.Match[str]) -> bool:
-    """Does a negation govern this gate phrase? Same clause only; before it, only
-    the three words right in front ("not waiting on", "no new Ada")."""
+    """Does a negation govern this gate phrase within its clause?"""
     head = text[:match.start()]
     cuts = list(_CLAUSE_END.finditer(head))
     clause = head[cuts[-1].end():] if cuts else head
     near = " ".join(clause.split()[-3:])
+    conditional = None
+    # Search the whole clause, but only let a nearby without/until phrase
+    # govern this gate (including a short adjective or article in between).
+    conditional_matches = list(_CONDITIONAL_GATE.finditer(clause))
+    if conditional_matches:
+        candidate = conditional_matches[-1]
+        words_between = clause[candidate.end():].split()
+        if len(words_between) <= 4:
+            conditional = candidate
     gate_condition = bool(
-        re.search(r"\b(?:without|until)\s+$", clause, re.I)
-        and re.search(r"\b(?:approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)\b",
-                      match.group(), re.I)
+        conditional and _PROHIBITION.search(clause[:conditional.start()])
     )
     after = text[match.end():]
     end = _CLAUSE_END.search(after)
@@ -1514,6 +1539,61 @@ class StaleAnswer(RuntimeError):
     """The card was blocked again after the human read it."""
 
 
+def _unblock_task_at_version(conn: Any, kanban_db: Any, task_id: str, version: str) -> bool:
+    """Perform Hermes' native unblock transition in the same txn as its version check.
+
+    Hermes' public helper owns its transaction, so calling it after a separate check leaves a
+    race. Its transition rules are applied here with the same native helpers and SQL semantics.
+    """
+    with kanban_db.write_txn(conn):
+        current = kanban_db.get_task(conn, task_id)
+        if current is None:
+            raise LookupError(f"card {task_id} not found")
+        block = _latest_block(conn, kanban_db, task_id)
+        since = _block_since(block, current)
+        current_version = str(block.id if block else since)
+        if current_version != version:
+            raise StaleAnswer(
+                f"card {task_id} has a newer block; your answer was posted, but the new question "
+                "remains blocked; refresh to see it")
+
+        status = str(getattr(current.status, "value", current.status))
+        if status not in {"blocked", "scheduled"}:
+            return False
+        now = int(time.time())
+        resume_status = (
+            kanban_db._resume_status_from_events(conn, task_id)
+            if status == "blocked" else "ready"
+        )
+        kanban_db._reclaim_dangling_run(
+            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            note="invariant recovery on unblock",
+        )
+        landing_status = kanban_db._landing_status_after_parents(conn, task_id)
+        new_status = (
+            "review"
+            if landing_status == "ready" and resume_status == "review"
+            else landing_status
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        kanban_db._append_event(
+            conn, task_id, "unblocked",
+            (
+                {"status": new_status, "resume_status": resume_status}
+                if new_status != "ready" or resume_status != "ready"
+                else None
+            ),
+        )
+        return True
+
+
 def answer_card(board: str, task_id: str, text: str, *, release: bool,
                 version: Optional[str] = None, home: Optional[Path] = None) -> dict[str, Any]:
     """Unblock through native Kanban, then comment as the principal if asked.
@@ -1576,17 +1656,7 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
         released = False
         if release:
             release_failed = False
-            with kanban_db.write_txn(conn, allow_nested=True):
-                # Recheck immediately before invoking Hermes' transaction-owning helper.
-                latest_block = _latest_block(conn, kanban_db, task_id)
-                latest_since = _block_since(latest_block, current)
-                latest_version = str(latest_block.id if latest_block else latest_since)
-                if latest_version != current_version:
-                    raise StaleAnswer(
-                        f"card {task_id} has a newer block; your answer was posted, but the new question "
-                        "remains blocked; refresh to see it")
-            # unblock_task opens its own write_txn in Hermes and must run outside this txn.
-            if kanban_db.unblock_task(conn, task_id):
+            if _unblock_task_at_version(conn, kanban_db, task_id, current_version):
                 released = True
             else:
                 latest = kanban_db.get_task(conn, task_id)
