@@ -58,7 +58,6 @@ class ApiQA(unittest.TestCase):
 
     def test_answer_carries_the_version_and_stale_is_409(self):
         kdb = types.ModuleType("hermes_cli.kanban_db")
-        kdb._normalize_board_slug = lambda b: b
         kdb.board_exists = lambda b: True
         pkg = types.ModuleType("hermes_cli"); pkg.kanban_db = kdb
         saved = {k: sys.modules.get(k) for k in ("hermes_cli", "hermes_cli.kanban_db")}

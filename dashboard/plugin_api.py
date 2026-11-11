@@ -137,7 +137,7 @@ def _checked_card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
     if not board or not task_id:
         raise HTTPException(status_code=400, detail="board and task_id are required")
     try:
-        board = kanban_db._normalize_board_slug(board)
+        board = _needs().normalize_board_slug(board)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if not board or not kanban_db.board_exists(board):
@@ -295,7 +295,7 @@ def answer(body: Answer):
     from hermes_cli import kanban_db  # type: ignore
 
     try:
-        board = kanban_db._normalize_board_slug(body.board)
+        board = _needs().normalize_board_slug(body.board)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if not kanban_db.board_exists(board):

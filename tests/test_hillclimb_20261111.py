@@ -90,3 +90,37 @@ def test_bluf_payload_redacted():
     content = needs.bluf_messages(item, comments)[1]["content"]
     assert home not in content and "abcdef123456" not in content and "ghp_" not in content
     assert "Deploy" in content and "failed in" in content
+
+
+# --- F26: the plugin no longer calls kanban_db's private slug normalizer
+
+SLUG_INPUTS = ["demo", " Demo ", "UPPER", "a", "0a", "a-b_c", "-lead", "_lead", "", "   ", None, "a" * 64,
+               "a" * 65, "has space", "../x", "a/b", "caf\u00e9", "x\n", "a.b"]
+
+
+def _outcome(fn, v):
+    try:
+        return ("ok", fn(v))
+    except ValueError as exc:
+        return ("err", str(exc))
+
+
+def test_plugin_api_does_not_use_the_private_slug_normalizer():
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py").read_text()
+    assert "_normalize_board_slug" not in src
+
+
+def test_vendored_slug_normalizer_rules():
+    assert needs.normalize_board_slug(" Demo ") == "demo"
+    assert needs.normalize_board_slug(None) is None and needs.normalize_board_slug("  ") is None
+    for bad in ("-x", "_x", "a/b", "../x", "a" * 65, "has space", "x\n.y"):
+        with pytest.raises(ValueError):
+            needs.normalize_board_slug(bad)
+
+
+def test_vendored_slug_normalizer_matches_hermes_when_importable():
+    pytest.importorskip("hermes_cli.kanban_db")
+    from hermes_cli import kanban_db
+    for v in SLUG_INPUTS:
+        assert _outcome(needs.normalize_board_slug, v) == _outcome(kanban_db._normalize_board_slug, v), v

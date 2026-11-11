@@ -753,6 +753,24 @@ def _state_dbs(home: Path) -> list[tuple[str, Path]]:
     return out
 
 
+# Hermes has no public board-slug validator, so this mirrors kanban_db._normalize_board_slug (the
+# plugin must not call a private name). tests/test_hillclimb_20261111.py checks the two agree.
+_BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
+
+
+def normalize_board_slug(slug: Any) -> Optional[str]:
+    """Lowercase + strip a board slug; None for empty; ValueError for an invalid one."""
+    s = str(slug).strip().lower() if slug is not None else ""
+    if not s:
+        return None
+    if not _BOARD_SLUG_RE.match(s):
+        raise ValueError(
+            f"invalid board slug {slug!r}: must be 1-64 chars, lowercase "
+            f"alphanumerics / hyphens / underscores, not starting with '-' or '_'"
+        )
+    return s
+
+
 def _bot_name(home: Path, profile: str) -> str:
     """The name Bot Mode shows for a seat (profile.yaml ui_meta.hermes-bots.title).
     A line scan, not a YAML parser: the plugin host may not ship PyYAML."""
