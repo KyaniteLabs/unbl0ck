@@ -945,7 +945,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     run(
       () => ctx.rest('/kanban/answer', {
         method: 'POST',
-        body: { board: item.board, task_id: item.task_id, text: answer, release }
+        body: { board: item.board, task_id: item.task_id, text: answer, release, version: item.version }
       }),
       r => (triage
         ? `Answered ${item.task_id} (triage)`

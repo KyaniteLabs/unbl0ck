@@ -28,9 +28,15 @@ import hashlib
 import json
 import logging
 import os
+import collections
 import re
 import sqlite3
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows: the process-local lock still applies
+    fcntl = None  # type: ignore[assignment]
 import threading
+from contextlib import contextmanager
 import time
 from contextlib import closing
 from enum import Enum
@@ -126,7 +132,11 @@ def _patterns(names: Optional[list[str]] = None) -> dict[str, re.Pattern[str]]:
         r"(approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
         r"|({P}|CEO) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
         r"|(which|what) (one|option|choice) do you (prefer|want|choose)"
-        r"|human[- ]gate)\b",
+        r"|human[- ]gate"
+        r"|([A-Za-z]+/)?(operator|owner|CEO|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
+        r"|({P}|CEO|principal) (approved|authorized|authorised|signed off)"
+        r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,20}(route|access|path|executor)"
+        r"|(credentials?|api[- ]?keys?|tokens?) (are |is )?(dead|expired|missing|needed|required|revoked))\b",
         re.I,
     )
     # Weaker cue, trusted only together with an explicit needs_input kind.
@@ -181,7 +191,22 @@ def _hidden_path(home: Optional[Path]) -> Path:
     return data_dir(home) / "hidden.json"
 
 
-_STATE_LOCK = threading.Lock()   # hidden.json and bluf.json are read-modify-write
+_STATE_LOCK = threading.Lock()   # hidden.json, bluf.json and pending-release.json are read-modify-write
+
+
+@contextmanager
+def _state_lock(home: Optional[Path]):
+    """Serialise a read-modify-write of UNBL0CK's state files across threads AND processes
+    (the dashboard backend, the agent plugin and a plugin host can all write them)."""
+    with _STATE_LOCK:
+        d = data_dir(home)
+        fd = os.open(d / ".state.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)   # closing the descriptor drops the flock
 
 
 def _read_json(p: Path) -> dict[str, Any]:
@@ -198,9 +223,12 @@ def _read_json(p: Path) -> dict[str, Any]:
 def _write_json(p: Path, data: dict[str, Any]) -> None:
     tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # waits hold prompt text
-    with os.fdopen(fd, "w") as fh:
-        fh.write(json.dumps(data, indent=1, sort_keys=True))
-    tmp.replace(p)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(data, indent=1, sort_keys=True))
+        tmp.replace(p)
+    finally:
+        tmp.unlink(missing_ok=True)   # gone after a successful replace; removed after a failed write
 
 
 def load_hidden(home: Optional[Path] = None) -> dict[str, str]:
@@ -237,7 +265,7 @@ def hide(item_id: str, version: str, home: Optional[Path] = None) -> None:
     item_id, version = str(item_id or ""), str(version or "")
     if not item_id or len(item_id) > 300 or len(version) > 200:
         raise ValueError("item id and version must be short strings")
-    with _STATE_LOCK:
+    with _state_lock(home):
         hidden = load_hidden(home)
         hidden.pop(item_id, None)
         hidden[item_id] = version
@@ -248,7 +276,7 @@ def hide(item_id: str, version: str, home: Optional[Path] = None) -> None:
 
 def unhide(item_id: str, home: Optional[Path] = None) -> bool:
     """Undo "Not for me". Returns whether the item was hidden."""
-    with _STATE_LOCK:
+    with _state_lock(home):
         hidden = load_hidden(home)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
         if item_id not in hidden:
@@ -256,6 +284,32 @@ def unhide(item_id: str, home: Optional[Path] = None) -> bool:
         del hidden[item_id]
         _write_json(_hidden_path(home), hidden)
         return True
+
+
+# --- Releases that failed after the answer was posted ---------------------------------------
+# {item_id: block version}. The answer is on the card but the card is still blocked, so the queue
+# keeps showing it (tier "release_failed") and answer_card may retry the release without
+# posting the answer twice.
+
+def _pending_path(home: Optional[Path]) -> Path:
+    return data_dir(home) / "pending-release.json"
+
+
+def load_pending_releases(home: Optional[Path] = None) -> dict[str, str]:
+    return _read_json(_pending_path(home))
+
+
+def _set_pending_release(item_id: str, version: Optional[str], home: Optional[Path] = None) -> None:
+    with _state_lock(home):
+        data = load_pending_releases(home)
+        if version is None:
+            if data.pop(item_id, None) is None:
+                return
+        else:
+            data[item_id] = version
+            if len(data) > _HIDDEN_KEEP:
+                data = dict(list(data.items())[-_HIDDEN_KEEP:])
+        _write_json(_pending_path(home), data)
 
 
 # --- BLUF cache (one model summary per item version) ----------------------------------------
@@ -284,7 +338,7 @@ _BLUF_KEEP = 300   # cache entries kept; resolved cards age out
 
 
 def save_bluf(item_id: str, version: str, bluf: str, why: str, home: Optional[Path] = None) -> None:
-    with _STATE_LOCK:   # read-modify-write: concurrent workers must not drop each other's entries
+    with _state_lock(home):   # read-modify-write: concurrent workers must not drop each other's entries
         data = load_blufs(home)
         data.pop(item_id, None)
         data[item_id] = {"version": version, "bluf": bluf, "why": why, "at": int(time.time())}
@@ -515,6 +569,20 @@ def _block_since(block: Optional[Any], task: Any) -> Any:
     return block.created_at if block else task.created_at
 
 
+def stuck_reason(reason: str, kind: Optional[str], block: Any) -> str:
+    """One plain line for a blocked card whose block names no ask for the principal."""
+    reason = (reason or "").strip()
+    if block is None:
+        return "Blocked with no block record (crashed or retry limit); needs an owner to resume"
+    if reason == "initial_status":
+        return "Held on creation; an owner must claim and release it"
+    if kind == "capability":
+        return "Missing a capability (access, credential or host); route to Platform"
+    if kind == "dependency":
+        return "Waiting on another card"
+    return "Blocked with no ask for you recorded; route to its owner"
+
+
 def kanban_items(
     boards: Optional[Iterable[str]] = None,
     errors: Optional[list[str]] = None,
@@ -529,6 +597,7 @@ def kanban_items(
 
     items: list[dict[str, Any]] = []
     author = principal_author()
+    pending: Optional[dict[str, str]] = None   # read only when an answered card turns up
     for board in boards or _boards():
         try:
             conn = kbc.connect(board=board)
@@ -544,20 +613,35 @@ def kanban_items(
                     payload = (block.payload or {}) if block else {}
                     reason = str(payload.get("reason") or "")
                     why = kanban_needs_you(reason, payload.get("kind"))
+                    tier = "ask"
                     if not why:
-                        continue
+                        # Anything blocked is a NEED to unblock. No ask for the principal was
+                        # recorded, so say why it is stuck instead of dropping it silently.
+                        tier = "stuck"
+                        why = stuck_reason(reason, payload.get("kind") or getattr(task, "block_kind", None), block)
                     since = _block_since(block, task)
+                    # Answered cards leave the queue in both tiers, so a card the queue shows
+                    # is exactly a card answer_card accepts.
+                    version = str(block.id if block else since)
                     if _answered_since(conn, kanban_db, task.id, author, since):
-                        continue
+                        if pending is None:
+                            pending = load_pending_releases()
+                        if pending.get(f"kanban:{board}:{task.id}") != version:
+                            continue
+                        # Your answer is posted but releasing the card failed: keep it in front
+                        # of you so the release can be retried.
+                        tier = "release_failed"
+                        why = "Your answer is posted, but the card could not be unblocked; retry the release"
                     items.append({
                         "id": f"kanban:{board}:{task.id}",
-                        "version": str(block.id if block else since),
+                        "version": version,
                         "source": "kanban",
                         "board": board,
                         "task_id": task.id,
                         "title": task.title,
                         "ask": reason,
                         "why": why,
+                        "tier": tier,
                         "owner": task.assignee,
                         "priority": task.priority,
                         "status": task.status,
@@ -707,9 +791,11 @@ def chat_items(
                         + "ORDER BY timestamp DESC, id DESC LIMIT 1")
             for sid, title, platform, chat_type, user_id, display_name in sessions:
                 platform = str(platform or "")
-                if (owners and platform.lower() not in LOCAL_PLATFORMS and user_id
-                        and str(user_id) not in owners):
-                    continue   # a gateway chat with someone other than you: its questions are theirs
+                if (owners and platform and platform.lower() not in LOCAL_PLATFORMS
+                        and str(user_id or "") not in owners):
+                    # A gateway chat with someone other than you, or with nobody known: when you
+                    # set owner_user_ids, only chats proven to be yours are shown (and summarised).
+                    continue
                 try:
                     row = conn.execute(last_sql, (sid,)).fetchone()
                 except sqlite3.Error as exc:
@@ -1027,11 +1113,16 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
              if include_hidden or visibility(hidden, i["id"], i["version"]) is not Visibility.HIDDEN]
     # Same order as the panel: live prompts (a run is paused), pairing requests (expire within
     # the hour), Kanban, chats; inside a source, higher priority first (as on the board), then newest.
-    shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), -(_num(i.get("priority"))), -(_num(i.get("since")))))
+    shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), i.get("tier") == "stuck", -(_num(i.get("priority"))), -(_num(i.get("since")))))
     attach_blufs(shown, home)
     return {
         "generated_at": int(time.time()),
         "count": len(shown),
+        "counts": {
+            "asks": sum(1 for i in shown if i.get("tier") != "stuck"),
+            "stuck": sum(1 for i in shown if i.get("tier") == "stuck"),
+            "stuck_by_why": dict(collections.Counter(i["why"] for i in shown if i.get("tier") == "stuck")),
+        },
         "hidden": len(items) - len(shown),
         "items": shown,
         "errors": errors,
@@ -1043,21 +1134,31 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
 class UnblockFailed(RuntimeError):
     """The answer was written but the card could not be released; never claim otherwise."""
 
-    def __init__(self, task_id: str, comment_id: int):
+    def __init__(self, task_id: str, comment_id: Optional[int]):
         self.task_id = task_id
         self.comment_id = comment_id
+        posted = f"answer was posted as comment {comment_id}" if comment_id else "your answer is already posted"
         super().__init__(
-            f"answer was posted as comment {comment_id}, but card {task_id} could not be "
-            "unblocked; it is still blocked"
+            f"{posted}, but card {task_id} could not be unblocked; it is still blocked. "
+            "Retry the release from the queue."
         )
 
 
-def answer_card(board: str, task_id: str, text: str, *, release: bool) -> dict[str, Any]:
+class StaleAnswer(RuntimeError):
+    """The card was blocked again after the human read it; the answer was not posted."""
+
+
+def answer_card(board: str, task_id: str, text: str, *, release: bool,
+                version: Optional[str] = None, home: Optional[Path] = None) -> dict[str, Any]:
     """Comment as the principal through native Kanban, then unblock if asked.
 
-    The check and the comment share one write transaction, so a double submit cannot
-    post two comments. A failed unblock raises instead of reporting success. Triage
-    cards (``block_loop_detected``) accept the answer but cannot be released here.
+    *version* is the queue item's version the human read (the block event id). When given, the
+    answer is refused if the card has been blocked again since, so an answer to an old question
+    never releases a new one. The check and the comment share one write transaction, so a double
+    submit cannot post two comments. A failed unblock raises and is remembered: the card stays
+    in the queue, and answering it again with ``release`` retries the release without posting
+    the answer twice. Triage cards (``block_loop_detected``) accept the answer but cannot be
+    released here.
     """
     from hermes_cli import kanban_db  # type: ignore
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
@@ -1066,6 +1167,8 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool) -> dict[s
     if not text:
         raise ValueError("answer text is required")
     author = principal_author()
+    item_id = f"kanban:{board}:{task_id}"
+    comment_id: Optional[int] = None
     with closing(kbc.connect(board=board)) as conn:
         if kanban_db.get_task(conn, task_id) is None:
             raise LookupError(f"card {task_id} not found on {board}")
@@ -1076,12 +1179,20 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool) -> dict[s
             if current is None:
                 raise LookupError(f"card {task_id} not found on {board}")
             check_answerable(task_id, current.status, release=release)
+            block = _latest_block(conn, kanban_db, task_id)
+            since = _block_since(block, current)
+            current_version = str(block.id if block else since)
+            if version is not None and str(version) != current_version:
+                raise StaleAnswer(
+                    f"card {task_id} was blocked again after you read it; refresh to see the new question")
             # The same "answered since this block" test the queue uses, so a card the queue
             # shows is exactly a card that accepts an answer.
-            since = _block_since(_latest_block(conn, kanban_db, task_id), current)
             if _answered_since(conn, kanban_db, task_id, author, since):
-                raise RuntimeError(f"card {task_id} was already answered since it was blocked")
-            comment_id = kanban_db.add_comment(conn, task_id, author=author, body=text)
+                retry = release and load_pending_releases(home).get(item_id) == current_version
+                if not retry:
+                    raise RuntimeError(f"card {task_id} was already answered since it was blocked")
+            else:
+                comment_id = kanban_db.add_comment(conn, task_id, author=author, body=text)
         released = False
         if release:
             if kanban_db.unblock_task(conn, task_id):
@@ -1089,8 +1200,10 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool) -> dict[s
             else:
                 latest = kanban_db.get_task(conn, task_id)
                 if latest is None or str(getattr(latest.status, "value", latest.status)) in HELD_STATUSES:
+                    _set_pending_release(item_id, current_version, home)
                     raise UnblockFailed(task_id, comment_id)
                 released = True  # another actor released it in the race; do not claim it was ours
+            _set_pending_release(item_id, None, home)
     return {"ok": True, "comment_id": comment_id, "released": released}
 
 
@@ -1256,7 +1369,7 @@ def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]]) 
 # --- Pocket pack (TV / X55 card format) ----------------------------------------------------
 
 def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
-    """The queue in the Liam Pocket card format, for gadgets that opt in. Written next to the
+    """The queue in the Pocket card format, for gadgets that opt in. Written next to the
     plugin's data, never over the gadget plugin's own pocket-pack.json."""
     now = int(time.time())
     cards = []

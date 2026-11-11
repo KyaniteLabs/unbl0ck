@@ -1,6 +1,6 @@
 name: unbl0ck
 label: UNBL0CK
-version: "0.4.5"
+version: "0.4.6"
 description: >
   UNBL0CK clears whatever is blocked on you. One queue of everything waiting on you: blocked Kanban cards that need your
   answer, chats on any platform whose last turn is a bot asking you something, agents paused right now on a

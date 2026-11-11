@@ -4,10 +4,11 @@ GET  /queue                  the queue (Kanban cards, chats, live prompts, pairi
 GET  /card?id=               read-only context for one Kanban card
 GET  /card/ask/{job}         poll a running Ask
 POST /card/ask               ask the configured model about one card (multi-turn)
-POST /kanban/answer          {board, task_id, text, release}: comment as the principal, optionally unblock
+POST /kanban/answer          {board, task_id, text, release, version}: comment as the principal, optionally unblock
 POST /hide                   {id, version}: "Not for me" until the source changes
 POST /unhide                 {id}: undo "Not for me"
-GET  /pack                   the queue as a Pocket-format card pack (also written to plugin-data/unbl0ck)
+GET  /pack                   the queue as a Pocket-format card pack (read-only)
+POST /pack                   the same pack, also written to plugin-data/unbl0ck/pocket-pack.json
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -98,6 +99,7 @@ class Answer(BaseModel):
     task_id: str
     text: str
     release: bool = True
+    version: Optional[str] = None   # the queue item version the human answered; stale -> 409
 
 
 class Hide(BaseModel):
@@ -148,7 +150,8 @@ def queue():
     ctx = _loaded_ctx()
     if q.get("bluf_enabled") and ctx is not None and hasattr(ctx, "llm"):
         for it in q["items"]:
-            if not it.get("bluf") and it.get("source") not in getattr(n, "NO_BLUF_SOURCES", ()):
+            if (not it.get("bluf") and it.get("source") not in getattr(n, "NO_BLUF_SOURCES", ())
+                    and it.get("tier") != "stuck"):   # stuck cards are not asks: no model call each
                 _queue_bluf(n, ctx, it)
     return q
 
@@ -278,7 +281,7 @@ def answer(body: Answer):
     if not kanban_db.board_exists(board):
         raise HTTPException(status_code=404, detail=f"board {board!r} does not exist")
     try:
-        return _needs().answer_card(board, body.task_id, body.text, release=body.release)
+        return _needs().answer_card(board, body.task_id, body.text, release=body.release, version=body.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except LookupError as exc:
@@ -307,6 +310,12 @@ def unhide(body: Unhide):
 
 @router.get("/pack")
 def pack():
+    n = _needs()
+    return n.pocket_pack(n.build_queue())
+
+
+@router.post("/pack")
+def write_pack():
     n = _needs()
     q = n.build_queue()
     n.write_pocket_pack(q)

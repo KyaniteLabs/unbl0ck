@@ -21,7 +21,11 @@ jobs:
       - uses: astral-sh/setup-uv@v6
       - name: Install Hermes from its own lockfile
         run: uv sync --frozen --python 3.14 --directory .hermes-runtime
-      - run: python -m unittest discover -s plugin/tests -v
+      - name: Tests in the Hermes runtime (a skipped test fails the gate)
+        run: |
+          set -o pipefail
+          HERMES_HOME="$RUNNER_TEMP/hermes-test-home" .hermes-runtime/.venv/bin/python -m unittest discover -s plugin/tests -v 2>&1 | tee test.log
+          if grep -Eq "skipped=[1-9]|\.\.\. skipped" test.log; then echo "::error::tests were skipped; the gate needs every test to run"; exit 1; fi
       - name: Real validator receipt (no credentials)
         run: |
           mkdir -p receipts
