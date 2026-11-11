@@ -7,6 +7,8 @@
 - **Real asks stop vanishing from the queue.** A negation now counts only in the same clause and only in the three words right before the ask, so "Cannot proceed: needs CEO approval to merge" and "Needs your approval. Not urgent." are listed. After the ask, only "is not needed/required" cancels it. New phrasings are recognised: "approval from Ada", "can't deploy without your approval", "Please approve…", "need the human to…". A relayed order ("CEO says: …") still counts as a stop unless it asks for *your* approval or decision. On the live board, 16 of 209 blocked cards are now listed, up from 10.
 - **Fewer false chat asks.** Question marks inside URLs, sign-offs like "Anything else you need?", questions the turn answers itself ("Why did it fail? Because…"), "which option was faster" and an archived decision packet no longer count as asks.
 - **"Answer, keep blocked" cards stay in the queue.** Before, answering a card without unblocking it made it vanish, so it stayed blocked with no way back from UNBL0CK. Now it stays listed as `answered` (counted apart from new asks, no model summary) with a **Release (unbl0ck)** button that unblocks it without posting a second comment.
+- **The shortcut shows what it will do.** When your answer says to keep the card blocked, ⌘/Ctrl + Enter keeps it blocked; the ⏎ mark now moves to **Answer, keep blocked** and the hint says so. The Release button no longer shows a shortcut it does not have.
+- **Docs say what actually happens.** Failed summaries are retried after 10 minutes and the page polls every 45 seconds; listing pairing requests prunes expired ones, as `hermes pairing list` does; the CLI points to the `/unblock` page.
 
 ## 0.4.6 (2026-11-11)
 

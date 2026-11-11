@@ -30,7 +30,7 @@ def _summary(limit: int = 12) -> str:
         if it.get("approve_command"):
             lines.append(f"  approve: {it['approve_command']}")
     if q["count"] > limit:
-        lines.append(f"…and {q['count'] - limit} more. Open /unbl0ck in Desktop.")
+        lines.append(f"…and {q['count'] - limit} more. Open /unblock in Desktop.")
     for err in q["errors"]:
         lines.append(f"(source error: {err})")
     return "\n".join(lines)
