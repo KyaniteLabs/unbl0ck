@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **One click gets the bottom line.** "Ask about this card" is now **TL;DR**: clicking it asks your model, straight away, what the card wants from you and what to pick, in plain words and under 80 words. Follow-up questions still work in the same panel.
+- **Ask no longer comes back empty on reasoning models.** With a 900-token cap, MiniMax M3.1 Flash spent the whole budget thinking and returned no text, which showed as "The model returned an empty answer". The cap is now 4000, inline `<think>` blocks are dropped, and a reply with no answer text says so and suggests a retry.
 - **Real asks stop vanishing from the queue.** A negation now counts only in the same clause and only in the three words right before the ask, so "Cannot proceed: needs CEO approval to merge" and "Needs your approval. Not urgent." are listed. After the ask, only "is not needed/required" cancels it. New phrasings are recognised: "approval from Ada", "can't deploy without your approval", "Please approve…", "need the human to…". A relayed order ("CEO says: …") still counts as a stop unless it asks for *your* approval or decision. On the live board, 16 of 209 blocked cards are now listed, up from 10.
 - **Fewer false chat asks.** Question marks inside URLs, sign-offs like "Anything else you need?", questions the turn answers itself ("Why did it fail? Because…"), "which option was faster" and an archived decision packet no longer count as asks.
 

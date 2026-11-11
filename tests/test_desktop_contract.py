@@ -22,7 +22,8 @@ class DesktopContract(unittest.TestCase):
         self.assertIn("Use as answer", src)
         self.assertIn("Discuss in chat", src)
         self.assertIn("host.composer.setDraft", src)
-        self.assertIn("Ask about this card", src)
+        self.assertIn("TL;DR", src)
+        self.assertIn("askSend(false, TLDR_ASK)", src)   # one click asks; no typing
         # Undo for "Not for me" must call the backend route that exists.
         self.assertIn("'/unhide'", src)
         api = (ROOT / "dashboard" / "plugin_api.py").read_text()

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import re
 import sys
 import time
 import uuid
@@ -245,13 +246,29 @@ def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
             messages,
             purpose="unbl0ck.card_ask",
             temperature=0.2,
-            max_tokens=900,
+            # Reasoning models spend part of the budget thinking before they answer; at 900
+            # tokens MiniMax M3.1 Flash often ran out first and returned no text at all.
+            max_tokens=ASK_MAX_TOKENS,
             timeout=120,
         )
     except Exception as exc:  # noqa: BLE001 - surface the host error honestly
         _ASK_JOBS.fail(job, f"model call failed: {type(exc).__name__}: {exc}")
         return
-    _ASK_JOBS.finish(job, result.text, getattr(result, "provider", None), getattr(result, "model", None))
+    reply = ask_reply_text(getattr(result, "text", ""))
+    if not reply:
+        model = getattr(result, "model", None) or "the model"
+        _ASK_JOBS.fail(job, f"{model} returned no answer text (it may have used its whole budget thinking). Retry, or pick a non-reasoning model for plugins.")
+        return
+    _ASK_JOBS.finish(job, reply, getattr(result, "provider", None), getattr(result, "model", None))
+
+
+ASK_MAX_TOKENS = 4000
+_THINK_RE = re.compile(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", re.S | re.I)
+
+
+def ask_reply_text(text: Any) -> str:
+    """The visible answer: drop inline <think> blocks some reasoning models emit."""
+    return _THINK_RE.sub("", text if isinstance(text, str) else "").strip()
 
 
 @router.get("/card/ask/{job}")

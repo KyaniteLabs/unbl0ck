@@ -21,6 +21,8 @@ const $undo = atom(null)   // the last "Not for me": { id, title } while it can 
 const UNDO_MS = 12000
 // An answer that says to keep the card blocked, sent with the unblocking button.
 const KEEP_BLOCKED = /\b(keep|leave|stay|remain)s?\b[^.]{0,24}\bblocked\b|\b(do not|don't|dont|never)\s+(unblock|release)/i
+// What the TL;DR button asks (the /bro rule: bottom line first, plain words, no jargon).
+const TLDR_ASK = 'TL;DR: in plain words, what does this card want from me, and what do you recommend? Bottom line first, under 80 words, no jargon.'
 
 const FONTS = /*@@FONTS@@*/ {}
 
@@ -917,6 +919,8 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     const next = !askOpen
     setAskOpen(next)
     if (next && !detailOpen) loadDetail()
+    // One click is the ask: opening TL;DR asks for the bottom line straight away (like /bro).
+    if (next && !askMsgs.length && !askBusy) askSend(false, TLDR_ASK)
   }
 
   const run = async (fn, okFor, cue = 'ok') => {
@@ -961,13 +965,13 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const ready = !busy && answer.trim().length > 0
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
 
-  const askSend = async (retry = false) => {
-    const q = askInput.trim()
+  const askSend = async (retry = false, preset = '') => {
+    const q = preset || askInput.trim()
     if (askBusy || (!retry && !q)) return
     const next = retry ? askMsgs : [...askMsgs, { role: 'user', content: q }]
     if (!next.length || next[next.length - 1].role !== 'user') return
     setAskMsgs(next)
-    if (!retry) setAskInput('')
+    if (!retry && !preset) setAskInput('')
     setAskBusy(true)
     setAskError('')
     try {
@@ -1057,7 +1061,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
       ]
   const tools = [
     button({ kind: 'ghost', disabled: busy, onClick: toggleDetail, 'aria-expanded': detailOpen, children: detailOpen ? 'Hide context' : 'Context' }),
-    askEnabled ? button({ kind: 'ghost', disabled: busy, onClick: toggleAsk, 'aria-expanded': askOpen, children: askOpen ? 'Hide ask' : 'Ask about this card' }) : null,
+    askEnabled ? button({ kind: 'ghost', disabled: busy, onClick: toggleAsk, 'aria-expanded': askOpen, title: 'Plain-English bottom line for this card. Read-only: the model never acts.', children: askOpen ? 'Hide TL;DR' : 'TL;DR' }) : null,
     button({ kind: 'ghost', disabled: busy, onClick: discussInChat, children: 'Discuss in chat' }),
     button({ kind: 'ghost', disabled: busy, onClick: openBoard, children: 'Open board' }),
     button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
@@ -1127,7 +1131,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
         children: [
           jsxs('div', {
             className: 'hd',
-            children: [jsx('span', { children: 'ASK ABOUT THIS CARD' }), jsx('span', { children: 'READ-ONLY · NEVER ACTS' })]
+            children: [jsx('span', { children: 'TL;DR' }), jsx('span', { children: 'READ-ONLY · NEVER ACTS' })]
           }),
           jsxs('div', {
             className: 'ub-msgs',
@@ -1137,13 +1141,13 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
                     className: `ub-msg ${m.role}`,
                     children: [
                       jsx('div', { className: 'who', children: m.role === 'user' ? 'YOU' : 'UNBL0CK' }),
-                      jsx('p', { children: m.role === 'assistant' ? replyParts(m.content) : m.content }),
+                      jsx('p', { children: m.role === 'assistant' ? replyParts(m.content) : m.content === TLDR_ASK ? 'TL;DR' : m.content }),
                       m.role === 'assistant' && i === lastAssistant
                         ? jsx('div', { className: 'use', children: button({ kind: 'ghost', onClick: useAsAnswer, children: 'Use as answer' }) })
                         : null
                     ]
                   }, i))
-                : jsx('div', { className: 'ub-note', children: 'Ask what the card means, what is being asked, or what to pick. The model sees this card only; it cannot change anything.' }),
+                : jsx('div', { className: 'ub-note', children: 'Asking for the bottom line… The model sees this card only; it cannot change anything.' }),
               askBusy ? jsx('div', { className: 'ub-thinking', children: 'Thinking' }) : null,
               jsx('div', { ref: askEnd })
             ]
@@ -1164,7 +1168,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
                 value: askInput,
                 rows: 1,
                 disabled: askBusy,
-                placeholder: 'Ask about this card… (Enter sends, Shift+Enter adds a line)',
+                placeholder: 'Ask a follow-up… (Enter sends, Shift+Enter adds a line)',
                 onChange: e => setAskInput(e.target.value),
                 onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askSend() } }
               }),

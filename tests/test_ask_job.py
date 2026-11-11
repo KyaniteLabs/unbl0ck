@@ -33,6 +33,32 @@ class AskJobTest(unittest.TestCase):
         self.assertEqual(p["reply"], "Pick A")
         self.assertEqual(self.c.get(f"/card/ask/{job}").status_code, 404)   # consumed
 
+    def _ask_with(self, text):
+        seen = {}
+        def complete(messages, **kw):
+            seen.update(kw); return types.SimpleNamespace(text=text, provider="p", model="MiniMax-M3.1-Flash")
+        self.api._loaded_ctx = lambda: types.SimpleNamespace(llm=types.SimpleNamespace(complete=complete))
+        job = self.c.post("/card/ask", json={"id": "x", "messages": [{"role": "user", "content": "TL;DR"}]}).json()["job"]
+        for _ in range(40):
+            r = self.c.get(f"/card/ask/{job}")
+            if not r.json().get("pending"): break
+            time.sleep(0.05)
+        return r, seen
+
+    def test_reasoning_models_get_room_to_answer(self):
+        _, seen = self._ask_with("Unblock it.")
+        self.assertGreaterEqual(seen["max_tokens"], 4000)
+
+    def test_inline_thinking_is_not_shown(self):
+        r, _ = self._ask_with("<think>long musing</think>\nUnblock it: the fix is merged.")
+        self.assertEqual(r.json()["reply"], "Unblock it: the fix is merged.")
+
+    def test_no_answer_text_is_an_honest_error(self):
+        for text in ("", "   ", "<think>ran out of budget mid-thought"):
+            r, _ = self._ask_with(text)
+            self.assertEqual(r.status_code, 502)
+            self.assertIn("returned no answer text", r.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()
