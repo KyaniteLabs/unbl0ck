@@ -29,6 +29,10 @@ config_schema:
     type: str
     default: "owner"
     description: "The authority label on pocket-pack decision cards. Set it to the word your pocket device expects."
+  ask_history_turns:
+    type: int
+    default: 6
+    description: "How many earlier chat turns an Ask sends along with the card, newest first. The whole prompt also stays under a 40,000-character budget."
   comment_author:
     type: str
     default: ""

@@ -1784,7 +1784,20 @@ def _ask_card_view(value: Any, _key: str = "") -> Any:
 ASK_PROMPT_BUDGET = 40000
 
 
-def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
+ASK_HISTORY_TURNS = 6   # default number of prior chat turns sent with an Ask
+
+
+def ask_history_turns(settings: Optional[dict[str, Any]] = None) -> int:
+    """Prior turns an Ask sends (setting ``ask_history_turns``; bad or non-positive values use the default)."""
+    raw = (settings if settings is not None else _settings()).get("ask_history_turns")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return ASK_HISTORY_TURNS
+    return n if n > 0 else ASK_HISTORY_TURNS
+
+
+def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]], turns: Optional[int] = None) -> list[dict[str, str]]:
     """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns."""
     context = json.dumps(_ask_card_view(card), ensure_ascii=False, default=str)
     if len(context) > 24000:
@@ -1801,7 +1814,7 @@ def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]]) 
     ]
     used = sum(len(m["content"]) for m in messages)
     kept: list[dict[str, str]] = []
-    for item in reversed(list(history)[-20:]):   # newest first: the latest turns win the budget
+    for item in reversed(list(history)[-(ask_history_turns() if turns is None else turns):]):   # newest first
         role = item.get("role") if isinstance(item, dict) else None
         content = item.get("content") if isinstance(item, dict) else None
         if role not in ("user", "assistant") or not isinstance(content, str):

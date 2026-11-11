@@ -57,3 +57,26 @@ def test_ub2_credential_and_home_path_shapes_never_reach_ctx_llm_complete():
         assert frag not in blob, frag
 
 
+def test_ub3_ask_history_is_capped_at_six_turns():
+    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i:02d}"} for i in range(40)]
+    msgs = needs.build_ask_messages({"id": "t"}, history)
+    turns = msgs[2:]
+    assert len(turns) == needs.ASK_HISTORY_TURNS == 6
+    assert turns[-1]["content"] == "turn 39"                     # newest kept
+
+
+def test_ub3_forty_long_turns_stay_inside_the_budget():
+    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 8000} for i in range(40)]
+    msgs = needs.build_ask_messages({"id": "t", "title": "y" * 60000}, history)
+    assert sum(len(m["content"]) for m in msgs) <= needs.ASK_PROMPT_BUDGET
+    assert len(msgs[2:]) <= 6
+
+
+def test_ub3_the_turn_cap_is_a_setting():
+    assert needs.ask_history_turns({"ask_history_turns": 2}) == 2
+    assert needs.ask_history_turns({"ask_history_turns": "junk"}) == 6
+    assert needs.ask_history_turns({"ask_history_turns": 0}) == 6
+    msgs = needs.build_ask_messages({"id": "t"}, [{"role": "user", "content": str(i)} for i in range(9)], turns=2)
+    assert len(msgs[2:]) == 2
+
+
