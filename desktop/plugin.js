@@ -19,6 +19,11 @@ const PATH = '/unblock'
 const POLL_MS = 45000
 const $queue = atom({ items: [], count: 0, errors: [], loading: true, at: 0 })
 function askCount(q) { return q.counts?.asks ?? q.count ?? 0 }
+function oldestAskSince(items) {
+  return items
+    .filter(i => i.tier !== 'stuck' && i.tier !== 'answered')
+    .reduce((m, i) => (i.since && (!m || i.since < m) ? i.since : m), 0)
+}
 const $undo = atom(null)   // the last "Not for me": { id, title } while it can be undone
 const UNDO_MS = 12000
 // An answer that says to keep the card blocked, sent with the unblocking button.
@@ -1296,7 +1301,7 @@ function Page({ ctx, refresh }) {
   const outside = q.items.filter(i => i.source === 'outside')
   const prompts = q.items.filter(i => i.source === 'prompt')
   const pairing = q.items.filter(i => i.source === 'pairing')
-  const oldest = q.items.reduce((m, i) => (i.since && (!m || i.since < m) ? i.since : m), 0)
+  const oldest = oldestAskSince(q.items)
   const oldestH = oldest ? (Date.now() / 1000 - oldest) / 3600 : 0
   let n = 0
   const group = (label, items, collapsed = false) =>

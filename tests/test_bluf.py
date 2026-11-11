@@ -30,6 +30,19 @@ class BlufTest(unittest.TestCase):
                  'Final answer: {"bluf":"Pick A.","why":"The release waits."}')
         self.assertEqual(needs.parse_bluf(reply), ("Pick A.", "The release waits."))
 
+    def test_parse_uses_top_level_bluf_and_ignores_trailing_format_example(self):
+        cases = [
+            ('{"bluf":"Approve the merge","why":"tests pass",'
+             '"refs":{"pr":12}}', ("Approve the merge", "tests pass")),
+            ('{"bluf":"Approve empty config {} for prod","why":"ops"}',
+             ("Approve empty config {} for prod", "ops")),
+            ('{"bluf":"Final","why":"ready"}\nExample format: '
+             '{"bluf":"...","why":"..."}', ("Final", "ready")),
+        ]
+        for reply, expected in cases:
+            with self.subTest(reply=reply):
+                self.assertEqual(needs.parse_bluf(reply), expected)
+
     def test_background_bluf_uses_reasoning_model_token_budget(self):
         spec = importlib.util.spec_from_file_location("unbl0ck_plugin_api_bluf_test", ROOT / "dashboard" / "plugin_api.py")
         api = importlib.util.module_from_spec(spec)

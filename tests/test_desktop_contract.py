@@ -70,7 +70,7 @@ const env = {
   sfx: {play: noop}, petEmit: noop, host: {notifyError: e => {throw e}},
   $undo: {set: noop}, $queue: 'queue', $fxOn: 'fx', UNDO_MS: 12000, askCount: q => q.count,
   Field: noop, Watermark: noop, Banner: noop, Pet: noop, Ticker: noop, FxToggle: noop, SfxToggle: noop,
-  grainUrl: () => '',
+  grainUrl: () => '', oldestAskSince: items => items.reduce((m, x) => Math.min(m, x.since ?? Infinity), Infinity),
 };
 const {Item, Page} = new Function('env', `with(env) { ${views}; return {Item, Page}; }`)(env);
 function all(n) {
@@ -110,6 +110,23 @@ const base = {id: 'outside:filed:1', version: 'v1', source: 'outside', kind: 'dr
             with self.subTest(path=path.name):
                 result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_oldest_age_ignores_stuck_and_answered_cards(self):
+        script = r'''const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const helper = src.match(/function oldestAskSince\(items\) \{[\s\S]*?\n\}/)?.[0];
+if (!helper) throw new Error('oldest ask helper missing');
+const oldestAskSince = new Function(`${helper}; return oldestAskSince;`)();
+const since = oldestAskSince([
+  {tier: 'stuck', since: 1},
+  {tier: 'answered', since: 2},
+  {tier: 'ask', since: 30},
+  {tier: 'ask', since: 40}
+]);
+if (since !== 30) throw new Error(`oldest ask timestamp was ${since}`);
+'''
+        subprocess.run(["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
+                       check=True, capture_output=True, text=True)
 
 
 if __name__ == "__main__":
