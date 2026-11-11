@@ -33,6 +33,7 @@ import sqlite3
 import threading
 import time
 from contextlib import closing
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -206,6 +207,29 @@ def load_hidden(home: Optional[Path] = None) -> dict[str, str]:
     return _read_json(_hidden_path(home))
 
 
+class Visibility(str, Enum):
+    """Where one queue item stands with "Not for me". Stored as ``hidden.json``:
+    ``{item_id: version}`` (format unchanged). Derived, never stored::
+
+        SHOWN --hide(v)--> HIDDEN --source changes (new version)--> RESURFACED
+          ^                  |                                        |
+          +-----unhide-------+-------------------unhide---------------+
+        HIDDEN | RESURFACED --hide(v')--> HIDDEN
+
+    unhide on SHOWN is refused (returns False). RESURFACED shows like SHOWN; its stale
+    entry is dropped by the next hide or unhide, or by the size cap.
+    """
+    SHOWN = "shown"
+    HIDDEN = "hidden"
+    RESURFACED = "resurfaced"
+
+
+def visibility(hidden: dict[str, Any], item_id: str, version: str) -> Visibility:
+    if item_id not in hidden:
+        return Visibility.SHOWN
+    return Visibility.HIDDEN if hidden[item_id] == version else Visibility.RESURFACED
+
+
 _HIDDEN_KEEP = 1000
 
 
@@ -226,8 +250,10 @@ def unhide(item_id: str, home: Optional[Path] = None) -> bool:
     """Undo "Not for me". Returns whether the item was hidden."""
     with _STATE_LOCK:
         hidden = load_hidden(home)
-        if hidden.pop(item_id, None) is None:
+        # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
+        if item_id not in hidden:
             return False
+        del hidden[item_id]
         _write_json(_hidden_path(home), hidden)
         return True
 
@@ -434,18 +460,59 @@ def _latest_block(conn: Any, kanban_db: Any, task_id: str) -> Optional[Any]:
         return _latest_block_event(kanban_db.list_events(conn, task_id))
 
 
+def _same_author(a: Any, b: Any) -> bool:
+    return str(a or "").casefold() == str(b or "").casefold()
+
+
 def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, since: int) -> bool:
+    """Has *author* commented since the block began? The one test for "answered", used by
+    the queue and by answer_card. Names compare in Python (casefold) on both paths: SQLite's
+    LOWER() folds ASCII only, so "ZOË" and "Zoë" used to differ on the fast path alone."""
     try:
-        row = conn.execute(
-            "SELECT 1 FROM task_comments WHERE task_id = ? AND LOWER(author) = LOWER(?) AND created_at >= ? LIMIT 1",
-            (task_id, author, since or 0),
-        ).fetchone()
-        return row is not None
+        rows = conn.execute(
+            "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            (task_id, since or 0),
+        ).fetchall()
+        return any(_same_author(r[0], author) for r in rows)
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
         return any(
-            c.author.lower() == author.lower() and c.created_at >= (since or 0)
+            _same_author(c.author, author) and c.created_at >= (since or 0)
             for c in kanban_db.list_comments(conn, task_id)
         )
+
+
+class CardStatus(str, Enum):
+    """The Kanban card statuses UNBL0CK acts on (Kanban owns the full set and every write).
+
+        BLOCKED   --answer-->            BLOCKED  (answered: off the queue until a new block)
+        BLOCKED   --answer + release-->  Kanban's unblock_task moves it out of HELD
+        SCHEDULED --answer [+ release]-> as BLOCKED (answerable, never listed)
+        TRIAGE    --answer-->            TRIAGE
+        TRIAGE    --answer + release-->  refused: a block loop is not ours to release
+        any other status --answer-->     refused
+    """
+    BLOCKED = "blocked"
+    SCHEDULED = "scheduled"
+    TRIAGE = "triage"
+
+
+QUEUE_STATUSES = (CardStatus.BLOCKED, CardStatus.TRIAGE)   # listed in the queue
+HELD_STATUSES = frozenset(s.value for s in CardStatus)     # answerable; "still held" after unblock
+RELEASABLE_STATUSES = frozenset({CardStatus.BLOCKED.value, CardStatus.SCHEDULED.value})
+
+
+def check_answerable(task_id: str, status: Any, *, release: bool) -> None:
+    """Refuse an answer the card's status does not allow. The one guard for answer_card."""
+    status = str(getattr(status, "value", status) or "")
+    if status not in HELD_STATUSES:
+        raise RuntimeError(f"card {task_id} is {status}, not blocked")
+    if release and status not in RELEASABLE_STATUSES:
+        raise ValueError("triage cards cannot be unblocked from UNBL0CK; answer without unblocking")
+
+
+def _block_since(block: Optional[Any], task: Any) -> Any:
+    """When the current block began: its event, else the card's creation."""
+    return block.created_at if block else task.created_at
 
 
 def kanban_items(
@@ -471,8 +538,7 @@ def kanban_items(
             continue
         try:
             with closing(conn):
-                tasks = list(kanban_db.list_tasks(conn, status="blocked"))
-                tasks += list(kanban_db.list_tasks(conn, status="triage"))
+                tasks = [t for st in QUEUE_STATUSES for t in kanban_db.list_tasks(conn, status=st.value)]
                 for task in tasks:
                     block = _latest_block(conn, kanban_db, task.id)
                     payload = (block.payload or {}) if block else {}
@@ -480,7 +546,7 @@ def kanban_items(
                     why = kanban_needs_you(reason, payload.get("kind"))
                     if not why:
                         continue
-                    since = block.created_at if block else task.created_at
+                    since = _block_since(block, task)
                     if _answered_since(conn, kanban_db, task.id, author, since):
                         continue
                     items.append({
@@ -650,8 +716,6 @@ def chat_items(
                     if errors is not None:
                         errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
                     break   # same schema for every session: say it once
-                if not row:
-                    continue
                 if not row:
                     continue
                 mid, role, content, ts = row
@@ -864,24 +928,47 @@ def _platform_label(platform: str) -> str:
     return _PLATFORM_LABELS.get(p) or p.replace("_", " ").title()
 
 
+class WaitState(str, Enum):
+    """A live prompt's record in ``waits/<request_id>.json`` (format unchanged)::
+
+        (no file) --on_human_input_request--> OPEN --on_human_input_resolved--> (no file)
+                                               |
+                                               +--process gone / over a day / malformed--> STALE
+        STALE --next poll--> (no file)
+
+    OPEN is the only state ever shown.
+    """
+    OPEN = "open"
+    STALE = "stale"
+
+
+def wait_state(f: Path, rec: dict[str, Any], now: Optional[float] = None) -> WaitState:
+    """Classify one wait record read from *f* (an empty dict means unreadable)."""
+    now = time.time() if now is None else now
+    try:
+        pid = int(rec.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    rid = str(rec.get("request_id") or "")
+    if (not rec or pid <= 0 or not _SAFE_ID.match(rid) or f.stem != rid
+            or now - _num(rec.get("since")) > WAIT_MAX_AGE
+            or not _alive(pid, rec.get("proc_start"))):
+        return WaitState.STALE
+    return WaitState.OPEN
+
+
 def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) -> list[dict[str, Any]]:
     """Open live prompts. A wait whose process is gone is deleted, not shown."""
     home = home or hermes_home()
     items: list[dict[str, Any]] = []
     for f in sorted(_waits_dir(home).glob("*.json")):
         rec = _read_json(f)
-        try:
-            pid = int(rec.get("pid") or 0)
-        except (TypeError, ValueError):
-            pid = 0
-        rid = str(rec.get("request_id") or "")
-        if (not rec or pid <= 0 or not _SAFE_ID.match(rid) or f.stem != rid
-                or time.time() - _num(rec.get("since")) > WAIT_MAX_AGE
-                or not _alive(pid, rec.get("proc_start"))):
+        if wait_state(f, rec) is WaitState.STALE:
             # Dead waiter, malformed record, or a wait so old its resolved hook must have been
             # missed: never show a prompt nobody is waiting on.
             f.unlink(missing_ok=True)
             continue
+        rid = str(rec["request_id"])
         kind = str(rec.get("kind") or "")
         profile = str(rec.get("profile") or "default")
         who = _bot_name(home, profile) if profile != "default" else "An agent"
@@ -906,7 +993,10 @@ def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) 
 
 # --- the queue -----------------------------------------------------------------------------
 
-SOURCE_ORDER = {"prompt": 0, "pairing": 1, "kanban": 2, "chat": 3}
+# Every value an item's "source" can hold, in queue order (a new source must be added here,
+# and the tests fail until every consumer handles it).
+SOURCES = ("prompt", "pairing", "kanban", "chat")
+SOURCE_ORDER = {s: i for i, s in enumerate(SOURCES)}
 # Sources whose text is already one plain line; a model summary would only add latency and cost.
 NO_BLUF_SOURCES = ("prompt", "pairing")
 
@@ -933,7 +1023,8 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
     except Exception as exc:  # noqa: BLE001
         errors.append(f"pairing: {type(exc).__name__}: {exc}")
     hidden = load_hidden(home)
-    shown = [i for i in items if include_hidden or hidden.get(i["id"]) != i["version"]]
+    shown = [i for i in items
+             if include_hidden or visibility(hidden, i["id"], i["version"]) is not Visibility.HIDDEN]
     # Same order as the panel: live prompts (a run is paused), pairing requests (expire within
     # the hour), Kanban, chats; inside a source, higher priority first (as on the board), then newest.
     shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), -(_num(i.get("priority"))), -(_num(i.get("since")))))
@@ -961,9 +1052,6 @@ class UnblockFailed(RuntimeError):
         )
 
 
-_ANSWERABLE_STATUSES = ("blocked", "scheduled", "triage")
-
-
 def answer_card(board: str, task_id: str, text: str, *, release: bool) -> dict[str, Any]:
     """Comment as the principal through native Kanban, then unblock if asked.
 
@@ -987,18 +1075,11 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool) -> dict[s
             current = kanban_db.get_task(conn, task_id)
             if current is None:
                 raise LookupError(f"card {task_id} not found on {board}")
-            if current.status not in _ANSWERABLE_STATUSES:
-                raise RuntimeError(f"card {task_id} is {current.status}, not blocked")
-            if release and current.status == "triage":
-                raise ValueError(
-                    "triage cards cannot be unblocked from UNBL0CK; answer without unblocking"
-                )
-            block = _latest_block_event(kanban_db.list_events(conn, task_id))
-            since = block.created_at if block else current.created_at
-            if any(
-                c.author.lower() == author.lower() and c.created_at >= (since or 0)
-                for c in kanban_db.list_comments(conn, task_id)
-            ):
+            check_answerable(task_id, current.status, release=release)
+            # The same "answered since this block" test the queue uses, so a card the queue
+            # shows is exactly a card that accepts an answer.
+            since = _block_since(_latest_block(conn, kanban_db, task_id), current)
+            if _answered_since(conn, kanban_db, task_id, author, since):
                 raise RuntimeError(f"card {task_id} was already answered since it was blocked")
             comment_id = kanban_db.add_comment(conn, task_id, author=author, body=text)
         released = False
@@ -1007,7 +1088,7 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool) -> dict[s
                 released = True
             else:
                 latest = kanban_db.get_task(conn, task_id)
-                if latest is None or latest.status in ("blocked", "triage", "scheduled"):
+                if latest is None or str(getattr(latest.status, "value", latest.status)) in HELD_STATUSES:
                     raise UnblockFailed(task_id, comment_id)
                 released = True  # another actor released it in the race; do not claim it was ours
     return {"ok": True, "comment_id": comment_id, "released": released}
