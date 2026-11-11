@@ -1067,8 +1067,8 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const answerButtons = triage
     ? [button({ kind: 'primary', keycap: '⏎', disabled: !ready, onClick: sendPrimary, title: '⌘/Ctrl + Enter · triage cards stay in triage', children: 'Answer (stays in triage)' })]
     : [
-        button({ kind: 'primary', keycap: '⏎', disabled: !ready, onClick: sendPrimary, title: saysKeep ? 'Your answer says to keep it blocked' : '⌘/Ctrl + Enter', children: 'Answer + unbl0ck' }),
-        button({ disabled: !ready, onClick: () => send(false), children: 'Answer, keep blocked' })
+        button({ kind: 'primary', keycap: saysKeep ? undefined : '⏎', disabled: !ready, onClick: sendPrimary, title: saysKeep ? 'Your answer says to keep it blocked' : '⌘/Ctrl + Enter', children: 'Answer + unbl0ck' }),
+        button({ keycap: saysKeep ? '⏎' : undefined, disabled: !ready, onClick: () => send(false), title: saysKeep ? '⌘/Ctrl + Enter now keeps it blocked, because your answer says so' : undefined, children: 'Answer, keep blocked' })
       ]
   const tools = [
     button({ kind: 'ghost', disabled: busy, onClick: toggleDetail, 'aria-expanded': detailOpen, children: detailOpen ? 'Hide context' : 'Context' }),
@@ -1081,7 +1081,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const actions = answered
     ? [
         jsx('div', { className: 'ub-hint', role: 'note', children: 'Your answer is on the card. Release it when the work can go on.' }),
-        jsxs('div', { className: 'ub-btns', children: [button({ kind: 'primary', keycap: '⏎', disabled: busy, onClick: release, children: 'Release (unbl0ck)' })] }),
+        jsxs('div', { className: 'ub-btns', children: [button({ kind: 'primary', disabled: busy, onClick: release, children: 'Release (unbl0ck)' })] }),
         jsxs('div', { className: 'ub-btns tools', children: tools })
       ]
     : isKanban
@@ -1098,7 +1098,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && ready) { e.preventDefault(); saysKeep ? send(false) : sendPrimary() }
           }
         }),
-        saysKeep ? jsx('div', { className: 'ub-hint', role: 'status', children: 'Your answer says to keep it blocked. Did you mean ANSWER, KEEP BLOCKED?' }) : null,
+        saysKeep ? jsx('div', { className: 'ub-hint', role: 'status', children: 'Your answer says to keep it blocked, so ⌘/Ctrl + Enter now means ANSWER, KEEP BLOCKED.' }) : null,
         jsxs('div', { className: 'ub-btns', children: answerButtons }),
         jsxs('div', { className: 'ub-btns tools', children: tools })
       ]
