@@ -1,8 +1,35 @@
-
 Nous girl mascot
 ----------------
 The ASCII Nous girl in the desktop panel is converted from Hermes Agent's
-assets/nous-girl-white.svg (MIT License, Copyright (c) 2025 Nous Research),
-the mascot of Nous Research. It is used here in Hermes-related work for
-attribution only. This project is independent of Nous Research; no endorsement
-is implied.
+assets/nous-girl-white.svg (MIT License, Copyright (c) 2025 Nous Research), the
+mascot of Nous Research, and appears in UNBL0CK's Desktop panel as that panel's
+mascot. The MIT license covers the artwork only. "Nous", "Nous Research",
+"Hermes" and the Hermes mascot are names and brand assets of Nous Research, and
+nothing here grants any right to them. UNBL0CK is an independent KyaniteLabs
+project; it is not made, sponsored or endorsed by Nous Research.
+
+Hermes Gadget SDK (mascot face geometry)
+---------------------------------------
+design/mascot/conv.py derives the mascot's blink, wink and talk geometry from
+python/hermes_gadget/face.py in the Hermes Gadget SDK
+(https://github.com/Adolanium/hermes-gadget-sdk), MIT License,
+Copyright (c) 2026 Hermes Gadget SDK contributors. That notice and permission
+text are reproduced here for that portion:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

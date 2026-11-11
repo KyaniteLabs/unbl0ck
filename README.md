@@ -22,7 +22,7 @@ Then set your name, so UNBL0CK knows which asks are aimed at you. Use the plugin
 hermes config set plugins.entries.unbl0ck.settings.principal_name "Ada, Ada Lovelace"
 ```
 
-`principal_name` is comma-separated: list the names your agents use for you. "CEO", "principal" and "human" always count. Your answers are posted under the first name, unless you set `comment_author`. If no name is set, only those generic words are detected.
+`principal_name` is comma-separated: list the names your agents use for you. "CEO", "principal" and "human" always count. Your answers are posted under the first name, unless you set `comment_author`. If no name is set, only those generic words count as your name: a one-to-one chat or a Kanban block that says "your approval" is still detected, but in a group, channel or thread the ask must contain one of them.
 
 **Summaries** are on by default. Turn them off with `bluf_enabled: false`; cards then show the raw block reason.
 
@@ -74,7 +74,11 @@ The Desktop UI source is `desktop/src/plugin.src.js`. Run `python desktop/build.
 
 ## Credits
 
-The ASCII mascot is converted from Hermes Agent's Nous girl art (MIT, © Nous Research), and the fonts are under the SIL Open Font License. See [NOTICE](NOTICE). UNBL0CK is an independent project by KyaniteLabs and is not endorsed by Nous Research.
+The ASCII mascot is converted from Hermes Agent's Nous girl art (MIT, © Nous Research) and
+the panel's blink, wink and talk geometry comes from the Hermes Gadget SDK (MIT). The fonts
+are SIL OFL 1.1; the Share Tech Mono subset is renamed UB Tech Mono because the original
+reserves the name "Share". See [NOTICE](NOTICE). UNBL0CK is an independent project by
+KyaniteLabs, not endorsed by Nous Research.
 
 ## License
 

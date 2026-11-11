@@ -10,7 +10,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 FONTS = {
     "Rajdhani:500": "Rajdhani-Medium.woff2",
     "Rajdhani:700": "Rajdhani-Bold.woff2",
-    "ShareTechMono:400": "ShareTechMono-Regular.woff2",
+    "Tech Mono:400": "TechMono-Regular.woff2",
 }
 src = (HERE / "src" / "plugin.src.js").read_text()
 blob = {k: base64.b64encode((HERE / "fonts" / f).read_bytes()).decode() for k, f in FONTS.items()}
