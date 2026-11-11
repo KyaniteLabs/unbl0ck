@@ -642,7 +642,7 @@ function Ticker({ items }) {
   if (!items.length) return null
   const runs = items.map(i =>
     jsxs('span', {
-      children: [jsx('b', { children: '◆ ' }), jsx('em', { children: i.source === 'kanban' ? i.task_id : i.source === 'prompt' ? `${String(i.kind || 'PROMPT').toUpperCase()} · LIVE` : i.source === 'pairing' ? `PAIRING · ${String(i.platform || '').toUpperCase()}` : (i.owner || i.profile || 'CHAT').toUpperCase() }), ` · ${String(i.title || '').toUpperCase()} · ${ago(i.since)}`]
+      children: [jsx('b', { children: '◆ ' }), jsx('em', { children: i.source === 'kanban' ? i.task_id : i.source === 'prompt' ? `${String(i.kind || 'PROMPT').toUpperCase()} · LIVE` : i.source === 'pairing' ? `PAIRING · ${String(i.platform || '').toUpperCase()}` : i.source === 'outside' ? `${String(i.kind || 'other').toUpperCase()} · OUTSIDE` : (i.owner || i.profile || 'CHAT').toUpperCase() }), ` · ${String(i.title || '').toUpperCase()} · ${ago(i.since)}`]
     }, `${i.id}`)
   )
   const chars = items.reduce((n, i) => n + String(i.title || '').length + 24, 0)
@@ -881,6 +881,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const isKanban = item.source === 'kanban'
   const isPrompt = item.source === 'prompt'
   const isPairing = item.source === 'pairing'
+  const isOutside = item.source === 'outside'
   const platformName = platformLabel(item.platform)
   // Desktop can open its own sessions (and CLI/TUI ones, which share the store). A Telegram or
   // Discord chat is answered in Telegram or Discord.
@@ -978,6 +979,9 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     const r = await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
     if (r) $undo.set({ id: item.id, title: item.title, at: Date.now() })
   }
+  const outsideDone = () => run(
+    () => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null
+  )
   const ready = !busy && answer.trim().length > 0
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
 
@@ -1058,6 +1062,11 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
         className: 'ub-meta',
         children: ['PAIRING \\\\ ', jsx('em', { children: platformName.toUpperCase() }), ` · ${item.profile}`]
       })
+    : isOutside
+    ? jsx('div', {
+        className: 'ub-meta',
+        children: `${String(item.kind || 'other').toUpperCase()} · ${item.origin === 'filed' ? 'FILED BY AGENT' : 'FOLDER'}`
+      })
     : jsxs('div', {
         className: 'ub-meta',
         children: [
@@ -1131,6 +1140,16 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
         }),
         jsxs('div', { className: 'ub-btns', children: [button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })] })
       ]
+    : isOutside
+    ? [
+        jsx('div', { className: 'ub-hint', children: `Act in: ${item.act_where}` }),
+        item.to ? jsx('div', { className: 'ub-note', children: `To: ${item.to}` }) : null,
+        item.ref ? jsx('div', { className: 'ub-note', style: { userSelect: 'text', overflowWrap: 'anywhere' }, children: item.ref }) : null,
+        jsxs('div', { className: 'ub-btns', children: [
+          button({ kind: 'primary', disabled: busy, onClick: outsideDone, children: item.origin === 'folder' ? 'Done — hides until the file changes' : 'Done' }),
+          button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
+        ] })
+      ].filter(Boolean)
     : [
         opensHere ? null : jsx('div', { className: 'ub-hint', role: 'note', children: `Reply in ${platformName || 'the chat'}. It leaves this list once you answer.` }),
         jsxs('div', {
@@ -1202,7 +1221,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     : null
 
   return jsx('section', {
-    className: `ub-card ${isKanban ? 'kanban' : isPrompt ? 'prompt' : isPairing ? 'pairing' : 'chat'}${done ? ' done' : ''}${done === 'kept' ? ' kept' : ''}`,
+    className: `ub-card ${isKanban ? 'kanban' : isPrompt ? 'prompt' : isPairing ? 'pairing' : isOutside ? 'chat outside' : 'chat'}${done ? ' done' : ''}${done === 'kept' ? ' kept' : ''}`,
     style: { '--i': n - 1 },
     tabIndex: -1,
     onPointerEnter: () => sfx.play('move'),
@@ -1242,6 +1261,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           : [
               item.bluf_pending ? jsx('div', { className: 'ub-pending', children: '◇ SUMMARIZING' }) : null,
               jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: item.ask }),
+              isOutside ? jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' }) : null,
               item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null
             ]),
         jsx('div', { className: 'ub-act', children: actions }),
@@ -1277,6 +1297,7 @@ function Page({ ctx, refresh }) {
   const kanbanStuck = kanban.filter(i => i.tier === 'stuck')
   const kanbanAnswered = kanban.filter(i => i.tier === 'answered')
   const chats = q.items.filter(i => i.source === 'chat')
+  const outside = q.items.filter(i => i.source === 'outside')
   const prompts = q.items.filter(i => i.source === 'prompt')
   const pairing = q.items.filter(i => i.source === 'pairing')
   const oldest = oldestAskSince(q.items)
@@ -1340,7 +1361,7 @@ function Page({ ctx, refresh }) {
                         className: 'ub-sub',
                         children: [
                           q.loading
-                            ? 'Scanning boards, chats, live prompts and pairing requests'
+                            ? 'Scanning boards, outside items, chats, live prompts and pairing requests'
                             : q.fault
                               ? 'Cannot reach the queue; showing the last known list.'
                               : (q.errors || []).length
@@ -1361,6 +1382,7 @@ function Page({ ctx, refresh }) {
                 children: [
                   tile('KANBAN', q.loading ? '··' : pad(kanban.length)),
                   tile('CHATS', q.loading ? '··' : pad(chats.length)),
+                  outside.length ? tile('OUTSIDE', pad(outside.length)) : null,
                   tile('LIVE', q.loading ? '··' : pad(prompts.length), prompts.length ? 'warn' : ''),
                   pairing.length ? tile('ACCESS', pad(pairing.length), 'warn') : null,
                   tile('OLDEST', oldest ? ago(oldest) : '—', oldestH > 24 ? 'warn' : ''),
@@ -1391,9 +1413,10 @@ function Page({ ctx, refresh }) {
           ...group('KANBAN.CARDS', kanbanAsks),
           ...group('KANBAN.STUCK', kanbanStuck, true),
           ...group('KANBAN.ANSWERED', kanbanAnswered, true),
+          ...group('OUTSIDE.HERMES', outside),
           ...group('CHATS', chats),
           !q.loading && !askCount(q) && !q.fault && !(q.errors || []).length
-            ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, chat, prompt or pairing request is waiting on you.' })] })
+            ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, outside item, chat, prompt or pairing request is waiting on you.' })] })
             : null
         ]
       })

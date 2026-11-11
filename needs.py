@@ -1,4 +1,4 @@
-"""The "needs you" queue: everything waiting on the human, from four sources.
+"""The "needs you" queue: everything waiting on the human, from five sources.
 
 - Kanban: a blocked card whose latest block asks the principal for something (an explicit
   ``needs_input`` block that names the principal, or a reason that is plainly a principal gate).
@@ -16,6 +16,8 @@
 - Pairing requests: someone messaged a bot and is waiting for the human to approve them, read
   through the gateway's own PairingStore.list_pending() (never the codes). Approving happens on the dashboard's
   Pairing page or with ``hermes pairing approve``.
+- Outside Hermes: agent-filed items and read-only .eml/.md/.txt exports in configured folders.
+  The human acts in the original app; Done deletes only our own filed records or hides a file version.
 
 Nothing here generates, ranks or rewrites decisions, and nothing is accepted on silence. Items the
 human hides with "Not for me" stay hidden until the source changes (a new block or a new turn).
@@ -31,6 +33,10 @@ import os
 import collections
 import re
 import sqlite3
+import stat
+import uuid
+from email import policy
+from email.parser import BytesParser
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows: the process-local lock still applies
@@ -196,7 +202,7 @@ def _hidden_path(home: Optional[Path]) -> Path:
     return data_dir(home) / "hidden.json"
 
 
-_STATE_LOCK = threading.Lock()   # hidden.json, bluf.json and pending-release.json are read-modify-write
+_STATE_LOCK = threading.Lock()   # shared state, including filed outside items, is read-modify-write
 
 
 @contextmanager
@@ -1155,11 +1161,194 @@ def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) 
     return items
 
 
+# --- things waiting outside Hermes ----------------------------------------------------------
+
+_OUTSIDE_KINDS = ("draft", "notes", "approval", "other")
+_OUTSIDE_LIMIT = 200
+_OUTSIDE_READ_LIMIT = 256 * 1024
+_FILED_ID = re.compile(r"outside:filed:([a-f0-9]{32})\Z")
+_FOLDER_ID = re.compile(r"outside:folder:[a-f0-9]{64}\Z")
+
+
+def _outside_dir(home: Optional[Path] = None) -> Path:
+    d = data_dir(home) / "outside"
+    d.mkdir(mode=0o700, exist_ok=True)
+    return d
+
+
+def _outside_field(args: dict[str, Any], name: str, limit: int, *, required: bool = False) -> str:
+    value = args.get(name, "")
+    if not isinstance(value, str) or (required and not value.strip()):
+        raise ValueError(f"{name} must be {'a non-empty string' if required else 'a string'}")
+    if name == "body" and len(value) > limit:
+        marker = "\n[truncated]"
+        return value[:limit - len(marker)] + marker
+    return value[:limit]
+
+
+def file_outside(args: dict[str, Any], home: Optional[Path] = None, **kwargs: Any) -> dict[str, Any]:
+    """File/update one agent claim, or resolve one of our own records. No external actions."""
+    action = args.get("action", "file")
+    if action not in ("file", "resolve"):
+        raise ValueError("action must be file or resolve")
+    key = _outside_field(args, "dedupe_key", 120)
+    if action == "file":
+        kind = args.get("kind")
+        if kind not in _OUTSIDE_KINDS:
+            raise ValueError("kind must be draft, notes, approval or other")
+        if "body" not in args:
+            raise ValueError("body is required (an empty string is allowed)")
+        fields = {
+            "kind": kind, "title": _outside_field(args, "title", 160, required=True),
+            "text": _outside_field(args, "body", 8000),
+            "act_where": _outside_field(args, "act_where", 120, required=True),
+            "ref": _outside_field(args, "ref", 300), "dedupe_key": key,
+            "profile": str(kwargs.get("profile") or ""),
+            "session_id": str(kwargs.get("session_id") or ""),
+        }
+    else:
+        item_id = args.get("id", "")
+        if item_id and (not isinstance(item_id, str) or not _FILED_ID.fullmatch(item_id)):
+            raise ValueError("id must identify an agent-filed outside item")
+        if bool(item_id) == bool(key):
+            raise ValueError("resolve requires either id or dedupe_key")
+    with _state_lock(home):
+        d = _outside_dir(home)
+        files = list(d.glob("*.json"))
+        match = None
+        if action == "resolve" and item_id:
+            match = d / (_FILED_ID.fullmatch(item_id).group(1) + ".json")
+        elif key:
+            match = next((f for f in files if not f.is_symlink() and _read_json(f).get("dedupe_key") == key), None)
+        if action == "resolve":
+            if match is None or not match.is_file() or match.is_symlink():
+                raise LookupError("No filed outside item matches that id or dedupe_key")
+            match.unlink()
+            return {"ok": True, "resolved": True, "id": f"outside:filed:{match.stem}"}
+        if match is None and len(files) >= _OUTSIDE_LIMIT:
+            raise ValueError("Outside queue is full (200 filed items); resolve an item before filing another")
+        old = _read_json(match) if match else {}
+        record_id = match.stem if match else uuid.uuid4().hex
+        item_id = f"outside:filed:{record_id}"
+        version = hashlib.sha256(json.dumps(fields, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        rec = {**fields, "id": item_id, "version": version, "source": "outside", "origin": "filed",
+               "tier": "normal", "since": old.get("since") or time.time()}
+        _write_json(d / f"{record_id}.json", rec)
+        return {"ok": True, "id": item_id, "version": version}
+
+
+def _folder_outside_item(f: Path, root: Path, expected: os.stat_result) -> Optional[dict[str, Any]]:
+    # Recheck containment at read time. O_NOFOLLOW and fstat also reject a leaf swapped for
+    # a symlink, FIFO or device after the directory scan; never block on a special file.
+    if f.is_symlink() or f.resolve().parent != root:
+        return None
+    fd = os.open(f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (expected.st_dev, expected.st_ino):
+            return None
+        raw = fh.read(_OUTSIDE_READ_LIMIT)
+        after = os.fstat(fh.fileno())
+        if (st.st_mtime_ns, st.st_size) != (after.st_mtime_ns, after.st_size):
+            return None   # the next poll reads a coherent version
+    to = ""
+    if f.suffix.lower() == ".eml":
+        msg = BytesParser(policy=policy.default).parsebytes(raw)
+        title = str(msg.get("Subject") or f.name).strip()[:160]
+        to = str(msg.get("To") or "")[:2000]
+        text = "(No text/plain body; HTML is not displayed.)"
+        for part in msg.walk():
+            if not part.is_multipart() and part.get_content_type() == "text/plain":
+                text = (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
+                break
+        kind, where = "draft", "Your mail app → Drafts"
+    else:
+        text = raw.decode("utf-8", errors="replace")
+        title = next((line.strip()[:160] for line in text.splitlines() if line.strip()), f.name[:160])
+        kind, where = "notes", "Your notes app"
+    return {
+        "id": "outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest(),
+        "version": f"{st.st_mtime_ns}:{st.st_size}", "source": "outside", "tier": "normal",
+        "origin": "folder", "kind": kind, "title": title, "text": text, "to": to,
+        "since": st.st_mtime, "act_where": where, "ref": str(f), "path": f.name,
+    }
+
+
+def outside_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) -> list[dict[str, Any]]:
+    """Our filed records plus bounded, non-recursive reads of explicitly watched folders."""
+    errors = errors if errors is not None else []
+    items = []
+    for f in _outside_dir(home).glob("*.json"):
+        if f.is_symlink():
+            continue
+        rec = _read_json(f)
+        if (rec.get("id") == f"outside:filed:{f.stem}" and _FILED_ID.fullmatch(rec["id"])
+                and rec.get("origin") == "filed" and rec.get("kind") in _OUTSIDE_KINDS):
+            items.append(rec)
+    raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
+    seen: set[Path] = set()
+    for name in str(raw).split(","):
+        if not name.strip():
+            continue
+        try:
+            root = Path(name.strip()).expanduser()
+            if not root.is_absolute():
+                raise ValueError("outside_dirs requires absolute paths")
+            root = root.resolve()
+            if root in seen:
+                continue
+            seen.add(root)
+            candidates = []
+            for f in root.iterdir():
+                if f.name.startswith(".") or f.suffix.lower() not in (".eml", ".md", ".txt"):
+                    continue
+                try:
+                    st = f.lstat()
+                    if stat.S_ISREG(st.st_mode) and f.resolve().parent == root:
+                        candidates.append((f, st))
+                except OSError as exc:
+                    errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
+            candidates.sort(key=lambda pair: (-pair[1].st_mtime_ns, pair[0].name))
+            for f, st in candidates[:_OUTSIDE_LIMIT]:
+                try:
+                    item = _folder_outside_item(f, root, st)
+                    if item is not None:
+                        items.append(item)
+                except (OSError, ValueError) as exc:
+                    errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
+        except (OSError, ValueError, RuntimeError) as exc:
+            errors.append(f"outside: {name.strip()}: {type(exc).__name__}: {exc}")
+    for it in items:
+        it["ask"] = it.get("text") or "(No text supplied.)"
+        it["excerpt"] = _excerpt(it["ask"])
+        it["why"] = "Filed by agent; act in the original app." if it["origin"] == "filed" else "From a watched folder; act in the original app."
+    return items
+
+
+def done_outside(item_id: str, version: str, home: Optional[Path] = None) -> dict[str, Any]:
+    """Done only deletes our own record; folder items are hidden at the version read."""
+    match = _FILED_ID.fullmatch(item_id)
+    if match:
+        with _state_lock(home):
+            f = _outside_dir(home) / (match.group(1) + ".json")
+            rec = _read_json(f)
+            if not rec or f.is_symlink():
+                raise LookupError("Filed outside item no longer exists")
+            if rec.get("version") != version:
+                raise RuntimeError("Outside item changed; refresh before marking it Done")
+            f.unlink()
+        return {"ok": True, "deleted": True}
+    if not _FOLDER_ID.fullmatch(item_id):
+        raise ValueError("id must identify an outside item")
+    hide(item_id, version, home)
+    return {"ok": True, "hidden": True}
+
+
 # --- the queue -----------------------------------------------------------------------------
 
 # Every value an item's "source" can hold, in queue order (a new source must be added here,
 # and the tests fail until every consumer handles it).
-SOURCES = ("prompt", "pairing", "kanban", "chat")
+SOURCES = ("prompt", "pairing", "kanban", "outside", "chat")
 SOURCE_ORDER = {s: i for i, s in enumerate(SOURCES)}
 # Sources whose text is already one plain line; a model summary would only add latency and cost.
 NO_BLUF_SOURCES = ("prompt", "pairing")
@@ -1186,11 +1375,15 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
         items.extend(pairing_items(home, errors=errors))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"pairing: {type(exc).__name__}: {exc}")
+    try:
+        items.extend(outside_items(home, errors=errors))
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"outside: {type(exc).__name__}: {exc}")
     hidden = load_hidden(home)
     shown = [i for i in items
              if include_hidden or visibility(hidden, i["id"], i["version"]) is not Visibility.HIDDEN]
     # Same order as the panel: live prompts (a run is paused), pairing requests (expire within
-    # the hour), Kanban, chats; inside a source, higher priority first (as on the board), then newest.
+    # the hour), Kanban, outside Hermes, chats; inside a source, higher priority first, then newest.
     shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), i.get("tier") in ("stuck", "answered"), -(_num(i.get("priority"))), -(_num(i.get("since")))))
     attach_blufs(shown, home)
     counts = {
@@ -1496,6 +1689,9 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         elif it["source"] == "prompt":
             where = _platform_label(it.get("platform") or "") if it.get("platform") else "the session"
             options = [{"label": "Answer there", "send": f"Answer the prompt in {where}", "effect": "The run resumes", "tone": "primary"}]
+        elif it["source"] == "outside":
+            where = it.get("act_where") or "the original app"
+            options = [{"label": "Act there", "send": f"Act in {where}", "effect": "Review in the original app", "tone": "primary"}]
         elif it["source"] == "chat" and it.get("bot_chat"):
             options = [{"label": "Open chat", "send": f"Open {it['profile']} Bot Chat", "effect": "Reply in the chat", "tone": "primary"}]
         else:

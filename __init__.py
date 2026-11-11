@@ -1,4 +1,4 @@
-"""UNBL0CK: one queue of everything blocked on you (Kanban cards, chats, live prompts, pairing requests).
+"""UNBL0CK: one queue of everything blocked on you, inside and outside Hermes.
 
 register() registers a slash command, a CLI command, and stashes its context so the
 dashboard backend can use the host-owned LLM for "Ask about this card". Everything that
@@ -24,6 +24,7 @@ def _summary(limit: int = 12) -> str:
         where = (f"{it['board']}:{it['task_id']}" if it["source"] == "kanban"
                  else f"{it.get('kind') or 'prompt'} {it['profile']}" if it["source"] == "prompt"
                  else f"pairing {it.get('platform')}" if it["source"] == "pairing"
+                 else f"outside {it['kind']} · {it['act_where']}" if it["source"] == "outside"
                  else f"chat {it.get('platform') or it['profile']}"
                  + (f" with {it['chat_with']}" if it.get("chat_with") else ""))
         lead = it.get("bluf") or " ".join(str(it.get("ask") or "").split())[:140]
@@ -77,11 +78,43 @@ def _cli(args):
     print(_summary())
 
 
+FILE_SCHEMA = {
+    "name": "unbl0ck_file",
+    "description": "File one thing waiting on the human outside Hermes, or resolve a previously filed item. "
+                   "This only records an agent claim; it never sends mail, opens references or acts in another app.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["file", "resolve"], "default": "file"},
+            "kind": {"type": "string", "enum": ["draft", "notes", "approval", "other"]},
+            "title": {"type": "string", "maxLength": 160},
+            "body": {"type": "string", "maxLength": 8000},
+            "act_where": {"type": "string", "maxLength": 120, "description": "Where the human acts, e.g. Outlook → Drafts or Plaud app"},
+            "ref": {"type": "string", "maxLength": 300, "description": "Plain-text id, URL or path; never opened automatically"},
+            "dedupe_key": {"type": "string", "maxLength": 120, "description": "Re-file this key to update in place; also usable with resolve"},
+            "id": {"type": "string", "description": "Previously returned item id, for resolve"},
+        },
+        "description": "file requires kind, title, body and act_where; resolve requires either id or dedupe_key",
+        "additionalProperties": False,
+    },
+}
+
+
+def unbl0ck_file(args: dict, **kwargs) -> str:
+    import json
+
+    try:
+        return json.dumps(_needs().file_outside(args, **kwargs))
+    except Exception as exc:  # tools return JSON errors, never break an agent turn
+        return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+
 def register(ctx):
     global _PLUGIN_CTX
     _PLUGIN_CTX = ctx
     ctx.register_command("unbl0ck", slash_unbl0ck, description="What is blocked on you right now")
-    ctx.register_cli_command("unbl0ck", "List what is blocked on you (Kanban, chats, live prompts, pairing)", _setup_cli, _cli)
+    ctx.register_cli_command("unbl0ck", "List what is blocked on you (Kanban, outside Hermes, chats, live prompts, pairing)", _setup_cli, _cli)
+    ctx.register_tool("unbl0ck_file", "unbl0ck", FILE_SCHEMA, unbl0ck_file, description=FILE_SCHEMA["description"])
     # Live prompts: stock observers for every point an agent blocks on a human (clarify,
     # approval, admin password). Observers only; a failure here never touches the prompt.
     register_hook = getattr(ctx, "register_hook", None)

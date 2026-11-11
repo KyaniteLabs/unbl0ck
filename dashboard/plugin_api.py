@@ -1,12 +1,13 @@
 """UNBL0CK backend routes, mounted at /api/plugins/unbl0ck/.
 
-GET  /queue                  the queue (Kanban cards, chats, live prompts, pairing requests)
+GET  /queue                  the queue (Kanban, outside items, chats, live prompts, pairing requests)
 GET  /card?id=               read-only context for one Kanban card
 GET  /card/ask/{job}         poll a running Ask
 POST /card/ask               ask the configured model about one card (multi-turn)
 POST /kanban/answer          {board, task_id, text, release, version}: comment as the principal, optionally unblock
 POST /hide                   {id, version}: "Not for me" until the source changes
 POST /unhide                 {id}: undo "Not for me"
+POST /outside/done           {id, version}: delete a filed record or hide a watched file version
 GET  /pack                   the queue as a Pocket-format card pack (read-only)
 POST /pack                   the same pack, also written to plugin-data/unbl0ck/pocket-pack.json
 """
@@ -315,6 +316,18 @@ def hide(body: Hide):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True}
+
+
+@router.post("/outside/done")
+def outside_done(body: Hide):
+    try:
+        return _needs().done_outside(body.id, body.version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 class Unhide(BaseModel):
