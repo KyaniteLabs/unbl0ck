@@ -56,6 +56,61 @@ if (result.children !== '◆ 1 NEEDS YOU') throw new Error(`unexpected chip: ${r
         subprocess.run(["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
                        check=True, capture_output=True, text=True)
 
+    def test_outside_cards_render_safe_text_and_send_done_to_the_backend(self):
+        script = r'''
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const views = src.slice(src.indexOf('function Item('), src.indexOf('function Chip('));
+const node = (type, props) => ({type, props});
+const noop = () => {};
+const env = {
+  jsx: node, jsxs: node, useState: x => [x, noop], useEffect: noop, useRef: () => ({}),
+  platformLabel: x => x, LOCAL_PLATFORMS: [], KEEP_BLOCKED: /keep blocked/i,
+  button: props => node('button', props), openBoard: noop, ago: () => '', ageClass: () => '', pad: String,
+  sfx: {play: noop}, petEmit: noop, host: {notifyError: e => {throw e}},
+  $undo: {set: noop}, $queue: 'queue', $fxOn: 'fx', UNDO_MS: 12000, askCount: q => q.count,
+  Field: noop, Watermark: noop, Banner: noop, Pet: noop, Ticker: noop, FxToggle: noop, SfxToggle: noop,
+  grainUrl: () => '',
+};
+const {Item, Page} = new Function('env', `with(env) { ${views}; return {Item, Page}; }`)(env);
+function all(n) {
+  if (n == null) return [];
+  if (Array.isArray(n)) return n.flatMap(all);
+  if (typeof n !== 'object') return [n];
+  return [n, ...all(n.props?.children)];
+}
+function text(n) { return all(n).filter(x => typeof x === 'string').join(''); }
+const requests = [];
+const ctx = {rest: async (url, options) => {requests.push({url, ...options}); return {ok: true}}};
+const refresh = async () => {};
+const base = {id: 'outside:filed:1', version: 'v1', source: 'outside', kind: 'draft', origin: 'filed',
+  title: '<img onerror=bad()>', ask: 'Full original text', bluf: 'Send the reply', act_where: 'Outlook → Drafts',
+  ref: 'javascript:alert(1)', since: 1};
+(async () => {
+  const filed = Item({ctx, item: base, n: 1, refresh, askEnabled: false});
+  for (const required of ['DRAFT · FILED BY AGENT', base.title, base.bluf, '+ FULL TEXT', 'Act in: Outlook → Drafts', base.ref]) {
+    if (!text(filed).includes(required)) throw new Error(`missing filed card content: ${required}`);
+  }
+  if (all(filed).some(x => x?.type === 'a' || x?.props?.dangerouslySetInnerHTML || x?.props?.href)) throw new Error('reference must stay text');
+  const buttons = all(filed).filter(x => x?.type === 'button');
+  if (!buttons.some(x => text(x) === 'Not for me')) throw new Error('missing hide');
+  const done = buttons.find(x => text(x) === 'Done');
+  if (!done || done.props.kind !== 'primary') throw new Error('missing primary Done');
+  await done.props.onClick();
+  if (requests[0]?.url !== '/outside/done' || requests[0].body.id !== base.id || requests[0].body.version !== 'v1') throw new Error('Done request lost identity/version');
+  const folder = Item({ctx, item: {...base, kind: 'notes', origin: 'folder'}, n: 1, refresh, askEnabled: false});
+  if (!text(folder).includes('NOTES · FOLDER') || !text(folder).includes('Done — hides until the file changes')) throw new Error('folder Done must describe hiding');
+  const q = {items: [base, {source: 'kanban', tier: 'normal', id: 'k'}, {source: 'chat', id: 'c'}], count: 3, errors: [], at: Date.now()};
+  env.useValue = key => key === 'queue' ? q : false;
+  const page = text(Page({ctx, refresh}));
+  if (!(page.indexOf('KANBAN.CARDS') < page.indexOf('OUTSIDE.HERMES') && page.indexOf('OUTSIDE.HERMES') < page.lastIndexOf('CHATS'))) throw new Error('outside group is missing or out of order');
+})().catch(e => { console.error(e); process.exitCode = 1 });
+'''
+        for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
+            with self.subTest(path=path.name):
+                result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

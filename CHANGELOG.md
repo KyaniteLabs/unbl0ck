@@ -10,6 +10,10 @@
 - **The shortcut shows what it will do.** When your answer says to keep the card blocked, ⌘/Ctrl + Enter keeps it blocked; the ⏎ mark now moves to **Answer, keep blocked** and the hint says so. The Release button no longer shows a shortcut it does not have.
 - **Docs say what actually happens.** Failed summaries are retried after 10 minutes and the page polls every 45 seconds; listing pairing requests prunes expired ones, as `hermes pairing list` does; the CLI points to the `/unblock` page.
 
+## 0.5.0 (2026-11-11)
+
+- **Things waiting outside Hermes (#10).** The new **OUTSIDE.HERMES** queue group collects mail drafts, call notes and other items through the `unbl0ck_file` agent tool or read-only watched `.eml`/`.md`/`.txt` folders (`outside_dirs`, off by default). Agent claims are labelled, filing supports deduplication and resolve, and BLUF summaries include outside text when enabled. Done deletes only UNBL0CK's filed records; folder Done hides until the file changes. No external app APIs, credentials or automatic external actions.
+
 ## 0.4.6 (2026-11-11)
 
 Fixes from the hackathon roast (two independent audits).

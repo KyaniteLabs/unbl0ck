@@ -1,10 +1,11 @@
 name: unbl0ck
 label: UNBL0CK
-version: "0.4.6"
+version: "0.5.0"
 description: >
   UNBL0CK clears whatever is blocked on you. One queue of everything waiting on you: blocked Kanban cards that need your
   answer, chats on any platform whose last turn is a bot asking you something, agents paused right now on a
-  clarify question, command approval or admin password prompt, and new people waiting for you to approve their pairing request.
+  clarify question, command approval or admin password prompt, new people waiting for you to approve their pairing request,
+  and drafts, call notes or other items outside Hermes filed by your agent or read from watched folders.
   Answer a card in place and it is commented and unblocked through native
   Kanban; read its full context; ask a read-only assistant about it and decide
   without leaving the card; open a chat straight from the queue. Desktop gets an /unblock page
@@ -12,7 +13,7 @@ description: >
 author: KyaniteLabs
 license: MIT
 requires_hermes: ">=0.23.0"
-provides_tools: []
+provides_tools: [unbl0ck_file]
 provides_hooks: [on_human_input_request, on_human_input_resolved]
 provides_middleware: []
 config_schema:
@@ -35,4 +36,8 @@ config_schema:
   bluf_enabled:
     type: bool
     default: true
-    description: "Lead each card with a one-line model-written summary. Each new or changed Kanban card's or chat's title and text are sent once to the model provider configured in Hermes (through its plugin LLM API) and the summary is cached in plugin-data. Set false to send nothing automatically."
+    description: "Lead each card with a one-line model-written summary. Each new or changed Kanban card's, chat's, agent-filed item's or watched-folder file's title and text are sent once to the model provider configured in Hermes (through its plugin LLM API) and the summary is cached in plugin-data. Set false to send nothing automatically."
+  outside_dirs:
+    type: str
+    default: ""
+    description: "Comma-separated absolute folders (~ expanded) to watch read-only for .eml drafts and .md/.txt notes. Empty means off. Direct regular files only; up to 200 newest files per folder, 256 KiB per file. Fallback: UNBL0CK_OUTSIDE_DIRS."
