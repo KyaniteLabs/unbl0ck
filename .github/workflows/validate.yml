@@ -6,19 +6,24 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: plugin
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.14"
+      - name: Desktop build is current (rebuild desktop/plugin.js and fail on any diff)
+        working-directory: plugin
+        run: |
+          python desktop/build.py
+          git diff --exit-code -- desktop design
       - name: Checkout tested Hermes runtime
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: NousResearch/hermes-agent
           ref: 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19  # v0.23.0
           path: .hermes-runtime
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
       - name: Install Hermes from its own lockfile
         run: uv sync --frozen --python 3.14 --directory .hermes-runtime
       - name: Tests in the Hermes runtime (a skipped test fails the gate)
@@ -30,7 +35,7 @@ jobs:
         run: |
           mkdir -p receipts
           HERMES_HOME="$RUNNER_TEMP/hermes-home" .hermes-runtime/.venv/bin/hermes plugins validate plugin --json > receipts/validate.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: plugin-validation

@@ -79,6 +79,10 @@ The things you would want to know before installing:
 - **Hermes internals:** Kanban access uses Hermes's internal `hermes_cli.kanban_db*` modules, because no public plugin API for Kanban comments and unblocks exists yet. To keep each poll fast, the queue also reads the newest block event and your latest comment per card with one indexed SQL query each, falling back to the public `list_events`/`list_comments` if the schema differs. A Hermes release that changes those modules can break the queue until UNBL0CK is updated. `hermes plugins validate` reports this as a warning. Settings are read with `hermes_cli.config.load_config_readonly()` and the Hermes home with `hermes_constants.get_hermes_home()`.
 - **Optional environment fallbacks:** `UNBL0CK_PRINCIPAL`, `UNBL0CK_AUTHOR`, `UNBL0CK_OWNER_IDS` and `UNBL0CK_OUTSIDE_DIRS` stand in for `principal_name`, `comment_author`, `owner_user_ids` and `outside_dirs` when those settings are empty. None is required and none holds a secret.
 
+## Platform limits
+
+State files (`hidden.json`, `bluf.json`, `pending-release.json`) are guarded by a thread lock everywhere and by an `fcntl` file lock on macOS and Linux. **Windows has no cross-process lock**: two processes writing at once there can lose an update. On macOS and Linux a lock held longer than 5 seconds raises `TimeoutError` instead of hanging.
+
 ## Develop
 
 ```
