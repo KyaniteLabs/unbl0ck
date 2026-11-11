@@ -33,3 +33,8 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Board-slug normalizer
+---------------------
+needs.normalize_board_slug is adapted from Hermes Agent kanban_db._normalize_board_slug
+(MIT License, Copyright (c) 2025 Nous Research).

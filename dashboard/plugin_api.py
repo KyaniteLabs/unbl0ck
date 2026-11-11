@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 log = logging.getLogger("unbl0ck")
@@ -96,12 +96,17 @@ def _loaded_ctx():
 router = APIRouter()
 
 
+MAX_ID = 300            # matches the hide-id limit in needs.hide
+MAX_TEXT = 20_000       # one typed answer or one chat message, in characters
+MAX_MESSAGES = 50       # Ask only uses the last 20; this is the most a client may send
+
+
 class Answer(BaseModel):
-    board: str
-    task_id: str
-    text: str
+    board: str = Field(max_length=MAX_ID)
+    task_id: str = Field(max_length=MAX_ID)
+    text: str = Field(max_length=MAX_TEXT)
     release: bool = True
-    version: Optional[str] = None   # the queue item version the human answered; stale -> 409
+    version: Optional[str] = Field(default=None, max_length=MAX_ID)   # the queue item version the human answered; stale -> 409
 
 
 class Hide(BaseModel):
@@ -110,10 +115,19 @@ class Hide(BaseModel):
 
 
 class CardAsk(BaseModel):
-    id: str = ""
-    board: str = ""
-    task_id: str = ""
-    messages: list[dict[str, Any]] = []
+    id: str = Field(default="", max_length=MAX_ID)
+    board: str = Field(default="", max_length=MAX_ID)
+    task_id: str = Field(default="", max_length=MAX_ID)
+    messages: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_MESSAGES)
+
+    @field_validator("messages")
+    @classmethod
+    def _message_content_is_bounded(cls, msgs):
+        for m in msgs:
+            c = m.get("content") if isinstance(m, dict) else None
+            if isinstance(c, str) and len(c) > MAX_TEXT:
+                raise ValueError(f"message content is over {MAX_TEXT} characters")
+        return msgs
 
 
 def _card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
@@ -137,7 +151,7 @@ def _checked_card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
     if not board or not task_id:
         raise HTTPException(status_code=400, detail="board and task_id are required")
     try:
-        board = kanban_db._normalize_board_slug(board)
+        board = _needs().normalize_board_slug(board)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if not board or not kanban_db.board_exists(board):
@@ -183,8 +197,7 @@ def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
             log.info("unbl0ck: comments for %s unavailable: %s", item["id"], exc)
             comments = []
         result = ctx.llm.complete(
-            n.bluf_messages(item, comments), purpose="unbl0ck.bluf", temperature=0.1,
-            max_tokens=ASK_MAX_TOKENS, timeout=90
+            n.bluf_messages(item, comments), purpose="unbl0ck.bluf", temperature=0.1, max_tokens=BLUF_MAX_TOKENS, timeout=90
         )
         bluf, why = n.parse_bluf(result.text)
         n.save_bluf(item["id"], item["version"], bluf, why)
@@ -254,7 +267,8 @@ def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
             timeout=120,
         )
     except Exception as exc:  # noqa: BLE001 - surface the host error honestly
-        _ASK_JOBS.fail(job, f"model call failed: {type(exc).__name__}: {exc}")
+        log.warning("unbl0ck: ask model call failed: %s: %s", type(exc).__name__, exc)   # detail stays in the log
+        _ASK_JOBS.fail(job, f"model call failed: {type(exc).__name__}")
         return
     reply = ask_reply_text(getattr(result, "text", ""))
     if not reply:
@@ -265,6 +279,8 @@ def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
 
 
 ASK_MAX_TOKENS = 4000
+# Reasoning models spend tokens thinking before the JSON; 200 cut them off mid-thought (F09).
+BLUF_MAX_TOKENS = ASK_MAX_TOKENS
 _THINK_RE = re.compile(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", re.S | re.I)
 
 
@@ -294,7 +310,7 @@ def answer(body: Answer):
     from hermes_cli import kanban_db  # type: ignore
 
     try:
-        board = kanban_db._normalize_board_slug(body.board)
+        board = _needs().normalize_board_slug(body.board)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     if not kanban_db.board_exists(board):

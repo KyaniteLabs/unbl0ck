@@ -20,7 +20,19 @@ config_schema:
   principal_name:
     type: str
     default: ""
-    description: "Your name(s) as agents write them in block reasons and chats, comma-separated (e.g. \"Ada, Ada Lovelace\"). CEO, principal and human always count."
+    description: "Your name(s) as agents write them in block reasons and chats, comma-separated (e.g. \"Ada, Ada Lovelace\"). The words in role_words, plus principal and human, always count."
+  role_words:
+    type: str
+    default: "CEO"   # role-words default
+    description: "Title words agents use for you in block reasons, comma-separated (e.g. \"Boss, founder\"). Matched like your name."
+  pocket_authority:
+    type: str
+    default: "owner"
+    description: "The authority label on pocket-pack decision cards. Set it to the word your pocket device expects."
+  ask_history_turns:
+    type: int
+    default: 6
+    description: "How many earlier chat turns an Ask sends along with the card, newest first. The whole prompt also stays under a 40,000-character budget."
   comment_author:
     type: str
     default: ""
@@ -36,7 +48,7 @@ config_schema:
   bluf_enabled:
     type: bool
     default: true
-    description: "Lead each card with a one-line model-written summary. Each new or changed Kanban card's, chat's, agent-filed item's or watched-folder file's title and text are sent once to the model provider configured in Hermes (through its plugin LLM API) and the summary is cached in plugin-data. Set false to send nothing automatically."
+    description: "Lead each card with a one-line model-written summary. Each new or changed Kanban card's, chat's, agent-filed item's or watched-folder file's title and text are sent once to the model provider configured in Hermes (through its plugin LLM API) and the summary is cached in plugin-data. Keys, tokens and home-directory paths are scrubbed from that text before it leaves your machine. Set false to send nothing automatically."
   outside_dirs:
     type: str
     default: ""

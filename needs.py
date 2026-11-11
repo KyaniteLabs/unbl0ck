@@ -50,9 +50,10 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 # Who the human is. Set in Hermes config: plugins.entries.unbl0ck.settings.principal_name
-# (comma-separated names, e.g. "Ada, Ada Lovelace"). Generic words (CEO, principal, human)
-# always count. Answers are commented as the first name, or comment_author if set.
-_GENERIC = ("CEO", "principal", "human")
+# (comma-separated names, e.g. "Ada, Ada Lovelace"). The generic words "principal" and "human"
+# always count, plus the configurable role words below. Answers are commented as the first
+# name, or comment_author if set.
+ROLE_WORDS_DEFAULT = "CEO"   # role-words default: the `role_words` setting overrides it
 
 
 log = logging.getLogger("unbl0ck")
@@ -87,6 +88,20 @@ def principal_names(settings: Optional[dict[str, Any]] = None) -> list[str]:
     return [n.strip() for n in str(raw).split(",") if n.strip()]
 
 
+def role_words(settings: Optional[dict[str, Any]] = None) -> list[str]:
+    """Title words agents use for the human in block reasons (setting ``role_words``, comma-separated)."""
+    raw = (settings if settings is not None else _settings()).get("role_words")
+    if raw is None or not str(raw).strip():
+        raw = ROLE_WORDS_DEFAULT
+    return [w.strip() for w in str(raw).split(",") if w.strip()]
+
+
+def pocket_authority(settings: Optional[dict[str, Any]] = None) -> str:
+    """The ``authority`` label on a pocket-pack decision card (setting ``pocket_authority``)."""
+    raw = (settings if settings is not None else _settings()).get("pocket_authority")
+    return str(raw).strip() if raw and str(raw).strip() else "owner"
+
+
 def principal_author(settings: Optional[dict[str, Any]] = None) -> str:
     s = settings if settings is not None else _settings()
     names = principal_names(s)
@@ -115,63 +130,65 @@ CHAT_TITLES = ("Bot Chat",)
 _PATTERN_CACHE: dict[str, dict[str, re.Pattern[str]]] = {}
 
 
-def _patterns(names: Optional[list[str]] = None) -> dict[str, re.Pattern[str]]:
-    """Detection regexes for the configured principal name(s); cached per name set."""
+def _patterns(names: Optional[list[str]] = None, role_words: Optional[list[str]] = None) -> dict[str, re.Pattern[str]]:
+    """Detection regexes for the configured principal name(s) and role words; cached per set."""
     names = principal_names() if names is None else names
     alt = "|".join(re.escape(n) for n in names) or r"(?!x)x"
-    key = alt
+    roles = globals()["role_words"]() if role_words is None else role_words
+    ralt = "(?:" + ("|".join(re.escape(w) for w in roles) or r"(?!x)x") + ")"
+    key = alt + "\0" + ralt
     if key in _PATTERN_CACHE:
         return _PATTERN_CACHE[key]
     pats: dict[str, re.Pattern[str]] = {}
 
     def _c(pattern: str, flags: int = 0) -> re.Pattern[str]:
-        return re.compile(pattern.replace("{P}", alt), flags)
+        return re.compile(pattern.replace("{P}", alt).replace("{C}", ralt), flags)
 
     # A reason that is a principal gate on its own, with or without a needs_input kind.
     # Second-person forms ("your approval", "blocked pending your go") are as strong as
     # a named gate; the audit's false negatives were all of this shape.
     pats["_GATE"] = _c(
-        r"\b(CEO[- ](gate|gated|word|decision|approval|call|sign[- ]?off)"
-        r"|({P}|CEO|principal)(['’]s)? (approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
-        r"|(awaiting|waiting (on|for)|needs?|requires?|blocked on|blocked pending|pending) ({P}|the CEO|CEO|principal|(the )?human)"
-        r"|(approval|decision|sign[- ]?off|input|answer|reply|go|ok) from ({P}|the CEO|CEO|(the )?principal|(the )?human|you)"
-        r"|(can['’]?t|cannot) \w+( \w+)? without (your|({P}|the CEO|CEO|(the )?principal)(['’]s)?) "
+        r"\b({C}[- ](gate|gated|word|decision|approval|call|sign[- ]?off)"
+        r"|({P}|{C}|principal)(['’]s)? (approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
+        r"|(awaiting|waiting (on|for)|needs?|requires?|blocked on|blocked pending|pending) ({P}|the {C}|{C}|principal|(the )?human)"
+        r"|(approval|decision|sign[- ]?off|input|answer|reply|go|ok) from ({P}|the {C}|{C}|(the )?principal|(the )?human|you)"
+        r"|(can['’]?t|cannot) \w+( \w+)? without (your|({P}|the {C}|{C}|(the )?principal)(['’]s)?) "
         r"(approval|decision|sign[- ]?off|input|answer|go|ok)"
         r"|^\W*please (approve|decide|choose|pick|confirm|sign)"
         r"|(awaiting|waiting (on|for)|needs?|requires?|blocked (on|pending)|pending) your "
         r"(approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
-        r"|({P}|CEO) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
+        r"|({P}|{C}) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
         r"|(which|what) (one|option|choice) do you (prefer|want|choose)"
         r"|human[- ]gate"
-        r"|([A-Za-z]+/)?(operator|owner|CEO|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
-        r"|({P}|CEO|principal) (approved|authorized|authorised|signed off)"
+        r"|([A-Za-z]+/)?(operator|owner|{C}|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
+        r"|({P}|{C}|principal) (approved|authorized|authorised|signed off)"
         r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,20}(route|access|path|executor)"
         r"|(credentials?|api[- ]?keys?|tokens?) (are |is )?(dead|expired|missing|needed|required|revoked))\b",
         re.I,
     )
     # Weaker cue, trusted only together with an explicit needs_input kind.
-    pats["_NAMES"] = _c(r"\b({P}|CEO|principal|human)\b", re.I)
+    pats["_NAMES"] = _c(r"\b({P}|{C}|principal|human)\b", re.I)
     # The supervisor/ops "stop" style blocks name the principal without asking anything.
-    pats["_ORDER"] = _c(r"^\s*({P}|CEO)\s+(\d{1,2}:\d{2}|says|said|orders?|ordered)\b", re.I)
+    pats["_ORDER"] = _c(r"^\s*({P}|{C})\s+(\d{1,2}:\d{2}|says|said|orders?|ordered)\b", re.I)
 
     pats["_ASK_STRONG"] = _c(
         r"\b(need(s)? (your|you to)|your (call|decision|approval|go|ok|sign[- ]?off|pick|answer)"
         r"|(please )?(approve|confirm|choose|pick one|reply with|say (yes|go))"
         r"|waiting on you|blocked on you|want (me|it) to|should I|shall I|do you want|which (one|option)"
         r"|decision (needed|for you)|needs? you"
-        r"|(picks?|options?|choices?|decisions?|questions?) for (you|the CEO|{P})"
-        r"|reply needed|your (pick|answer|word)|(CEO|{P})(['’]s)? (call|pick|decision|word)"
+        r"|(picks?|options?|choices?|decisions?|questions?) for (you|the {C}|{P})"
+        r"|reply needed|your (pick|answer|word)|({C}|{P})(['’]s)? (call|pick|decision|word)"
         r"|decision packet)\b",
         re.I,
     )
     # Asks that do not need a question mark to be an ask (decision packets, option lists).
     pats["_ASK_PACKET"] = _c(
-        r"\b((picks?|options?|choices?|decisions?|questions?) for (you|the CEO|{P})"
+        r"\b((picks?|options?|choices?|decisions?|questions?) for (you|the {C}|{P})"
         r"|decision packet(?! (?:was |is )?(?:archived|closed|resolved|answered|sent|done))"
         r"|reply needed|which (one|option|choice) (do|would|should) (you|I|we)|waiting (on|for) your (call|decision|word))\b",
         re.I,
     )
-    pats["_YOU"] = _c(r"\b(you|your|{P}|CEO)\b", re.I)
+    pats["_YOU"] = _c(r"\b(you|your|{P}|{C})\b", re.I)
     _PATTERN_CACHE[key] = pats
     return pats
 
@@ -202,6 +219,7 @@ def _hidden_path(home: Optional[Path]) -> Path:
     return data_dir(home) / "hidden.json"
 
 
+STATE_LOCK_TIMEOUT = 5.0   # seconds to wait for the state lock before giving up
 _STATE_LOCK = threading.Lock()   # shared state, including filed outside items, is read-modify-write
 
 
@@ -209,15 +227,27 @@ _STATE_LOCK = threading.Lock()   # shared state, including filed outside items, 
 def _state_lock(home: Optional[Path]):
     """Serialise a read-modify-write of UNBL0CK's state files across threads AND processes
     (the dashboard backend, the agent plugin and a plugin host can all write them)."""
-    with _STATE_LOCK:
+    deadline = time.monotonic() + STATE_LOCK_TIMEOUT
+    if not _STATE_LOCK.acquire(timeout=STATE_LOCK_TIMEOUT):
+        raise TimeoutError("unbl0ck: state lock busy (another thread holds it)")
+    try:
         d = data_dir(home)
         fd = os.open(d / ".state.lock", os.O_RDWR | os.O_CREAT, 0o600)
         try:
             if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("unbl0ck: state lock busy (another process holds it)")
+                        time.sleep(0.02)
             yield
         finally:
             os.close(fd)   # closing the descriptor drops the flock
+    finally:
+        _STATE_LOCK.release()
 
 
 def _read_json(p: Path) -> dict[str, Any]:
@@ -375,40 +405,60 @@ def bluf_messages(item: dict[str, Any], comments: Optional[list[dict[str, Any]]]
         card["recent_comments"] = [
             {"author": str(c.get("author") or ""), "text": str(c.get("body") or "")[:600]} for c in comments[-6:]
         ]
+    card = _ask_card_view(card)  # same redaction as Ask: no home dir, no secrets (F4)
     return [
         {"role": "system", "content": BLUF_SYSTEM},
         {"role": "user", "content": "CARD (untrusted):\n```json\n" + json.dumps(card, ensure_ascii=False) + "\n```"},
     ]
 
 
+_BLUF_THINK_RE = re.compile(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", re.S | re.I)
+
+
+_BLUF_PLACEHOLDERS = frozenset({
+    "tbd", "todo", "n/a", "na", "none", "null", "placeholder", "bluf", "summary", "answer",
+    "your answer", "one sentence", "example", "value", "string", "text",
+})
+
+
+def _real_bluf(value: Any) -> bool:
+    """A BLUF is real text: not the "..." format placeholder or a template word.
+    Short answers such as "Merge PR." are real."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not re.search(r"[A-Za-z0-9]", text):
+        return False
+    return text.strip(" .…!?:;<>[]{}()\"'`").lower() not in _BLUF_PLACEHOLDERS
+
+
 def parse_bluf(text: str) -> tuple[str, str]:
-    """Pull ``bluf``/``why`` out of a model reply; tolerate code fences and stray prose."""
-    text = re.sub(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", "", text or "", flags=re.S | re.I)
+    """Pull ``bluf``/``why`` out of a model reply; tolerate code fences, stray prose,
+    reasoning blocks (closed or cut off) and extra JSON objects. The answer is the last
+    object outside any reasoning block whose ``bluf`` is a real sentence and that is not
+    introduced as an example or schema."""
+    text = _BLUF_THINK_RE.sub("", text or "")
     decoder = json.JSONDecoder()
     data = None
-    i = 0
-    while i < len(text):
-        if text[i] != "{":
-            i += 1
-            continue
+    i = text.find("{")
+    while i != -1:
         try:
-            candidate, end = decoder.raw_decode(text, i)
-        except json.JSONDecodeError:
-            i += 1
+            obj, end = decoder.raw_decode(text, i)
+        except ValueError:
+            i = text.find("{", i + 1)
             continue
-        if isinstance(candidate, dict):
+        if isinstance(obj, dict):
             prefix = text[:i]
             is_example = re.search(
-                r"(?:^|\n)\s*(?:example(?:\s+format)?|schema|for example)\s*:\s*$",
+                r"(?:(?:^|\n)\s*(?:example(?:\s+format)?|schema|for example)|\b(?:example\s+format|for example))\s*:\s*$",
                 prefix, re.I,
             )
-            raw_bluf = candidate.get("bluf")
-            if not is_example and isinstance(raw_bluf, str) and raw_bluf.strip():
-                data = candidate
+            raw_bluf = obj.get("bluf")
+            # Keep the last real answer: a model may restate or correct itself.
+            if not is_example and isinstance(raw_bluf, str) and _real_bluf(raw_bluf):
+                data = obj
         # Skip nested objects inside a successfully decoded top-level object.
-        i = end
+        i = text.find("{", end)
     if data is None:
-        raise ValueError("no JSON object in reply")
+        raise ValueError("no JSON object with a real bluf in reply")
     bluf = re.sub(r"\s+", " ", data["bluf"]).strip()
     return bluf[:200], re.sub(r"\s+", " ", str(data.get("why") or "")).strip()[:240]
 
@@ -454,7 +504,7 @@ _TOKEN_GLUE = "/\\-_@"
 
 
 # A clause ends at sentence or clause punctuation; negation never reaches across it
-# ("Cannot proceed: needs CEO approval" is an ask).
+# ("Cannot proceed: needs <role word> approval" is an ask).
 _CLAUSE_END = re.compile(r"[,.;:!?\n]|\s[-–—]\s")
 # After the phrase, only "... is not needed/required" undoes it; any other negation
 # there ("Needs your approval. Not urgent.") belongs to something else.
@@ -522,7 +572,7 @@ def kanban_needs_you(reason: str, kind: Optional[str]) -> Optional[str]:
         return None
     if pats["_ORDER"].match(reason):
         # A relayed order is a stop, not a question, unless it asks *you* for something
-        # ("CEO says: need your approval for the spend").
+        # ("<role word> says: need your approval for the spend").
         return "Block reason names a decision for you" if _YOUR_GATE.search(reason) else None
     if _any_gate(reason, pats):
         return "Block reason names a decision for you"
@@ -765,14 +815,50 @@ def _state_dbs(home: Path) -> list[tuple[str, Path]]:
     return out
 
 
+# Hermes has no public board-slug validator, so this mirrors kanban_db._normalize_board_slug (the
+# plugin must not call a private name). tests/test_hillclimb_20261111.py checks the two agree.
+_BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
+
+
+def normalize_board_slug(slug: Any) -> Optional[str]:
+    """Lowercase + strip a board slug; None for empty; ValueError for an invalid one."""
+    s = str(slug).strip().lower() if slug is not None else ""
+    if not s:
+        return None
+    if not _BOARD_SLUG_RE.match(s):
+        raise ValueError(
+            f"invalid board slug {slug!r}: must be 1-64 chars, lowercase "
+            f"alphanumerics / hyphens / underscores, not starting with '-' or '_'"
+        )
+    return s
+
+
+_BOT_NAME_CACHE: dict[str, tuple[tuple[int, int], str]] = {}   # profile.yaml path -> ((mtime_ns, size), title or "")
+
+
 def _bot_name(home: Path, profile: str) -> str:
     """The name Bot Mode shows for a seat (profile.yaml ui_meta.hermes-bots.title).
-    A line scan, not a YAML parser: the plugin host may not ship PyYAML."""
+    A line scan, not a YAML parser: the plugin host may not ship PyYAML. The file is re-read only
+    when its mtime or size changes, so the 45 s poll does not open every profile each time."""
     fallback = "Your agent" if profile == "default" else profile
+    path = home / "profiles" / profile / "profile.yaml"
+    key = str(path)
     try:
-        lines = (home / "profiles" / profile / "profile.yaml").read_text().splitlines()
+        st = path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+        hit = _BOT_NAME_CACHE.get(key)
+        if hit and hit[0] == sig:
+            return hit[1] or fallback
+        lines = path.read_text().splitlines()
     except OSError:
+        _BOT_NAME_CACHE.pop(key, None)
         return fallback
+    title = _scan_bot_title(lines)
+    _BOT_NAME_CACHE[key] = (sig, title)
+    return title or fallback
+
+
+def _scan_bot_title(lines: list[str]) -> str:
     in_bots = False
     for line in lines:
         if re.match(r"^\s{2}hermes-bots:\s*$", line):
@@ -782,8 +868,8 @@ def _bot_name(home: Path, profile: str) -> str:
         elif in_bots:
             m = re.match(r"^\s{4}title:\s*['\"]?(.+?)['\"]?\s*$", line)
             if m:
-                return _clean(m.group(1), 60) or fallback
-    return fallback
+                return _clean(m.group(1), 60)
+    return ""
 
 
 # Platforms that only you type into (this machine's own clients), as opposed to gateway
@@ -1040,12 +1126,30 @@ def _waits_dir(home: Optional[Path] = None) -> Path:
 
 
 def _proc_start(pid: int) -> Optional[str]:
-    """Kernel start time of *pid* (Linux), so a recycled PID is not mistaken for the waiter."""
+    """Start time of *pid*, so a recycled PID is not mistaken for the waiter.
+
+    Linux reads the kernel start tick from /proc. Elsewhere (macOS, the BSDs) it asks
+    ``ps -o lstart=``. Recording and checking always go through this function, so
+    both sides use the same source. None means unknown, and the caller treats that as alive.
+    """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         return stat.rsplit(")", 1)[1].split()[19]
     except (OSError, IndexError):
+        pass
+    if os.name != "posix" or Path("/proc/self/stat").exists():
         return None
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(int(pid))],
+            capture_output=True, text=True, timeout=2, check=False,
+            env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"},
+        ).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return out or None
 
 
 def _alive(pid: int, start: Optional[str]) -> bool:
@@ -1703,9 +1807,76 @@ ASK_SYSTEM = (
 )
 
 
-def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]]) -> list[dict[str, str]]:
-    """System prompt + card data (untrusted) + the client's prior turns."""
-    context = json.dumps(card, ensure_ascii=False, default=str)
+_ASK_SECRET_PATTERNS = (
+    # URL userinfo: scheme://user:pass@host
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[redacted]@"),
+    # Authorization headers
+    (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [redacted]"),
+    # key=value / key: value for secret-looking keys
+    (re.compile(r"(?i)\b([a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)s?)(\s*[=:]\s*)[\"']?[^\s\"',;]+"),
+     r"\1\2[redacted]"),
+    # JWTs and home-directory shapes of any user (the current user's own home is handled in _ask_redact)
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"), "[redacted]"),
+    (re.compile(r"(?<![\w.])/(?:Users|home)/[^/\s\"'`]+(?=/|\s|$|[\"'`)\],;:])"), "~"),
+    (re.compile(r"(?i)\b[A-Z]:\\Users\\[^\\\s\"'`]+"), "~"),
+    # Well-known token shapes
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"), "[redacted]"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"), "[redacted]"),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "[redacted]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted]"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[redacted]"),
+)
+
+
+def _ask_redact(text: str) -> str:
+    home = os.path.expanduser("~")
+    if home and home not in ("/", "~"):
+        text = text.replace(home, "~")
+    for pattern, repl in _ASK_SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def _ask_card_view(value: Any, _key: str = "") -> Any:
+    """A copy of the card fit to send to an LLM: no workspace path, no home dir, no secrets.
+
+    The operator asked about the card, not about their filesystem or credentials, so the Ask
+    payload keeps the decision context (title, body, block reason, comments, branch, errors)
+    and drops or redacts what could leak (F4)."""
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if _key == "workspace" and k == "path":
+                continue
+            out[k] = _ask_card_view(v, str(k))
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_ask_card_view(v, _key) for v in value]
+    if isinstance(value, str):
+        return _ask_redact(value)
+    return value
+
+
+# Whole-prompt cap for Ask (system + card context + history), in characters.
+ASK_PROMPT_BUDGET = 40000
+
+
+ASK_HISTORY_TURNS = 6   # default number of prior chat turns sent with an Ask
+
+
+def ask_history_turns(settings: Optional[dict[str, Any]] = None) -> int:
+    """Prior turns an Ask sends (setting ``ask_history_turns``; bad or non-positive values use the default)."""
+    raw = (settings if settings is not None else _settings()).get("ask_history_turns")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return ASK_HISTORY_TURNS
+    return n if n > 0 else ASK_HISTORY_TURNS
+
+
+def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]], turns: Optional[int] = None) -> list[dict[str, str]]:
+    """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns."""
+    context = json.dumps(_ask_card_view(card), ensure_ascii=False, default=str)
     if len(context) > 24000:
         context = context[:24000] + "…[truncated]"
     messages: list[dict[str, str]] = [
@@ -1718,14 +1889,24 @@ def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]]) 
             ),
         },
     ]
-    for item in list(history)[-20:]:
+    used = sum(len(m["content"]) for m in messages)
+    kept: list[dict[str, str]] = []
+    for item in reversed(list(history)[-(ask_history_turns() if turns is None else turns):]):   # newest first
         role = item.get("role") if isinstance(item, dict) else None
         content = item.get("content") if isinstance(item, dict) else None
         if role not in ("user", "assistant") or not isinstance(content, str):
             continue
-        content = content.strip()
-        if content:
-            messages.append({"role": role, "content": content[:8000]})
+        content = content.strip()[:8000]
+        if not content:
+            continue
+        room = ASK_PROMPT_BUDGET - used
+        if len(content) > room:
+            if kept or room <= 0:
+                break
+            content = content[:room]   # the newest turn is always sent, trimmed to fit
+        kept.append({"role": role, "content": content})
+        used += len(content)
+    messages.extend(reversed(kept))
     return messages
 
 
@@ -1767,7 +1948,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
             "prompt": it["ask"],
             "why_now": it["why"],
             "owner": it.get("owner") or "",
-            "authority": "ceo",
+            "authority": pocket_authority(),
             "reversibility": "reversible",
             "evidence": [it["id"]],
             "ttl_s": 3600,

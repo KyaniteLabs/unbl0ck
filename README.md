@@ -22,7 +22,7 @@ Then set your name, so UNBL0CK knows which asks are aimed at you. Use the plugin
 hermes config set plugins.entries.unbl0ck.settings.principal_name "Ada, Ada Lovelace"
 ```
 
-`principal_name` is comma-separated: list the names your agents use for you. "CEO", "principal" and "human" always count. Your answers are posted under the first name, unless you set `comment_author`. If no name is set, only those generic words count as your name: a one-to-one chat or a Kanban block that says "your approval" is still detected, but in a group, channel or thread the ask must contain one of them.
+`principal_name` is comma-separated: list the names your agents use for you. The words in `role_words` (see `plugin.yaml` for the default), "principal" and "human" always count. Your answers are posted under the first name, unless you set `comment_author`. If no name is set, only those generic words count as your name: a one-to-one chat or a Kanban block that says "your approval" is still detected, but in a group, channel or thread the ask must contain one of them.
 
 **Summaries** are on by default. Turn them off with `bluf_enabled: false`; cards then show the raw block reason.
 
@@ -61,8 +61,8 @@ Each card shows **Act in:** and its reference so you can finish in the original 
 The things you would want to know before installing:
 
 - **No telemetry.** UNBL0CK sends no usage data anywhere. The Desktop page talks only to this plugin's own backend, through the plugin SDK.
-- **Summaries send item text to your model provider, once per change.** With `bluf_enabled` on (the default), each new or changed Kanban card's, chat's, agent-filed item's or watched-folder file's title and text (text cut to 6000 characters; live prompts and pairing requests are never sent), plus a Kanban card's last six comments (each cut to 600 characters, so the summary skips what is already settled), go to the model provider configured in Hermes, through Hermes's own plugin LLM API (logged in its plugin audit log), in a background thread. The result is cached in `bluf.json`; nothing is resent until the item changes while its summary remains cached, except that a failed summary is retried 10 minutes later. The open page and its status chip poll the queue every 45 seconds, so with the setting on, new items are summarized without you opening them. Set `bluf_enabled: false` to send nothing automatically.
-- **Ask sends card content to your model provider when you ask.** Clicking **TL;DR**, or sending a follow-up there, sends that card's context and the question to the model provider configured in Hermes, through Hermes's own plugin LLM API, and logs the call in Hermes's plugin audit log. **Discuss in chat** only types a draft into a normal Hermes chat; the chat you then start makes its own model calls. Turn Ask off with `ask_enabled: false`.
+- **Summaries send item text to your model provider, once per change.** With `bluf_enabled` on (the default), each new or changed Kanban card's, chat's, agent-filed item's or watched-folder file's title and text (text cut to 6000 characters; live prompts and pairing requests are never sent), plus a Kanban card's last six comments (each cut to 600 characters, so the summary skips what is already settled), go to the model provider configured in Hermes, through Hermes's own plugin LLM API (logged in its plugin audit log), in a background thread. The result is cached in `bluf.json`; nothing is resent until the item changes, except that a failed summary is retried after 10 minutes, then 20, and is given up after 3 tries until the item changes. The open page and its status chip poll the queue every 45 seconds, so with the setting on, new items are summarized without you opening them. Set `bluf_enabled: false` to send nothing automatically.
+- **Ask sends card content to your model provider when you ask.** Clicking **TL;DR**, or sending a follow-up there, sends that card's context (without its workspace path; your home folder shows as `~`, and secret-looking values such as tokens, passwords and credentials in URLs are replaced with `[redacted]`, as they are in summaries) and the question to the model provider configured in Hermes, through Hermes's own plugin LLM API, and logs the call in Hermes's plugin audit log. **Discuss in chat** only types a draft into a normal Hermes chat; the chat you then start makes its own model calls. Turn Ask off with `ask_enabled: false`.
 - **No credentials.** There is no Outlook, Gmail or Plaud API integration and no account credentials are needed. Those items reach the queue through your agent filing them with `unbl0ck_file` or through a watched folder. The text you file or export may itself contain private information; choose watched folders accordingly.
 - **Reads outside its own data:**
   - Kanban boards, through Hermes's Kanban modules (`hermes_cli.kanban_db`).
@@ -75,14 +75,18 @@ The things you would want to know before installing:
   - Its own files under `<HERMES_HOME>/plugin-data/unbl0ck/`: `hidden.json` ("Not for me" items and folder Done actions, capped at 1000), `waits/<id>.json` (one small owner-only file per live prompt, deleted when it is answered), `outside/<id>.json` (one owner-only 0600 file per agent-filed item, capped at 200, deleted on Done or agent resolve), `bluf.json` (cached summaries, capped at 300) and `pocket-pack.json` (only when you ask for the pack).
   - In Desktop, two display toggles (effects and sound) in `localStorage`.
 - **No shell commands, no subprocesses and no self-updating.** Summaries and Ask replies run in small in-process thread pools inside the Hermes backend.
-- **Sound:** the Desktop page plays short synthesized UI sounds through Web Audio. Turn them off with **SFX**.
+- **Sound:** off by default. Switch on **SFX** and the Desktop page plays short synthesized UI sounds through Web Audio; no audio context is created before that. Your choice is kept in `localStorage`.
 - **Hermes internals:** Kanban access uses Hermes's internal `hermes_cli.kanban_db*` modules, because no public plugin API for Kanban comments and unblocks exists yet. To keep each poll fast, the queue also reads the newest block event and your latest comment per card with one indexed SQL query each, falling back to the public `list_events`/`list_comments` if the schema differs. A Hermes release that changes those modules can break the queue until UNBL0CK is updated. `hermes plugins validate` reports this as a warning. Settings are read with `hermes_cli.config.load_config_readonly()` and the Hermes home with `hermes_constants.get_hermes_home()`.
 - **Optional environment fallbacks:** `UNBL0CK_PRINCIPAL`, `UNBL0CK_AUTHOR`, `UNBL0CK_OWNER_IDS` and `UNBL0CK_OUTSIDE_DIRS` stand in for `principal_name`, `comment_author`, `owner_user_ids` and `outside_dirs` when those settings are empty. None is required and none holds a secret.
+
+## Platform limits
+
+State files (`hidden.json`, `bluf.json`, `pending-release.json`) are guarded by a thread lock everywhere and by an `fcntl` file lock on macOS and Linux. **Windows has no cross-process lock**: two processes writing at once there can lose an update. On macOS and Linux a lock held longer than 5 seconds raises `TimeoutError` instead of hanging.
 
 ## Develop
 
 ```
-python -m unittest discover -s tests -v
+python -m pytest -rs tests
 hermes plugins validate .
 ```
 

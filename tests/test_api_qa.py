@@ -31,6 +31,7 @@ class ApiQA(unittest.TestCase):
                 raise ValueError("bad id")
         self.needs = types.SimpleNamespace(
             NO_BLUF_SOURCES=real.NO_BLUF_SOURCES, hide=hide, StaleAnswer=real.StaleAnswer,
+            normalize_board_slug=real.normalize_board_slug,
             pocket_pack=lambda q: {"cards": len(q["items"])},
             write_pocket_pack=lambda q: self.written.append(q),
             answer_card=self._answer,
@@ -58,7 +59,6 @@ class ApiQA(unittest.TestCase):
 
     def test_answer_carries_the_version_and_stale_is_409(self):
         kdb = types.ModuleType("hermes_cli.kanban_db")
-        kdb._normalize_board_slug = lambda b: b
         kdb.board_exists = lambda b: True
         pkg = types.ModuleType("hermes_cli"); pkg.kanban_db = kdb
         saved = {k: sys.modules.get(k) for k in ("hermes_cli", "hermes_cli.kanban_db")}

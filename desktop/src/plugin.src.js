@@ -307,8 +307,8 @@ const SFX_SPECS = {
   warn: () => seq([[300, 70, 0.38], [220, 92, 0.32]]),
   err: () => seq([[200, 80, 0.42], [140, 120, 0.36]])
 }
-let sfxOnNow = true
-try { sfxOnNow = localStorage.getItem('unbl0ck.sfx') !== 'off' } catch {}
+let sfxOnNow = false   // sound is opt-in: a fresh profile stays silent until the SFX toggle is used
+try { sfxOnNow = localStorage.getItem('unbl0ck.sfx') === 'on' } catch {}
 const $sfxOn = atom(sfxOnNow)
 let fxInit = true
 try { fxInit = localStorage.getItem('unbl0ck.fx') !== 'off' } catch {}
@@ -319,6 +319,7 @@ const sfx = (() => {
   let ac = null, bufs = null, lastAny = 0
   const last = {}
   const boot = () => {
+    if (!sfxOnNow) return null   // no audio context until sound is switched on
     if (ac) return ac.state === 'suspended' ? ac.resume() : null
     try {
       ac = new (window.AudioContext || window.webkitAudioContext)()

@@ -27,8 +27,8 @@ class BlufTest(unittest.TestCase):
 
     def test_parse_ignores_reasoning_and_uses_last_json_object(self):
         reply = ('<think>Consider this example: {"bluf":"wrong","why":"wrong"}</think>'
-                 'Final answer: {"bluf":"Pick A.","why":"The release waits."}')
-        self.assertEqual(needs.parse_bluf(reply), ("Pick A.", "The release waits."))
+                 'Final answer: {"bluf":"Pick option A.","why":"The release waits."}')
+        self.assertEqual(needs.parse_bluf(reply), ("Pick option A.", "The release waits."))
 
     def test_parse_uses_top_level_bluf_and_ignores_trailing_format_example(self):
         cases = [
@@ -36,8 +36,8 @@ class BlufTest(unittest.TestCase):
              '"refs":{"pr":12}}', ("Approve the merge", "tests pass")),
             ('{"bluf":"Approve empty config {} for prod","why":"ops"}',
              ("Approve empty config {} for prod", "ops")),
-            ('{"bluf":"Final","why":"ready"}\nExample format: '
-             '{"bluf":"...","why":"..."}', ("Final", "ready")),
+            ('{"bluf":"Final answer here","why":"ready"}\nExample format: '
+             '{"bluf":"...","why":"..."}', ("Final answer here", "ready")),
         ]
         for reply, expected in cases:
             with self.subTest(reply=reply):
@@ -73,6 +73,8 @@ class BlufTest(unittest.TestCase):
         fastapi.HTTPException = type("HTTPException", (Exception,), {})
         pydantic = types.ModuleType("pydantic")
         pydantic.BaseModel = type("BaseModel", (), {})
+        pydantic.Field = lambda *a, **k: None
+        pydantic.field_validator = lambda *a, **k: (lambda fn: fn)
         with mock.patch.dict(sys.modules, {"fastapi": fastapi, "pydantic": pydantic}):
             spec.loader.exec_module(api)
         calls = {}
@@ -80,7 +82,7 @@ class BlufTest(unittest.TestCase):
         class LLM:
             def complete(self, messages, **kwargs):
                 calls.update(kwargs)
-                return types.SimpleNamespace(text='{"bluf":"Pick A.","why":"The release waits."}')
+                return types.SimpleNamespace(text='{"bluf":"Pick option A.","why":"The release waits."}')
 
         class Jobs:
             def succeed(self, key): pass
