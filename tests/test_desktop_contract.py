@@ -56,6 +56,23 @@ if (result.children !== '◆ 1 NEEDS YOU') throw new Error(`unexpected chip: ${r
         subprocess.run(["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
                        check=True, capture_output=True, text=True)
 
+    def test_oldest_age_ignores_stuck_and_answered_cards(self):
+        script = r'''const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const helper = src.match(/function oldestAskSince\(items\) \{[\s\S]*?\n\}/)?.[0];
+if (!helper) throw new Error('oldest ask helper missing');
+const oldestAskSince = new Function(`${helper}; return oldestAskSince;`)();
+const since = oldestAskSince([
+  {tier: 'stuck', since: 1},
+  {tier: 'answered', since: 2},
+  {tier: 'ask', since: 30},
+  {tier: 'ask', since: 40}
+]);
+if (since !== 30) throw new Error(`oldest ask timestamp was ${since}`);
+'''
+        subprocess.run(["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
+                       check=True, capture_output=True, text=True)
+
 
 if __name__ == "__main__":
     unittest.main()
