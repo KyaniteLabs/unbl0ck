@@ -44,7 +44,7 @@ config_schema:
   bluf_enabled:
     type: bool
     default: true
-    description: "Lead each card with a one-line model-written summary. Each new or changed Kanban card's, chat's, agent-filed item's or watched-folder file's title and text are sent once to the model provider configured in Hermes (through its plugin LLM API) and the summary is cached in plugin-data. Set false to send nothing automatically."
+    description: "Lead each card with a one-line model-written summary. Each new or changed Kanban card's, chat's, agent-filed item's or watched-folder file's title and text are sent once to the model provider configured in Hermes (through its plugin LLM API) and the summary is cached in plugin-data. Keys, tokens and home-directory paths are scrubbed from that text before it leaves your machine. Set false to send nothing automatically."
   outside_dirs:
     type: str
     default: ""

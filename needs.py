@@ -1738,6 +1738,10 @@ _ASK_SECRET_PATTERNS = (
     # key=value / key: value for secret-looking keys
     (re.compile(r"(?i)\b([a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)s?)(\s*[=:]\s*)[\"']?[^\s\"',;]+"),
      r"\1\2[redacted]"),
+    # JWTs and home-directory shapes of any user (the current user's own home is handled in _ask_redact)
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"), "[redacted]"),
+    (re.compile(r"(?<![\w.])/(?:Users|home)/[^/\s\"'`]+(?=/|\s|$|[\"'`)\],;:])"), "~"),
+    (re.compile(r"(?i)\b[A-Z]:\\Users\\[^\\\s\"'`]+"), "~"),
     # Well-known token shapes
     (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"), "[redacted]"),
     (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"), "[redacted]"),
