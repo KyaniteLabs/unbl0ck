@@ -415,6 +415,15 @@ def bluf_messages(item: dict[str, Any], comments: Optional[list[dict[str, Any]]]
 _BLUF_THINK_RE = re.compile(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", re.S | re.I)
 
 
+BLUF_MIN_CHARS = 10
+
+
+def _real_bluf(value: Any) -> bool:
+    """A BLUF is a sentence: not the "..." format placeholder, and not a stub."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return len(text) >= BLUF_MIN_CHARS and bool(re.search(r"[A-Za-z0-9]", text))
+
+
 def parse_bluf(text: str) -> tuple[str, str]:
     """Pull ``bluf``/``why`` out of a model reply; tolerate code fences, stray prose,
     reasoning blocks (closed or cut off) and extra JSON objects. The answer is the first
@@ -430,16 +439,14 @@ def parse_bluf(text: str) -> tuple[str, str]:
         except ValueError:
             i = text.find("{", i + 1)
             continue
-        if isinstance(obj, dict) and "bluf" in obj:
+        if isinstance(obj, dict) and "bluf" in obj and _real_bluf(obj["bluf"]):
             if not re.search(r"\b(?:example\s+format|for example)\s*:\s*$", text[:i], re.I):
                 data = obj
                 break
         i = text.find("{", end)
     if data is None:
-        raise ValueError("no JSON object with a bluf in reply")
+        raise ValueError("no JSON object with a real bluf in reply")
     bluf = re.sub(r"\s+", " ", str(data.get("bluf") or "")).strip()
-    if not bluf:
-        raise ValueError("empty bluf")
     return bluf[:200], re.sub(r"\s+", " ", str(data.get("why") or "")).strip()[:240]
 
 
