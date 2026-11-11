@@ -138,6 +138,18 @@ class Classify(unittest.TestCase):
     def test_comma_ends_a_negation_clause(self):
         self.assertTrue(needs.kanban_needs_you("Not yet done, needs CEO approval", None))
 
+    def test_approval_conditions_are_asks_but_denials_remain_negated(self):
+        for reason in [
+            "Won't merge without CEO approval",
+            "Do not deploy until CEO approval",
+            "Can't deploy without your approval",
+        ]:
+            with self.subTest(reason=reason):
+                self.assertTrue(needs.kanban_needs_you(reason, None), reason)
+        for reason in ["No CEO approval needed", "Not waiting on CEO approval"]:
+            with self.subTest(reason=reason):
+                self.assertIsNone(needs.kanban_needs_you(reason, None), reason)
+
     def test_chat_non_asks_drop(self):
         for text in [
             "Done. The file is saved at /tmp/out.txt. Anything else you need?",

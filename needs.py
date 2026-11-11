@@ -380,15 +380,23 @@ def parse_bluf(text: str) -> tuple[str, str]:
     text = re.sub(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", "", text or "", flags=re.S | re.I)
     decoder = json.JSONDecoder()
     data = None
-    for i, char in enumerate(text):
-        if char != "{":
+    i = 0
+    while i < len(text):
+        if text[i] != "{":
+            i += 1
             continue
         try:
-            candidate, _ = decoder.raw_decode(text, i)
+            candidate, end = decoder.raw_decode(text, i)
         except json.JSONDecodeError:
+            i += 1
             continue
         if isinstance(candidate, dict):
-            data = candidate
+            prefix = text[:i]
+            is_example = re.search(r"\b(?:example\s+format|for example)\s*:\s*$", prefix, re.I)
+            if not is_example:
+                data = candidate
+        # Skip nested objects inside a successfully decoded top-level object.
+        i = end
     if data is None:
         raise ValueError("no JSON object in reply")
     bluf = re.sub(r"\s+", " ", str(data.get("bluf") or "")).strip()
@@ -448,10 +456,15 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
     cuts = list(_CLAUSE_END.finditer(head))
     clause = head[cuts[-1].end():] if cuts else head
     near = " ".join(clause.split()[-3:])
+    gate_condition = bool(
+        re.search(r"\b(?:without|until)\s+$", clause, re.I)
+        and re.search(r"\b(?:approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)\b",
+                      match.group(), re.I)
+    )
     after = text[match.end():]
     end = _CLAUSE_END.search(after)
     after = after[:end.start()] if end else after
-    return bool(_NEGATION.search(near) or _POST_NEGATION.search(after))
+    return bool((_NEGATION.search(near) and not gate_condition) or _POST_NEGATION.search(after))
 
 
 def _match_is_standalone(text: str, match: re.Match[str]) -> bool:
@@ -1217,15 +1230,14 @@ class StaleAnswer(RuntimeError):
 
 def answer_card(board: str, task_id: str, text: str, *, release: bool,
                 version: Optional[str] = None, home: Optional[Path] = None) -> dict[str, Any]:
-    """Comment as the principal through native Kanban, then unblock if asked.
+    """Unblock through native Kanban, then comment as the principal if asked.
 
     *version* is the queue item's version the human read (the block event id). It is required to
     release; an answer is refused if the card has been blocked again since, so an answer to an old
-    question never releases a new one. The check and the comment share one write transaction, so a double
-    submit cannot post two comments. A failed unblock raises and is remembered: the card stays
-    in the queue, and answering it again with ``release`` retries the release without posting
-    the answer twice. Triage cards (``block_loop_detected``) accept the answer but cannot be
-    released here.
+    question never releases a new one. The answer is posted first, so a resumed worker sees it;
+    Hermes owns the unblock transaction. A failed unblock is remembered, and a retry releases
+    without posting the answer twice. Triage cards (``block_loop_detected``) accept
+    the answer but cannot be released here.
     """
     from hermes_cli import kanban_db  # type: ignore
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
@@ -1238,6 +1250,7 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
     author = principal_author()
     item_id = f"kanban:{board}:{task_id}"
     comment_id: Optional[int] = None
+    post_answer = False
     with closing(kbc.connect(board=board)) as conn:
         if kanban_db.get_task(conn, task_id) is None:
             raise LookupError(f"card {task_id} not found on {board}")
@@ -1254,32 +1267,31 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
             if version is not None and str(version) != current_version:
                 raise StaleAnswer(
                     f"card {task_id} was blocked again after you read it; refresh to see the new question")
-            # The same "answered since this block" test the queue uses, so a card the queue
-            # shows is exactly a card that accepts an answer.
-            if _answered_since(conn, kanban_db, task_id, author, since):
-                # Already answered: a release (a retry, or a card kept blocked earlier) goes
-                # ahead; a changed answer is posted, but an identical retry is not duplicated.
+            # The same "answered since this block" test the queue uses.
+            already_answered = _answered_since(conn, kanban_db, task_id, author, since)
+            if already_answered:
                 if not release:
                     raise RuntimeError(f"card {task_id} was already answered since it was blocked")
                 if text:
                     prior = kanban_db.list_comments(conn, task_id)
-                    duplicate = any(
+                    post_answer = not any(
                         str(getattr(c, "author", "")).casefold() == author.casefold()
                         and str(getattr(c, "body", "")).strip() == text
                         for c in prior
                     )
-                    if not duplicate:
-                        comment_id = kanban_db.add_comment(conn, task_id, author=author, body=text)
             elif not text:
                 raise ValueError("answer text is required")
             else:
+                post_answer = True
+            # Post before releasing so a resumed worker always sees the answer. A retry after a
+            # failed release finds this comment and does not post it again.
+            if post_answer:
                 comment_id = kanban_db.add_comment(conn, task_id, author=author, body=text)
         released = False
         if release:
             release_failed = False
             with kanban_db.write_txn(conn, allow_nested=True):
-                # The answer transaction has committed. Recheck under the release transaction
-                # so an intervening block cannot be released using the older answer.
+                # Recheck immediately before invoking Hermes' transaction-owning helper.
                 latest_block = _latest_block(conn, kanban_db, task_id)
                 latest_since = _block_since(latest_block, current)
                 latest_version = str(latest_block.id if latest_block else latest_since)
@@ -1287,14 +1299,15 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
                     raise StaleAnswer(
                         f"card {task_id} has a newer block; your answer was posted, but the new question "
                         "remains blocked; refresh to see it")
-                if kanban_db.unblock_task(conn, task_id):
-                    released = True
+            # unblock_task opens its own write_txn in Hermes and must run outside this txn.
+            if kanban_db.unblock_task(conn, task_id):
+                released = True
+            else:
+                latest = kanban_db.get_task(conn, task_id)
+                if latest is None or str(getattr(latest.status, "value", latest.status)) in HELD_STATUSES:
+                    release_failed = True
                 else:
-                    latest = kanban_db.get_task(conn, task_id)
-                    if latest is None or str(getattr(latest.status, "value", latest.status)) in HELD_STATUSES:
-                        release_failed = True
-                    else:
-                        released = True  # another actor released it; do not claim it was ours
+                    released = True  # another actor released it; do not claim it was ours
             if release_failed:
                 _set_pending_release(item_id, current_version, home)
                 raise UnblockFailed(task_id, comment_id)
