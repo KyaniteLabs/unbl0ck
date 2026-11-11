@@ -183,8 +183,7 @@ def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
             log.info("unbl0ck: comments for %s unavailable: %s", item["id"], exc)
             comments = []
         result = ctx.llm.complete(
-            n.bluf_messages(item, comments), purpose="unbl0ck.bluf", temperature=0.1,
-            max_tokens=ASK_MAX_TOKENS, timeout=90
+            n.bluf_messages(item, comments), purpose="unbl0ck.bluf", temperature=0.1, max_tokens=BLUF_MAX_TOKENS, timeout=90
         )
         bluf, why = n.parse_bluf(result.text)
         n.save_bluf(item["id"], item["version"], bluf, why)
@@ -265,6 +264,8 @@ def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
 
 
 ASK_MAX_TOKENS = 4000
+# Reasoning models spend tokens thinking before the JSON; 200 cut them off mid-thought (F09).
+BLUF_MAX_TOKENS = ASK_MAX_TOKENS
 _THINK_RE = re.compile(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", re.S | re.I)
 
 

@@ -46,7 +46,8 @@ class BlufState(str, Enum):
 class BlufJobs:
     """``{(item_id, version): {"state", "at", "error"}}`` with one function per move."""
 
-    RETRY_S = 600      # a failed summary is retried this long after it failed
+    RETRY_S = 600      # the first retry waits this long; each later one waits twice as long
+    MAX_ATTEMPTS = 3   # after this many failures a card version is not summarized again
     STUCK_S = 3600     # a pending job this old never reported back (the model call times out at 90 s)
     PRUNE_OVER = 500   # table size at which settled entries are dropped
 
@@ -65,7 +66,10 @@ class BlufJobs:
             return True
         age = self._clock() - st["at"]
         if st["state"] is BlufState.FAILED:
-            return age >= self.RETRY_S
+            n = st.get("attempts", 1)
+            if n >= self.MAX_ATTEMPTS:
+                return False
+            return age >= self.RETRY_S * (2 ** (n - 1))
         return age >= self.STUCK_S
 
     def start(self, key: tuple[str, str]) -> bool:
@@ -73,8 +77,10 @@ class BlufJobs:
         with self._lock:
             if not self.can_start(key):
                 return False
+            prev = self._jobs.get(key)
+            attempts = prev.get("attempts", 0) if prev and prev["state"] is BlufState.FAILED else 0
             self._prune()
-            self._jobs[key] = {"state": BlufState.PENDING, "at": self._clock(), "error": None}
+            self._jobs[key] = {"state": BlufState.PENDING, "at": self._clock(), "error": None, "attempts": attempts}
             return True
 
     def succeed(self, key: tuple[str, str]) -> None:
@@ -91,7 +97,12 @@ class BlufJobs:
             st = self._jobs.get(key)
             if st is not None and st["state"] is not BlufState.PENDING:
                 raise IllegalTransition(f"summary {key} is {st['state'].value}, not pending")
-            self._jobs[key] = {"state": BlufState.FAILED, "at": self._clock(), "error": str(error)}
+            attempts = (st.get("attempts", 0) if st is not None else 0) + 1
+            self._jobs[key] = {"state": BlufState.FAILED, "at": self._clock(), "error": str(error), "attempts": attempts}
+
+    def attempts(self, key: tuple[str, str]) -> int:
+        st = self._jobs.get(key)
+        return 0 if st is None else int(st.get("attempts", 0))
 
     def is_pending(self, key: tuple[str, str]) -> bool:
         return self.state(key) is BlufState.PENDING

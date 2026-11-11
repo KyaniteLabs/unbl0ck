@@ -348,7 +348,7 @@ class BlufJobsMachine(unittest.TestCase):
     def test_random_walk_invariants(self):
         rng = random.Random(11)
         keys = [(f"k{i}", "1") for i in range(4)]
-        model = {}   # key -> (state, at)
+        model = {}   # key -> (state, at, attempts)
         for _ in range(500):
             k, op = rng.choice(keys), rng.choice(["start", "succeed", "fail", "tick"])
             st = model.get(k)
@@ -357,17 +357,20 @@ class BlufJobsMachine(unittest.TestCase):
                 continue
             if op == "start":
                 age = None if st is None else self.clock.t - st[1]
-                want = (st is None or (st[0] == "failed" and age >= jobs.BlufJobs.RETRY_S)
+                n = 0 if st is None else st[2]
+                want = (st is None
+                        or (st[0] == "failed" and n < jobs.BlufJobs.MAX_ATTEMPTS
+                            and age >= jobs.BlufJobs.RETRY_S * 2 ** (n - 1))
                         or (st[0] == "pending" and age >= jobs.BlufJobs.STUCK_S))
                 self.assertEqual(self.j.start(k), want)
                 if want:
-                    model[k] = ("pending", self.clock.t)
+                    model[k] = ("pending", self.clock.t, n if st is not None and st[0] == "failed" else 0)
             elif st is None or st[0] == "pending":
                 getattr(self.j, op)(*((k,) if op == "succeed" else (k, "e")))
                 if op == "succeed":
                     model.pop(k, None)
                 else:
-                    model[k] = ("failed", self.clock.t)
+                    model[k] = ("failed", self.clock.t, (st[2] if st is not None else 0) + 1)
             else:
                 with self.assertRaises(jobs.IllegalTransition):
                     getattr(self.j, op)(*((k,) if op == "succeed" else (k, "e")))
