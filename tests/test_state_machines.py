@@ -183,10 +183,11 @@ class AnswerCardStatuses(unittest.TestCase):
         pkg.kanban_db, pkg.kanban_db_connect = kdb, kbc
         with mock.patch.dict(sys.modules, {"hermes_cli": pkg, "hermes_cli.kanban_db": kdb,
                                            "hermes_cli.kanban_db_connect": kbc}):
-            try:
-                return needs.answer_card("b", "t", "go", release=release), calls
-            except Exception as exc:  # noqa: BLE001
-                return exc, calls
+            with tempfile.TemporaryDirectory() as home:   # the pending-release marker lands here
+                try:
+                    return needs.answer_card("b", "t", "go", release=release, home=Path(home)), calls
+                except Exception as exc:  # noqa: BLE001
+                    return exc, calls
 
     def test_every_status(self):
         for status in [s.value for s in needs.CardStatus] + ["todo", "running", "done"]:

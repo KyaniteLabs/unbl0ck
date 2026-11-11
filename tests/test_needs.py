@@ -85,7 +85,7 @@ class Classify(unittest.TestCase):
     def test_live_false_positives_drop(self):
         cases = [
             ("Superseded. Dead card. Do not retry. Path /home/ada/workspaces/demo/app", "needs_input"),
-            ("Ask Liam in ada/fleet", "needs_input"),
+            ("Ask the operator in the fleet channel", "needs_input"),
             ("Ada-reserved slot", "needs_input"),
             ("no new Ada approval requested", None),
             ("Owner-domain input, not a principal gate", "needs_input"),
@@ -220,9 +220,18 @@ class FakeKanban(unittest.TestCase):
         )
         self.stack = fake_hermes(kdb, fake_connect())
         self.stack.__enter__()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.saved_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(self.home)   # the pending-release marker lands here
 
     def tearDown(self):
         self.stack.__exit__(None, None, None)
+        if self.saved_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = self.saved_home
+        self.tmp.cleanup()
 
     def test_answer_and_release(self):
         r = needs.answer_card("factory", "t_1", "Go with A", release=True)
@@ -253,6 +262,37 @@ class FakeKanban(unittest.TestCase):
             needs.answer_card("factory", "t_1", "Go", release=True)
         self.assertIn("comment 7", str(ctx.exception))
         self.assertEqual([c[0] for c in self.calls], ["comment", "unblock"])
+
+    def test_answer_to_an_old_block_is_refused(self):
+        # The card was blocked again (event 12) after the human read the block-11 question.
+        self.events = [block_event(), types.SimpleNamespace(
+            id=12, kind="blocked", created_at=130, payload={"reason": "new question", "kind": "needs_input"})]
+        with self.assertRaises(needs.StaleAnswer):
+            needs.answer_card("factory", "t_1", "Go with A", release=True, version="11")
+        self.assertEqual(self.calls, [])
+        r = needs.answer_card("factory", "t_1", "Go with B", release=True, version="12")
+        self.assertTrue(r["released"])
+
+    def test_failed_release_stays_in_queue_and_retries_without_a_second_comment(self):
+        kdb = sys.modules["hermes_cli.kanban_db"]
+        kdb.unblock_task = lambda c, t: self.calls.append(("unblock", t)) or False
+        with self.assertRaises(needs.UnblockFailed):
+            needs.answer_card("factory", "t_1", "Go", release=True, version="11")
+        self.assertEqual(needs.load_pending_releases(), {"kanban:factory:t_1": "11"})
+        # The comment is now on the card.
+        self.comments = [types.SimpleNamespace(author="ada", created_at=150, body="Go")]
+        kdb.list_tasks = lambda c, status=None: [self.task] if status == "blocked" else []
+        it, = needs.kanban_items(boards=["factory"])
+        self.assertEqual(it["tier"], "release_failed")
+        # Answer-only on an answered card is still refused; a release retry is allowed once.
+        with self.assertRaises(RuntimeError):
+            needs.answer_card("factory", "t_1", "Go", release=False)
+        kdb.unblock_task = lambda c, t: self.calls.append(("unblock", t)) or True
+        r = needs.answer_card("factory", "t_1", "Go", release=True, version="11")
+        self.assertEqual(r, {"ok": True, "comment_id": None, "released": True})
+        self.assertEqual([c[0] for c in self.calls], ["comment", "unblock", "unblock"])
+        self.assertEqual(needs.load_pending_releases(), {})
+        self.assertEqual(needs.kanban_items(boards=["factory"]), [])
 
     def test_triage_cannot_be_released(self):
         self.task = task(status="triage")
@@ -328,7 +368,7 @@ class QueueKanban(unittest.TestCase):
 
     def test_operator_and_credential_phrasing_detected(self):
         for reason in [
-            "Liam/operator input is needed to reconcile the judge",
+            "Operator input is needed to reconcile the judge",
             "Ada approved this last week",
             "npm credentials are dead",
             "needs an authorized host route",
@@ -340,7 +380,7 @@ class CardContext(unittest.TestCase):
     def test_context_shape(self):
         ctx_task = task(
             task_id="t_ctx", priority=4, created_by="ada", session_id="sess-1",
-            body="Do the thing", assignee="liam", workspace_kind="git",
+            body="Do the thing", assignee="worker", workspace_kind="git",
             workspace_path="/tmp/wt", branch_name="feat/x", project_id="proj",
             completion_contract="owner/repo#7", last_failure_error="boom",
             consecutive_failures=2, result=None, started_at=110, completed_at=None,
@@ -350,14 +390,14 @@ class CardContext(unittest.TestCase):
             id=14, kind="pr_acceptance", created_at=130,
             payload={"ok": True, "classification": "green", "detail": ""}, run_id=3,
         )
-        comment = types.SimpleNamespace(id=4, author="liam", body="Which option?", created_at=121)
+        comment = types.SimpleNamespace(id=4, author="worker", body="Which option?", created_at=121)
         run = types.SimpleNamespace(
-            id=3, profile="liam", status="blocked", outcome="blocked", summary="waiting on you",
+            id=3, profile="worker", status="blocked", outcome="blocked", summary="waiting on you",
             error=None, started_at=110, ended_at=120,
         )
         attachment = types.SimpleNamespace(
             id=1, filename="evidence.txt", content_type="text/plain", size=12,
-            uploaded_by="liam", created_at=115,
+            uploaded_by="worker", created_at=115,
         )
         kdb = fake_db(
             get_task=lambda conn, task_id: ctx_task if task_id == "t_ctx" else None,

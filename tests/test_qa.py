@@ -102,6 +102,10 @@ class Chats(unittest.TestCase):
             SETTINGS["owner_user_ids"] = "111, 333"
             try:
                 self.assertEqual(sorted(i["session_id"] for i in needs.chat_items(Path(d))), ["local", "me"])
+                # A gateway chat with no known user is not proven to be yours: hidden too.
+                with tempfile.TemporaryDirectory() as d2:
+                    chat_db(Path(d2) / "state.db", [("anon", "telegram", None, ""), ("old", "", None, "")])
+                    self.assertEqual([i["session_id"] for i in needs.chat_items(Path(d2))], ["old"])
             finally:
                 SETTINGS.pop("owner_user_ids")
 
