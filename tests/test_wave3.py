@@ -80,3 +80,15 @@ def test_ub3_the_turn_cap_is_a_setting():
     assert len(msgs[2:]) == 2
 
 
+def test_ub1b_a_failing_item_is_tried_at_most_three_times_in_24_hours_and_a_new_version_resets():
+    t = [0.0]
+    j = jobs.BlufJobs(clock=lambda: t[0])
+    key = ("kanban:b:t", "v1")
+    starts = 0
+    while t[0] < 24 * 3600:                      # the desktop polls every 45 s
+        if j.start(key):
+            starts += 1
+            j.fail(key, "ValueError: no JSON object in reply")
+        t[0] += 45
+    assert starts <= 3
+    assert j.start(("kanban:b:t", "v2"))         # a version bump starts again
