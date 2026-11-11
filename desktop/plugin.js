@@ -959,6 +959,16 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           : `Answered ${item.task_id} (kept blocked)`)
     )
   const sendPrimary = () => send(!triage)
+  // Answered already (kept blocked, or the release failed): only the release is left to do.
+  const answered = isKanban && !triage && (item.tier === 'answered' || item.tier === 'release_failed')
+  const release = () =>
+    run(
+      () => ctx.rest('/kanban/answer', {
+        method: 'POST',
+        body: { board: item.board, task_id: item.task_id, text: '', release: true, version: item.version }
+      }),
+      r => (r && r.released ? `Unblocked ${item.task_id}` : `Could not unblock ${item.task_id}`)
+    )
   const hide = async () => {
     const r = await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
     if (r) $undo.set({ id: item.id, title: item.title, at: Date.now() })
@@ -1068,7 +1078,13 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
   ].filter(Boolean)
 
-  const actions = isKanban
+  const actions = answered
+    ? [
+        jsx('div', { className: 'ub-hint', role: 'note', children: 'Your answer is on the card. Release it when the work can go on.' }),
+        jsxs('div', { className: 'ub-btns', children: [button({ kind: 'primary', keycap: '⏎', disabled: busy, onClick: release, children: 'Release (unbl0ck)' })] }),
+        jsxs('div', { className: 'ub-btns tools', children: tools })
+      ]
+    : isKanban
     ? [
         jsx('textarea', {
           className: answer ? 'ub-ta has' : 'ub-ta',

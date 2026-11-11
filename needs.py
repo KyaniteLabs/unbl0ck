@@ -586,7 +586,8 @@ def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, since:
 class CardStatus(str, Enum):
     """The Kanban card statuses UNBL0CK acts on (Kanban owns the full set and every write).
 
-        BLOCKED   --answer-->            BLOCKED  (answered: off the queue until a new block)
+        BLOCKED   --answer-->            BLOCKED  (answered: stays listed with a release action)
+        BLOCKED   --release (answered)-> Kanban's unblock_task, no second comment
         BLOCKED   --answer + release-->  Kanban's unblock_task moves it out of HELD
         SCHEDULED --answer [+ release]-> as BLOCKED (answerable, never listed)
         TRIAGE    --answer-->            TRIAGE
@@ -674,12 +675,18 @@ def kanban_items(
                     if _answered_since(conn, kanban_db, task.id, author, since):
                         if pending is None:
                             pending = load_pending_releases()
-                        if pending.get(f"kanban:{board}:{task.id}") != version:
-                            continue
-                        # Your answer is posted but releasing the card failed: keep it in front
-                        # of you so the release can be retried.
-                        tier = "release_failed"
-                        why = "Your answer is posted, but the card could not be unblocked; retry the release"
+                        if pending.get(f"kanban:{board}:{task.id}") == version:
+                            # Your answer is posted but releasing the card failed: keep it in
+                            # front of you so the release can be retried.
+                            tier = "release_failed"
+                            why = "Your answer is posted, but the card could not be unblocked; retry the release"
+                        elif str(getattr(task.status, "value", task.status)) in RELEASABLE_STATUSES:
+                            # Answered and kept blocked: nothing more to answer, but it must stay
+                            # reachable so it can be released later.
+                            tier = "answered"
+                            why = "You answered and kept it blocked; release it when it is ready"
+                        else:
+                            continue  # answered triage card: nothing left for you to do here
                     items.append({
                         "id": f"kanban:{board}:{task.id}",
                         "version": version,
@@ -1161,13 +1168,14 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
              if include_hidden or visibility(hidden, i["id"], i["version"]) is not Visibility.HIDDEN]
     # Same order as the panel: live prompts (a run is paused), pairing requests (expire within
     # the hour), Kanban, chats; inside a source, higher priority first (as on the board), then newest.
-    shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), i.get("tier") == "stuck", -(_num(i.get("priority"))), -(_num(i.get("since")))))
+    shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), i.get("tier") in ("stuck", "answered"), -(_num(i.get("priority"))), -(_num(i.get("since")))))
     attach_blufs(shown, home)
     return {
         "generated_at": int(time.time()),
         "count": len(shown),
         "counts": {
-            "asks": sum(1 for i in shown if i.get("tier") != "stuck"),
+            "asks": sum(1 for i in shown if i.get("tier") not in ("stuck", "answered")),
+            "answered": sum(1 for i in shown if i.get("tier") == "answered"),
             "stuck": sum(1 for i in shown if i.get("tier") == "stuck"),
             "stuck_by_why": dict(collections.Counter(i["why"] for i in shown if i.get("tier") == "stuck")),
         },
@@ -1212,7 +1220,7 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
 
     text = (text or "").strip()
-    if not text:
+    if not text and not release:
         raise ValueError("answer text is required")
     author = principal_author()
     item_id = f"kanban:{board}:{task_id}"
@@ -1236,9 +1244,12 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
             # The same "answered since this block" test the queue uses, so a card the queue
             # shows is exactly a card that accepts an answer.
             if _answered_since(conn, kanban_db, task_id, author, since):
-                retry = release and load_pending_releases(home).get(item_id) == current_version
-                if not retry:
+                # Already answered: a release (a retry, or a card kept blocked earlier) goes
+                # ahead without posting the answer twice; a second answer is refused.
+                if not release:
                     raise RuntimeError(f"card {task_id} was already answered since it was blocked")
+            elif not text:
+                raise ValueError("answer text is required")
             else:
                 comment_id = kanban_db.add_comment(conn, task_id, author=author, body=text)
         released = False
