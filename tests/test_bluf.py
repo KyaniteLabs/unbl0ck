@@ -54,6 +54,8 @@ class BlufTest(unittest.TestCase):
         fastapi.HTTPException = type("HTTPException", (Exception,), {})
         pydantic = types.ModuleType("pydantic")
         pydantic.BaseModel = type("BaseModel", (), {})
+        pydantic.Field = lambda *a, **k: None
+        pydantic.field_validator = lambda *a, **k: (lambda fn: fn)
         with mock.patch.dict(sys.modules, {"fastapi": fastapi, "pydantic": pydantic}):
             spec.loader.exec_module(api)
         calls = {}
