@@ -20,7 +20,15 @@ config_schema:
   principal_name:
     type: str
     default: ""
-    description: "Your name(s) as agents write them in block reasons and chats, comma-separated (e.g. \"Ada, Ada Lovelace\"). CEO, principal and human always count."
+    description: "Your name(s) as agents write them in block reasons and chats, comma-separated (e.g. \"Ada, Ada Lovelace\"). The words in role_words, plus principal and human, always count."
+  role_words:
+    type: str
+    default: "CEO"   # role-words default
+    description: "Title words agents use for you in block reasons, comma-separated (e.g. \"Boss, founder\"). Matched like your name."
+  pocket_authority:
+    type: str
+    default: "owner"
+    description: "The authority label on pocket-pack decision cards. Set it to the word your pocket device expects."
   comment_author:
     type: str
     default: ""

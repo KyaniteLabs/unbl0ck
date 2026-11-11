@@ -50,9 +50,10 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 # Who the human is. Set in Hermes config: plugins.entries.unbl0ck.settings.principal_name
-# (comma-separated names, e.g. "Ada, Ada Lovelace"). Generic words (CEO, principal, human)
-# always count. Answers are commented as the first name, or comment_author if set.
-_GENERIC = ("CEO", "principal", "human")
+# (comma-separated names, e.g. "Ada, Ada Lovelace"). The generic words "principal" and "human"
+# always count, plus the configurable role words below. Answers are commented as the first
+# name, or comment_author if set.
+ROLE_WORDS_DEFAULT = "CEO"   # role-words default: the `role_words` setting overrides it
 
 
 log = logging.getLogger("unbl0ck")
@@ -87,6 +88,20 @@ def principal_names(settings: Optional[dict[str, Any]] = None) -> list[str]:
     return [n.strip() for n in str(raw).split(",") if n.strip()]
 
 
+def role_words(settings: Optional[dict[str, Any]] = None) -> list[str]:
+    """Title words agents use for the human in block reasons (setting ``role_words``, comma-separated)."""
+    raw = (settings if settings is not None else _settings()).get("role_words")
+    if raw is None or not str(raw).strip():
+        raw = ROLE_WORDS_DEFAULT
+    return [w.strip() for w in str(raw).split(",") if w.strip()]
+
+
+def pocket_authority(settings: Optional[dict[str, Any]] = None) -> str:
+    """The ``authority`` label on a pocket-pack decision card (setting ``pocket_authority``)."""
+    raw = (settings if settings is not None else _settings()).get("pocket_authority")
+    return str(raw).strip() if raw and str(raw).strip() else "owner"
+
+
 def principal_author(settings: Optional[dict[str, Any]] = None) -> str:
     s = settings if settings is not None else _settings()
     names = principal_names(s)
@@ -115,63 +130,65 @@ CHAT_TITLES = ("Bot Chat",)
 _PATTERN_CACHE: dict[str, dict[str, re.Pattern[str]]] = {}
 
 
-def _patterns(names: Optional[list[str]] = None) -> dict[str, re.Pattern[str]]:
-    """Detection regexes for the configured principal name(s); cached per name set."""
+def _patterns(names: Optional[list[str]] = None, role_words: Optional[list[str]] = None) -> dict[str, re.Pattern[str]]:
+    """Detection regexes for the configured principal name(s) and role words; cached per set."""
     names = principal_names() if names is None else names
     alt = "|".join(re.escape(n) for n in names) or r"(?!x)x"
-    key = alt
+    roles = globals()["role_words"]() if role_words is None else role_words
+    ralt = "(?:" + ("|".join(re.escape(w) for w in roles) or r"(?!x)x") + ")"
+    key = alt + "\0" + ralt
     if key in _PATTERN_CACHE:
         return _PATTERN_CACHE[key]
     pats: dict[str, re.Pattern[str]] = {}
 
     def _c(pattern: str, flags: int = 0) -> re.Pattern[str]:
-        return re.compile(pattern.replace("{P}", alt), flags)
+        return re.compile(pattern.replace("{P}", alt).replace("{C}", ralt), flags)
 
     # A reason that is a principal gate on its own, with or without a needs_input kind.
     # Second-person forms ("your approval", "blocked pending your go") are as strong as
     # a named gate; the audit's false negatives were all of this shape.
     pats["_GATE"] = _c(
-        r"\b(CEO[- ](gate|gated|word|decision|approval|call|sign[- ]?off)"
-        r"|({P}|CEO|principal)(['’]s)? (approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
-        r"|(awaiting|waiting (on|for)|needs?|requires?|blocked on|blocked pending|pending) ({P}|the CEO|CEO|principal|(the )?human)"
-        r"|(approval|decision|sign[- ]?off|input|answer|reply|go|ok) from ({P}|the CEO|CEO|(the )?principal|(the )?human|you)"
-        r"|(can['’]?t|cannot) \w+( \w+)? without (your|({P}|the CEO|CEO|(the )?principal)(['’]s)?) "
+        r"\b({C}[- ](gate|gated|word|decision|approval|call|sign[- ]?off)"
+        r"|({P}|{C}|principal)(['’]s)? (approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
+        r"|(awaiting|waiting (on|for)|needs?|requires?|blocked on|blocked pending|pending) ({P}|the {C}|{C}|principal|(the )?human)"
+        r"|(approval|decision|sign[- ]?off|input|answer|reply|go|ok) from ({P}|the {C}|{C}|(the )?principal|(the )?human|you)"
+        r"|(can['’]?t|cannot) \w+( \w+)? without (your|({P}|the {C}|{C}|(the )?principal)(['’]s)?) "
         r"(approval|decision|sign[- ]?off|input|answer|go|ok)"
         r"|^\W*please (approve|decide|choose|pick|confirm|sign)"
         r"|(awaiting|waiting (on|for)|needs?|requires?|blocked (on|pending)|pending) your "
         r"(approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
-        r"|({P}|CEO) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
+        r"|({P}|{C}) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
         r"|(which|what) (one|option|choice) do you (prefer|want|choose)"
         r"|human[- ]gate"
-        r"|([A-Za-z]+/)?(operator|owner|CEO|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
-        r"|({P}|CEO|principal) (approved|authorized|authorised|signed off)"
+        r"|([A-Za-z]+/)?(operator|owner|{C}|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
+        r"|({P}|{C}|principal) (approved|authorized|authorised|signed off)"
         r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,20}(route|access|path|executor)"
         r"|(credentials?|api[- ]?keys?|tokens?) (are |is )?(dead|expired|missing|needed|required|revoked))\b",
         re.I,
     )
     # Weaker cue, trusted only together with an explicit needs_input kind.
-    pats["_NAMES"] = _c(r"\b({P}|CEO|principal|human)\b", re.I)
+    pats["_NAMES"] = _c(r"\b({P}|{C}|principal|human)\b", re.I)
     # The supervisor/ops "stop" style blocks name the principal without asking anything.
-    pats["_ORDER"] = _c(r"^\s*({P}|CEO)\s+(\d{1,2}:\d{2}|says|said|orders?|ordered)\b", re.I)
+    pats["_ORDER"] = _c(r"^\s*({P}|{C})\s+(\d{1,2}:\d{2}|says|said|orders?|ordered)\b", re.I)
 
     pats["_ASK_STRONG"] = _c(
         r"\b(need(s)? (your|you to)|your (call|decision|approval|go|ok|sign[- ]?off|pick|answer)"
         r"|(please )?(approve|confirm|choose|pick one|reply with|say (yes|go))"
         r"|waiting on you|blocked on you|want (me|it) to|should I|shall I|do you want|which (one|option)"
         r"|decision (needed|for you)|needs? you"
-        r"|(picks?|options?|choices?|decisions?|questions?) for (you|the CEO|{P})"
-        r"|reply needed|your (pick|answer|word)|(CEO|{P})(['’]s)? (call|pick|decision|word)"
+        r"|(picks?|options?|choices?|decisions?|questions?) for (you|the {C}|{P})"
+        r"|reply needed|your (pick|answer|word)|({C}|{P})(['’]s)? (call|pick|decision|word)"
         r"|decision packet)\b",
         re.I,
     )
     # Asks that do not need a question mark to be an ask (decision packets, option lists).
     pats["_ASK_PACKET"] = _c(
-        r"\b((picks?|options?|choices?|decisions?|questions?) for (you|the CEO|{P})"
+        r"\b((picks?|options?|choices?|decisions?|questions?) for (you|the {C}|{P})"
         r"|decision packet(?! (?:was |is )?(?:archived|closed|resolved|answered|sent|done))"
         r"|reply needed|which (one|option|choice) (do|would|should) (you|I|we)|waiting (on|for) your (call|decision|word))\b",
         re.I,
     )
-    pats["_YOU"] = _c(r"\b(you|your|{P}|CEO)\b", re.I)
+    pats["_YOU"] = _c(r"\b(you|your|{P}|{C})\b", re.I)
     _PATTERN_CACHE[key] = pats
     return pats
 
@@ -461,7 +478,7 @@ _TOKEN_GLUE = "/\\-_@"
 
 
 # A clause ends at sentence or clause punctuation; negation never reaches across it
-# ("Cannot proceed: needs CEO approval" is an ask).
+# ("Cannot proceed: needs <role word> approval" is an ask).
 _CLAUSE_END = re.compile(r"[,.;:!?\n]|\s[-–—]\s")
 # After the phrase, only "... is not needed/required" undoes it; any other negation
 # there ("Needs your approval. Not urgent.") belongs to something else.
@@ -523,7 +540,7 @@ def kanban_needs_you(reason: str, kind: Optional[str]) -> Optional[str]:
         return None
     if pats["_ORDER"].match(reason):
         # A relayed order is a stop, not a question, unless it asks *you* for something
-        # ("CEO says: need your approval for the spend").
+        # ("<role word> says: need your approval for the spend").
         return "Block reason names a decision for you" if _YOUR_GATE.search(reason) else None
     if _any_gate(reason, pats):
         return "Block reason names a decision for you"
@@ -1837,7 +1854,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
             "prompt": it["ask"],
             "why_now": it["why"],
             "owner": it.get("owner") or "",
-            "authority": "ceo",
+            "authority": pocket_authority(),
             "reversibility": "reversible",
             "evidence": [it["id"]],
             "ttl_s": 3600,

@@ -22,7 +22,7 @@ Then set your name, so UNBL0CK knows which asks are aimed at you. Use the plugin
 hermes config set plugins.entries.unbl0ck.settings.principal_name "Ada, Ada Lovelace"
 ```
 
-`principal_name` is comma-separated: list the names your agents use for you. "CEO", "principal" and "human" always count. Your answers are posted under the first name, unless you set `comment_author`. If no name is set, only those generic words count as your name: a one-to-one chat or a Kanban block that says "your approval" is still detected, but in a group, channel or thread the ask must contain one of them.
+`principal_name` is comma-separated: list the names your agents use for you. The words in `role_words` (see `plugin.yaml` for the default), "principal" and "human" always count. Your answers are posted under the first name, unless you set `comment_author`. If no name is set, only those generic words count as your name: a one-to-one chat or a Kanban block that says "your approval" is still detected, but in a group, channel or thread the ask must contain one of them.
 
 **Summaries** are on by default. Turn them off with `bluf_enabled: false`; cards then show the raw block reason.
 
@@ -75,7 +75,7 @@ The things you would want to know before installing:
   - Its own files under `<HERMES_HOME>/plugin-data/unbl0ck/`: `hidden.json` ("Not for me" items and folder Done actions, capped at 1000), `waits/<id>.json` (one small owner-only file per live prompt, deleted when it is answered), `outside/<id>.json` (one owner-only 0600 file per agent-filed item, capped at 200, deleted on Done or agent resolve), `bluf.json` (cached summaries, capped at 300) and `pocket-pack.json` (only when you ask for the pack).
   - In Desktop, two display toggles (effects and sound) in `localStorage`.
 - **No shell commands, no subprocesses and no self-updating.** Summaries and Ask replies run in small in-process thread pools inside the Hermes backend.
-- **Sound:** the Desktop page plays short synthesized UI sounds through Web Audio. Turn them off with **SFX**.
+- **Sound:** off by default. Switch on **SFX** and the Desktop page plays short synthesized UI sounds through Web Audio; no audio context is created before that. Your choice is kept in `localStorage`.
 - **Hermes internals:** Kanban access uses Hermes's internal `hermes_cli.kanban_db*` modules, because no public plugin API for Kanban comments and unblocks exists yet. To keep each poll fast, the queue also reads the newest block event and your latest comment per card with one indexed SQL query each, falling back to the public `list_events`/`list_comments` if the schema differs. A Hermes release that changes those modules can break the queue until UNBL0CK is updated. `hermes plugins validate` reports this as a warning. Settings are read with `hermes_cli.config.load_config_readonly()` and the Hermes home with `hermes_constants.get_hermes_home()`.
 - **Optional environment fallbacks:** `UNBL0CK_PRINCIPAL`, `UNBL0CK_AUTHOR`, `UNBL0CK_OWNER_IDS` and `UNBL0CK_OUTSIDE_DIRS` stand in for `principal_name`, `comment_author`, `owner_user_ids` and `outside_dirs` when those settings are empty. None is required and none holds a secret.
 
