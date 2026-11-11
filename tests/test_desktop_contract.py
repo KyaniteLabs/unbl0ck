@@ -1,4 +1,5 @@
 import unittest
+import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -38,6 +39,22 @@ class DesktopContract(unittest.TestCase):
         # A kept-blocked answer must not stamp the card UNBL0CKED.
         self.assertIn("'■ ANSWERED'", src)
         self.assertIn("'■ ANSWERED'", built)
+
+    def test_chip_renders_the_ask_count_from_queue_data(self):
+        src = (ROOT / "desktop" / "src" / "plugin.src.js").read_text()
+        script = r'''const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const helper = src.match(/function askCount\(q\) \{[^\n]*\}/)?.[0] || 'function askCount(q) { return q.count; }';
+const chip = src.match(/function Chip\(\) \{[\s\S]*?\n\}/)?.[0];
+if (!helper || !chip) throw new Error('count renderer or helper missing');
+const jsx = (_type, props) => props;
+const render = new Function('jsx', 'useValue', '$queue', `${helper}; return (${chip});`)(
+  jsx, () => ({count: 10, counts: {asks: 1}}), Symbol('queue'));
+const result = render();
+if (result.children !== '◆ 1 NEEDS YOU') throw new Error(`unexpected chip: ${result.children}`);
+'''
+        subprocess.run(["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
+                       check=True, capture_output=True, text=True)
 
 
 if __name__ == "__main__":

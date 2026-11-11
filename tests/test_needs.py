@@ -135,6 +135,9 @@ class Classify(unittest.TestCase):
         ]:
             self.assertTrue(needs.kanban_needs_you(reason, kind), reason)
 
+    def test_comma_ends_a_negation_clause(self):
+        self.assertTrue(needs.kanban_needs_you("Not yet done, needs CEO approval", None))
+
     def test_chat_non_asks_drop(self):
         for text in [
             "Done. The file is saved at /tmp/out.txt. Anything else you need?",
@@ -205,6 +208,25 @@ class Chats(unittest.TestCase):
             needs.hide(q["items"][0]["id"], "older", home)  # source changed → shows again
             self.assertEqual(needs.build_queue(home)["count"], 1)
 
+    def test_queue_count_and_pocket_pack_include_only_unanswered_asks(self):
+        ask = {"id": "kanban:f:ask", "version": "1", "source": "kanban", "tier": "ask",
+               "task_id": "ask", "board": "f", "title": "Ask", "ask": "Choose A", "why": "blocked"}
+        stuck = {"id": "kanban:f:stuck", "version": "2", "source": "kanban", "tier": "stuck",
+                 "task_id": "stuck", "board": "f", "title": "Stuck", "ask": "Order only", "why": "stuck"}
+        answered = {"id": "kanban:f:answered", "version": "3", "source": "kanban", "tier": "answered",
+                    "task_id": "answered", "board": "f", "title": "Answered", "ask": "Already answered", "why": "held"}
+        original = (needs.kanban_items, needs.chat_items, needs.wait_items, needs.pairing_items)
+        needs.kanban_items = lambda errors=None: [ask, stuck, answered]
+        needs.chat_items = needs.wait_items = needs.pairing_items = lambda home, errors=None: []
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                queue = needs.build_queue(Path(d))
+                self.assertEqual(queue["count"], 1)
+                self.assertEqual(queue["counts"]["asks"], 1)
+                self.assertEqual([card["id"] for card in needs.pocket_pack(queue)["cards"]], [ask["id"]])
+        finally:
+            needs.kanban_items, needs.chat_items, needs.wait_items, needs.pairing_items = original
+
     def test_pocket_pack_shape(self):
         with tempfile.TemporaryDirectory() as d:
             home = make_home(Path(d))
@@ -265,7 +287,7 @@ class FakeKanban(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_answer_and_release(self):
-        r = needs.answer_card("factory", "t_1", "Go with A", release=True)
+        r = needs.answer_card("factory", "t_1", "Go with A", release=True, version="11")
         self.assertEqual(r, {"ok": True, "comment_id": 7, "released": True})
         self.assertEqual(self.calls, [("comment", "t_1", "ada", "Go with A"), ("unblock", "t_1")])
 
@@ -275,9 +297,9 @@ class FakeKanban(unittest.TestCase):
 
     def test_empty_and_missing(self):
         with self.assertRaises(ValueError):
-            needs.answer_card("factory", "t_1", "  ", release=True)
+            needs.answer_card("factory", "t_1", "  ", release=True, version="11")
         with self.assertRaises(LookupError):
-            needs.answer_card("factory", "t_9", "x", release=True)
+            needs.answer_card("factory", "t_9", "x", release=True, version="11")
 
     def test_double_submit_is_rejected_before_a_second_comment(self):
         self.comments = [types.SimpleNamespace(author="ada", created_at=150, body="already")]
@@ -290,7 +312,7 @@ class FakeKanban(unittest.TestCase):
         kdb.unblock_task = lambda c, t: self.calls.append(("unblock", t)) or False
         # rebuild the module with the new unblock
         with self.assertRaises(needs.UnblockFailed) as ctx:
-            needs.answer_card("factory", "t_1", "Go", release=True)
+            needs.answer_card("factory", "t_1", "Go", release=True, version="11")
         self.assertIn("comment 7", str(ctx.exception))
         self.assertEqual([c[0] for c in self.calls], ["comment", "unblock"])
 
@@ -303,6 +325,27 @@ class FakeKanban(unittest.TestCase):
         self.assertEqual(self.calls, [])
         r = needs.answer_card("factory", "t_1", "Go with B", release=True, version="12")
         self.assertTrue(r["released"])
+
+    def test_answer_release_does_not_unblock_a_newer_block_after_answer_commit(self):
+        kdb = sys.modules["hermes_cli.kanban_db"]
+        txns = 0
+
+        @contextlib.contextmanager
+        def write_txn(conn, allow_nested=False):
+            nonlocal txns
+            txns += 1
+            yield conn
+            if txns == 1:
+                # Another actor blocks the card after the answer transaction commits.
+                self.events.append(types.SimpleNamespace(
+                    id=12, kind="blocked", created_at=130,
+                    payload={"reason": "new question", "kind": "needs_input"}))
+
+        kdb.write_txn = write_txn
+        with self.assertRaises(needs.StaleAnswer):
+            needs.answer_card("factory", "t_1", "Go with A", release=True, version="11")
+        self.assertEqual(self.calls, [("comment", "t_1", "ada", "Go with A")])
+        self.assertEqual([event.id for event in self.events], [11, 12])
 
     def test_failed_release_stays_in_queue_and_retries_without_a_second_comment(self):
         kdb = sys.modules["hermes_cli.kanban_db"]
@@ -341,9 +384,34 @@ class FakeKanban(unittest.TestCase):
         self.assertEqual(r, {"ok": True, "comment_id": None, "released": True})
         self.assertEqual([c[0] for c in self.calls], ["comment", "unblock"])
 
+    def test_release_with_updated_answer_posts_it_on_an_already_answered_card(self):
+        self.comments = [types.SimpleNamespace(author="ada", created_at=150, body="old answer")]
+        r = needs.answer_card("factory", "t_1", "Updated answer", release=True, version="11")
+        self.assertEqual(r["comment_id"], 7)
+        self.assertEqual(self.calls, [("comment", "t_1", "ada", "Updated answer"), ("unblock", "t_1")])
+
+    def test_release_requires_the_version_the_user_saw(self):
+        with self.assertRaisesRegex(ValueError, "version"):
+            needs.answer_card("factory", "t_1", "Go with A", release=True)
+        self.assertEqual(self.calls, [])
+
+    def test_external_release_clears_pending_release_marker(self):
+        needs._set_pending_release("kanban:factory:t_1", "11", self.home)
+        self.comments = [types.SimpleNamespace(author="ada", created_at=150, body="Go")]
+        kdb = sys.modules["hermes_cli.kanban_db"]
+        self.task.status = "blocked"
+        def external_release(c, t):
+            self.calls.append(("unblock", t))
+            self.task.status = "open"
+            return False
+        kdb.unblock_task = external_release
+        result = needs.answer_card("factory", "t_1", "", release=True, version="11", home=self.home)
+        self.assertTrue(result["released"])
+        self.assertEqual(needs.load_pending_releases(self.home), {})
+
     def test_empty_text_still_needs_an_answer_on_an_unanswered_card(self):
         with self.assertRaises(ValueError):
-            needs.answer_card("factory", "t_1", "", release=True)
+            needs.answer_card("factory", "t_1", "", release=True, version="11")
         with self.assertRaises(ValueError):
             needs.answer_card("factory", "t_1", "  ", release=False)
         self.assertEqual(self.calls, [])
@@ -358,7 +426,7 @@ class FakeKanban(unittest.TestCase):
     def test_triage_cannot_be_released(self):
         self.task = task(status="triage")
         with self.assertRaises(ValueError):
-            needs.answer_card("factory", "t_1", "answer", release=True)
+            needs.answer_card("factory", "t_1", "answer", release=True, version="11")
         self.assertEqual(self.calls, [])
         needs.answer_card("factory", "t_1", "answer", release=False)
         self.assertEqual([c[0] for c in self.calls], ["comment"])

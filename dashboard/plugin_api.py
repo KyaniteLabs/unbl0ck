@@ -182,7 +182,8 @@ def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
             log.info("unbl0ck: comments for %s unavailable: %s", item["id"], exc)
             comments = []
         result = ctx.llm.complete(
-            n.bluf_messages(item, comments), purpose="unbl0ck.bluf", temperature=0.1, max_tokens=200, timeout=90
+            n.bluf_messages(item, comments), purpose="unbl0ck.bluf", temperature=0.1,
+            max_tokens=ASK_MAX_TOKENS, timeout=90
         )
         bluf, why = n.parse_bluf(result.text)
         n.save_bluf(item["id"], item["version"], bluf, why)
