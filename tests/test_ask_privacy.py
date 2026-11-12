@@ -148,6 +148,18 @@ def test_auth_credential_keys_redacted_without_redacting_person_fields():
         assert safe[key] == "[redacted]"
 
 
+def test_auth_key_detection_keeps_author_ids_modes_and_oauth_scopes():
+    card = {
+        "author_id": "person-123",
+        "auth_mode": "oauth",
+        "oauth_scopes": ["read:tasks", "write:comments"],
+    }
+
+    safe = needs._ask_card_view(card)
+
+    assert safe == card
+
+
 def test_cookie_shell_credentials_and_password_phrases_redacted_from_ask_and_bluf():
     sensitive = (
         "  Cookie: sessionid=synthetic-cookie-value-0001\n"
@@ -208,6 +220,29 @@ def test_authorization_prose_survives_redaction_in_ask_and_bluf():
         assert "CEO approval" in payload
 
 
+def test_authorization_prose_and_following_question_survive_redaction():
+    prose = (
+        "Authorization: needs CEO sign-off before deploy. Should we ship today?\n"
+        "Awaiting authorization: the reviewer needs to sign the DPA before Friday.\n"
+        "OAuth: the redirect needs review. Cookies: the banner needs review."
+    )
+    payloads = (
+        json.dumps(
+            needs.build_ask_messages({"title": "Deploy", "ask": prose}, []),
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            needs.bluf_messages({"title": "Deploy", "ask": prose}), ensure_ascii=False
+        ),
+    )
+    for payload in payloads:
+        assert "needs CEO sign-off before deploy" in payload
+        assert "Should we ship today?" in payload
+        assert "the reviewer needs to sign the DPA before Friday" in payload
+        assert "OAuth: the redirect needs review" in payload
+        assert "Cookies: the banner needs review" in payload
+
+
 def test_authorization_headers_with_any_scheme_and_nested_secret_values_are_redacted():
     sensitive = (
         'curl -H "Authorization: synthetic-no-scheme-auth-0101"\n'
@@ -245,6 +280,128 @@ def test_authorization_headers_with_any_scheme_and_nested_secret_values_are_reda
             assert secret not in payload, secret
 
 
+def test_structured_redaction_keeps_text_after_the_secret_value():
+    body = (
+        "Authorization: Bearer synthetic-header-secret-0501\n"
+        "Question: should we rotate? KEEPME\n"
+        "Missing credentials: {aws, gcp}. Which provider should I use? KEEPME\n"
+        "The API token: [expired] so calls fail. Team, renew? KEEPME\n"
+        "api_key = [REDACTED]\nThe deploy failed. Keep this sentence."
+    )
+    payloads = (
+        json.dumps(
+            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            needs.bluf_messages({"title": "Review", "ask": body}), ensure_ascii=False
+        ),
+    )
+    for payload in payloads:
+        assert "synthetic-header-secret-0501" not in payload
+        for context in (
+            "Question: should we rotate? KEEPME",
+            "Which provider should I use? KEEPME",
+            "Team, renew? KEEPME",
+            "The deploy failed. Keep this sentence.",
+        ):
+            assert context in payload
+
+
+def test_yaml_block_scalars_under_secret_keys_are_redacted_in_ask_and_bluf():
+    body = (
+        "password: |\n  R8_PASSWORD_BLOCK_SECRET\n"
+        "api_token: >-\n  R8_API_TOKEN_BLOCK_SECRET\n"
+        "client_secret: |\n  R8_CLIENT_SECRET_BLOCK_SECRET\n"
+        "private_key: >\n  R8_PRIVATE_KEY_BLOCK_SECRET\n"
+        "Should we rotate these credentials? Keep this question."
+    )
+    payloads = (
+        json.dumps(
+            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            needs.bluf_messages({"title": "Review", "ask": body}), ensure_ascii=False
+        ),
+    )
+    for payload in payloads:
+        for secret in (
+            "R8_PASSWORD_BLOCK_SECRET",
+            "R8_API_TOKEN_BLOCK_SECRET",
+            "R8_CLIENT_SECRET_BLOCK_SECRET",
+            "R8_PRIVATE_KEY_BLOCK_SECRET",
+        ):
+            assert secret not in payload
+        assert "Should we rotate these credentials? Keep this question." in payload
+
+
+def test_named_environment_values_and_short_password_keys_are_redacted():
+    body = (
+        "env:\n  - name: API_TOKEN\n    value: R8_ENV_VALUE_SECRET\n"
+        '{"name":"API_TOKEN","value":"R8_JSON_ENV_SECRET"}\n'
+        "{'creds': {'user':'bob','pw':'R8_PW_SECRET'}}\n"
+        "pass: R8_PASS_SECRET\npwd=R8_PWD_SECRET"
+    )
+    payloads = (
+        json.dumps(
+            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            needs.bluf_messages({"title": "Review", "ask": body}), ensure_ascii=False
+        ),
+    )
+    for payload in payloads:
+        for secret in (
+            "R8_ENV_VALUE_SECRET",
+            "R8_JSON_ENV_SECRET",
+            "R8_PW_SECRET",
+            "R8_PASS_SECRET",
+            "R8_PWD_SECRET",
+        ):
+            assert secret not in payload
+
+
+def test_deeply_nested_json_is_redacted_without_crashing_ask_or_bluf():
+    nested = "[" * 1100 + '{"token":"R8_NESTED_SECRET"}' + "]" * 1100
+    ask = json.dumps(
+        needs.build_ask_messages({"title": "Review", "ask": nested}, []),
+        ensure_ascii=False,
+    )
+    bluf = json.dumps(
+        needs.bluf_messages({"title": "Review", "ask": nested}), ensure_ascii=False
+    )
+
+    assert "[redacted]" in ask
+    assert "[redacted]" in bluf
+    assert "R8_NESTED_SECRET" not in ask
+    assert "R8_NESTED_SECRET" not in bluf
+
+
+def test_stripe_gitlab_google_and_npm_tokens_are_redacted():
+    secrets = (
+        "sk_live_" + "A" * 24,
+        "rk_test_" + "B" * 24,
+        "glpat-" + "C" * 24,
+        "AIza" + "D" * 24,
+        "npm_" + "E" * 24,
+    )
+    body = " ".join(secrets)
+    payloads = (
+        json.dumps(
+            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            needs.bluf_messages({"title": "Review", "ask": body}), ensure_ascii=False
+        ),
+    )
+    for payload in payloads:
+        for secret in secrets:
+            assert secret not in payload, secret
+
+
 def test_cookie_and_command_line_credentials_are_redacted():
     sensitive = (
         "Set-Cookie: session=synthetic-set-cookie-0201; HttpOnly\n"
@@ -276,6 +433,17 @@ def test_cookie_and_command_line_credentials_are_redacted():
             "synthetic-passphrase-0210",
         ):
             assert secret not in payload, secret
+
+
+def test_command_password_flags_do_not_redact_ports_or_neighboring_commands():
+    safe = needs._ask_redact(
+        "mysql -h db -P 3306; docker run -p 8080:80\n"
+        "sshpass -p synthetic-ssh-password-0601 ssh host"
+    )
+
+    assert "mysql -h db -P 3306" in safe
+    assert "docker run -p 8080:80" in safe
+    assert "synthetic-ssh-password-0601" not in safe
 
 
 def test_cookie_keys_in_recursive_and_embedded_mappings_are_redacted():

@@ -182,6 +182,44 @@ class Classify(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertIsNone(needs.kanban_needs_you(reason, None), reason)
 
+    def test_permission_words_do_not_hide_real_approval_gates(self):
+        asks = [
+            "We are not proceeding without CEO approval",
+            "We are not continuing without CEO approval",
+            "We aren't continuing without CEO approval",
+            "Nothing is fixed until CEO approves",
+            "The issue is not resolved until CEO approves",
+            "Releasing the fixed version without CEO approval is blocked by policy.",
+            "Shipping the resolved patch without CEO approval breaks policy.",
+            "Continuing without CEO sign-off is not allowed.",
+            "Continuing is impossible without CEO approval",
+            "The conflict is resolved yet the merge waits until CEO signs off",
+            "Is it safe to ship without CEO approval",
+            "The fixed build is stuck without CEO approval",
+            "Fixed scope work is paused until CEO decides",
+            "We continued on staging while prod is frozen until CEO approval",
+        ]
+        for reason in asks:
+            with self.subTest(reason=reason):
+                self.assertTrue(needs.kanban_needs_you(reason, None), reason)
+
+        permitted = [
+            "Can proceed without CEO approval once CI is green",
+            "Proceeded without CEO approval",
+            "The issue is resolved without CEO approval",
+        ]
+        for reason in permitted:
+            with self.subTest(reason=reason):
+                self.assertIsNone(needs.kanban_needs_you(reason, None), reason)
+
+    def test_plural_no_subjects_do_not_create_false_approval_asks(self):
+        for reason in [
+            "No new failures we can deploy without CEO approval.",
+            "No blockers remain we can merge without CEO sign-off.",
+        ]:
+            with self.subTest(reason=reason):
+                self.assertIsNone(needs.kanban_needs_you(reason, None), reason)
+
     def test_until_holds_are_gates_but_negation_is_scoped_to_its_clause(self):
         for reason in [
             "Hold until CEO approval",

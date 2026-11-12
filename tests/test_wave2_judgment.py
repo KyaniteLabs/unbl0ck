@@ -122,6 +122,10 @@ def test_conditional_gates_distinguish_permissions_from_blockers(monkeypatch):
     non_asks = [
         "We have no blocker so ship without CEO approval",
         "There is no risk so we ship without CEO sign-off",
+        "There is no risk, so we merge without CEO approval",
+        "No blockers remain, so we deploy without CEO sign-off",
+        "We ship without CEO approval",
+        "We merge without CEO approval",
         "Not a breaking change so merge without CEO approval",
         "Free to merge until CEO review on Friday",
         "There is no problem shipping without CEO approval",

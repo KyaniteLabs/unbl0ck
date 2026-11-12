@@ -180,6 +180,24 @@ class BlufTest(unittest.TestCase):
                     ("Ship the fix.", "Checks are clear."),
                 )
 
+    def test_parse_accepts_sample_and_format_lead_ins_without_an_answer(self):
+        for label in ("Format:", "Sample card summary:"):
+            with self.subTest(label=label):
+                reply = f'{label}\n{{"bluf":"Ship the fix.","why":"Checks are clear."}}'
+                self.assertEqual(
+                    needs.parse_bluf(reply),
+                    ("Ship the fix.", "Checks are clear."),
+                )
+
+    def test_parse_keeps_real_answer_before_template_and_i_e_examples(self):
+        for label in ("Template:", "i.e."):
+            with self.subTest(label=label):
+                reply = (
+                    '{"bluf":"Real answer","why":"real"}\n'
+                    f'{label} {{"bluf":"Illustration","why":"example"}}'
+                )
+                self.assertEqual(needs.parse_bluf(reply), ("Real answer", "real"))
+
     def test_parse_ignores_inline_for_example_after_real_answer(self):
         reply = (
             '{"bluf":"Real answer","why":"real"} For example: '
