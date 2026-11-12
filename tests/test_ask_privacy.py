@@ -45,6 +45,20 @@ def test_secrets_redacted():
     assert "[redacted]" in p
 
 
+def test_non_bearer_authorization_headers_redacted():
+    card = _card()
+    card["comments"] = [
+        {"body": "Authorization: ApiKey synthetic-api-key-abcdef0123456789"},
+        {"body": 'Authorization: Digest username="synthetic", nonce="synthetic-nonce-123456789"'},
+        {"body": "Proxy-Authorization: ApiKey synthetic-proxy-key-abcdef0123456789"},
+        {"body": "authorization=synthetic-auth-key-abcdef0123456789"},
+    ]
+    payload = json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False)
+    for secret in ("synthetic-api-key-abcdef0123456789", "synthetic-nonce-123456789",
+                   "synthetic-proxy-key-abcdef0123456789", "synthetic-auth-key-abcdef0123456789"):
+        assert secret not in payload
+
+
 def test_useful_context_kept():
     p = _payload()
     for s in ("Deploy", "please ship", "needs a decision", "feat/x", "auth failed"):

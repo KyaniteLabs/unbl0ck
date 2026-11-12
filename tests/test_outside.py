@@ -165,6 +165,16 @@ class Outside(OutsideFixture):
         self.assertNotIn("Second plain part", it["text"])
         self.assertEqual(it["path"], "draft.eml")
 
+    def test_eml_decodes_declared_latin_1_charset(self):
+        self.watch()
+        raw = (b"From: sender@example.test\r\nSubject: Lunch\r\n"
+               b"Content-Type: text/plain; charset=\"iso-8859-1\"\r\n"
+               b"Content-Transfer-Encoding: 8bit\r\n\r\n"
+               b"Reuni\xf3n ma\xf1ana en el caf\xe9\r\n")
+        (self.folder / "draft.eml").write_bytes(raw)
+        it, = needs.build_queue()["items"]
+        self.assertEqual(it["text"].strip(), "Reuni\u00f3n ma\u00f1ana en el caf\u00e9")
+
     def test_html_only_mail_never_displays_html(self):
         self.watch()
         msg = EmailMessage()

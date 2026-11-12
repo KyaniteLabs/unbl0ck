@@ -151,6 +151,25 @@ class Classify(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertIsNone(needs.kanban_needs_you(reason, None), reason)
 
+    def test_until_holds_are_gates_but_negation_is_scoped_to_its_clause(self):
+        for reason in [
+            "Hold until CEO approval",
+            "Holding until CEO approval",
+            "On hold until Ada's approval",
+            "Paused until Ada's sign-off",
+            "Waiting until CEO approval",
+            "Deploy held until Ada approval",
+            "Release is pending until Ada approval",
+            "Parked until CEO approval",
+            "Holding without Ada's approval",
+        ]:
+            with self.subTest(reason=reason):
+                self.assertTrue(needs.kanban_needs_you(reason, None), reason)
+
+    def test_negation_in_another_conjunct_does_not_turn_without_into_a_gate(self):
+        self.assertIsNone(needs.kanban_needs_you(
+            "Not urgent and we can ship without Ada's approval", None))
+
     def test_without_until_gate_requires_a_prohibition_in_the_same_clause(self):
         cases = [
             ("Won't merge without explicit CEO approval", "needs_input", True),

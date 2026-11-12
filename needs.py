@@ -448,8 +448,8 @@ def parse_bluf(text: str) -> tuple[str, str]:
         if isinstance(obj, dict):
             prefix = text[:i]
             is_example = re.search(
-                r"(?:(?:^|\n)\s*(?:example(?:\s+format)?|schema|for example)|\b(?:example\s+format|for example))\s*:\s*$",
-                prefix, re.I,
+                r"(?:(?:^|\n)\s*(?:example(?:\s+format)?|schema|for example)|\b(?:example\s+format|for example))\s*:\s*(?:```[a-z0-9_-]*\s*)?$",
+                prefix, re.IGNORECASE,
             )
             raw_bluf = obj.get("bluf")
             # Keep the last real answer: a model may restate or correct itself.
@@ -486,7 +486,7 @@ def recent_comments(item: dict[str, Any], limit: int = 6) -> list[dict[str, Any]
 # Negation words that turn a gate phrase into "not a gate" ("no new Ada approval
 # requested", "not a principal gate", "approval is not needed").
 _NEGATION = re.compile(
-    r"\b(?:no|not|never|without|until|nothing|none|neither|nor|"
+    r"\b(?:no|not|never|without|nothing|none|neither|nor|"
     r"isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
     r"don['’]?t|doesn['’]?t|didn['’]?t|won['’]?t|"
     r"can['’]?t|cannot|no longer|no new)\b",
@@ -505,11 +505,15 @@ _TOKEN_GLUE = "/\\-_@"
 
 # A clause ends at sentence or clause punctuation; negation never reaches across it
 # ("Cannot proceed: needs <role word> approval" is an ask).
-_CLAUSE_END = re.compile(r"[,.;:!?\n]|\s[-–—]\s")
+_CLAUSE_END = re.compile(r"[,.;:!?\n]|\s[-–—]\s|\s+(?:and|but|or)\s+", re.I)
 # After the phrase, only "... is not needed/required" undoes it; any other negation
 # there ("Needs your approval. Not urgent.") belongs to something else.
 _POST_NEGATION = re.compile(
     r"^\s*(?:is|are|was|were)?\s*(?:not|no longer|n['’]t)\s+(?:needed|required|necessary|wanted)\b", re.I
+)
+_DENIAL_BEFORE_UNTIL = re.compile(r"\b(?:no|not)\b.{0,40}\bneeded\b", re.I)
+_HOLD_VERB_BEFORE_GATE = re.compile(
+    r"\b(?:hold|holding|paused|on hold|waiting|pending|parked|held)\b(?:\s+\w+){0,2}$", re.I
 )
 
 
@@ -528,13 +532,21 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
         words_between = clause[candidate.end():].split()
         if len(words_between) <= 4:
             conditional = candidate
+    before_conditional = clause[:conditional.start()] if conditional else ""
+    denial = bool(conditional and conditional.group().lower() == "until"
+                  and _DENIAL_BEFORE_UNTIL.search(before_conditional))
     gate_condition = bool(
-        conditional and _PROHIBITION.search(clause[:conditional.start()])
+        conditional and not denial and (
+            (conditional.group().lower() == "until")
+            or _PROHIBITION.search(before_conditional)
+            or _HOLD_VERB_BEFORE_GATE.search(before_conditional.rstrip())
+        )
     )
     after = text[match.end():]
     end = _CLAUSE_END.search(after)
     after = after[:end.start()] if end else after
-    return bool((_NEGATION.search(near) and not gate_condition) or _POST_NEGATION.search(after))
+    return bool(denial or (_NEGATION.search(near) and not gate_condition)
+                or _POST_NEGATION.search(after))
 
 
 def _match_is_standalone(text: str, match: re.Match[str]) -> bool:
@@ -1377,7 +1389,12 @@ def _folder_outside_item(f: Path, root: Path, expected: os.stat_result) -> Optio
         text = "(No text/plain body; HTML is not displayed.)"
         for part in msg.walk():
             if not part.is_multipart() and part.get_content_type() == "text/plain":
-                text = (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
+                payload = part.get_payload(decode=True) or b""
+                charset = part.get_content_charset() or "utf-8"
+                try:
+                    text = payload.decode(charset, errors="replace")
+                except (LookupError, UnicodeError):
+                    text = payload.decode("utf-8", errors="replace")
                 break
         kind, where = "draft", "Your mail app → Drafts"
     else:
@@ -1812,8 +1829,9 @@ _ASK_SECRET_PATTERNS = (
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[redacted]@"),
     # Authorization headers
     (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [redacted]"),
+    (re.compile(r"(?i)\b(?:proxy-)?authorization\s*:\s*[^\r\n]*"), "[redacted]"),
     # key=value / key: value for secret-looking keys
-    (re.compile(r"(?i)\b([a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential)s?)(\s*[=:]\s*)[\"']?[^\s\"',;]+"),
+    (re.compile(r"(?i)\b([a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization)s?)(\s*[=:]\s*)[\"']?[^\s\"',;]+"),
      r"\1\2[redacted]"),
     # JWTs and home-directory shapes of any user (the current user's own home is handled in _ask_redact)
     (re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"), "[redacted]"),

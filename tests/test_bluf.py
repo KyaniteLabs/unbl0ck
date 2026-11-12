@@ -62,6 +62,11 @@ class BlufTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             needs.parse_bluf('Example: {"bluf":"Example only","why":"illustrative"}')
 
+    def test_parse_ignores_example_inside_markdown_fence(self):
+        reply = ('{"bluf":"Approve the merge.","why":"tests pass"}\nExample:\n'
+                 '```json\n{"bluf":"Choose a different release.","why":"sample"}\n```')
+        self.assertEqual(needs.parse_bluf(reply), ("Approve the merge.", "tests pass"))
+
     def test_background_bluf_uses_reasoning_model_token_budget(self):
         spec = importlib.util.spec_from_file_location("unbl0ck_plugin_api_bluf_test", ROOT / "dashboard" / "plugin_api.py")
         api = importlib.util.module_from_spec(spec)
