@@ -119,6 +119,7 @@ def test_conditional_gates_distinguish_permissions_from_blockers(monkeypatch):
     monkeypatch.setenv("UNBL0CK_PRINCIPAL", "Ada")
     monkeypatch.setattr(needs, "_settings", dict)
     needs._PATTERN_CACHE.clear()
+
     non_asks = [
         "We have no blocker so ship without CEO approval",
         "There is no risk so we ship without CEO sign-off",
@@ -227,4 +228,40 @@ def test_conditional_gates_distinguish_permissions_from_blockers(monkeypatch):
         assert needs.kanban_needs_you(reason, "needs_input") is None, reason
     for reason in asks:
         assert needs.kanban_needs_you(reason, "needs_input"), reason
+    needs._PATTERN_CACHE.clear()
+
+
+def test_round10_approval_preconditions_remain_actionable(monkeypatch):
+    monkeypatch.setenv("UNBL0CK_PRINCIPAL", "Ada")
+    monkeypatch.setattr(needs, "_settings", dict)
+    needs._PATTERN_CACHE.clear()
+    asks = [
+        "Safe to deploy after Ada's approval",
+        "Safe to deploy only with Ada's approval",
+        "OK to merge pending Ada's sign-off",
+        "Free to release once we get Ada's approval",
+        "Safe to deploy after Ada's approval; please confirm",
+        "Needs Ada's approval before the cron job expires tonight",
+        "We can make no progress without Ada's approval",
+        "I will keep retrying until Ada approves",
+        "We ship nothing until Ada approves",
+        "Not moving forward until Ada approves",
+        "Unsafe to proceed; safe to ship only with CEO approval",
+        "No artifacts can be released without CEO approval",
+        "No production changes can be deployed without CEO approval",
+        "Needs Ada's approval; we will deploy once Bob approves",
+    ]
+    controls = [
+        "We can deploy today without CEO approval",
+        "No new failures we can deploy without CEO approval",
+        "Free to merge until Ada approves",
+        "No reason to hold until CEO approval",
+        "Cron job runs every hour until CEO approval expires Friday",
+        "Approved already: valid until CEO review next quarter",
+        "We will deploy once Ada approves",
+    ]
+    for reason in asks:
+        assert needs.kanban_needs_you(reason, "needs_input"), reason
+    for reason in controls:
+        assert needs.kanban_needs_you(reason, "needs_input") is None, reason
     needs._PATTERN_CACHE.clear()

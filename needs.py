@@ -647,7 +647,6 @@ _PERMISSION_BEFORE_GATE = re.compile(
     r"|\b(?:we|i|they)\s+will\s+(?:(?:safely|easily|quickly)\s+)?"
     r"(?:ship|merge|release|deploy|proceed|continue|launch|publish|roll out|go ahead|move forward)"
     r"|\bwill\s+(?:ship|merge|release|deploy|proceed|continue|launch|publish|roll out|go ahead|move forward)\b"
-    r"|\b(?:i|we|they)\s+will\s+(?:keep\s+|continue to\s+)?(?:retry|try)\w*\b"
     r"|\b(?:going ahead|moving forward)\b"
     r"|\bthis is (?:fine|okay|ok|safe)\b"
     r"|\bthis\s+can\s+go\s+out\b"
@@ -670,7 +669,12 @@ _NEGATED_PERMISSION = re.compile(
     r"deploy\w*|done|fix\w*|resolv\w*|go\s+out)\b"
     r"|\bno\s+(?:new\s+)?(?:deployments?|changes?|releases?|merges?)\s+"
     r"(?:can|may|will)\s+(?:proceed|go\s+out|be\s+(?:shipped|merged|released|deployed))\b"
+    r"|\bno(?:\s+\w+){0,5}\s+(?:can|may|will)\s+be\s+"
+    r"(?:shipped|merged|released|deployed|published|rolled\s+out)\b"
     r"|\bnothing(?:\s+\w+){0,3}\s+(?:i|we|they)\s+can\s+do\b"
+    r"|\b(?:no|little)\s+(?:\w+\s+){0,2}(?:progress|headway|movement|work)\b"
+    r"|\b(?:ship|merge|release|deploy|proceed|continue|launch|publish)\s+nothing\b"
+    r"|\b(?:not|no longer)\s+(?:moving forward|going ahead)\b"
     r"|\b(?:can|may|will|do)\s+(?:do\s+)?nothing\b",
     re.IGNORECASE,
 )
@@ -685,7 +689,17 @@ _HISTORICAL_HOLD_UNTIL = re.compile(
 )
 _HISTORICAL_GATE_MENTION = re.compile(
     r"\b(?:unrelated to\b|decision already (?:landed|made|arrived)\b|"
-    r"approved already\b|valid until\b|(?:cron|job|schedule)\b.{0,80}\bexpires?\b)",
+    r"approved already\b|valid until\b)",
+    re.IGNORECASE,
+)
+_HISTORICAL_SCHEDULE_EXPIRY = re.compile(
+    r"\b(?:cron|job|schedule)\b.{0,80}\bexpires?\b", re.IGNORECASE
+)
+_NON_BLOCKING_ONCE_PLAN = re.compile(
+    r"\b(?:(?:we|i|they)\s+will|(?:ok|okay)\s+to)\s+"
+    r"(?:ship|merge|release|deploy|publish)\b.{0,40}\bonce\s+"
+    r"(?:[A-Z][\w'-]*|the\s+[A-Z][\w'-]*)\b.{0,20}"
+    r"(?:approves?|signs? off|confirms?)\b",
     re.IGNORECASE,
 )
 _CONDITIONAL_GATE = re.compile(r"\b(?:without|until)\b", re.IGNORECASE)
@@ -785,15 +799,6 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
         and not _NEGATED_PERMISSION.search(before_conditional)
         and not _GATE_PROHIBITION.search(after_clause)
     )
-    if (
-        permission_match
-        and re.match(
-            r"(?i)^(?:no problem|no issue|nothing stops us|no reason to|free to|safe to|ok to)\b",
-            permission_match.group().strip(),
-        )
-        and not _NEGATED_PERMISSION.search(before_conditional)
-    ):
-        return True
     after = after[: end.start()] if end else after
     historical_hold = bool(
         conditional
@@ -820,11 +825,28 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
         )
     )
     gate_condition = bool(conditional and not denial)
+    no_reason_to_wait = bool(
+        permission_match
+        and re.match(
+            r"(?i)^no reason to (?:hold|wait|pause|stop)\b", permission_match.group()
+        )
+    )
     gate_context = f"{clause} {match.group()} {after_clause}"
-    if _HISTORICAL_GATE_MENTION.search(" ".join(gate_context.split())):
+    normalized_context = " ".join(gate_context.split())
+    if _NON_BLOCKING_ONCE_PLAN.search(normalized_context):
+        return True
+    if _HISTORICAL_GATE_MENTION.search(normalized_context):
+        return True
+    schedule_expiry = _HISTORICAL_SCHEDULE_EXPIRY.search(normalized_context)
+    gate_offset = len(" ".join(clause.split())) + 1
+    if (
+        schedule_expiry
+        and schedule_expiry.start() < gate_offset < schedule_expiry.end()
+    ):
         return True
     return bool(
         denial
+        or no_reason_to_wait
         or (_NEGATION.search(near) and not gate_condition)
         or _POST_NEGATION.search(after)
     )
@@ -2393,20 +2415,16 @@ ASK_SYSTEM = (
 )
 
 _ASK_SECRET_KEY = (
-    r"[a-z0-9_.-]{0,64}?(?P<secret_word>password|passwd|passphrase|pass|pwd|pw|secret|token|"
-    r"api[_-]?key|access[_-]?key|private[_-]?key|credential|authentication|authorization|cookie|auth)"
+    r"[a-z0-9_.-]{0,64}(?P<secret_word>password|passwd|passphrase|pass|pwd|pw|secret|token|"
+    r"api(?:[_-]|\s)?key|access(?:[_-]|\s)?key|private(?:[_-]|\s)?key|credential|"
+    r"authentication|authorization|cookie|oauth|auth|storepass)"
     r"[a-z0-9_.-]{0,32}"
 )
 
 
 _ASK_SECRET_PATTERNS = (
     # URL userinfo: scheme://user:pass@host
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[redacted]@"),
-    # Credential-bearing HTTP headers and shell auth flags. Keep prose after the header/value.
-    (
-        re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"),
-        r"\1 [redacted]",
-    ),
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1[redacted]@"),
     (
         re.compile(
             r"(?i)((?:proxy-)?authorization\s*:\s*digest\b[^\r\n]*?\bnonce\s*[=:]\s*)"
@@ -2449,6 +2467,20 @@ _ASK_SECRET_PATTERNS = (
             r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s'\"]+)"""
         ),
         r"\1[redacted]",
+    ),
+    (
+        re.compile(
+            r"(?i)(?P<prefix>\bkeytool\b[^\r\n]*?\s-storepass(?:=|[ \t]+))"
+            r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s;]+)"
+        ),
+        r"\g<prefix>[redacted]",
+    ),
+    (
+        re.compile(
+            r"(?i)(?P<prefix>\bIDENTIFIED\s+BY\s+)"
+            r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
+        ),
+        r"\g<prefix>[redacted]",
     ),
     (
         re.compile(
@@ -2500,7 +2532,6 @@ _ASK_NON_SECRET_AUTH_KEYS = frozenset(
         "auth_mode",
         "auth_method",
         "authentication_method",
-        "oauth",
         "oauth_scopes",
         "tokenizer",
         "max_tokens",
@@ -2508,30 +2539,89 @@ _ASK_NON_SECRET_AUTH_KEYS = frozenset(
         "bypass",
     }
 )
+_ASK_SECRET_PLURALS = {
+    "tokens": "token",
+    "credentials": "credential",
+    "cookies": "cookie",
+    "secrets": "secret",
+}
+_ASK_SECRET_WORD_PRIORITY = {
+    "password": 100,
+    "passwd": 100,
+    "passphrase": 100,
+    "credential": 90,
+    "storepass": 90,
+    "private_key": 80,
+    "api_key": 80,
+    "access_key": 80,
+    "secret_key": 80,
+    "secret": 75,
+    "token": 70,
+    "authorization": 65,
+    "authentication": 65,
+    "cookie": 60,
+    "oauth": 55,
+    "auth": 50,
+    "pwd": 25,
+    "pass": 20,
+    "pw": 10,
+}
+_ASK_GLUE_SECRET_WORDS = frozenset(
+    {
+        "password",
+        "passwd",
+        "passphrase",
+        "credential",
+        "authentication",
+        "authorization",
+        "cookie",
+        "oauth",
+        "token",
+        "secret",
+        "auth",
+        "storepass",
+    }
+)
+_ASK_SECRET_KEY_TERMINALS = frozenset(
+    {
+        "password",
+        "passwd",
+        "passphrase",
+        "pass",
+        "pwd",
+        "pw",
+        "secret",
+        "secrets",
+        "token",
+        "tokens",
+        "credential",
+        "credentials",
+        "authentication",
+        "authorization",
+        "auth",
+        "cookie",
+        "cookies",
+        "oauth",
+        "storepass",
+    }
+)
 _ASK_SECRET_ASSIGNMENT = re.compile(
-    rf"""(?ix)(?<![A-Za-z0-9_.-])(?P<flag>--)?(?P<key_open>\\*["']?)(?P<key>{_ASK_SECRET_KEY})(?P<key_close>\\*["']?)(?![A-Za-z0-9_.-])"""
-    r"""(?P<sep>[ \t]*[=:][ \t]*|[ \t]+)"""
+    rf"""(?ix)(?<![A-Za-z0-9.-])(?P<flag>--)?(?P<key_open>\\*["']?)(?P<key>{_ASK_SECRET_KEY})(?P<key_close>\\*["']?)(?![A-Za-z0-9_.-])"""
+    r"""(?P<sep>[ \t]*(?:=>|[=:])[ \t]*(?:\r?\n[ \t]*)?|[ \t]+)"""
 )
 
 _ASK_AUTH_HEADER = re.compile(
-    r"(?im)(?P<prefix>(?:^|[\r\n{,][ \t]*)(?:proxy-)?authorization\s*:\s*)"
-    r"(?P<value>[^\r\n]*)"
-)
-_ASK_QUOTED_AUTH_HEADER = re.compile(
-    r"""(?i)(?P<prefix>(?P<quote>["'])(?:proxy-)?authorization\s*:\s*)"""
-    r"""(?P<value>.*?)(?P=quote)"""
+    r"(?im)(?P<prefix>\b(?:proxy-)?authorization[ \t]*:[ \t]*)"
+    r"(?P<value>[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)?)"
 )
 _ASK_AUTH_PROSE = re.compile(
     r"^(?:header\s+(?:missing|is|was|wasn't|doesn't)|flow\s+(?:is|was|looks|seems)|"
     r"pending\b|none\b|required\b|needs?\b|need\b|must\b|should\b|broken\b|"
     r"legal\s+review\b|(?:may|can|should)\s+(?:i|we|you)\b|"
-    r"missing\b|failed\b|failing\b|invalid\b|the\s+\w+\s+(?:needs?|needs\s+to|is|was)\b|"
+    r"missing\b|failed\b|failing\b|invalid\b|granted\b|approved\b|tbd\b|tokens?\s+are\b|"
+    r"the\s+\w+\s+(?:needs?|needs\s+to|is|was)\b|"
     r"[a-z][a-z'-]*\s+(?:must|should|needs?|requires?|is|was|can|may|will)\b)",
     re.IGNORECASE,
-)
-_ASK_AUTH_SCHEME_VALUE = re.compile(
-    r"(?i)^(?:JWT|Api-Key|OAuth|SharedKey|AWS|Bearer|Key)"
-    r"(?::[ \t]*|[ \t]+)(?P<token>[^\s\r\n]+)"
 )
 _ASK_BARE_AUTH_SCHEME_LINE = re.compile(
     r"(?im)(?P<indent>^[ \t]*)(?P<scheme>JWT|Api-Key|OAuth|SharedKey|AWS|Bearer|Key)"
@@ -2539,7 +2629,19 @@ _ASK_BARE_AUTH_SCHEME_LINE = re.compile(
 )
 
 
-_ASK_SHORT_SECRET_WORDS = frozenset({"pass", "pw"})
+_ASK_SHORT_PASSWORD_FLAG = re.compile(
+    r"(?P<prefix>(?<!\S)-p(?:=|[ \t]+))"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s;]+)"
+)
+_ASK_AUTH_CREDENTIAL_MARKER = re.compile(
+    r"(?i)\b(?:token|oauth|key|secret|password|credential|session)\b"
+    r"(?:\s+(?:value\s+)?is\s+|\s*[=:]\s*|\s+(?!to\b|are\b|were\b|was\b)\S+)"
+)
+_ASK_AUTH_TRAILING_VALUE = re.compile(r"(?i)\bfailed\s+with\s+[A-Z0-9_-]+\s*$")
+_ASK_BARE_CREDENTIAL_VALUE = re.compile(
+    r"(?i)\b(?P<scheme>bearer|basic|token)(?P<space>[ \t]+)"
+    r"(?P<token>[A-Za-z0-9._~+/=-]+)"
+)
 
 
 def _ask_cookie_prose(value: str) -> bool:
@@ -2564,7 +2666,9 @@ _ASK_COOKIE_HEADER = re.compile(
 
 def _ask_redact_cookie_headers(text: str) -> str:
     def replace(match: re.Match[str]) -> str:
-        if _ask_cookie_prose(match.group("value")):
+        if _ask_cookie_prose(
+            match.group("value")
+        ) and not _ASK_AUTH_CREDENTIAL_MARKER.search(match.group("value")):
             return match.group(0)
         return f"{match.group('prefix')}{match.group('header')}: [redacted]"
 
@@ -2572,37 +2676,146 @@ def _ask_redact_cookie_headers(text: str) -> str:
 
 
 def _ask_secret_word(key: str) -> str | None:
-    normalized = str(key).casefold().strip().strip("\"'")
-    normalized = normalized.removeprefix("--")
+    original = str(key).strip().strip("\"'").removeprefix("--")
+    original = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", original)
+    original = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", original)
+    normalized = re.sub(r"[^a-z0-9]+", "_", original.casefold()).strip("_")
     if normalized in _ASK_NON_SECRET_AUTH_KEYS:
         return None
-    if normalized.startswith("author_"):
-        following = _ASK_SECRET_KEY_RE.search(normalized[len("author_") :])
-        if following is None:
-            return None
-        return following.group("secret_word").casefold()
-    match = _ASK_SECRET_KEY_RE.search(normalized)
-    return match.group("secret_word").casefold() if match else None
+    normalized = normalized.removeprefix("author_")
+    parts = normalized.split("_")
+    found: list[str] = []
+    for index, part in enumerate(parts):
+        if part in _ASK_SECRET_PLURALS:
+            found.append(_ASK_SECRET_PLURALS[part])
+        if (
+            part in {"api", "access", "private", "secret"}
+            and index + 1 < len(parts)
+            and parts[index + 1] == "key"
+        ):
+            found.append(f"{part}_key")
+        for word in _ASK_SECRET_WORD_PRIORITY:
+            if part == word or (
+                word in _ASK_GLUE_SECRET_WORDS
+                and (
+                    part.endswith(word) or re.fullmatch(re.escape(word) + r"\d+", part)
+                )
+            ):
+                found.append(word)
+    if not found:
+        return None
+    return max(found, key=lambda word: _ASK_SECRET_WORD_PRIORITY[word])
+
+
+def _ask_secret_key_is_exact(key: str) -> bool:
+    original = str(key).strip().strip("\"'").removeprefix("--")
+    original = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", original)
+    original = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", original)
+    normalized = re.sub(r"[^a-z0-9]+", "_", original.casefold()).strip("_")
+    if normalized in _ASK_SECRET_KEY_TERMINALS | {
+        "api_key",
+        "access_key",
+        "private_key",
+        "secret_key",
+    }:
+        return True
+    parts = normalized.split("_")
+    if not parts:
+        return False
+    terminal = parts[-1]
+    if terminal in _ASK_SECRET_KEY_TERMINALS:
+        return True
+    if re.search(
+        r"(?:password|passwd|passphrase|credential|authentication|authorization|cookie|oauth|token|secret|auth|storepass)\d+$",
+        terminal,
+    ):
+        return True
+    if terminal.endswith(tuple(_ASK_GLUE_SECRET_WORDS)):
+        return True
+    return (
+        terminal == "key"
+        and len(parts) > 1
+        and parts[-2] in {"api", "access", "private", "secret"}
+    )
+
+
+def _ask_harmless_secret_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        return True
+    if not isinstance(value, str):
+        return False
+    value = value.strip().strip("\"' ").casefold()
+    return value in {"true", "false", "yes", "no", "n/a", "na", "none"} or bool(
+        re.fullmatch(
+            r"\d+(?:\s+of\s+\d+|\s+(?:fail(?:ed|ures?)?|pass(?:ed)?)\s*:\s*\d+)?",
+            value,
+        )
+    )
+
+
+def _ask_path_field_value(key: str, value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    original = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", str(key))
+    normalized = re.sub(r"[^a-z0-9]+", "_", original.casefold()).strip("_")
+    if not normalized.endswith(("_path", "_file", "_dir")):
+        return False
+    value = value.strip().strip("\"'")
+    return bool(
+        re.fullmatch(
+            r"(?:[A-Za-z]:)?/?[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)+",
+            value,
+        )
+    )
+
+
+def _ask_auth_value_is_prose(value: str) -> bool:
+    value = value.strip().strip("\"'` ")
+    if _ASK_AUTH_CREDENTIAL_MARKER.search(value) or _ASK_AUTH_TRAILING_VALUE.search(
+        value
+    ):
+        return False
+    return bool(_ASK_AUTH_PROSE.match(value))
 
 
 def _ask_secret_value_shape(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     value = value.strip().strip("\"'")
-    return len(value) >= 8 and not any(char.isspace() for char in value)
+    if len(value) < 8 or any(char.isspace() for char in value):
+        return False
+    has_upper = any(char.isupper() for char in value)
+    has_digit = any(char.isdigit() for char in value)
+    has_symbol = any(not char.isalnum() for char in value)
+    return (
+        (has_digit and has_upper)
+        or (len(value) >= 16 and has_digit and has_symbol)
+        or (len(value) >= 12 and has_upper and has_symbol)
+    )
 
 
 def _ask_is_secret_key(key: str, value: Any = None) -> bool:
     word = _ask_secret_word(key)
     if word is None:
         return False
+    if _ask_harmless_secret_value(value):
+        return False
+    if _ask_path_field_value(key, value):
+        return False
     if (
-        word in {"auth", "authentication", "authorization", "cookie"}
+        word in {"auth", "authentication", "authorization", "oauth", "cookie"}
         and isinstance(value, str)
-        and _ASK_AUTH_PROSE.match(value.strip().strip("\"' "))
+        and _ask_auth_value_is_prose(value)
     ):
         return False
-    if word == "cookie" and isinstance(value, str) and _ask_cookie_prose(value):
+    if (
+        word == "cookie"
+        and isinstance(value, str)
+        and _ask_cookie_prose(value)
+        and not _ASK_AUTH_CREDENTIAL_MARKER.search(value)
+    ):
         return False
     if (
         word == "token"
@@ -2618,51 +2831,40 @@ def _ask_is_secret_key(key: str, value: Any = None) -> bool:
         and re.match(r"(?i)^none\b", value.strip().strip("\"' "))
     ):
         return False
-    return word not in _ASK_SHORT_SECRET_WORDS or _ask_secret_value_shape(value)
+    return _ask_secret_key_is_exact(key) or _ask_secret_value_shape(value)
 
 
 def _ask_auth_redaction(value: str) -> str | None:
     """Redact Authorization values unless they read like ordinary status prose."""
     value = value.strip().strip("\"'")
-    if _ASK_AUTH_PROSE.match(value):
-        return None
-    scheme = _ASK_AUTH_SCHEME_VALUE.match(value)
-    if scheme:
-        token = scheme.group("token")
-        if (
-            _ask_secret_value_shape(token)
-            or any(char.isdigit() for char in token)
-            or ":" in token
-            or (len(token) == 1 and token.isupper())
-        ):
-            return "[redacted]"
+    if _ask_auth_value_is_prose(value):
         return None
     return "[redacted]" if value else None
 
 
 def _ask_redact_authorization_headers(text: str) -> str:
-    def quoted(match: re.Match[str]) -> str:
-        value = match.group("value").strip()
-        redacted = _ask_auth_redaction(value)
-        if redacted is None:
-            return match.group(0)
-        return f"{match.group('prefix')}{redacted}{match.group('quote')}"
-
-    text = _ASK_QUOTED_AUTH_HEADER.sub(quoted, text)
-
     def line(match: re.Match[str]) -> str:
-        redacted = _ask_auth_redaction(match.group("value"))
+        raw_value = match.group("value")
+        redacted = _ask_auth_redaction(raw_value)
         if redacted is None:
             return match.group(0)
-        return f"{match.group('prefix')}{redacted}"
+        suffix = ""
+        value = raw_value.rstrip()
+        if value.endswith(('"', "'", "`")):
+            suffix = value[-1]
+        return f"{match.group('prefix')}{redacted}{suffix}"
 
     text = _ASK_AUTH_HEADER.sub(line, text)
 
     def bare_scheme(match: re.Match[str]) -> str:
-        scheme_value = (
-            f"{match.group('scheme')}{match.group('separator')}{match.group('token')}"
-        )
-        if _ask_auth_redaction(scheme_value) is None:
+        if not (
+            _ask_secret_value_shape(match.group("token"))
+            or (
+                len(match.group("token")) == 1
+                and match.group("token").isupper()
+                and not match.group("tail").strip()
+            )
+        ):
             return match.group(0)
         return (
             f"{match.group('indent')}{match.group('scheme')}"
@@ -2672,9 +2874,23 @@ def _ask_redact_authorization_headers(text: str) -> str:
     return _ASK_BARE_AUTH_SCHEME_LINE.sub(bare_scheme, text)
 
 
+def _ask_redact_bare_credential_values(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        token = match.group("token")
+        if not _ask_secret_value_shape(token):
+            return match.group(0)
+        return f"{match.group('scheme')}{match.group('space')}[redacted]"
+
+    return _ASK_BARE_CREDENTIAL_VALUE.sub(replace, text)
+
+
 _ASK_YAML_FIELD = re.compile(
     r"^(?P<indent>[ \t]*)(?P<dash>-\s*)?(?P<quote>[\"']?)"
     r"(?P<key>[A-Za-z0-9_.-]+)(?P=quote)\s*:\s*(?P<value>[^\r\n]*)"
+)
+_ASK_YAML_EXPLICIT_FIELD = re.compile(
+    rf"(?im)^(?P<indent>[ \t]*)\?[ \t]*(?P<key>{_ASK_SECRET_KEY})[ \t]*"
+    r"\r?\n(?P=indent):[ \t]*(?P<value>[^\r\n]*)"
 )
 _ASK_YAML_BLOCK = re.compile(
     r"^(?P<style>[|>](?:[+-][1-9]?|[1-9][+-]?)?)(?P<tail>[ \t]*(?:#.*)?)$"
@@ -2689,9 +2905,14 @@ def _ask_yaml_indent(match: re.Match[str]) -> int:
     return len(match.group("indent")) + len(match.group("dash") or "")
 
 
-def _ask_yaml_scalar_end(lines: list[str], index: int, indent: int) -> tuple[int, str]:
+def _ask_yaml_scalar_end(
+    lines: list[str],
+    index: int,
+    indent: int,
+    explicit_indent: int | None = None,
+) -> tuple[int, str]:
     end = index + 1
-    scalar_indent: int | None = None
+    scalar_indent = explicit_indent
     first_value = ""
     while end < len(lines):
         body = lines[end].rstrip("\r\n")
@@ -2715,7 +2936,7 @@ def _ask_yaml_scalar_end(lines: list[str], index: int, indent: int) -> tuple[int
         ):
             break
         if scalar_indent is None:
-            scalar_indent = content_indent
+            scalar_indent = indent + 1
         if not first_value:
             first_value = body.strip()
         end += 1
@@ -2752,6 +2973,15 @@ def _ask_flow_secret_values(text: str) -> str:
 
 def _ask_redact_yaml(text: str) -> str:
     text = _ask_flow_secret_values(text)
+
+    def explicit_field(match: re.Match[str]) -> str:
+        key = match.group("key")
+        value = match.group("value")
+        if not _ask_is_secret_key(key, value):
+            return match.group(0)
+        return f"{match.group('indent')}? {key}\n{match.group('indent')}: [redacted]"
+
+    text = _ASK_YAML_EXPLICIT_FIELD.sub(explicit_field, text)
     lines = text.splitlines(keepends=True)
     fields = [_ask_yaml_field(line) for line in lines]
     paired_values: dict[int, str] = {}
@@ -2773,12 +3003,9 @@ def _ask_redact_yaml(text: str) -> str:
                     continue
                 candidate_key = candidate.group("key").casefold()
                 candidate_indent = _ask_yaml_indent(candidate)
-                if candidate_key in {"name", "key"} and candidate_indent == base_indent:
+                if candidate_key in {"name", "key"} and candidate_indent <= base_indent:
                     break
-                if (
-                    candidate_key in {"value", "val", "default"}
-                    and candidate_indent == base_indent
-                ):
+                if candidate_key in {"value", "val", "default"}:
                     paired_values[candidate_index] = name
                     paired = True
                     break
@@ -2803,12 +3030,6 @@ def _ask_redact_yaml(text: str) -> str:
             out.append(lines[index])
             index += 1
             continue
-        if (direct_secret or paired_name is not None) and raw_value.lstrip().startswith(
-            ("[", "{")
-        ):
-            out.append(lines[index])
-            index += 1
-            continue
         scalar = _ASK_YAML_BLOCK.fullmatch(raw_value.strip())
         collection = raw_value.strip() == "" and (
             direct_secret or paired_name is not None
@@ -2816,8 +3037,12 @@ def _ask_redact_yaml(text: str) -> str:
         scalar_end = index + 1
         scalar_value = ""
         if scalar or collection:
+            explicit = re.search(r"[1-9]", scalar.group("style")) if scalar else None
+            explicit_indent = (
+                _ask_yaml_indent(field) + int(explicit.group()) if explicit else None
+            )
             scalar_end, scalar_value = _ask_yaml_scalar_end(
-                lines, index, _ask_yaml_indent(field)
+                lines, index, _ask_yaml_indent(field), explicit_indent
             )
             collection = collection and scalar_end > index + 1
         if (
@@ -2837,8 +3062,9 @@ def _ask_redact_yaml(text: str) -> str:
         secret_word = _ask_secret_word(secret_name)
         if (
             paired_name is None
-            and secret_word in {"authorization", "cookie"}
-            and _ASK_AUTH_PROSE.match(raw_value)
+            and secret_word
+            in {"auth", "authentication", "authorization", "oauth", "cookie"}
+            and _ask_auth_value_is_prose(raw_value)
         ):
             out.append(lines[index])
             index += 1
@@ -2848,6 +3074,34 @@ def _ask_redact_yaml(text: str) -> str:
         ):
             out.extend(lines[index:scalar_end])
             index = scalar_end
+            continue
+        container_start = len(raw_value) - len(raw_value.lstrip())
+        if (
+            scalar is None
+            and not collection
+            and raw_value[container_start : container_start + 1] in {"[", "{"}
+        ):
+            container_end = _ask_json_container_end(raw_value, container_start)
+            if container_end is None:
+                scalar_end, _ = _ask_yaml_scalar_end(
+                    lines, index, _ask_yaml_indent(field)
+                )
+                container_end = len(raw_value)
+                if scalar_end > index + 1:
+                    line_without_newline = lines[index].rstrip("\r\n")
+                    newline = lines[index][len(line_without_newline) :]
+                    before_value = line_without_newline[: field.start("value")]
+                    out.append(f"{before_value}[redacted]{newline}")
+                    index = scalar_end
+                    continue
+            line_without_newline = lines[index].rstrip("\r\n")
+            newline = lines[index][len(line_without_newline) :]
+            before_value = line_without_newline[: field.start("value")]
+            tail = raw_value[container_end:]
+            if re.match(r"\s*,\s*[\"']?[A-Za-z0-9_.-]+[\"']?\s*:", tail):
+                tail = ""
+            out.append(f"{before_value}[redacted]{tail}{newline}")
+            index += 1
             continue
         line_without_newline = lines[index].rstrip("\r\n")
         newline = lines[index][len(line_without_newline) :]
@@ -2864,9 +3118,9 @@ def _ask_redact_yaml(text: str) -> str:
 
 def _ask_json_container_end(text: str, start: int) -> int | None:
     """Find one JSON container's end without recursing through its nesting."""
-    if start >= len(text) or text[start] not in "[{":
+    if start >= len(text) or text[start] not in "[{(":
         return None
-    expected = ["]" if text[start] == "[" else "}"]
+    expected = [{"[": "]", "{": "}", "(": ")"}[text[start]]]
     quote: str | None = None
     escaped = False
     for i in range(start + 1, len(text)):
@@ -2885,7 +3139,9 @@ def _ask_json_container_end(text: str, start: int) -> int | None:
             expected.append("]")
         elif char == "{":
             expected.append("}")
-        elif char in "]}":
+        elif char == "(":
+            expected.append(")")
+        elif char in "]})":
             if not expected or char != expected[-1]:
                 return None
             expected.pop()
@@ -2929,7 +3185,7 @@ def _ask_assignment_value_end(text: str, start: int) -> int:
         return line_end if line_end >= 0 else len(text)
     if text[start] in "\"'":
         return _ask_quoted_end(text, start)
-    if text[start] in "[{":
+    if text[start] in "[{(":
         end = _ask_json_container_end(text, start)
         if end is not None:
             return end
@@ -2946,13 +3202,21 @@ def _ask_redact_assignments(text: str) -> str:
         if match.start() < cursor:
             continue
         key = (match.group("flag") or "") + match.group("key")
-        if not match.group("flag") and not re.search(r"[=:]", match.group("sep")):
+        leading_colon = match.start() > 0 and text[match.start() - 1] == ":"
+        if (
+            not match.group("flag")
+            and not leading_colon
+            and not re.search(r"[=:]", match.group("sep"))
+        ):
             continue
         start = match.end()
         end = _ask_assignment_value_end(text, start)
-        if text[start : start + 1] in "[{" and end > start:
+        if text[start : start + 1] in "[{(" and end > start:
             line_end = text.find("\n", end)
             suffix = text[end : line_end if line_end >= 0 else len(text)]
+            if re.match(r"[ \t]*,[ \t]*[\"']?[A-Za-z0-9_.-]+[\"']?[ \t]*:", suffix):
+                end = line_end if line_end >= 0 else len(text)
+                suffix = ""
             extra = re.match(
                 r"[ \t]+(?P<value>[A-Za-z0-9_.-]{1,32}(?:=[^ \t,;]+)?)", suffix
             )
@@ -2961,7 +3225,7 @@ def _ask_redact_assignments(text: str) -> str:
                 or re.search(r"[0-9_-]", extra.group("value"))
             ):
                 end += extra.end()
-        if end <= start:
+        if end < start:
             continue
         raw = text[start:end]
         line_end = text.find("\n", start)
@@ -2975,15 +3239,24 @@ def _ask_redact_assignments(text: str) -> str:
         if value.casefold() == "[redacted]":
             continue
         if (
-            word == "authorization"
+            word in {"authorization", "authentication", "auth", "oauth"}
             and colon
             and not match.group("flag")
-            and _ask_auth_redaction(prose_value) is None
+            and _ask_auth_value_is_prose(prose_value)
         ):
             continue
-        if word == "cookie" and colon and _ask_cookie_prose(prose_value):
+        if (
+            word == "cookie"
+            and colon
+            and _ask_cookie_prose(prose_value)
+            and not _ASK_AUTH_CREDENTIAL_MARKER.search(prose_value)
+        ):
             continue
         out.append(text[cursor:start])
+        if end == start:
+            out.append("[redacted]")
+            cursor = end
+            continue
         quote = raw[0] if raw[:1] in ('"', "'") else ""
         out.append(f"{quote}[redacted]{quote}")
         cursor = end
@@ -2991,6 +3264,35 @@ def _ask_redact_assignments(text: str) -> str:
         return text
     out.append(text[cursor:])
     return "".join(out)
+
+
+_ASK_HTTP_BASIC_AUTH = re.compile(
+    r"(?i)(?P<prefix>\bHTTPBasicAuth\(\s*)"
+    r"(?P<user>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^,)]*)"
+    r"(?P<between>\s*,\s*)"
+    r"(?P<password>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^)]*)"
+    r"(?P<suffix>\s*\))"
+)
+
+
+def _ask_redact_http_basic_auth(text: str) -> str:
+    return _ASK_HTTP_BASIC_AUTH.sub(
+        lambda match: (
+            f"{match.group('prefix')}{match.group('user')}"
+            f"{match.group('between')}[redacted]{match.group('suffix')}"
+        ),
+        text,
+    )
+
+
+def _ask_redact_short_password_flags(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        value = match.group("value").strip().strip("\"'")
+        if re.fullmatch(r"\d+:\d+", value):
+            return match.group(0)
+        return f"{match.group('prefix')}[redacted]"
+
+    return _ASK_SHORT_PASSWORD_FLAG.sub(replace, text)
 
 
 def _ask_redact_embedded_json(text: str) -> str:
@@ -3070,8 +3372,11 @@ def _ask_redact(text: str) -> str:
         text = text.replace(home, "~")
     for pattern, repl in _ASK_SECRET_PATTERNS:
         text = pattern.sub(repl, text)
+    text = _ask_redact_http_basic_auth(text)
+    text = _ask_redact_short_password_flags(text)
     text = _ask_redact_cookie_headers(text)
     text = _ask_redact_authorization_headers(text)
+    text = _ask_redact_bare_credential_values(text)
     text = _ask_redact_yaml(text)
     text = _ask_redact_embedded_json(text)
     text = _ask_redact_assignments(text)
