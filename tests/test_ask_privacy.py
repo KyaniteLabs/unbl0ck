@@ -805,3 +805,254 @@ def test_round9_secret_name_value_layouts_and_token_prefixes_are_redacted():
         {"Name": "DB_PASSWORD", "Value": "R9_DIRECT_CAPITAL_SECRET"}
     )
     assert safe["Value"] == "[redacted]"
+
+
+def test_round10_short_pass_values_and_strongest_secret_key_are_redacted():
+    body = """DB_PASS=hunter2
+ADMIN_PASS=
+pass:
+pw=
+wifi_pass:
+SMTP_PASS: 'hunter2'
+SMTP_PASS: 'correct horse battery'
+pass: p@ss!
+bypass_token: S
+passport_secret: S
+compass_api_key: S
+passenger_password: S
+passthrough_token: S
+sso_bypass_secret: S
+encompass_token: S
+upw_token: S
+cpw_secret: S"""
+    for payload in _round9_payloads(body):
+        for secret in (
+            "hunter2",
+            "correct horse battery",
+            "p@ss!",
+        ):
+            assert secret not in payload
+        assert "[redacted]" in payload
+        for key in (
+            "bypass_token",
+            "passport_secret",
+            "compass_api_key",
+            "passenger_password",
+            "passthrough_token",
+            "sso_bypass_secret",
+            "encompass_token",
+            "upw_token",
+            "cpw_secret",
+        ):
+            assert f"{key}: S" not in payload
+
+    safe = needs._ask_card_view(
+        {
+            "env": {"DB_PASS": "hunter2"},
+            "config": {"bypass_token": "S"},
+            "body": "DB_PASS=hunter2",
+        }
+    )
+    assert "hunter2" not in json.dumps(safe)
+    assert safe["config"]["bypass_token"] == "[redacted]"
+
+
+def test_round10_structured_next_line_and_explicit_yaml_values_are_redacted():
+    secrets = (
+        "R10_DEPLOY_TOKEN_SENTINEL",
+        "R10_COMMENT_PASSWORD_SENTINEL",
+        "R10_OAUTH_SENTINEL",
+        "R10_PASS_SENTINEL",
+        "R10_PW_SENTINEL",
+        "R10_PASSWORD_SENTINEL",
+        "R10_NAMED_FLOW_SENTINEL",
+        "R10_YAML_BLOCK_SENTINEL",
+        "R10_EXPLICIT_KEY_SENTINEL",
+        "R10_MISINDENTED_VALUE_SENTINEL",
+        "R10_COOKIE_SENTINEL",
+    )
+    body = (
+        "Here is the deploy token:\nR10_DEPLOY_TOKEN_SENTINEL\n"
+        "oauth: {access_token: 'R10_OAUTH_SENTINEL'}\n"
+        "pass: R10_PASS_SENTINEL extra\n"
+        'pass: "a b R10_PW_SENTINEL"\n'
+        '{"pw": {"v": "R10_PW_SENTINEL"}}\n'
+        "password: {a: 'it's', b: R10_PASSWORD_SENTINEL}\n"
+        "- name: DB_PASSWORD\n  value: {key: R10_NAMED_FLOW_SENTINEL}\n"
+        "password: |\n    first\n  R10_YAML_BLOCK_SENTINEL\n"
+        "password: |2\n    first\n  R10_EXPLICIT_KEY_SENTINEL\n"
+        "? db_password\n: R10_EXPLICIT_KEY_SENTINEL\n"
+        "- name: DB_PASSWORD\n value: R10_MISINDENTED_VALUE_SENTINEL\n"
+        "Cookie: the session value is R10_COOKIE_SENTINEL\n"
+        'password: {a: 1}, "b": "R10_NAMED_FLOW_SENTINEL"\n'
+        "Question: should we rotate these credentials? KEEP_THIS_QUESTION"
+    )
+    comments = [{"body": "password =\n  R10_COMMENT_PASSWORD_SENTINEL"}]
+    payloads = (
+        json.dumps(
+            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            needs.bluf_messages({"title": "Review", "ask": body}, comments),
+            ensure_ascii=False,
+        ),
+    )
+    for payload in payloads:
+        for secret in secrets:
+            assert secret not in payload, secret
+        assert "KEEP_THIS_QUESTION" in payload
+
+
+def test_round10_authorization_headers_and_nested_oauth_values_are_redacted():
+    body = (
+        "The request used Authorization: Splunk R10_AUTH_SPLUNK_SENTINEL\n"
+        "> Authorization: Bearer R10_AUTH_BULLET_SENTINEL\n"
+        "| Authorization: R10_AUTH_TABLE_SENTINEL |\n"
+        "`Authorization: R10_AUTH_BACKTICK_SENTINEL`\n"
+        '"Authorization: Basic R10_AUTH_QUOTED_SENTINEL"\n'
+        "Authorization:\n  R10_AUTH_NEXT_LINE_SENTINEL\n"
+        "Authorization: the token is R10_AUTH_PROSE_SENTINEL\n"
+        "Authorization: failed token R10_AUTH_FAILED_SENTINEL\n"
+        "Authorization: failed with R10_AUTH_FAILED_WITH_SENTINEL\n"
+        "oauth=R10_OAUTH_ASSIGNMENT_SENTINEL\n"
+        '{"oauth": "R10_OAUTH_JSON_SENTINEL"}\n'
+        'oauth: {access_token: "R10_OAUTH_CONTAINER_SENTINEL"}\n'
+        'password: {"a": 1}, "b": "R10_PASSWORD_SIBLING_SENTINEL"\n'
+        "Authorization: granted token to Ada on Monday\n"
+        "Authorization: tokens are redacted again\n"
+        "Authorization: TBD\n"
+        "Question: keep this question? KEEP_AUTH_QUESTION"
+    )
+    secrets = (
+        "R10_AUTH_SPLUNK_SENTINEL",
+        "R10_AUTH_BULLET_SENTINEL",
+        "R10_AUTH_TABLE_SENTINEL",
+        "R10_AUTH_BACKTICK_SENTINEL",
+        "R10_AUTH_QUOTED_SENTINEL",
+        "R10_AUTH_NEXT_LINE_SENTINEL",
+        "R10_AUTH_PROSE_SENTINEL",
+        "R10_AUTH_FAILED_SENTINEL",
+        "R10_AUTH_FAILED_WITH_SENTINEL",
+        "R10_OAUTH_ASSIGNMENT_SENTINEL",
+        "R10_OAUTH_JSON_SENTINEL",
+        "R10_OAUTH_CONTAINER_SENTINEL",
+        "R10_PASSWORD_SIBLING_SENTINEL",
+    )
+    payloads = (
+        json.dumps(
+            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            ensure_ascii=False,
+        ),
+        json.dumps(
+            needs.bluf_messages({"title": "Review", "ask": body}, [{"body": body}]),
+            ensure_ascii=False,
+        ),
+    )
+    for payload in payloads:
+        for secret in secrets:
+            assert secret not in payload, secret
+        assert "Authorization: granted token to Ada on Monday" in payload
+        assert "Authorization: tokens are redacted again" in payload
+        assert "Authorization: TBD" in payload
+        assert "KEEP_AUTH_QUESTION" in payload
+
+
+def test_round10_credential_shape_keeps_ordinary_scheme_and_key_prose():
+    ordinary = (
+        "Key takeaways from the meeting\n"
+        "AWS migration needs CEO approval\n"
+        "OAuth 2.0 flow\n"
+        "JWT expiry: 15 minutes\n"
+        "token_count: 5\n"
+        "tokenization: bpe\n"
+        "bypass_cache: true\n"
+        "passenger: waiting\n"
+        "passport: issued\n"
+        "secretary: Jane\n"
+        "Co-authored-by: Ada\n"
+        "auth_provider: okta\n"
+        "cookie_banner: enabled\n"
+        "token_ttl: 3600\n"
+        "private_key_path: src/keys/private-key-v2.pem\n"
+        "--token-ttl 3600\n"
+        "--auth-mode basic\n"
+        "AWS us-east-1 is down\n"
+        "Key 1: choose option A\n"
+        "JWT 2 hours\n"
+        "Bearer 3 notes\n"
+        "Authorization: granted token to Ada on Monday\n"
+        "Authorization: tokens are redacted again"
+    )
+    safe = needs._ask_redact(ordinary)
+    assert safe == ordinary
+
+    credential = "Bearer R10_BARE_SCHEME_SECRET_0123"
+    redacted = needs._ask_redact(credential)
+    assert credential not in redacted
+    assert "Bearer [redacted]" in redacted
+
+
+def test_round10_remaining_common_credential_forms_are_redacted():
+    body = """password => R10_SQL_ASSIGNMENT_SENTINEL
+API key: R10_API_KEY_SENTINEL
+-p R10_SHORT_FLAG_SENTINEL
+IDENTIFIED BY 'R10_SQL_PASSWORD_SENTINEL'
+redis://:R10_REDIS_PASSWORD_SENTINEL@cache.example.test
+keytool -storepass R10_STOREPASS_SENTINEL
+:_authToken R10_AUTH_TOKEN_SENTINEL
+auth=("bob","R10_BASIC_TUPLE_SENTINEL")
+HTTPBasicAuth("bob", "R10_HTTP_BASIC_SENTINEL")"""
+    secrets = (
+        "R10_SQL_ASSIGNMENT_SENTINEL",
+        "R10_API_KEY_SENTINEL",
+        "R10_SHORT_FLAG_SENTINEL",
+        "R10_SQL_PASSWORD_SENTINEL",
+        "R10_REDIS_PASSWORD_SENTINEL",
+        "R10_STOREPASS_SENTINEL",
+        "R10_AUTH_TOKEN_SENTINEL",
+        "R10_BASIC_TUPLE_SENTINEL",
+        "R10_HTTP_BASIC_SENTINEL",
+    )
+    safe = needs._ask_redact(body)
+    for secret in secrets:
+        assert secret not in safe, secret
+    assert needs._ask_redact('auth=("bob","S")') == "auth=[redacted]"
+    assert needs._ask_redact('HTTPBasicAuth("bob", "S")') == (
+        'HTTPBasicAuth("bob", [redacted])'
+    )
+    assert needs._ask_redact("IDENTIFIED BY 'S'") == "IDENTIFIED BY [redacted]"
+
+
+def test_round10_short_values_are_redacted_across_structured_forms():
+    cases = {
+        "pass: S extra": "pass: [redacted]",
+        'pass: "a b S"': 'pass: "[redacted]"',
+        '{"pw": {"v": "S"}}': '{"pw": "[redacted]"}',
+        "password: {a: 'it's', b: S}": "password: [redacted]",
+        "- name: DB_PASSWORD\n  value: {key: S}": (
+            "- name: DB_PASSWORD\n  value: [redacted]"
+        ),
+        "Here is the deploy token:\nS": "Here is the deploy token:\n[redacted]",
+        "password =\n  S": "password =\n  [redacted]",
+        "Cookie: the session value is S": "Cookie: [redacted]",
+        "The request used Authorization: Splunk S": (
+            "The request used Authorization: [redacted]"
+        ),
+        "Authorization: the token is S": "Authorization: [redacted]",
+        "Authorization: failed token S": "Authorization: [redacted]",
+        'password: {"a": 1}, "b": "S"': "password: [redacted]",
+        "oauth=S": "oauth=[redacted]",
+        '{"oauth": "S"}': '{"oauth": "[redacted]"}',
+        "password => S": "password => [redacted]",
+        "API key: S": "API key: [redacted]",
+        "-p S": "-p [redacted]",
+        "IDENTIFIED BY 'S'": "IDENTIFIED BY [redacted]",
+        "redis://:S@host": "redis://[redacted]@host",
+        "keytool -storepass S": "keytool -storepass [redacted]",
+        ":_authToken S": ":_authToken [redacted]",
+        'auth=("bob","S")': "auth=[redacted]",
+        'HTTPBasicAuth("bob", "S")': 'HTTPBasicAuth("bob", [redacted])',
+    }
+    for source, expected in cases.items():
+        assert needs._ask_redact(source) == expected, source
