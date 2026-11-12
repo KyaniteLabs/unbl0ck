@@ -356,6 +356,25 @@ class OutsideAPI(OutsideFixture):
         self.assertFalse(self.record(result).exists())
         self.assertEqual(needs.build_queue()["count"], 0)
 
+    def test_queue_sends_only_an_excerpt_and_full_text_is_fetched_lazily(self):
+        self.watch()
+        source_text = "First line. " + ("Long note text. " * 5000)
+        f = self.folder / "large.txt"
+        f.write_text(source_text)
+        item, = needs.build_queue()["items"]
+        response = self.client.get("/queue")
+        self.assertEqual(response.status_code, 200)
+        queued, = response.json()["items"]
+        self.assertNotIn("text", queued)
+        self.assertLessEqual(len(queued["ask"]), 480)
+        self.assertEqual(queued["ask"], item["excerpt"])
+        full = self.client.get("/outside/text", params={"id": item["id"], "version": item["version"]})
+        self.assertEqual(full.status_code, 200)
+        self.assertEqual(full.json()["text"], source_text)
+        f.write_text("Changed note")
+        stale = self.client.get("/outside/text", params={"id": item["id"], "version": item["version"]})
+        self.assertEqual(stale.status_code, 409)
+
     def test_done_folder_hides_until_change_without_touching_file(self):
         self.watch()
         f = self.folder / "call.txt"

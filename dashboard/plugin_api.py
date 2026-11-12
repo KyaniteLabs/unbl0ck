@@ -2,6 +2,7 @@
 
 GET  /queue                  the queue (Kanban, outside items, chats, live prompts, pairing requests)
 GET  /card?id=               read-only context for one Kanban card
+GET  /outside/text?id=&version=  full text for one current outside item, fetched on demand
 GET  /card/ask/{job}         poll a running Ask
 POST /card/ask               ask the configured model about one card (multi-turn)
 POST /kanban/answer          {board, task_id, text, release, version}: comment as the principal, optionally unblock
@@ -169,6 +170,12 @@ def queue():
             if (not it.get("bluf") and it.get("source") not in getattr(n, "NO_BLUF_SOURCES", ())
                     and it.get("tier") not in ("stuck", "answered")):   # not asks: no model call each
                 _queue_bluf(n, ctx, it)
+    # Outside files can be 256 KiB apiece and their source limits allow many per folder.
+    # Keep the polled queue compact; the desktop fetches a full body only when opened.
+    for item in q.get("items", []):
+        if item.get("source") == "outside":
+            item["ask"] = item.get("excerpt") or "(No text supplied.)"
+            item.pop("text", None)
     return q
 
 
@@ -216,6 +223,19 @@ def card(id: str = "", board: str = "", task_id: str = ""):
         raise HTTPException(status_code=404, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.get("/outside/text")
+def outside_text(id: str = "", version: str = ""):
+    if len(id) > MAX_ID or not id.startswith("outside:") or len(version) > MAX_ID:
+        raise HTTPException(status_code=400, detail="invalid outside item reference")
+    items = _needs().outside_items()
+    item = next((candidate for candidate in items if candidate.get("id") == id), None)
+    if item is None:
+        raise HTTPException(status_code=404, detail="outside item is no longer available")
+    if item.get("version") != version:
+        raise HTTPException(status_code=409, detail="outside item changed; refresh the queue")
+    return {"id": id, "version": version, "text": item.get("text") or "(No text supplied.)"}
 
 
 @router.post("/card/ask")

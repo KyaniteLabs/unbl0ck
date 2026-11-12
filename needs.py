@@ -375,18 +375,25 @@ def load_blufs(home: Optional[Path] = None) -> dict[str, dict[str, str]]:
     return _read_json(_bluf_path(home))
 
 
-_BLUF_KEEP = 300   # cache entries kept; resolved cards age out
-
-
 def save_bluf(item_id: str, version: str, bluf: str, why: str, home: Optional[Path] = None) -> None:
     with _state_lock(home):   # read-modify-write: concurrent workers must not drop each other's entries
         data = load_blufs(home)
         data.pop(item_id, None)
         data[item_id] = {"version": version, "bluf": bluf, "why": why, "at": int(time.time())}
-        if len(data) > _BLUF_KEEP:
-            newest = sorted(data.items(), key=lambda kv: kv[1].get("at", 0) if isinstance(kv[1], dict) else 0)
-            data = dict(newest[-_BLUF_KEEP:])
         _write_json(_bluf_path(home), data)
+
+
+def prune_blufs(items: list[dict[str, Any]], home: Optional[Path] = None) -> None:
+    """Keep summaries for current queue members and discard resolved or changed versions."""
+    current = {item["id"]: item["version"] for item in items}
+    with _state_lock(home):
+        data = load_blufs(home)
+        kept = {
+            item_id: value for item_id, value in data.items()
+            if item_id in current and isinstance(value, dict) and value.get("version") == current[item_id]
+        }
+        if kept != data:
+            _write_json(_bluf_path(home), kept)
 
 
 def attach_blufs(items: list[dict[str, Any]], home: Optional[Path] = None) -> list[dict[str, Any]]:
@@ -494,7 +501,8 @@ _NEGATION = re.compile(
 )
 _PROHIBITION = re.compile(
     r"\b(?:will\s+not|do\s+not|does\s+not|did\s+not|won['’]?t|"
-    r"can['’]?t|cannot|don['’]?t|blocked|not|never)\b",
+    r"can['’]?t|cannot|don['’]?t|shouldn['’]?t|unable|refus\w*|"
+    r"hold(?:ing)?|held|nothing|no|blocked|not|never)\b",
     re.I,
 )
 _CONDITIONAL_GATE = re.compile(r"\b(?:without|until)\b", re.I)
@@ -629,7 +637,7 @@ def chat_asks_you(text: str) -> bool:
 
 def _excerpt(text: str, n: int = 480) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
-    return text if len(text) <= n else "…" + text[-n:]
+    return text if len(text) <= n else "…" + text[-(n - 1):]
 
 
 # --- Kanban source -------------------------------------------------------------------------
@@ -1515,6 +1523,10 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
     except Exception as exc:  # noqa: BLE001
         errors.append(f"outside: {type(exc).__name__}: {exc}")
     hidden = load_hidden(home)
+    if not errors:
+        # A source that failed this poll would look "resolved"; pruning then would drop its
+        # summaries and re-summarize every item on the next good poll.
+        prune_blufs(items, home)
     shown = [i for i in items
              if include_hidden or visibility(hidden, i["id"], i["version"]) is not Visibility.HIDDEN]
     # Same order as the panel: live prompts (a run is paused), pairing requests (expire within

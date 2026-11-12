@@ -873,6 +873,8 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const [detail, setDetail] = useState(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [detailError, setDetailError] = useState('')
+  const [outsideText, setOutsideText] = useState(null)
+  const [outsideTextLoading, setOutsideTextLoading] = useState(false)
   const [askOpen, setAskOpen] = useState(false)
   const [askMsgs, setAskMsgs] = useState([])
   const [askInput, setAskInput] = useState('')
@@ -901,6 +903,16 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
       .finally(() => setDetailLoading(false))
     return () => { alive = false }
   }, [item.version, detailOpen])
+  useEffect(() => {
+    if (!isOutside || !open || outsideText?.__version === item.version) return
+    let alive = true
+    setOutsideTextLoading(true)
+    ctx.rest(`/outside/text?id=${encodeURIComponent(item.id)}&version=${encodeURIComponent(item.version)}`)
+      .then(d => { if (alive) setOutsideText({ text: d.text, __version: item.version }) })
+      .catch(e => { if (alive) host.notifyError(e, 'UNBL0CK: could not load full text') })
+      .finally(() => { if (alive) setOutsideTextLoading(false) })
+    return () => { alive = false }
+  }, [item.id, item.version, isOutside, open])
   useEffect(() => {
     if (askEnd.current) askEnd.current.scrollIntoView({ block: 'nearest' })
   }, [askMsgs, askBusy])
@@ -985,6 +997,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   )
   const ready = !busy && answer.trim().length > 0
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
+  const outsideBody = outsideText?.__version === item.version ? outsideText.text : item.ask
 
   const askSend = async (retry = false, preset = '') => {
     const q = preset || askInput.trim()
@@ -1256,12 +1269,14 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           ? [
               jsx('p', { className: 'ub-bluf', children: item.bluf }),
               item.bluf_why ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.bluf_why] }) : null,
-              open ? jsx('p', { className: 'ub-ask open', children: item.ask }) : null,
+              open ? jsx('p', { className: 'ub-ask open', children: isOutside ? outsideBody : item.ask }) : null,
+              open && isOutside && outsideTextLoading ? jsx('div', { className: 'ub-pending', children: '◇ LOADING FULL TEXT' }) : null,
               jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' })
             ]
           : [
               item.bluf_pending ? jsx('div', { className: 'ub-pending', children: '◇ SUMMARIZING' }) : null,
-              jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: item.ask }),
+              jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: isOutside ? (open ? outsideBody : item.ask) : item.ask }),
+              open && isOutside && outsideTextLoading ? jsx('div', { className: 'ub-pending', children: '◇ LOADING FULL TEXT' }) : null,
               isOutside ? jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' }) : null,
               item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null
             ]),

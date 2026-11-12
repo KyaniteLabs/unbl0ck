@@ -109,19 +109,13 @@ class SilentFailures(unittest.TestCase):
             p.write_text("[1, 2]")
             self.assertEqual(needs._read_json(p), {})
 
-    def test_bluf_cache_is_capped_newest_first(self):
+    def test_bluf_cache_holds_only_current_queue_members(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
-            keep, needs._BLUF_KEEP = needs._BLUF_KEEP, 5
-            try:
-                for i in range(8):
-                    needs.save_bluf(f"i{i}", "1", f"b{i}", "w", home)
-            finally:
-                needs._BLUF_KEEP = keep
-            data = needs.load_blufs(home)
-            self.assertEqual(len(data), 5)
-            self.assertTrue(any(k.startswith("i7") for k in data))
-            self.assertFalse(any(k.startswith("i0") for k in data))
+            for i in range(8):
+                needs.save_bluf(f"i{i}", "1", f"b{i}", "w", home)
+            needs.prune_blufs([{"id": f"i{i}", "version": "1"} for i in range(5, 8)], home)
+            self.assertEqual(sorted(needs.load_blufs(home)), ["i5", "i6", "i7"])
 
     def test_concurrent_hides_lose_nothing(self):
         with tempfile.TemporaryDirectory() as d:

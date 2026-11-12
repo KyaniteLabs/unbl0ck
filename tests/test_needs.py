@@ -166,6 +166,25 @@ class Classify(unittest.TestCase):
             with self.subTest(reason=reason):
                 self.assertTrue(needs.kanban_needs_you(reason, None), reason)
 
+    def test_waiting_until_a_gate_stays_an_ask(self):
+        for reason in [
+            "Held until CEO approval", "Paused until CEO approval", "Stopped until CEO approval",
+            "Frozen until CEO approval", "Halted until CEO approval", "Suspended until CEO approval",
+            "Stuck until CEO approval", "Deferred until CEO approval", "Queued until CEO approval",
+            "Pending until CEO approval", "On hold until CEO's decision", "Waiting until CEO sign-off",
+            "Deploy is on hold until CEO approval", "Holding the release until CEO approval",
+            "Release waits until CEO approval", "Nothing ships until CEO approval",
+            "No action until CEO approval", "Idle until CEO reply",
+            "Unable to proceed until CEO approval", "Refusing to merge without CEO approval",
+            "Shouldn't deploy until CEO approval", "Until CEO's decision, this is paused",
+            "I am waiting until I get CEO approval",
+        ]:
+            with self.subTest(reason=reason):
+                self.assertTrue(needs.kanban_needs_you(reason, "needs_input"), reason)
+        for reason in ["No CEO approval needed", "No approval needed until CEO review"]:
+            with self.subTest(reason=reason):
+                self.assertIsNone(needs.kanban_needs_you(reason, "needs_input"), reason)
+
     def test_negation_in_another_conjunct_does_not_turn_without_into_a_gate(self):
         self.assertIsNone(needs.kanban_needs_you(
             "Not urgent and we can ship without Ada's approval", None))
