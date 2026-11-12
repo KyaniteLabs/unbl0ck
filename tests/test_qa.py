@@ -1,13 +1,25 @@
 """Regressions from the v0.4.1 adversarial audit: hostile names, forged timestamps, schema drift,
 ghost waits, ordering, and who a gateway chat is with."""
-import importlib.util, json, os, sqlite3, stat, tempfile, time, types, unittest
+
+import importlib.util
+import json
+import os
+import sqlite3
+import stat
+import sys
+import tempfile
+import time
+import types
+import unittest
 from pathlib import Path
-import sys; sys.path.insert(0, str(Path(__file__).parent))
+
+sys.path.insert(0, str(Path(__file__).parent))
 import stock_pairing
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("unbl0ck_needs_qa", ROOT / "needs.py")
-needs = importlib.util.module_from_spec(spec); spec.loader.exec_module(needs)
+needs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(needs)
 SETTINGS = {"principal_name": "Ada"}
 needs._settings = lambda: SETTINGS
 
@@ -25,54 +37,113 @@ def chat_db(path: Path, rows, legacy_messages=False, user_cols=True):
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path)
     extra = ", user_id TEXT, display_name TEXT" if user_cols else ""
-    db.execute(f"CREATE TABLE sessions(id TEXT, title TEXT, source TEXT, chat_type TEXT, started_at REAL, last_activity_at REAL{extra})")
+    db.execute(
+        f"CREATE TABLE sessions(id TEXT, title TEXT, source TEXT, chat_type TEXT, started_at REAL, last_activity_at REAL{extra})"
+    )
     mcols = "" if legacy_messages else ", display_kind TEXT, active INT"
-    db.execute(f"CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL{mcols})")
+    db.execute(
+        f"CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL{mcols})"
+    )
     now = time.time()
     for sid, src, uid, name in rows:
-        vals = (sid, "", src, "dm", now - 60, now - 30) + ((uid, name) if user_cols else ())
+        vals = (sid, "", src, "dm", now - 60, now - 30) + (
+            (uid, name) if user_cols else ()
+        )
         db.execute(f"INSERT INTO sessions VALUES({','.join('?' * len(vals))})", vals)
-        db.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES(?, 'assistant', ?, ?)", (sid, ASK, now - 30))
-    db.commit(); db.close()
+        db.execute(
+            "INSERT INTO messages(session_id, role, content, timestamp) VALUES(?, 'assistant', ?, ?)",
+            (sid, ASK, now - 30),
+        )
+    db.commit()
+    db.close()
 
 
 class Pairing(unittest.TestCase):
     def test_hostile_name_is_one_clean_line(self):
         with tempfile.TemporaryDirectory() as d:
-            pairing(Path(d), {RID: {"user_name": "Eve‮\n\x1b[31mgnp.exe​ " + "x" * 200, "created_at": time.time(), "hash": "h", "salt": "s"}})
-            it, = needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d)))
-            for bad in ("‮", "\n", "\x1b", "​"):
+            pairing(
+                Path(d),
+                {
+                    RID: {
+                        "user_name": "Eve‮\n\x1b[31mgnp.exe\u200b " + "x" * 200,  # noqa: PLE2502
+                        "created_at": time.time(),
+                        "hash": "h",
+                        "salt": "s",
+                    }
+                },
+            )
+            (it,) = needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d)))
+            for bad in ("‮", "\n", "\x1b", "\u200b"):  # noqa: PLE2502
                 self.assertNotIn(bad, it["title"])
             self.assertLess(len(it["title"]), 120)
 
     def test_future_timestamp_and_bool_are_rejected(self):
         with tempfile.TemporaryDirectory() as d:
-            pairing(Path(d), {"a": {"created_at": time.time() + 86400 * 365}, "b": {"created_at": True}})
-            self.assertEqual(needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d))), [])
+            pairing(
+                Path(d),
+                {
+                    "a": {"created_at": time.time() + 86400 * 365},
+                    "b": {"created_at": True},
+                },
+            )
+            self.assertEqual(
+                needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d))), []
+            )
 
     def test_approve_command_only_for_hashed_request_ids(self):
         with tempfile.TemporaryDirectory() as d:
             now = time.time()
-            pairing(Path(d), {RID: {"user_name": "Ana", "created_at": now, "hash": "h", "salt": "s"},
-                              "ABCD2345": {"user_name": "Old", "created_at": now}})
-            items = {i["title"].split()[0]: i for i in needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d)))}
-            self.assertEqual(items["Ana"]["approve_command"], f"hermes pairing approve telegram {RID}")
-            self.assertEqual(items["Old"]["approve_command"], "")   # a legacy key IS the code
+            pairing(
+                Path(d),
+                {
+                    RID: {
+                        "user_name": "Ana",
+                        "created_at": now,
+                        "hash": "h",
+                        "salt": "s",
+                    },
+                    "ABCD2345": {"user_name": "Old", "created_at": now},
+                },
+            )
+            items = {
+                i["title"].split()[0]: i
+                for i in needs.pairing_items(
+                    Path(d), store=stock_pairing.factory(Path(d))
+                )
+            }
+            self.assertEqual(
+                items["Ana"]["approve_command"],
+                f"hermes pairing approve telegram {RID}",
+            )
+            self.assertEqual(
+                items["Old"]["approve_command"], ""
+            )  # a legacy key IS the code
             self.assertNotIn("ABCD2345", json.dumps(list(items.values())))
             pack = json.dumps(needs.pocket_pack({"items": list(items.values())}))
-            self.assertNotIn(RID, pack)   # gadgets never get the id
+            self.assertNotIn(RID, pack)  # gadgets never get the id
 
     def test_profile_command_targets_the_profile(self):
         with tempfile.TemporaryDirectory() as d:
-            pairing(Path(d), {RID: {"created_at": time.time(), "hash": "h", "salt": "s"}}, "discord", "ops")
-            it, = needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d)))
-            self.assertEqual(it["approve_command"], f"hermes -p ops pairing approve discord {RID}")
+            pairing(
+                Path(d),
+                {RID: {"created_at": time.time(), "hash": "h", "salt": "s"}},
+                "discord",
+                "ops",
+            )
+            (it,) = needs.pairing_items(Path(d), store=stock_pairing.factory(Path(d)))
+            self.assertEqual(
+                it["approve_command"], f"hermes -p ops pairing approve discord {RID}"
+            )
 
 
 class Chats(unittest.TestCase):
     def test_old_messages_schema_lists_chats_without_error_flood(self):
         with tempfile.TemporaryDirectory() as d:
-            chat_db(Path(d) / "state.db", [(f"s{i}", "telegram", "1", "Me") for i in range(5)], legacy_messages=True)
+            chat_db(
+                Path(d) / "state.db",
+                [(f"s{i}", "telegram", "1", "Me") for i in range(5)],
+                legacy_messages=True,
+            )
             errors = []
             self.assertEqual(len(needs.chat_items(Path(d), errors=errors)), 5)
             self.assertEqual(errors, [])
@@ -87,54 +158,89 @@ class Chats(unittest.TestCase):
     def test_root_home_chat_has_a_human_name(self):
         with tempfile.TemporaryDirectory() as d:
             chat_db(Path(d) / "state.db", [("s", "cli", "1", "")])
-            it, = needs.chat_items(Path(d))
+            (it,) = needs.chat_items(Path(d))
             self.assertEqual(it["title"], "Your agent is asking you")
 
     def test_gateway_chat_says_who_it_is_with_and_owner_ids_filter(self):
         with tempfile.TemporaryDirectory() as d:
-            chat_db(Path(d) / "state.db", [("me", "discord", "111", "ada"), ("them", "discord", "222", "Mallory‮"),
-                                           ("local", "desktop", "999", "ignored")])
+            chat_db(
+                Path(d) / "state.db",
+                [
+                    ("me", "discord", "111", "ada"),
+                    ("them", "discord", "222", "Mallory‮"),  # noqa: PLE2502
+                    ("local", "desktop", "999", "ignored"),
+                ],
+            )
             items = {i["session_id"]: i for i in needs.chat_items(Path(d))}
             self.assertEqual(sorted(items), ["local", "me", "them"])
             self.assertEqual(items["them"]["chat_with"], "Mallory")
             self.assertEqual(items["local"]["chat_with"], "")
-            self.assertEqual(items["me"]["chat_with"], "")   # "ada" is the principal: not worth saying
+            self.assertEqual(
+                items["me"]["chat_with"], ""
+            )  # "ada" is the principal: not worth saying
             SETTINGS["owner_user_ids"] = "111, 333"
             try:
-                self.assertEqual(sorted(i["session_id"] for i in needs.chat_items(Path(d))), ["local", "me"])
+                self.assertEqual(
+                    sorted(i["session_id"] for i in needs.chat_items(Path(d))),
+                    ["local", "me"],
+                )
                 # A gateway chat with no known user is not proven to be yours: hidden too.
                 with tempfile.TemporaryDirectory() as d2:
-                    chat_db(Path(d2) / "state.db", [("anon", "telegram", None, ""), ("old", "", None, "")])
-                    self.assertEqual([i["session_id"] for i in needs.chat_items(Path(d2))], ["old"])
+                    chat_db(
+                        Path(d2) / "state.db",
+                        [("anon", "telegram", None, ""), ("old", "", None, "")],
+                    )
+                    self.assertEqual(
+                        [i["session_id"] for i in needs.chat_items(Path(d2))], ["old"]
+                    )
             finally:
                 SETTINGS.pop("owner_user_ids")
 
     def test_schema_without_user_columns(self):
         with tempfile.TemporaryDirectory() as d:
-            chat_db(Path(d) / "state.db", [("s", "telegram", None, None)], user_cols=False)
-            it, = needs.chat_items(Path(d))
+            chat_db(
+                Path(d) / "state.db", [("s", "telegram", None, None)], user_cols=False
+            )
+            (it,) = needs.chat_items(Path(d))
             self.assertEqual(it["chat_with"], "")
 
 
 class Waits(unittest.TestCase):
     def setUp(self):
-        self.d = tempfile.TemporaryDirectory(); self.home = Path(self.d.name)
+        self.d = tempfile.TemporaryDirectory()
+        self.home = Path(self.d.name)
 
     def tearDown(self):
         self.d.cleanup()
 
     def test_wait_file_is_owner_only(self):
-        needs.record_wait(self.home, request_id=RID, kind="sudo", prompt="password for ada")
+        needs.record_wait(
+            self.home, request_id=RID, kind="sudo", prompt="password for ada"
+        )
         f = needs._waits_dir(self.home) / f"{RID}.json"
         self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
 
     def test_malformed_and_ancient_waits_are_dropped_not_raised(self):
         w = needs._waits_dir(self.home)
         live = {"pid": os.getpid(), "proc_start": needs._proc_start(os.getpid())}
-        (w / "aaaaaaaaaaaaaaaa.json").write_text(json.dumps({**live, "since": time.time()}))                       # no request_id
-        (w / "bbbbbbbbbbbbbbbb.json").write_text(json.dumps({**live, "request_id": "../../x", "since": time.time()}))
-        (w / "cccccccccccccccc.json").write_text(json.dumps({**live, "request_id": "cccccccccccccccc", "since": time.time() - 2 * 86400}))
-        (w / "dddddddddddddddd.json").write_text(json.dumps({**live, "request_id": "dddddddddddddddd", "since": "soon"}))
+        (w / "aaaaaaaaaaaaaaaa.json").write_text(
+            json.dumps({**live, "since": time.time()})
+        )  # no request_id
+        (w / "bbbbbbbbbbbbbbbb.json").write_text(
+            json.dumps({**live, "request_id": "../../x", "since": time.time()})
+        )
+        (w / "cccccccccccccccc.json").write_text(
+            json.dumps(
+                {
+                    **live,
+                    "request_id": "cccccccccccccccc",
+                    "since": time.time() - 2 * 86400,
+                }
+            )
+        )
+        (w / "dddddddddddddddd.json").write_text(
+            json.dumps({**live, "request_id": "dddddddddddddddd", "since": "soon"})
+        )
         self.assertEqual(needs.wait_items(self.home), [])
         self.assertEqual(list(w.iterdir()), [])
 
@@ -146,8 +252,17 @@ class Ordering(unittest.TestCase):
             pairing(home, {RID: {"created_at": time.time(), "hash": "h", "salt": "s"}})
             chat_db(home / "state.db", [("s", "cli", "1", "")])
             needs.record_wait(home, request_id=RID, kind="clarify", prompt="Which?")
-            card = {"id": "kanban:b:t", "version": "1", "source": "kanban", "priority": 540, "since": time.time(),
-                    "title": "t", "ask": "a", "why": "w", "task_id": "t"}
+            card = {
+                "id": "kanban:b:t",
+                "version": "1",
+                "source": "kanban",
+                "priority": 540,
+                "since": time.time(),
+                "title": "t",
+                "ask": "a",
+                "why": "w",
+                "task_id": "t",
+            }
             saved = needs.kanban_items
             needs.kanban_items = lambda boards=None, errors=None: [card]
             try:
@@ -155,7 +270,10 @@ class Ordering(unittest.TestCase):
                     q = needs.build_queue(home)
             finally:
                 needs.kanban_items = saved
-            self.assertEqual([i["source"] for i in q["items"]], ["prompt", "pairing", "kanban", "chat"])
+            self.assertEqual(
+                [i["source"] for i in q["items"]],
+                ["prompt", "pairing", "kanban", "chat"],
+            )
             self.assertEqual(needs.pocket_pack(q)["cards"][0]["id"], f"prompt:{RID}")
 
 
@@ -177,37 +295,91 @@ class Hidden(unittest.TestCase):
 
 class Summary(unittest.TestCase):
     def test_cli_summary_says_who_and_how_to_approve(self):
-        spec = importlib.util.spec_from_file_location("unbl0ck_pkg_qa", ROOT / "__init__.py",
-                                                      submodule_search_locations=[str(ROOT)])
-        pkg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pkg)
-        q = {"count": 2, "errors": [], "items": [
-            {"source": "chat", "platform": "discord", "profile": "default", "chat_with": "Mallory",
-             "title": "Your agent is asking you", "ask": "Wipe prod?"},
-            {"source": "pairing", "platform": "telegram", "profile": "default", "title": "Ana wants to talk",
-             "ask": "x", "approve_command": f"hermes pairing approve telegram {RID}"}]}
+        spec = importlib.util.spec_from_file_location(
+            "unbl0ck_pkg_qa",
+            ROOT / "__init__.py",
+            submodule_search_locations=[str(ROOT)],
+        )
+        pkg = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pkg)
+        q = {
+            "count": 2,
+            "errors": [],
+            "items": [
+                {
+                    "source": "chat",
+                    "platform": "discord",
+                    "profile": "default",
+                    "chat_with": "Mallory",
+                    "title": "Your agent is asking you",
+                    "ask": "Wipe prod?",
+                },
+                {
+                    "source": "pairing",
+                    "platform": "telegram",
+                    "profile": "default",
+                    "title": "Ana wants to talk",
+                    "ask": "x",
+                    "approve_command": f"hermes pairing approve telegram {RID}",
+                },
+            ],
+        }
         pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q)
         out = pkg._summary()
         self.assertIn("[chat discord with Mallory]", out)
         self.assertIn(f"  approve: hermes pairing approve telegram {RID}", out)
 
     def test_slash_shows_the_queue_only_on_local_surfaces(self):
-        spec = importlib.util.spec_from_file_location("unbl0ck_pkg_qa2", ROOT / "__init__.py",
-                                                      submodule_search_locations=[str(ROOT)])
-        pkg = importlib.util.module_from_spec(spec); spec.loader.exec_module(pkg)
-        q = {"count": 1, "errors": [], "items": [
-            {"source": "prompt", "kind": "approval", "profile": "ops", "title": "ops needs your approval",
-             "ask": "rm -rf /srv/secret-thing", "approve_command": f"hermes -p ops pairing approve telegram {RID}"}]}
+        spec = importlib.util.spec_from_file_location(
+            "unbl0ck_pkg_qa2",
+            ROOT / "__init__.py",
+            submodule_search_locations=[str(ROOT)],
+        )
+        pkg = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pkg)
+        q = {
+            "count": 1,
+            "errors": [],
+            "items": [
+                {
+                    "source": "prompt",
+                    "kind": "approval",
+                    "profile": "ops",
+                    "title": "ops needs your approval",
+                    "ask": "rm -rf /srv/secret-thing",
+                    "approve_command": f"hermes -p ops pairing approve telegram {RID}",
+                }
+            ],
+        }
         pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q)
         for surface in ("cli", "tui", "desktop", "local", "CLI"):
             self.assertIn("rm -rf", pkg.slash_unbl0ck("", platform=surface))
-        for surface in ("telegram", "discord", "slack", "api_server", "webhook", "", None, "cli "):
+        for surface in (
+            "telegram",
+            "discord",
+            "slack",
+            "api_server",
+            "webhook",
+            "",
+            None,
+            "cli ",
+        ):
             out = pkg.slash_unbl0ck("", platform=surface)
-            self.assertEqual(out, "1 thing(s) waiting on you. Open UNBL0CK in Hermes Desktop or run "
-                                  "hermes unbl0ck on the machine to see them.")
+            self.assertEqual(
+                out,
+                "1 thing(s) waiting on you. Open UNBL0CK in Hermes Desktop or run "
+                "hermes unbl0ck on the machine to see them.",
+            )
             self.assertNotIn(RID, out)
-        self.assertNotIn("rm -rf", pkg.slash_unbl0ck(""))   # an old host that passes no platform
-        pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: {"count": 0, "errors": [], "items": []})
-        self.assertEqual(pkg.slash_unbl0ck("", platform="telegram"), "Nothing is blocked on you.")
+        self.assertNotIn(
+            "rm -rf", pkg.slash_unbl0ck("")
+        )  # an old host that passes no platform
+        pkg._needs = lambda: types.SimpleNamespace(
+            build_queue=lambda: {"count": 0, "errors": [], "items": []}
+        )
+        self.assertEqual(
+            pkg.slash_unbl0ck("", platform="telegram"), "Nothing is blocked on you."
+        )
 
 
 if __name__ == "__main__":

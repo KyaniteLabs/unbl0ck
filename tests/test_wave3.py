@@ -1,5 +1,6 @@
 """Wave 3 (Sonnet audit): BLUF egress scrub at the model boundary (UB-2), Ask history turn cap
 (UB-3) and the BLUF retry cap over 24 hours (UB-1b)."""
+
 import importlib.util
 import sys
 import types
@@ -15,7 +16,9 @@ fastapi = pytest.importorskip("fastapi")
 
 
 def _api():
-    spec = importlib.util.spec_from_file_location("ub_api_w3", ROOT / "dashboard/plugin_api.py")
+    spec = importlib.util.spec_from_file_location(
+        "ub_api_w3", ROOT / "dashboard/plugin_api.py"
+    )
     mod = importlib.util.module_from_spec(spec)
     sys.modules["ub_api_w3"] = mod
     spec.loader.exec_module(mod)
@@ -44,10 +47,20 @@ def test_ub2_credential_and_home_path_shapes_never_reach_ctx_llm_complete():
 
     ctx = types.SimpleNamespace(llm=types.SimpleNamespace(complete=complete))
     n = types.SimpleNamespace(
-        recent_comments=lambda it: [{"author": "a", "body": f"see {LEAKS[3]} and {LEAKS[5]}"}],
-        bluf_messages=needs.bluf_messages, parse_bluf=needs.parse_bluf, save_bluf=lambda *a: None)
-    item = {"id": "kanban:b:t", "version": "1", "title": f"Fix {LEAKS[0]} in {LEAKS[4]}",
-            "ask": " ".join(LEAKS[1:3] + LEAKS[6:]), "owner": "o"}
+        recent_comments=lambda it: [
+            {"author": "a", "body": f"see {LEAKS[3]} and {LEAKS[5]}"}
+        ],
+        bluf_messages=needs.bluf_messages,
+        parse_bluf=needs.parse_bluf,
+        save_bluf=lambda *a: None,
+    )
+    item = {
+        "id": "kanban:b:t",
+        "version": "1",
+        "title": f"Fix {LEAKS[0]} in {LEAKS[4]}",
+        "ask": " ".join(LEAKS[1:3] + LEAKS[6:]),
+        "owner": "o",
+    }
     api._run_bluf(n, ctx, item)
     assert seen, "the model was never called"
     blob = repr(seen)
@@ -58,15 +71,21 @@ def test_ub2_credential_and_home_path_shapes_never_reach_ctx_llm_complete():
 
 
 def test_ub3_ask_history_is_capped_at_six_turns():
-    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i:02d}"} for i in range(40)]
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i:02d}"}
+        for i in range(40)
+    ]
     msgs = needs.build_ask_messages({"id": "t"}, history)
     turns = msgs[2:]
     assert len(turns) == needs.ASK_HISTORY_TURNS == 6
-    assert turns[-1]["content"] == "turn 39"                     # newest kept
+    assert turns[-1]["content"] == "turn 39"  # newest kept
 
 
 def test_ub3_forty_long_turns_stay_inside_the_budget():
-    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 8000} for i in range(40)]
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": "x" * 8000}
+        for i in range(40)
+    ]
     msgs = needs.build_ask_messages({"id": "t", "title": "y" * 60000}, history)
     assert sum(len(m["content"]) for m in msgs) <= needs.ASK_PROMPT_BUDGET
     assert len(msgs[2:]) <= 6
@@ -76,7 +95,9 @@ def test_ub3_the_turn_cap_is_a_setting():
     assert needs.ask_history_turns({"ask_history_turns": 2}) == 2
     assert needs.ask_history_turns({"ask_history_turns": "junk"}) == 6
     assert needs.ask_history_turns({"ask_history_turns": 0}) == 6
-    msgs = needs.build_ask_messages({"id": "t"}, [{"role": "user", "content": str(i)} for i in range(9)], turns=2)
+    msgs = needs.build_ask_messages(
+        {"id": "t"}, [{"role": "user", "content": str(i)} for i in range(9)], turns=2
+    )
     assert len(msgs[2:]) == 2
 
 
@@ -85,10 +106,10 @@ def test_ub1b_a_failing_item_is_tried_at_most_three_times_in_24_hours_and_a_new_
     j = jobs.BlufJobs(clock=lambda: t[0])
     key = ("kanban:b:t", "v1")
     starts = 0
-    while t[0] < 24 * 3600:                      # the desktop polls every 45 s
+    while t[0] < 24 * 3600:  # the desktop polls every 45 s
         if j.start(key):
             starts += 1
             j.fail(key, "ValueError: no JSON object in reply")
         t[0] += 45
     assert starts <= 3
-    assert j.start(("kanban:b:t", "v2"))         # a version bump starts again
+    assert j.start(("kanban:b:t", "v2"))  # a version bump starts again

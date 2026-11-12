@@ -28,7 +28,9 @@ else:
     _HERMES_IMPORT_ERROR = None
 
 
-@unittest.skipIf(_HERMES_IMPORT_ERROR, f"Hermes dependency unavailable: {_HERMES_IMPORT_ERROR}")
+@unittest.skipIf(
+    _HERMES_IMPORT_ERROR, f"Hermes dependency unavailable: {_HERMES_IMPORT_ERROR}"
+)
 class RealHermesRelease(unittest.TestCase):
     def test_answer_release_uses_native_transaction_boundary_and_posts_once(self):
         previous_home = os.environ.get("HERMES_HOME")
@@ -47,12 +49,18 @@ class RealHermesRelease(unittest.TestCase):
                     version = str(block.id)
 
                 result = needs.answer_card(
-                    "default", task_id, "Use the first option", release=True,
-                    version=version, home=Path(directory),
+                    "default",
+                    task_id,
+                    "Use the first option",
+                    release=True,
+                    version=version,
+                    home=Path(directory),
                 )
                 self.assertTrue(result["released"])
                 with kanban_db_connect.connect(board="default") as conn:
-                    self.assertNotEqual(kanban_db.get_task(conn, task_id).status, "blocked")
+                    self.assertNotEqual(
+                        kanban_db.get_task(conn, task_id).status, "blocked"
+                    )
                     comments = kanban_db.list_comments(conn, task_id)
                     self.assertEqual(
                         [(comment.author, comment.body) for comment in comments],
@@ -66,15 +74,25 @@ class RealHermesRelease(unittest.TestCase):
                     kanban_db.block_task(
                         conn, retry_id, reason="Needs CEO approval", kind="needs_input"
                     )
-                    retry_version = str(needs._latest_block(conn, kanban_db, retry_id).id)
+                    retry_version = str(
+                        needs._latest_block(conn, kanban_db, retry_id).id
+                    )
 
                 needs.answer_card(
-                    "default", retry_id, "Keep the current path", release=False,
-                    version=retry_version, home=Path(directory),
+                    "default",
+                    retry_id,
+                    "Keep the current path",
+                    release=False,
+                    version=retry_version,
+                    home=Path(directory),
                 )
                 retry_result = needs.answer_card(
-                    "default", retry_id, "Keep the current path", release=True,
-                    version=retry_version, home=Path(directory),
+                    "default",
+                    retry_id,
+                    "Keep the current path",
+                    release=True,
+                    version=retry_version,
+                    home=Path(directory),
                 )
                 self.assertTrue(retry_result["released"])
                 with kanban_db_connect.connect(board="default") as conn:
@@ -100,7 +118,10 @@ class RealHermesRelease(unittest.TestCase):
                     )
                     task_id = getattr(task_id, "id", task_id)
                     kanban_db.block_task(
-                        conn, task_id, reason="Needs operator decision", kind="needs_input"
+                        conn,
+                        task_id,
+                        reason="Needs operator decision",
+                        kind="needs_input",
                     )
                     old_version = str(needs._latest_block(conn, kanban_db, task_id).id)
 
@@ -120,10 +141,14 @@ class RealHermesRelease(unittest.TestCase):
                     if top_level and top_level_txns == 2 and not interleaved:
                         interleaved = True
                         with kanban_db_connect.connect(board="default") as other:
-                            self.assertTrue(kanban_db.block_task(
-                                other, task_id,
-                                reason="Needs a new operator decision", kind="capability",
-                            ))
+                            self.assertTrue(
+                                kanban_db.block_task(
+                                    other,
+                                    task_id,
+                                    reason="Needs a new operator decision",
+                                    kind="capability",
+                                )
+                            )
                             new_version = str(
                                 needs._latest_block(other, kanban_db, task_id).id
                             )
@@ -131,8 +156,12 @@ class RealHermesRelease(unittest.TestCase):
                 kanban_db.write_txn = interleave_after_second_txn
                 try:
                     result = needs.answer_card(
-                        "default", task_id, "Use the earlier option", release=True,
-                        version=old_version, home=Path(directory),
+                        "default",
+                        task_id,
+                        "Use the earlier option",
+                        release=True,
+                        version=old_version,
+                        home=Path(directory),
                     )
                 finally:
                     kanban_db.write_txn = original_write_txn
@@ -142,9 +171,14 @@ class RealHermesRelease(unittest.TestCase):
                 self.assertNotEqual(old_version, new_version)
                 with kanban_db_connect.connect(board="default") as conn:
                     task = kanban_db.get_task(conn, task_id)
-                    self.assertEqual(str(getattr(task.status, "value", task.status)), "blocked")
+                    self.assertEqual(
+                        str(getattr(task.status, "value", task.status)), "blocked"
+                    )
                     comments = kanban_db.list_comments(conn, task_id)
-                    self.assertEqual([comment.body for comment in comments], ["Use the earlier option"])
+                    self.assertEqual(
+                        [comment.body for comment in comments],
+                        ["Use the earlier option"],
+                    )
             finally:
                 if previous_home is None:
                     os.environ.pop("HERMES_HOME", None)
@@ -167,45 +201,84 @@ class RealHermesRelease(unittest.TestCase):
                     child_id = getattr(child_id, "id", child_id)
                     kanban_db.link_tasks(conn, parent_id, child_id)
                     with kanban_db.write_txn(conn):
-                        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child_id,))
-                    self.assertTrue(kanban_db.block_task(
-                        conn, child_id, reason="Needs operator decision", kind="needs_input"
-                    ))
-                    child_version = str(needs._latest_block(conn, kanban_db, child_id).id)
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                            (child_id,),
+                        )
+                    self.assertTrue(
+                        kanban_db.block_task(
+                            conn,
+                            child_id,
+                            reason="Needs operator decision",
+                            kind="needs_input",
+                        )
+                    )
+                    child_version = str(
+                        needs._latest_block(conn, kanban_db, child_id).id
+                    )
 
                     review_id = kanban_db.create_task(
                         conn, title="Resume review work", body="", assignee="worker"
                     )
                     review_id = getattr(review_id, "id", review_id)
                     with kanban_db.write_txn(conn):
-                        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (review_id,))
-                    self.assertTrue(kanban_db.block_task(
-                        conn, review_id, reason="Needs operator decision", kind="needs_input"
-                    ))
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                            (review_id,),
+                        )
+                    self.assertTrue(
+                        kanban_db.block_task(
+                            conn,
+                            review_id,
+                            reason="Needs operator decision",
+                            kind="needs_input",
+                        )
+                    )
                     review_event = needs._latest_block(conn, kanban_db, review_id)
                     conn.execute(
                         "UPDATE task_events SET payload = ? WHERE id = ?",
-                        ('{"kind":"needs_input","resume_status":"review"}', review_event.id),
+                        (
+                            '{"kind":"needs_input","resume_status":"review"}',
+                            review_event.id,
+                        ),
                     )
                     review_version = str(review_event.id)
 
                 needs.answer_card(
-                    "default", child_id, "Resume after parent completes", release=True,
-                    version=child_version, home=Path(directory),
+                    "default",
+                    child_id,
+                    "Resume after parent completes",
+                    release=True,
+                    version=child_version,
+                    home=Path(directory),
                 )
                 needs.answer_card(
-                    "default", review_id, "Continue review", release=True,
-                    version=review_version, home=Path(directory),
+                    "default",
+                    review_id,
+                    "Continue review",
+                    release=True,
+                    version=review_version,
+                    home=Path(directory),
                 )
                 with kanban_db_connect.connect(board="default") as conn:
                     self.assertEqual(
-                        str(getattr(kanban_db.get_task(conn, child_id).status, "value",
-                                    kanban_db.get_task(conn, child_id).status)),
+                        str(
+                            getattr(
+                                kanban_db.get_task(conn, child_id).status,
+                                "value",
+                                kanban_db.get_task(conn, child_id).status,
+                            )
+                        ),
                         "todo",
                     )
                     self.assertEqual(
-                        str(getattr(kanban_db.get_task(conn, review_id).status, "value",
-                                    kanban_db.get_task(conn, review_id).status)),
+                        str(
+                            getattr(
+                                kanban_db.get_task(conn, review_id).status,
+                                "value",
+                                kanban_db.get_task(conn, review_id).status,
+                            )
+                        ),
                         "review",
                     )
             finally:

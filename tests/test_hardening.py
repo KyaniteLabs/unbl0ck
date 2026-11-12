@@ -22,7 +22,9 @@ class FakeKdb:
     class Event:
         @staticmethod
         def from_row(row):
-            return types.SimpleNamespace(id=row["id"], kind=row["kind"], created_at=row["created_at"])
+            return types.SimpleNamespace(
+                id=row["id"], kind=row["kind"], created_at=row["created_at"]
+            )
 
     def __init__(self, events=(), comments=()):
         self.events, self.comments, self.calls = list(events), list(comments), []
@@ -43,10 +45,19 @@ def board_db():
       CREATE TABLE task_events(id INTEGER PRIMARY KEY, task_id TEXT, run_id TEXT, kind TEXT, payload TEXT, created_at INT);
       CREATE TABLE task_comments(id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INT);
     """)
-    rows = [("t1", "created", 1), ("t1", "blocked", 5), ("t1", "commented", 9),
-            ("t1", "block_loop_detected", 7), ("t2", "blocked", 50)]
-    conn.executemany("INSERT INTO task_events(task_id, kind, created_at) VALUES(?,?,?)", rows)
-    conn.execute("INSERT INTO task_comments(task_id, author, body, created_at) VALUES('t1','Ada','ok',8)")
+    rows = [
+        ("t1", "created", 1),
+        ("t1", "blocked", 5),
+        ("t1", "commented", 9),
+        ("t1", "block_loop_detected", 7),
+        ("t2", "blocked", 50),
+    ]
+    conn.executemany(
+        "INSERT INTO task_events(task_id, kind, created_at) VALUES(?,?,?)", rows
+    )
+    conn.execute(
+        "INSERT INTO task_comments(task_id, author, body, created_at) VALUES('t1','Ada','ok',8)"
+    )
     return conn
 
 
@@ -65,7 +76,9 @@ class FastPaths(unittest.TestCase):
 
     def test_latest_block_falls_back_on_schema_drift(self):
         old = types.SimpleNamespace(kind="blocked", created_at=3)
-        kdb = FakeKdb(events=[old, types.SimpleNamespace(kind="commented", created_at=4)])
+        kdb = FakeKdb(
+            events=[old, types.SimpleNamespace(kind="commented", created_at=4)]
+        )
         self.assertIs(needs._latest_block(BrokenConn(), kdb, "t1"), old)
         self.assertEqual(kdb.calls, ["list_events"])
 
@@ -114,13 +127,18 @@ class SilentFailures(unittest.TestCase):
             home = Path(d)
             for i in range(8):
                 needs.save_bluf(f"i{i}", "1", f"b{i}", "w", home)
-            needs.prune_blufs([{"id": f"i{i}", "version": "1"} for i in range(5, 8)], home)
+            needs.prune_blufs(
+                [{"id": f"i{i}", "version": "1"} for i in range(5, 8)], home
+            )
             self.assertEqual(sorted(needs.load_blufs(home)), ["i5", "i6", "i7"])
 
     def test_concurrent_hides_lose_nothing(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
-            ts = [threading.Thread(target=needs.hide, args=(f"id{i}", "v", home)) for i in range(20)]
+            ts = [
+                threading.Thread(target=needs.hide, args=(f"id{i}", "v", home))
+                for i in range(20)
+            ]
             [t.start() for t in ts]
             [t.join() for t in ts]
             self.assertEqual(len(needs.load_hidden(home)), 20)
