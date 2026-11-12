@@ -634,16 +634,19 @@ _NEGATION = re.compile(
     re.IGNORECASE,
 )
 _PERMISSION_BEFORE_GATE = re.compile(
-    r"(?:\b(?:no problem|nothing stops us|no reason to (?:hold|wait|pause|stop))"
+    r"(?:\b(?:no problem|nothing stops us)"
+    r"(?:\s+(?:shipping|merging|releasing|deploying|proceeding|continuing))?"
+    r"|\bno reason to (?:hold|wait|pause|stop)"
     r"|\bfree to (?:ship|merge|release|deploy|proceed)"
     r"|\bsafe to (?:ship|merge|release|deploy|proceed)"
     r"|\b(?:can|may)\s+(?:ship|merge|release|deploy|proceed|continue)"
     r"|\b(?:we|i|they)\s+(?:can|may)\s+(?:ship|merge|release|deploy|proceed|continue)"
+    r"|\b(?:we|i|they)\s+(?:ship|merge|release|deploy|proceed|continue)\b"
     r"|\b(?:we|i|they)\s+(?:(?:am|is|are|was|were)\s+)?"
-    r"(?:proceeding|continuing|continued|went ahead|proceeded|done|fixed|resolved|"
+    r"(?:proceeding|continuing|continued|went ahead|proceeded|done|fixed(?: it)?|resolved|"
     r"shipped|works|worked|merged|released|deployed)"
     r"|\b(?:is|are|was|were)\s+(?:done|fixed|resolved)"
-    r"|\b(?:continued|proceeded|done|fixed|resolved|shipped|works|worked|merged|released|deployed)"
+    r"|\b(?:continuing|proceeding|continued|proceeded|done|fixed(?: it)?|resolved|shipped|works|worked|merged|released|deployed)"
     r"|^\s*(?:ship|merge|release|deploy|proceed))\s*$",
     re.IGNORECASE,
 )
