@@ -1045,7 +1045,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   }
   const discussInChat = async () => {
     try {
-      const d = detail || await loadDetail()
+      const d = detail?.__version === item.version ? detail : await loadDetail()
       const draft = seedDraft(item, d)
       host.newChat(null)
       await new Promise(res => setTimeout(res, reducedMotion() ? 0 : 200))

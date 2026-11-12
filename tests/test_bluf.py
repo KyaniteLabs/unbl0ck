@@ -114,6 +114,26 @@ class BlufTest(unittest.TestCase):
                     ("Approve the real release.", "It is ready."),
                 )
 
+    def test_parse_accepts_fenced_json_after_ordinary_lead_in_lines(self):
+        labels = [
+            "Here is the summary in the requested format:",
+            "Here's the answer in JSON format:",
+            "Following the schema you gave:",
+            "As per the example you provided:",
+            "Answer (JSON format):",
+            "Formatted as asked:",
+        ]
+        for label in labels:
+            with self.subTest(label=label):
+                reply = (
+                    f"{label}\n```json\n"
+                    '{"bluf":"Ship the fix.","why":"Checks are clear."}\n```'
+                )
+                self.assertEqual(
+                    needs.parse_bluf(reply),
+                    ("Ship the fix.", "Checks are clear."),
+                )
+
     def test_parse_ignores_inline_for_example_after_real_answer(self):
         reply = (
             '{"bluf":"Real answer","why":"real"} For example: '

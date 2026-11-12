@@ -120,6 +120,11 @@ def test_conditional_gates_distinguish_permissions_from_blockers(monkeypatch):
         "We went ahead without CEO approval",
         "We are proceeding without CEO sign-off",
         "We shipped without Ada's approval",
+        "Continuing without CEO approval",
+        "Fixed it without needing CEO approval",
+        "Safe to merge without CEO approval",
+        "Resolved without CEO sign-off",
+        "Blocked on CI. Retried twice without CEO approval being needed",
     ]
     asks = [
         "Stuck without CEO approval",
@@ -138,6 +143,18 @@ def test_conditional_gates_distinguish_permissions_from_blockers(monkeypatch):
         "Paused until Ada decides",
         "Blocked until the CEO signs off",
         "Waiting until the CEO approves",
+        "Nothing is done until Ada approves",
+        "Nothing gets merged until the CEO signs off",
+        "No one can merge until Ada approves",
+        "Nothing may be deployed without CEO approval",
+        "Nothing can ship without CEO approval",
+        "No release can go out without Ada's sign-off",
+        "We may not be able to ship without CEO approval",
+        "I can do nothing more without Ada's decision",
+        "The work is done but nothing can merge until Ada signs off",
+        "We aren't proceeding without CEO approval",
+        "Deployment isn't proceeding until Ada approves",
+        "We aren't done without CEO approval",
     ]
     for reason in non_asks:
         assert needs.kanban_needs_you(reason, "needs_input") is None, reason

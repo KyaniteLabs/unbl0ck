@@ -59,6 +59,36 @@ if (result.children !== '◆ 1 NEEDS YOU') throw new Error(`unexpected chip: ${r
         subprocess.run(["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
                        check=True, capture_output=True, text=True)
 
+    def test_discuss_in_chat_loads_detail_for_the_current_card_version(self):
+        script = r'''const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const seedStart = src.indexOf('const seedDraft =');
+const seedEnd = src.indexOf('\n\nfunction CardDetail', seedStart);
+const start = src.indexOf('  const discussInChat = async () => {');
+const end = src.indexOf('\n\n  const meta =', start);
+if (seedStart < 0 || seedEnd < 0 || start < 0 || end < 0) throw new Error('draft helpers missing');
+const oldDetail = {__version: 'v1', body: 'old description'};
+const currentDetail = {__version: 'v2', body: 'current description'};
+let loads = 0, draft = '';
+const env = {
+  item: {id: 'kanban:board:task', version: 'v2', board: 'board', task_id: 'task', title: 'Current card', ask: ''},
+  detail: oldDetail,
+  loadDetail: async () => { loads++; return currentDetail; },
+  host: {newChat: () => {}, composer: {setDraft: async (target, value) => { draft = value; return true; }}},
+  reducedMotion: () => true, sfx: {play: () => {}},
+};
+const run = new Function('env', `with(env) { ${src.slice(seedStart, seedEnd)}; ${src.slice(start, end)}; return discussInChat; }`)(env);
+(async () => {
+  await run();
+  if (loads !== 1) throw new Error(`stale detail was reused; current detail loads: ${loads}`);
+  if (!draft.includes('current description') || draft.includes('old description')) throw new Error(`wrong draft context: ${draft}`);
+})().catch(e => { console.error(e); process.exitCode = 1; });
+'''
+        for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
+            with self.subTest(path=path.name):
+                result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_outside_cards_render_safe_text_and_send_done_to_the_backend(self):
         script = r'''
 const fs = require('fs');

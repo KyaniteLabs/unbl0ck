@@ -2,6 +2,7 @@
 home directory, or secret-looking strings from run/failure errors, comments or events."""
 import json
 import os
+import time
 
 import needs
 
@@ -154,6 +155,102 @@ def test_authorization_prose_survives_redaction_in_ask_and_bluf():
         assert "deploy broke at step 3" in payload
         assert "flow is broken" in payload
         assert "CEO approval" in payload
+
+
+def test_authorization_headers_with_any_scheme_and_nested_secret_values_are_redacted():
+    sensitive = (
+        'curl -H "Authorization: synthetic-no-scheme-auth-0101"\n'
+        "curl -H 'Authorization: Bot synthetic-bot-auth-0102'\n"
+        "Authorization: SSWS synthetic-ssws-auth-0103\n"
+        "Authorization: Negotiate synthetic-negotiate-auth-0104\n"
+        "Authorization: NTLM synthetic-ntlm-auth-0105\n"
+        "Authorization: AWS4-HMAC-SHA256 Credential=synthetic-aws-auth-0106, Signature=synthetic-aws-signature-0107\n"
+        "authorization: synthetic-bare-auth-0108\n"
+        'tokens-json={"tokens": ["synthetic-nested-token-0109"]}\n'
+        'credentials-json={"credentials": {"user": "bob", "pw": "synthetic-nested-pw-0110"}}\n'
+        'log payload="{\\"tokens\\": [\\"synthetic-escaped-json-token-0111\\"]}"\n'
+        "private_key: |\n  synthetic-yaml-private-key-0112\n"
+    )
+    card = {"title": "Review", "ask": sensitive}
+    payloads = (
+        json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
+        json.dumps(needs.bluf_messages(card), ensure_ascii=False),
+    )
+    for payload in payloads:
+        for secret in (
+            "synthetic-no-scheme-auth-0101", "synthetic-bot-auth-0102",
+            "synthetic-ssws-auth-0103", "synthetic-negotiate-auth-0104",
+            "synthetic-ntlm-auth-0105", "synthetic-aws-auth-0106",
+            "synthetic-aws-signature-0107", "synthetic-bare-auth-0108",
+            "synthetic-nested-token-0109", "synthetic-nested-pw-0110",
+            "synthetic-escaped-json-token-0111", "synthetic-yaml-private-key-0112",
+        ):
+            assert secret not in payload, secret
+
+
+def test_cookie_and_command_line_credentials_are_redacted():
+    sensitive = (
+        "Set-Cookie: session=synthetic-set-cookie-0201; HttpOnly\n"
+        "curl -b 'session=synthetic-curl-cookie-0202' https://example.test/\n"
+        'curl --cookie "session=synthetic-long-cookie-0203" https://example.test/\n'
+        "curl -ubob:synthetic-glued-user-0204 https://example.test/\n"
+        "curl --user=alice:synthetic-equals-user-0205 https://example.test/\n"
+        "mysql -psynthetic-mysql-password-0206 database\n"
+        "sshpass -p synthetic-sshpass-password-0207 ssh server\n"
+        "docker login -p synthetic-docker-password-0208\n"
+        'config={"auth": "synthetic-auth-value-0209", "passphrase": "synthetic-passphrase-0210"}\n'
+    )
+    card = {"title": "Review", "ask": sensitive}
+    payloads = (
+        json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
+        json.dumps(needs.bluf_messages(card), ensure_ascii=False),
+    )
+    for payload in payloads:
+        for secret in (
+            "synthetic-set-cookie-0201", "synthetic-curl-cookie-0202",
+            "synthetic-long-cookie-0203", "synthetic-glued-user-0204",
+            "synthetic-equals-user-0205", "synthetic-mysql-password-0206",
+            "synthetic-sshpass-password-0207", "synthetic-docker-password-0208",
+            "synthetic-auth-value-0209", "synthetic-passphrase-0210",
+        ):
+            assert secret not in payload, secret
+
+
+def test_cookie_keys_in_recursive_and_embedded_mappings_are_redacted():
+    sensitive = (
+        '{"Cookie": "session=synthetic-json-cookie-0301"} '
+        "{'Cookie': 'session=synthetic-python-cookie-0302'}"
+    )
+    card = {
+        "title": "Review",
+        "ask": sensitive,
+        "events": [{"payload": {"Cookie": "session=synthetic-map-cookie-0303"}}],
+    }
+    payloads = (
+        json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
+        json.dumps(needs.bluf_messages(card), ensure_ascii=False),
+    )
+    for payload in payloads:
+        for secret in (
+            "synthetic-json-cookie-0301", "synthetic-python-cookie-0302",
+            "synthetic-map-cookie-0303",
+        ):
+            assert secret not in payload, secret
+
+
+def test_large_harmless_card_body_redacts_within_budget():
+    card = {"title": "Review", "body": "x" * 16000}
+    started = time.perf_counter()
+    needs.build_ask_messages(card, [])
+    elapsed = time.perf_counter() - started
+    assert elapsed < 0.05, f"16k harmless body took {elapsed:.3f}s"
+
+
+def test_clipped_embedded_secret_assignments_are_redacted_before_sending():
+    secret = "synthetic-clipped-nested-token-0401"
+    body = '{"tokens": ["' + secret + '"], "note": "' + "x" * 25000 + '"}'
+    payload = json.dumps(needs.build_ask_messages({"title": "Review", "body": body}, []), ensure_ascii=False)
+    assert secret not in payload
 
 
 def test_useful_context_kept():

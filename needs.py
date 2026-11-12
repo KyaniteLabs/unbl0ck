@@ -490,11 +490,13 @@ def parse_bluf(text: str) -> tuple[str, str]:
             continue
         if isinstance(obj, dict):
             prefix = text[:i]
-            is_example = re.search(
-                r"(?:^|\n|[ \t])(?:for\s+)?(?:an?\s+)?(?:example|sample|e\.g\.|format|schema)"
-                r"[^\n:]{0,40}:\s*(?:```[a-z0-9_-]*\s*)?$",
-                prefix, re.IGNORECASE,
+            example_label = (
+                r"(?:for\s+)?(?:an?\s+)?(?:(?:example|sample|format|schema)\b|e\.g\.)"
+                r"[^\n:]{0,40}:\s*(?:```[a-z0-9_-]*\s*)?$"
             )
+            is_example = re.search(rf"(?:^|\n)[ \t]*{example_label}", prefix, re.IGNORECASE)
+            if data is not None and not is_example:
+                is_example = re.search(rf"(?:^|\n|[ \t]){example_label}", prefix, re.IGNORECASE)
             raw_bluf = obj.get("bluf")
             # Keep the last real answer: a model may restate or correct itself.
             if not is_example and isinstance(raw_bluf, str) and _real_bluf(raw_bluf):
@@ -538,17 +540,22 @@ _NEGATION = re.compile(
 )
 _PERMISSION_BEFORE_GATE = re.compile(
     r"\b(?:no problem|nothing stops us|no reason to (?:hold|wait|pause|stop)|free to|"
-    r"can(?!['’]?t\b|\s+not\b|not\b)|may|went ahead|(?:am|is|are|was|were) proceeding|proceeding|done|shipped|"
-    r"proceeded|works|worked|merged|released|deployed|(?:we|i|they)\s+(?:ship|merge|release|deploy|proceed))\b"
+    r"safe to (?:ship|merge|release|deploy|proceed)|"
+    r"can(?!['’]?t\b|\s+not\b|not\b)|may|went ahead|(?:am|is|are|was|were) proceeding|"
+    r"proceeding|continu(?:ing|ed)|done|fixed|resolved|shipped|proceeded|works|worked|merged|released|deployed|"
+    r"(?:we|i|they)\s+(?:ship|merge|release|deploy|proceed))\b"
     r"|^\s*(?:ship|merge|release|deploy|proceed)\b"
     r"(?!\s+(?:is|are|was|were|frozen|stopped|stalled|blocked|forbidden|risky|impossible|"
     r"held|holding|holds|waiting|waits|pending|parked|on hold)\b)",
     re.IGNORECASE,
 )
 _NEGATED_PERMISSION = re.compile(
-    r"\b(?:not|never|cannot|can't|won't|don't|doesn't|didn't|shouldn't|"
-    r"may\s+not|can\s+not|will\s+not|do\s+not|does\s+not|did\s+not|should\s+not)\s+"
-    r"(?:\w+\s+){0,2}(?:proceed\w*|ship\w*|merg\w*|releas\w*|deploy\w*|done)\b",
+    r"\b(?:(?:nothing(?!\s+stops?\s+us\b))|no\s+one|nobody|none(?:\s+of\s+\w+)?|"
+    r"no\s+(?!problem\b|reason\b|risk\b|blocker\b|issue\b)\w+|"
+    r"not|never|cannot|can't|won't|don't|doesn't|didn't|shouldn't|"
+    r"may\s+not|can\s+not|will\s+not|do\s+not|does\s+not|did\s+not|should\s+not)\b"
+    r"(?:\s+\w+){0,8}\s+(?:proceed\w*|ship\w*|merg\w*|releas\w*|deploy\w*|done|go\s+out)\b"
+    r"|\b(?:can|may|will|do)\s+(?:do\s+)?nothing\b",
     re.IGNORECASE,
 )
 _HISTORICAL_HOLD_UNTIL = re.compile(
@@ -570,6 +577,7 @@ _POST_NEGATION = re.compile(
     r"^\s*(?:is|are|was|were)?\s*(?:not|no longer|n['’]t)\s+(?:needed|required|necessary|wanted)\b", re.I
 )
 _DENIAL_BEFORE_UNTIL = re.compile(r"\b(?:no|not)\b.{0,40}\bneeded\b", re.I)
+_WITHOUT_UNNEEDED = re.compile(r"\bbeing\s+(?:needed|required|necessary|wanted)\b", re.I)
 
 
 def _match_is_negated(text: str, match: re.Match[str]) -> bool:
@@ -595,6 +603,9 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
         and _PERMISSION_BEFORE_GATE.search(before_conditional)
         and not _NEGATED_PERMISSION.search(before_conditional)
     )
+    after = text[match.end():]
+    end = _CLAUSE_END.search(after)
+    after = after[:end.start()] if end else after
     historical_hold = bool(
         conditional
         and conditional.group().lower() == "until"
@@ -606,15 +617,16 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
             permission
             or historical_hold
             or (
+                conditional.group().lower() == "without"
+                and _WITHOUT_UNNEEDED.search(after)
+            )
+            or (
                 conditional.group().lower() == "until"
                 and _DENIAL_BEFORE_UNTIL.search(before_conditional)
             )
         )
     )
     gate_condition = bool(conditional and not denial)
-    after = text[match.end():]
-    end = _CLAUSE_END.search(after)
-    after = after[:end.start()] if end else after
     return bool(denial or (_NEGATION.search(near) and not gate_condition)
                 or _POST_NEGATION.search(after))
 
@@ -649,6 +661,14 @@ _YOUR_GATE = re.compile(
 def kanban_needs_you(reason: str, kind: Optional[str]) -> Optional[str]:
     """Why a blocked card's latest block is waiting on the principal, or None."""
     reason = (reason or "").strip()
+    reason = re.sub(
+        r"\b(?P<verb>is|are|was|were|do|does|did|can|should|may|could|would|must)n['’]t\b",
+        lambda match: f"{match.group('verb')} not",
+        reason,
+        flags=re.IGNORECASE,
+    )
+    reason = re.sub(r"\bwon['’]t\b", "will not", reason, flags=re.IGNORECASE)
+    reason = re.sub(r"\bcan['’]t\b", "can not", reason, flags=re.IGNORECASE)
     pats = _patterns()
     if not reason:
         return None
@@ -1948,15 +1968,38 @@ _ASK_SECRET_PATTERNS = (
         r"\1[redacted]",
     ),
     (
-        re.compile(r"(?im)(^[ \t]*|\n[ \t]*|(?:-H\s+['\"]))cookie\s*:\s*[^\r\n'\"]*"),
-        r"\1Cookie: [redacted]",
+        re.compile(
+            r"""(?im)(^[ \t]*|\n[ \t]*|(?:-H\s+['"]))(?P<header>(?:set-?)?cookie)\s*:\s*[^\r\n'"]*"""
+        ),
+        r"\1\g<header>: [redacted]",
     ),
     (
         re.compile(
-            r"(?i)(\bcurl\b[^\r\n]*?\s(?:-u|--user)\s+)"
+            r"(?i)(\bcurl\b[^\r\n]*?\s(?:--user|-u)(?:=|\s+)?)"
             r"""(?:"[^"\r\n]*:[^"\r\n]*"|'[^'\r\n]*:[^'\r\n]*'|[^:\s'\"]+:[^\s'\"]+)"""
         ),
         r"\1[redacted]",
+    ),
+    (
+        re.compile(
+            r"(?i)(\bcurl\b[^\r\n]*?\s(?:--cookie|-b)(?:=|\s+)?)"
+            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s'\"]+)"""
+        ),
+        r"\1[redacted]",
+    ),
+    (
+        re.compile(
+            r"(?i)(\b(?:mysql|sshpass|docker\s+login)\b[^\r\n]*?\s-p(?:=|\s+)?)"
+            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s'\"]+)"""
+        ),
+        r"\1[redacted]",
+    ),
+    (
+        re.compile(
+            r"(?im)(^[ \t]*[a-z0-9_.-]*private[_-]?key\s*:\s*\|[+-]?[ \t]*\r?\n)"
+            r"(?:[ \t]+[^\r\n]*(?:\r?\n|$))+"
+        ),
+        r"\1[redacted]\n",
     ),
     (
         re.compile(
@@ -1976,13 +2019,83 @@ _ASK_SECRET_PATTERNS = (
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[redacted]"),
 )
 
-_ASK_SECRET_KEY = r"[a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization)s?"
-_ASK_SECRET_KEY_RE = re.compile(_ASK_SECRET_KEY, re.IGNORECASE)
-_ASK_SECRET_ASSIGNMENT = re.compile(
-    rf'''(?ix)(?P<key_quote>["']?)(?P<key>{_ASK_SECRET_KEY})(?P=key_quote)'''
-    r'''(?P<sep>\s*[=:]\s*)(?:(?P<double>"(?:\\.|[^"\\])*")|'''
-    r'''(?P<single>'(?:\\.|[^'\\])*')|(?P<bare>[^\s"',;}\]]+))'''
+_ASK_SECRET_KEY = (
+    r"[a-z0-9_.-]{0,64}(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|"
+    r"private[_-]?key|credential|authorization|cookie|auth)s?"
 )
+_ASK_SECRET_KEY_RE = re.compile(r"(?<![A-Za-z0-9_.-])" + _ASK_SECRET_KEY, re.IGNORECASE)
+_ASK_SECRET_ASSIGNMENT = re.compile(
+    rf'''(?ix)(?<![A-Za-z0-9_.-])(?P<key_quote>["']?)(?P<key>{_ASK_SECRET_KEY})(?P=key_quote)'''
+    r'''(?P<sep>\s*[=:]\s*)(?:(?P<double>"(?:\\.|[^"\\])*(?:"|\Z))|'''
+    r'''(?P<single>'(?:\\.|[^'\\])*(?:'|\Z))|(?P<structured>(?:\[|\{)[\s\S]*)|'''
+    r'''(?P<bare>[^\s"',;}\]]+))'''
+)
+
+_ASK_AUTH_HEADER = re.compile(
+    r"(?im)(?P<prefix>\b(?:proxy-)?authorization\s*:\s*)(?P<value>[^\r\n]*)"
+)
+_ASK_QUOTED_AUTH_HEADER = re.compile(
+    r'''(?i)(?P<prefix>(?P<quote>["'])(?:proxy-)?authorization\s*:\s*)'''
+    r'''(?P<value>.*?)(?P=quote)'''
+)
+_ASK_AUTH_PROSE = re.compile(
+    r"^(?:header\s+(?:missing|is|was|wasn't|doesn't)|flow\s+(?:is|was|looks|seems))\b", re.I
+)
+
+
+def _ask_redact_authorization_headers(text: str) -> str:
+    def quoted(match: re.Match[str]) -> str:
+        value = match.group("value").strip()
+        if _ASK_AUTH_PROSE.match(value):
+            return match.group(0)
+        return f"{match.group('prefix')}[redacted]{match.group('quote')}"
+
+    text = _ASK_QUOTED_AUTH_HEADER.sub(quoted, text)
+
+    def line(match: re.Match[str]) -> str:
+        value = match.group("value").strip().strip("\"'")
+        if _ASK_AUTH_PROSE.match(value):
+            return match.group(0)
+        return f"{match.group('prefix')}[redacted]"
+
+    return _ASK_AUTH_HEADER.sub(line, text)
+
+
+def _ask_redact_embedded_json(text: str) -> str:
+    """Redact valid JSON objects embedded in prose or escaped JSON log strings."""
+    if not _ASK_SECRET_KEY_RE.search(text):
+        return text
+    decoder = json.JSONDecoder()
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == '"' and text[i + 1:i + 2] in ("{", "["):
+            try:
+                value, end = decoder.raw_decode(text, i)
+            except ValueError:
+                value = None
+            if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
+                try:
+                    embedded = json.loads(value)
+                except (ValueError, TypeError):
+                    embedded = None
+                if isinstance(embedded, (dict, list)):
+                    safe = _ask_card_view(embedded)
+                    out.append(json.dumps(json.dumps(safe, ensure_ascii=False), ensure_ascii=False))
+                    i = end
+                    continue
+        if text[i] in "{[":
+            try:
+                value, end = decoder.raw_decode(text, i)
+            except ValueError:
+                value = None
+            if isinstance(value, (dict, list)):
+                out.append(json.dumps(_ask_card_view(value), ensure_ascii=False))
+                i = end
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
 
 
 def _ask_redact_assignment(match: re.Match[str]) -> str:
@@ -1991,7 +2104,12 @@ def _ask_redact_assignment(match: re.Match[str]) -> str:
         and match.group("sep").lstrip().startswith(":")
         and not match.group("key_quote")
     ):
-        return match.group(0)
+        value = next(
+            (match.group(name) for name in ("double", "single", "bare") if match.group(name)), ""
+        )
+        prose = value.strip("\"' ")
+        if prose.lower() in {"header", "flow"} or _ASK_AUTH_PROSE.match(prose):
+            return match.group(0)
     quote = '"' if match.group("double") is not None else "'" if match.group("single") is not None else ""
     value = f"{quote}[redacted]{quote}"
     return f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}{match.group('sep')}{value}"
@@ -2003,11 +2121,16 @@ def _ask_redact(text: str) -> str:
         text = text.replace(home, "~")
     for pattern, repl in _ASK_SECRET_PATTERNS:
         text = pattern.sub(repl, text)
+    text = _ask_redact_authorization_headers(text)
+    text = _ask_redact_embedded_json(text)
     text = _ASK_SECRET_ASSIGNMENT.sub(_ask_redact_assignment, text)
     return text
 
 
-def _ask_card_view(value: Any, _key: str = "") -> Any:
+ASK_CARD_CONTEXT_LIMIT = 24000
+
+
+def _ask_card_view(value: Any, _key: str = "", _text_budget: Optional[list[int]] = None) -> Any:
     """A copy of the card fit to send to an LLM: no workspace path, no home dir, no secrets.
 
     The operator asked about the card, not about their filesystem or credentials, so the Ask
@@ -2021,11 +2144,16 @@ def _ask_card_view(value: Any, _key: str = "") -> Any:
             if _ASK_SECRET_KEY_RE.search(str(k)):
                 out[k] = "[redacted]"
                 continue
-            out[k] = _ask_card_view(v, str(k))
+            out[k] = _ask_card_view(v, str(k), _text_budget)
         return out
     if isinstance(value, (list, tuple)):
-        return [_ask_card_view(v, _key) for v in value]
+        return [_ask_card_view(v, _key, _text_budget) for v in value]
     if isinstance(value, str):
+        if _text_budget is not None:
+            remaining = max(0, _text_budget[0])
+            if len(value) > remaining:
+                value = value[:remaining]
+            _text_budget[0] = remaining - len(value)
         return _ask_redact(value)
     return value
 
@@ -2049,9 +2177,9 @@ def ask_history_turns(settings: Optional[dict[str, Any]] = None) -> int:
 
 def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]], turns: Optional[int] = None) -> list[dict[str, str]]:
     """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns."""
-    context = json.dumps(_ask_card_view(card), ensure_ascii=False, default=str)
-    if len(context) > 24000:
-        context = context[:24000] + "…[truncated]"
+    context = json.dumps(_ask_card_view(card, _text_budget=[ASK_CARD_CONTEXT_LIMIT]), ensure_ascii=False, default=str)
+    if len(context) > ASK_CARD_CONTEXT_LIMIT:
+        context = context[:ASK_CARD_CONTEXT_LIMIT] + "…[truncated]"
     messages: list[dict[str, str]] = [
         {"role": "system", "content": ASK_SYSTEM},
         {
