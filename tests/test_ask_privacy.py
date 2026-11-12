@@ -63,7 +63,10 @@ def test_json_secret_keys_and_quoted_values_redacted_from_ask_and_bluf():
     embedded = (
         '{"Authorization": "synthetic-json-auth-value-0001", '
         '"api_key": "synthetic-json-api-key-value-0002", '
-        '"password": "synthetic quoted password value with spaces"}'
+        '"password": "synthetic quoted password value with spaces", '
+        '"client_secret": "synthetic-json-client-secret-0005", '
+        '"token": "synthetic-json-token-0006"} '
+        "{'client_secret': 'synthetic-python-client-secret-0007'}"
     )
     card = {
         "title": "Review the deployment",
@@ -82,12 +85,75 @@ def test_json_secret_keys_and_quoted_values_redacted_from_ask_and_bluf():
         "synthetic-json-auth-value-0001",
         "synthetic-json-api-key-value-0002",
         "synthetic quoted password value with spaces",
+        "synthetic-json-client-secret-0005",
+        "synthetic-json-token-0006",
+        "synthetic-python-client-secret-0007",
     )
     for label, payload in payloads.items():
         for secret in secrets:
             assert secret not in payload, f"{label} leaked {secret}"
     assert "synthetic-event-auth-value-0003" not in payloads["Ask"]
     assert "synthetic-event-api-key-value-0004" not in payloads["Ask"]
+
+
+def test_cookie_shell_credentials_and_password_phrases_redacted_from_ask_and_bluf():
+    sensitive = (
+        "  Cookie: sessionid=synthetic-cookie-value-0001\n"
+        "curl -u bob:synthetic-curl-password-0002 https://example.test/\n"
+        "curl -H 'Authorization: ApiKey synthetic-curl-header-auth-0004'\n"
+        "Use Authorization: ApiKey synthetic-inline-header-auth-0005\n"
+        "Authorization: Digest username=bob, nonce=synthetic-digest-nonce-0008, "
+        "response=synthetic-digest-response-0009\n"
+        'curl -u "bob:synthetic curl secret phrase-0006" https://example.test/\n'
+        'password is "synthetic password phrase-0007"\n'
+        "password is synthetic-password-0003"
+    )
+    card = {"title": "Review deployment", "ask": sensitive}
+    payloads = (
+        json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
+        json.dumps(needs.bluf_messages(card), ensure_ascii=False),
+    )
+    for payload in payloads:
+        for secret in (
+            "synthetic-cookie-value-0001",
+            "synthetic-curl-password-0002",
+            "synthetic-password-0003",
+            "synthetic-curl-header-auth-0004",
+            "synthetic-inline-header-auth-0005",
+            "synthetic-digest-nonce-0008",
+            "synthetic-digest-response-0009",
+            "synthetic curl secret phrase-0006",
+            "synthetic password phrase-0007",
+        ):
+            assert secret not in payload
+
+
+def test_ordinary_response_objects_are_not_secret_redacted():
+    card = _card()
+    card["events"] = [
+        {"payload": {"response": {"status": 403, "body": "CEO approval missing"}}}
+    ]
+    payload = needs.build_ask_messages(card, [])[1]["content"]
+    assert '"status": 403' in payload
+    assert "CEO approval missing" in payload
+
+
+def test_authorization_prose_survives_redaction_in_ask_and_bluf():
+    prose = (
+        "Authorization: header missing in request; deploy broke at step 3.\n"
+        "The authorization: flow is broken; need CEO approval for the 12k spend."
+    )
+    card = {"title": "Deploy", "ask": prose}
+    payloads = (
+        json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
+        json.dumps(needs.bluf_messages(card), ensure_ascii=False),
+    )
+    for payload in payloads:
+        assert "authorization" in payload.lower()
+        assert "header missing in request" in payload
+        assert "deploy broke at step 3" in payload
+        assert "flow is broken" in payload
+        assert "CEO approval" in payload
 
 
 def test_useful_context_kept():

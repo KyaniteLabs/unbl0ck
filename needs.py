@@ -148,7 +148,8 @@ def _patterns(names: Optional[list[str]] = None, role_words: Optional[list[str]]
     # Second-person forms ("your approval", "blocked pending your go") are as strong as
     # a named gate; the audit's false negatives were all of this shape.
     pats["_GATE"] = _c(
-        r"\b({C}[- ](gate|gated|word|decision|approval|call|sign[- ]?off)"
+        r"\b(until ({P}|the {C}|{C}) (signs? off|approves|decides|confirms|replies|answers)"
+        r"|{C}[- ](gate|gated|word|decision|approval|call|sign[- ]?off)"
         r"|({P}|{C}|principal)(['’]s)? (approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
         r"|(awaiting|waiting (on|for)|needs?|requires?|blocked on|blocked pending|pending) ({P}|the {C}|{C}|principal|(the )?human)"
         r"|(approval|decision|sign[- ]?off|input|answer|reply|go|ok) from ({P}|the {C}|{C}|(the )?principal|(the )?human|you)"
@@ -355,6 +356,8 @@ def _set_pending_release(item_id: str, version: Optional[str], home: Optional[Pa
 
 # --- BLUF cache (one model summary per item version) ----------------------------------------
 
+_BLUF_KEEP = 2000
+
 BLUF_SYSTEM = (
     "You write the one-glance summary for a card in the operator's 'needs you' queue. The "
     "operator skims; the raw text is dense agent jargon. Reply with JSON only: "
@@ -375,23 +378,56 @@ def load_blufs(home: Optional[Path] = None) -> dict[str, dict[str, str]]:
     return _read_json(_bluf_path(home))
 
 
+def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str, Any]:
+    if len(data) <= _BLUF_KEEP:
+        return data
+
+    def saved_at(entry: Any) -> int:
+        try:
+            return int(entry.get("at") or 0) if isinstance(entry, dict) else 0
+        except (TypeError, ValueError):
+            return 0
+
+    ranked = sorted(
+        data.items(), key=lambda pair: (saved_at(pair[1]), pair[0] == newest_id)
+    )
+    return dict(ranked[-_BLUF_KEEP:])
+
+
 def save_bluf(item_id: str, version: str, bluf: str, why: str, home: Optional[Path] = None) -> None:
     with _state_lock(home):   # read-modify-write: concurrent workers must not drop each other's entries
         data = load_blufs(home)
         data.pop(item_id, None)
-        data[item_id] = {"version": version, "bluf": bluf, "why": why, "at": int(time.time())}
+        data[item_id] = {
+            "version": version,
+            "bluf": bluf,
+            "why": why,
+            "at": int(time.time()),
+        }
+        data = _trim_blufs(data, item_id)
         _write_json(_bluf_path(home), data)
 
 
-def prune_blufs(items: list[dict[str, Any]], home: Optional[Path] = None) -> None:
-    """Keep summaries for current queue members and discard resolved or changed versions."""
+def prune_blufs(
+    items: list[dict[str, Any]],
+    home: Optional[Path] = None,
+    *,
+    preserve_prefixes: tuple[str, ...] = (),
+) -> None:
+    """Keep current summaries and ids whose source the caller could not observe."""
     current = {item["id"]: item["version"] for item in items}
     with _state_lock(home):
         data = load_blufs(home)
         kept = {
-            item_id: value for item_id, value in data.items()
-            if item_id in current and isinstance(value, dict) and value.get("version") == current[item_id]
+            item_id: value
+            for item_id, value in data.items()
+            if isinstance(value, dict)
+            and (
+                item_id.startswith(preserve_prefixes)
+                or (item_id in current and value.get("version") == current[item_id])
+            )
         }
+        kept = _trim_blufs(kept)
         if kept != data:
             _write_json(_bluf_path(home), kept)
 
@@ -455,7 +491,8 @@ def parse_bluf(text: str) -> tuple[str, str]:
         if isinstance(obj, dict):
             prefix = text[:i]
             is_example = re.search(
-                r"(?:(?:^|\n)\s*(?:example(?:\s+format)?|schema|for example)|\b(?:example\s+format|for example))\s*:\s*(?:```[a-z0-9_-]*\s*)?$",
+                r"(?:^|\n|[ \t])(?:for\s+)?(?:an?\s+)?(?:example|sample|e\.g\.|format|schema)"
+                r"[^\n:]{0,40}:\s*(?:```[a-z0-9_-]*\s*)?$",
                 prefix, re.IGNORECASE,
             )
             raw_bluf = obj.get("bluf")
@@ -499,11 +536,24 @@ _NEGATION = re.compile(
     r"can['’]?t|cannot|no longer|no new)\b",
     re.I,
 )
-_PROHIBITION = re.compile(
-    r"\b(?:will\s+not|do\s+not|does\s+not|did\s+not|won['’]?t|"
-    r"can['’]?t|cannot|don['’]?t|shouldn['’]?t|unable|refus\w*|"
-    r"hold(?:ing)?|held|nothing|no|blocked|not|never)\b",
-    re.I,
+_PERMISSION_BEFORE_GATE = re.compile(
+    r"\b(?:no problem|nothing stops us|no reason to (?:hold|wait|pause|stop)|free to|"
+    r"can(?!['’]?t\b|\s+not\b|not\b)|may|went ahead|(?:am|is|are|was|were) proceeding|proceeding|done|shipped|"
+    r"proceeded|works|worked|merged|released|deployed|(?:we|i|they)\s+(?:ship|merge|release|deploy|proceed))\b"
+    r"|^\s*(?:ship|merge|release|deploy|proceed)\b"
+    r"(?!\s+(?:is|are|was|were|frozen|stopped|stalled|blocked|forbidden|risky|impossible|"
+    r"held|holding|holds|waiting|waits|pending|parked|on hold)\b)",
+    re.IGNORECASE,
+)
+_NEGATED_PERMISSION = re.compile(
+    r"\b(?:not|never|cannot|can't|won't|don't|doesn't|didn't|shouldn't|"
+    r"may\s+not|can\s+not|will\s+not|do\s+not|does\s+not|did\s+not|should\s+not)\s+"
+    r"(?:\w+\s+){0,2}(?:proceed\w*|ship\w*|merg\w*|releas\w*|deploy\w*|done)\b",
+    re.IGNORECASE,
+)
+_HISTORICAL_HOLD_UNTIL = re.compile(
+    r"\b(?:was|were|had been)\s+(?:held|paused|blocked|waiting|pending)\b.{0,40}\buntil\b",
+    re.IGNORECASE,
 )
 _CONDITIONAL_GATE = re.compile(r"\b(?:without|until)\b", re.I)
 # Characters that make a name part of a path, slug, env var or email instead of a
@@ -513,16 +563,13 @@ _TOKEN_GLUE = "/\\-_@"
 
 # A clause ends at sentence or clause punctuation; negation never reaches across it
 # ("Cannot proceed: needs <role word> approval" is an ask).
-_CLAUSE_END = re.compile(r"[,.;:!?\n]|\s[-–—]\s|\s+(?:and|but|or)\s+", re.I)
+_CLAUSE_END = re.compile(r"[,.;:!?\n]|\s[-–—]\s|\s+(?:and|but|or|so)\s+", re.I)
 # After the phrase, only "... is not needed/required" undoes it; any other negation
 # there ("Needs your approval. Not urgent.") belongs to something else.
 _POST_NEGATION = re.compile(
     r"^\s*(?:is|are|was|were)?\s*(?:not|no longer|n['’]t)\s+(?:needed|required|necessary|wanted)\b", re.I
 )
 _DENIAL_BEFORE_UNTIL = re.compile(r"\b(?:no|not)\b.{0,40}\bneeded\b", re.I)
-_HOLD_VERB_BEFORE_GATE = re.compile(
-    r"\b(?:hold|holding|paused|on hold|waiting|pending|parked|held)\b(?:\s+\w+){0,2}$", re.I
-)
 
 
 def _match_is_negated(text: str, match: re.Match[str]) -> bool:
@@ -531,6 +578,8 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
     cuts = list(_CLAUSE_END.finditer(head))
     clause = head[cuts[-1].end():] if cuts else head
     near = " ".join(clause.split()[-3:])
+    if match.group().lower().startswith("until "):
+        clause += match.group()
     conditional = None
     # Search the whole clause, but only let a nearby without/until phrase
     # govern this gate (including a short adjective or article in between).
@@ -538,18 +587,31 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
     if conditional_matches:
         candidate = conditional_matches[-1]
         words_between = clause[candidate.end():].split()
-        if len(words_between) <= 4:
+        if len(words_between) <= 6:
             conditional = candidate
     before_conditional = clause[:conditional.start()] if conditional else ""
-    denial = bool(conditional and conditional.group().lower() == "until"
-                  and _DENIAL_BEFORE_UNTIL.search(before_conditional))
-    gate_condition = bool(
-        conditional and not denial and (
-            (conditional.group().lower() == "until")
-            or _PROHIBITION.search(before_conditional)
-            or _HOLD_VERB_BEFORE_GATE.search(before_conditional.rstrip())
+    permission = bool(
+        conditional
+        and _PERMISSION_BEFORE_GATE.search(before_conditional)
+        and not _NEGATED_PERMISSION.search(before_conditional)
+    )
+    historical_hold = bool(
+        conditional
+        and conditional.group().lower() == "until"
+        and _HISTORICAL_HOLD_UNTIL.search(clause)
+    )
+    denial = bool(
+        conditional
+        and (
+            permission
+            or historical_hold
+            or (
+                conditional.group().lower() == "until"
+                and _DENIAL_BEFORE_UNTIL.search(before_conditional)
+            )
         )
     )
+    gate_condition = bool(conditional and not denial)
     after = text[match.end():]
     end = _CLAUSE_END.search(after)
     after = after[:end.start()] if end else after
@@ -638,6 +700,11 @@ def chat_asks_you(text: str) -> bool:
 def _excerpt(text: str, n: int = 480) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
     return text if len(text) <= n else "…" + text[-(n - 1):]
+
+
+def _excerpt_head(text: str, n: int = 480) -> str:
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    return text if len(text) <= n else text[:n - 1] + "…"
 
 
 # --- Kanban source -------------------------------------------------------------------------
@@ -1463,7 +1530,7 @@ def outside_items(home: Optional[Path] = None, errors: Optional[list[str]] = Non
             errors.append(f"outside: {name.strip()}: {type(exc).__name__}: {exc}")
     for it in items:
         it["ask"] = it.get("text") or "(No text supplied.)"
-        it["excerpt"] = _excerpt(it["ask"])
+        it["excerpt"] = _excerpt_head(it["ask"])
         it["why"] = "Filed by agent; act in the original app." if it["origin"] == "filed" else "From a watched folder; act in the original app."
     return items
 
@@ -1500,6 +1567,7 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
     home = home or hermes_home()
     errors: list[str] = []
     items: list[dict[str, Any]] = []
+    outside_source_failed = False
     # One broken source must not hide the other; one broken board must not hide the
     # rest of Kanban (kanban_items records ``kanban[board]: …`` itself).
     try:
@@ -1521,12 +1589,26 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
     try:
         items.extend(outside_items(home, errors=errors))
     except Exception as exc:  # noqa: BLE001
+        outside_source_failed = True
         errors.append(f"outside: {type(exc).__name__}: {exc}")
     hidden = load_hidden(home)
-    if not errors:
-        # A source that failed this poll would look "resolved"; pruning then would drop its
-        # summaries and re-summarize every item on the next good poll.
-        prune_blufs(items, home)
+    failed_sources = {error.split(":", 1)[0].split("[", 1)[0] for error in errors}
+    preserve_prefixes = tuple(
+        f"{source}:"
+        for source in ("kanban", "chat", "prompt", "pairing")
+        if source in failed_sources
+    )
+    if outside_source_failed:
+        preserve_prefixes += ("outside:",)
+    else:
+        # Folder ids are shared across profiles, but their configured folders are not.
+        preserve_prefixes += ("outside:folder:",)
+    try:
+        prune_blufs(items, home, preserve_prefixes=preserve_prefixes)
+    except (OSError, TimeoutError) as exc:
+        log.warning(
+            "unbl0ck: could not prune summary cache: %s: %s", type(exc).__name__, exc
+        )
     shown = [i for i in items
              if include_hidden or visibility(hidden, i["id"], i["version"]) is not Visibility.HIDDEN]
     # Same order as the panel: live prompts (a run is paused), pairing requests (expire within
@@ -1839,9 +1921,49 @@ ASK_SYSTEM = (
 _ASK_SECRET_PATTERNS = (
     # URL userinfo: scheme://user:pass@host
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"), r"\1[redacted]@"),
-    # Authorization headers
-    (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [redacted]"),
-    (re.compile(r"(?i)\b(?:proxy-)?authorization\s*:\s*[^\r\n]*"), "[redacted]"),
+    # Credential-bearing HTTP headers and shell auth flags. Keep prose after the header/value.
+    (
+        re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"),
+        r"\1 [redacted]",
+    ),
+    (
+        re.compile(
+            r"(?i)((?:proxy-)?authorization\s*:\s*digest\b[^\r\n]*?\bnonce\s*[=:]\s*)"
+            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"""
+        ),
+        r"\1[redacted]",
+    ),
+    (
+        re.compile(
+            r"(?i)((?:proxy-)?authorization\s*:\s*digest\b[^\r\n]*?\bresponse\s*[=:]\s*)"
+            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"""
+        ),
+        r"\1[redacted]",
+    ),
+    (
+        re.compile(
+            r"(?i)((?:proxy-)?authorization\s*:\s*)"
+            r"(?:bearer|basic|token|apikey|digest)\s+[^\s,'\";]+"
+        ),
+        r"\1[redacted]",
+    ),
+    (
+        re.compile(r"(?im)(^[ \t]*|\n[ \t]*|(?:-H\s+['\"]))cookie\s*:\s*[^\r\n'\"]*"),
+        r"\1Cookie: [redacted]",
+    ),
+    (
+        re.compile(
+            r"(?i)(\bcurl\b[^\r\n]*?\s(?:-u|--user)\s+)"
+            r"""(?:"[^"\r\n]*:[^"\r\n]*"|'[^'\r\n]*:[^'\r\n]*'|[^:\s'\"]+:[^\s'\"]+)"""
+        ),
+        r"\1[redacted]",
+    ),
+    (
+        re.compile(
+            r"""(?i)\b(password|passwd)\s+is\s+(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,'";]+)"""
+        ),
+        r"\1 is [redacted]",
+    ),
     # JWTs and home-directory shapes of any user (the current user's own home is handled in _ask_redact)
     (re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"), "[redacted]"),
     (re.compile(r"(?<![\w.])/(?:Users|home)/[^/\s\"'`]+(?=/|\s|$|[\"'`)\],;:])"), "~"),
@@ -1864,6 +1986,12 @@ _ASK_SECRET_ASSIGNMENT = re.compile(
 
 
 def _ask_redact_assignment(match: re.Match[str]) -> str:
+    if (
+        match.group("key").lower().startswith("authorization")
+        and match.group("sep").lstrip().startswith(":")
+        and not match.group("key_quote")
+    ):
+        return match.group(0)
     quote = '"' if match.group("double") is not None else "'" if match.group("single") is not None else ""
     value = f"{quote}[redacted]{quote}"
     return f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}{match.group('sep')}{value}"

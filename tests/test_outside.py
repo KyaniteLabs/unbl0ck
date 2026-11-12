@@ -248,6 +248,18 @@ class Outside(OutsideFixture):
         self.assertEqual(after["id"], it["id"])
         self.assertNotEqual(after["version"], it["version"])
 
+    def test_outside_excerpt_keeps_the_start_of_a_watched_note(self):
+        self.watch()
+        opening = "Quarterly vendor renewal: please approve the 12k spend."
+        source_text = opening + (" Supporting details follow. " * 40)
+        source_text += (
+            " CONFIDENTIALITY NOTICE: this e-mail is intended only for the addressee."
+        )
+        (self.folder / "renewal.txt").write_text(source_text)
+        (queued,) = needs.build_queue()["items"]
+        self.assertTrue(queued["excerpt"].startswith(opening), queued["excerpt"])
+        self.assertNotIn("CONFIDENTIALITY NOTICE", queued["excerpt"])
+
     def test_missing_or_unreadable_folder_reports_error_and_keeps_other_items(self):
         self.file()
         self.settings["outside_dirs"] = str(self.home / "missing")
