@@ -139,7 +139,65 @@ if (since !== 30) throw new Error(`oldest ask timestamp was ${since}`);
             calls = re.findall(r"ctx\.rest\('/kanban/answer',\s*\{(.*?)\n\s*\}\)", text, re.S)
             self.assertGreaterEqual(len(calls), 2, name)   # answer and release
             for body in calls:
-                self.assertRegex(body, r"body:\s*\{[^}]*\bversion:\s*item\.version\b", name)
+                self.assertRegex(body, r"body:\s*\{[^}]*\bversion:\s*(?:item\.version|answerVersion)\b", name)
+
+    def test_refreshed_kanban_card_keeps_drafts_stale_and_rejects_old_suggestions(self):
+        script = r'''const fs = require('fs');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const views = src.slice(src.indexOf('function Item('), src.indexOf('function Chip('));
+const node = (type, props) => ({type, props});
+const noop = () => {};
+let slots = [], cursor = 0;
+const env = {
+  jsx: node, jsxs: node,
+  useState: init => { const i = cursor++; if (!(i in slots)) slots[i] = typeof init === 'function' ? init() : init; return [slots[i], v => { slots[i] = typeof v === 'function' ? v(slots[i]) : v; }]; },
+  useEffect: noop, useRef: () => ({}), platformLabel: x => x, LOCAL_PLATFORMS: [], KEEP_BLOCKED: /keep blocked/i,
+  button: props => node('button', props), openBoard: noop, ago: () => '', ageClass: () => '', pad: String,
+  sfx: {play: noop}, petEmit: noop, host: {notify: noop, notifyError: noop, openSession: noop, newChat: noop},
+  $undo: {set: noop}, $queue: 'queue', $fxOn: 'fx', UNDO_MS: 12000, askCount: q => q.count,
+  Field: noop, Watermark: noop, Banner: noop, Pet: noop, Ticker: noop, FxToggle: noop, SfxToggle: noop,
+  grainUrl: () => '', oldestAskSince: items => items.reduce((m, x) => Math.min(m, x.since ?? Infinity), Infinity),
+  reducedMotion: () => true, seedDraft: () => '', replyPlain: x => x, replyParts: x => x, ts: () => '',
+  TLDR_ASK: 'What is the bottom line?',
+};
+const Item = new Function('env', `with(env) { ${views}; return Item; }`)(env);
+function all(n) { if (n == null) return []; if (Array.isArray(n)) return n.flatMap(all); if (typeof n !== 'object') return [n]; return [n, ...all(n.props?.children)]; }
+function render(item) { cursor = 0; return Item({ctx, item, n: 1, refresh: async () => {}, askEnabled: true}); }
+const requests = [];
+const ctx = {rest: async (url, options) => { requests.push({url, ...options}); return url === '/card/ask' ? {reply: 'Stage the staging environment.'} : {released: true}; }};
+const base = {id: 'kanban:board:task', task_id: 'task', board: 'board', source: 'kanban', tier: 'ask', status: 'blocked', version: 'v1', title: 'Staging deploy?', ask: 'May I stage it?', since: 1};
+(async () => {
+  let tree = render(base);
+  await all(tree).find(x => x?.type === 'button' && x.props.children === 'TL;DR').props.onClick();
+  await new Promise(resolve => setImmediate(resolve));
+  tree = render(base);
+  const suggestion = all(tree).find(x => x?.type === 'button' && x.props.children === 'Use as answer');
+  if (!suggestion) throw new Error('missing Ask suggestion');
+  suggestion.props.onClick();
+  tree = render(base);
+  const answer = all(tree).find(x => x?.type === 'textarea' && x.props['aria-label']?.startsWith('Answer'));
+  answer.props.onChange({target: {value: 'Yes, stage it'}});
+  tree = render({...base, version: 'v2', title: 'Production deletion?', ask: 'May I delete production data?'});
+  const text = all(tree).filter(x => typeof x === 'string').join('');
+  const refreshedAnswer = all(tree).find(x => x?.type === 'textarea' && x.props['aria-label']?.startsWith('Answer'));
+  const submit = all(tree).find(x => x?.type === 'button' && x.props.children === 'Answer + unbl0ck');
+  const oldSuggestion = all(tree).find(x => x?.type === 'button' && x.props.children === 'Use as answer');
+  if (refreshedAnswer?.props.value !== 'Yes, stage it') throw new Error('draft was not preserved');
+  if (!text.includes('older version')) throw new Error('stale draft was not marked');
+  if (!submit?.props.disabled) {
+    await submit.props.onClick();
+    throw new Error('stale draft could be submitted against the replacement version');
+  }
+  if (!oldSuggestion?.props.disabled) throw new Error('old Ask suggestion remained usable');
+  if (requests.some(r => r.url === '/kanban/answer')) throw new Error('stale answer reached the backend');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+'''
+        for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
+            with self.subTest(path=path.name):
+                result = subprocess.run(
+                    ["node", "-e", script, str(path)], check=False, capture_output=True, text=True
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

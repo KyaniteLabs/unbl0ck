@@ -1842,9 +1842,6 @@ _ASK_SECRET_PATTERNS = (
     # Authorization headers
     (re.compile(r"(?i)\b(bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,}"), r"\1 [redacted]"),
     (re.compile(r"(?i)\b(?:proxy-)?authorization\s*:\s*[^\r\n]*"), "[redacted]"),
-    # key=value / key: value for secret-looking keys
-    (re.compile(r"(?i)\b([a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization)s?)(\s*[=:]\s*)[\"']?[^\s\"',;]+"),
-     r"\1\2[redacted]"),
     # JWTs and home-directory shapes of any user (the current user's own home is handled in _ask_redact)
     (re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"), "[redacted]"),
     (re.compile(r"(?<![\w.])/(?:Users|home)/[^/\s\"'`]+(?=/|\s|$|[\"'`)\],;:])"), "~"),
@@ -1857,6 +1854,20 @@ _ASK_SECRET_PATTERNS = (
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[redacted]"),
 )
 
+_ASK_SECRET_KEY = r"[a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization)s?"
+_ASK_SECRET_KEY_RE = re.compile(_ASK_SECRET_KEY, re.IGNORECASE)
+_ASK_SECRET_ASSIGNMENT = re.compile(
+    rf'''(?ix)(?P<key_quote>["']?)(?P<key>{_ASK_SECRET_KEY})(?P=key_quote)'''
+    r'''(?P<sep>\s*[=:]\s*)(?:(?P<double>"(?:\\.|[^"\\])*")|'''
+    r'''(?P<single>'(?:\\.|[^'\\])*')|(?P<bare>[^\s"',;}\]]+))'''
+)
+
+
+def _ask_redact_assignment(match: re.Match[str]) -> str:
+    quote = '"' if match.group("double") is not None else "'" if match.group("single") is not None else ""
+    value = f"{quote}[redacted]{quote}"
+    return f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}{match.group('sep')}{value}"
+
 
 def _ask_redact(text: str) -> str:
     home = os.path.expanduser("~")
@@ -1864,6 +1875,7 @@ def _ask_redact(text: str) -> str:
         text = text.replace(home, "~")
     for pattern, repl in _ASK_SECRET_PATTERNS:
         text = pattern.sub(repl, text)
+    text = _ASK_SECRET_ASSIGNMENT.sub(_ask_redact_assignment, text)
     return text
 
 
@@ -1877,6 +1889,9 @@ def _ask_card_view(value: Any, _key: str = "") -> Any:
         out: dict[str, Any] = {}
         for k, v in value.items():
             if _key == "workspace" and k == "path":
+                continue
+            if _ASK_SECRET_KEY_RE.search(str(k)):
+                out[k] = "[redacted]"
                 continue
             out[k] = _ask_card_view(v, str(k))
         return out
