@@ -98,3 +98,49 @@ def test_u8_role_words_are_configurable():
 def test_u8_pocket_authority_is_neutral_and_configurable(monkeypatch):
     assert needs.pocket_authority({}) == "owner"
     assert needs.pocket_authority({"pocket_authority": "ceo"}) == "ceo"
+
+
+def test_conditional_gates_distinguish_permissions_from_blockers(monkeypatch):
+    monkeypatch.setenv("UNBL0CK_PRINCIPAL", "Ada")
+    monkeypatch.setattr(needs, "_settings", dict)
+    needs._PATTERN_CACHE.clear()
+    non_asks = [
+        "We have no blocker so ship without CEO approval",
+        "There is no risk so we ship without CEO sign-off",
+        "Not a breaking change so merge without CEO approval",
+        "Free to merge until CEO review on Friday",
+        "There is no problem shipping without CEO approval",
+        "Nothing stops us merging without Ada's approval",
+        "No reason to hold until CEO approval",
+        "It was held until CEO approval, which arrived Monday; now blocked on CI",
+        "Free to merge until Ada approves",
+        "No reason to hold until the CEO signs off",
+        "We can ship without CEO approval",
+        "We may merge without Ada's approval",
+        "We went ahead without CEO approval",
+        "We are proceeding without CEO sign-off",
+        "We shipped without Ada's approval",
+    ]
+    asks = [
+        "Stuck without CEO approval",
+        "Stalled without Ada's approval",
+        "Deploy frozen without CEO approval",
+        "Release is stopped without Ada's sign-off",
+        "Without CEO approval this cannot ship",
+        "Impossible to continue without CEO approval",
+        "Merge is forbidden without CEO approval",
+        "Too risky to ship without Ada's approval",
+        "We may not merge without CEO approval",
+        "We cannot ship until Ada approves",
+        "We are not done without CEO approval",
+        "Nothing ships until Ada approves",
+        "Blocked until Ada signs off",
+        "Paused until Ada decides",
+        "Blocked until the CEO signs off",
+        "Waiting until the CEO approves",
+    ]
+    for reason in non_asks:
+        assert needs.kanban_needs_you(reason, "needs_input") is None, reason
+    for reason in asks:
+        assert needs.kanban_needs_you(reason, "needs_input"), reason
+    needs._PATTERN_CACHE.clear()

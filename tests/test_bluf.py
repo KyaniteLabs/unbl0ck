@@ -89,6 +89,38 @@ class BlufTest(unittest.TestCase):
                  '```json\n{"bluf":"Choose a different release.","why":"sample"}\n```')
         self.assertEqual(needs.parse_bluf(reply), ("Approve the merge.", "tests pass"))
 
+    def test_parse_ignores_fenced_examples_after_common_labels(self):
+        labels = [
+            "Example output:",
+            "Example JSON:",
+            "Example response:",
+            "Sample:",
+            "e.g.:",
+            "For example, the format is:",
+            "Format:",
+            "E.g.:",
+            "Format reminder:",
+            "An example of the format:",
+        ]
+        for label in labels:
+            with self.subTest(label=label):
+                reply = (
+                    '{"bluf":"Approve the real release.","why":"It is ready."}\n'
+                    f"{label}\n```json\n"
+                    '{"bluf":"Choose the sample release.","why":"This is illustrative."}\n```'
+                )
+                self.assertEqual(
+                    needs.parse_bluf(reply),
+                    ("Approve the real release.", "It is ready."),
+                )
+
+    def test_parse_ignores_inline_for_example_after_real_answer(self):
+        reply = (
+            '{"bluf":"Real answer","why":"real"} For example: '
+            '{"bluf":"Example answer","why":"sample"}'
+        )
+        self.assertEqual(needs.parse_bluf(reply), ("Real answer", "real"))
+
     def test_background_bluf_uses_reasoning_model_token_budget(self):
         spec = importlib.util.spec_from_file_location("unbl0ck_plugin_api_bluf_test", ROOT / "dashboard" / "plugin_api.py")
         api = importlib.util.module_from_spec(spec)
@@ -155,9 +187,23 @@ class BlufTest(unittest.TestCase):
     def test_failed_source_poll_keeps_its_cached_summaries(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
-            needs.save_bluf("kanban:b:t1", "1", "Approve the deploy.", "It waits on you.", home)
-            needs.save_bluf("outside:folder:a", "1", "Read the note.", "Review it.", home)
-            outside = [{"id": "outside:folder:a", "version": "1", "source": "outside", "tier": "normal"}]
+            needs.save_bluf(
+                "kanban:b:t1", "1", "Approve the deploy.", "It waits on you.", home
+            )
+            needs.save_bluf(
+                "outside:folder:a", "1", "Read the note.", "Review it.", home
+            )
+            needs.save_bluf(
+                "chat:old", "1", "Summarize the chat.", "It is stale.", home
+            )
+            outside = [
+                {
+                    "id": "outside:folder:a",
+                    "version": "1",
+                    "source": "outside",
+                    "tier": "normal",
+                }
+            ]
             with mock.patch.multiple(
                 needs,
                 kanban_items=mock.Mock(side_effect=RuntimeError("board offline")),
@@ -168,6 +214,7 @@ class BlufTest(unittest.TestCase):
             ):
                 needs.build_queue(home)
             self.assertIn("kanban:b:t1", needs.load_blufs(home))
+            self.assertNotIn("chat:old", needs.load_blufs(home))
             with mock.patch.multiple(
                 needs,
                 kanban_items=mock.Mock(return_value=[]),
@@ -178,6 +225,133 @@ class BlufTest(unittest.TestCase):
             ):
                 needs.build_queue(home)
             self.assertEqual(set(needs.load_blufs(home)), {"outside:folder:a"})
+
+    def test_other_profile_does_not_prune_unwatched_folder_summaries(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            needs.save_bluf(
+                "outside:folder:root-note", "1", "Read the note.", "Review it.", home
+            )
+            needs.save_bluf("chat:stale", "1", "Read the chat.", "Review it.", home)
+            with (
+                mock.patch.dict("os.environ", {"UNBL0CK_OUTSIDE_DIRS": ""}),
+                mock.patch.object(needs, "_settings", return_value={}),
+                mock.patch.multiple(
+                    needs,
+                    kanban_items=mock.Mock(return_value=[]),
+                    chat_items=mock.Mock(return_value=[]),
+                    wait_items=mock.Mock(return_value=[]),
+                    pairing_items=mock.Mock(return_value=[]),
+                    outside_items=mock.Mock(return_value=[]),
+                ),
+            ):
+                needs.build_queue(home)
+            self.assertEqual(set(needs.load_blufs(home)), {"outside:folder:root-note"})
+
+    def test_other_profile_does_not_prune_a_different_watched_folder_cache(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            folder_a, folder_b = home / "folder-a", home / "folder-b"
+            folder_a.mkdir()
+            folder_b.mkdir()
+            (folder_a / "note.md").write_text("A watched note")
+            with (
+                mock.patch.dict("os.environ", {"UNBL0CK_OUTSIDE_DIRS": ""}),
+                mock.patch.multiple(
+                    needs,
+                    kanban_items=mock.Mock(return_value=[]),
+                    chat_items=mock.Mock(return_value=[]),
+                    wait_items=mock.Mock(return_value=[]),
+                    pairing_items=mock.Mock(return_value=[]),
+                ),
+            ):
+                with mock.patch.object(
+                    needs, "_settings", return_value={"outside_dirs": str(folder_a)}
+                ):
+                    (item,) = needs.build_queue(home)["items"]
+                    needs.save_bluf(
+                        item["id"],
+                        item["version"],
+                        "Read the note.",
+                        "Review it.",
+                        home,
+                    )
+                with mock.patch.object(
+                    needs, "_settings", return_value={"outside_dirs": str(folder_b)}
+                ):
+                    needs.build_queue(home)
+            self.assertIn(item["id"], needs.load_blufs(home))
+
+    def test_partial_outside_error_preserves_folder_summaries_and_prunes_clean_sources(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            needs.save_bluf(
+                "outside:folder:missing-note", "1", "Read the note.", "Review it.", home
+            )
+            needs.save_bluf("chat:stale", "1", "Read the chat.", "Review it.", home)
+
+            def broken_folder(home=None, errors=None):
+                errors.append("outside: missing watched folder")
+                return []
+
+            with (
+                mock.patch.object(
+                    needs, "_settings", return_value={"outside_dirs": "/missing"}
+                ),
+                mock.patch.multiple(
+                    needs,
+                    kanban_items=mock.Mock(return_value=[]),
+                    chat_items=mock.Mock(return_value=[]),
+                    wait_items=mock.Mock(return_value=[]),
+                    pairing_items=mock.Mock(return_value=[]),
+                    outside_items=mock.Mock(side_effect=broken_folder),
+                ),
+            ):
+                needs.build_queue(home)
+            self.assertIn("outside:folder:missing-note", needs.load_blufs(home))
+            self.assertNotIn("chat:stale", needs.load_blufs(home))
+
+    def test_bluf_cache_has_a_backstop_during_source_failures(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            limit = 2000
+            entries = {
+                f"outside:folder:{i}": {
+                    "version": "1",
+                    "bluf": "b",
+                    "why": "w",
+                    "at": i,
+                }
+                for i in range(limit)
+            }
+            needs._write_json(needs._bluf_path(home), entries)
+            needs.save_bluf("outside:folder:new", "1", "new", "w", home)
+            self.assertEqual(len(needs.load_blufs(home)), limit)
+            self.assertNotIn("outside:folder:0", needs.load_blufs(home))
+            self.assertIn("outside:folder:new", needs.load_blufs(home))
+            needs.prune_blufs([], home, preserve_prefixes=("outside:folder:",))
+            self.assertEqual(len(needs.load_blufs(home)), limit)
+
+    def test_queue_survives_bluf_prune_io_and_lock_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            source_mocks = {
+                "kanban_items": mock.Mock(return_value=[]),
+                "chat_items": mock.Mock(return_value=[]),
+                "wait_items": mock.Mock(return_value=[]),
+                "pairing_items": mock.Mock(return_value=[]),
+                "outside_items": mock.Mock(return_value=[]),
+            }
+            with mock.patch.multiple(needs, **source_mocks):
+                for error in (OSError("read only"), TimeoutError("lock held")):
+                    with (
+                        self.subTest(error=type(error).__name__),
+                        mock.patch.object(needs, "prune_blufs", side_effect=error),
+                        self.assertLogs("unbl0ck", "WARNING"),
+                    ):
+                        self.assertIn("items", needs.build_queue(home))
 
     def test_queue_compacts_the_400_item_60_kib_outside_payload(self):
         api = self.load_api_without_fastapi()
