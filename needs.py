@@ -26,34 +26,35 @@ This module imports Hermes lazily so it can be unit-tested without a Hermes inst
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import logging
 import os
-import collections
 import re
 import sqlite3
 import stat
 import uuid
 from email import policy
 from email.parser import BytesParser
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows: the process-local lock still applies
     fcntl = None  # type: ignore[assignment]
 import threading
-from contextlib import contextmanager
 import time
-from contextlib import closing
+from collections.abc import Iterable
+from contextlib import closing, contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any
 
 # Who the human is. Set in Hermes config: plugins.entries.unbl0ck.settings.principal_name
 # (comma-separated names, e.g. "Ada, Ada Lovelace"). The generic words "principal" and "human"
 # always count, plus the configurable role words below. Answers are commented as the first
 # name, or comment_author if set.
-ROLE_WORDS_DEFAULT = "CEO"   # role-words default: the `role_words` setting overrides it
+ROLE_WORDS_DEFAULT = "CEO"  # role-words default: the `role_words` setting overrides it
 
 
 log = logging.getLogger("unbl0ck")
@@ -71,7 +72,9 @@ def _load_settings() -> dict[str, Any]:
         entries = (load_config_readonly().get("plugins") or {}).get("entries") or {}
         return dict((entries.get("unbl0ck") or {}).get("settings") or {})
     except Exception as exc:  # noqa: BLE001 - a broken config must not take the queue down
-        log.warning("unbl0ck: could not read plugin settings: %s: %s", type(exc).__name__, exc)
+        log.warning(
+            "unbl0ck: could not read plugin settings: %s: %s", type(exc).__name__, exc
+        )
         return {}
 
 
@@ -83,12 +86,14 @@ def _settings() -> dict[str, Any]:
     return _SETTINGS_CACHE[1]
 
 
-def principal_names(settings: Optional[dict[str, Any]] = None) -> list[str]:
-    raw = (settings if settings is not None else _settings()).get("principal_name") or os.environ.get("UNBL0CK_PRINCIPAL", "")
+def principal_names(settings: dict[str, Any] | None = None) -> list[str]:
+    raw = (settings if settings is not None else _settings()).get(
+        "principal_name"
+    ) or os.environ.get("UNBL0CK_PRINCIPAL", "")
     return [n.strip() for n in str(raw).split(",") if n.strip()]
 
 
-def role_words(settings: Optional[dict[str, Any]] = None) -> list[str]:
+def role_words(settings: dict[str, Any] | None = None) -> list[str]:
     """Title words agents use for the human in block reasons (setting ``role_words``, comma-separated)."""
     raw = (settings if settings is not None else _settings()).get("role_words")
     if raw is None or not str(raw).strip():
@@ -96,19 +101,23 @@ def role_words(settings: Optional[dict[str, Any]] = None) -> list[str]:
     return [w.strip() for w in str(raw).split(",") if w.strip()]
 
 
-def pocket_authority(settings: Optional[dict[str, Any]] = None) -> str:
+def pocket_authority(settings: dict[str, Any] | None = None) -> str:
     """The ``authority`` label on a pocket-pack decision card (setting ``pocket_authority``)."""
     raw = (settings if settings is not None else _settings()).get("pocket_authority")
     return str(raw).strip() if raw and str(raw).strip() else "owner"
 
 
-def principal_author(settings: Optional[dict[str, Any]] = None) -> str:
+def principal_author(settings: dict[str, Any] | None = None) -> str:
     s = settings if settings is not None else _settings()
     names = principal_names(s)
-    return str(s.get("comment_author") or os.environ.get("UNBL0CK_AUTHOR") or (names[0] if names else "user")).strip()
+    return str(
+        s.get("comment_author")
+        or os.environ.get("UNBL0CK_AUTHOR")
+        or (names[0] if names else "user")
+    ).strip()
 
 
-def bluf_enabled(settings: Optional[dict[str, Any]] = None) -> bool:
+def bluf_enabled(settings: dict[str, Any] | None = None) -> bool:
     """Model-written one-line summaries (on unless ``bluf_enabled`` is explicitly false)."""
     raw = (settings if settings is not None else _settings()).get("bluf_enabled", True)
     if isinstance(raw, bool):
@@ -116,7 +125,7 @@ def bluf_enabled(settings: Optional[dict[str, Any]] = None) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off", "")
 
 
-def ask_enabled(settings: Optional[dict[str, Any]] = None) -> bool:
+def ask_enabled(settings: dict[str, Any] | None = None) -> bool:
     """The in-panel Ask feature (off only when the setting is explicitly false)."""
     raw = (settings if settings is not None else _settings()).get("ask_enabled", True)
     if isinstance(raw, bool):
@@ -130,7 +139,9 @@ CHAT_TITLES = ("Bot Chat",)
 _PATTERN_CACHE: dict[str, dict[str, re.Pattern[str]]] = {}
 
 
-def _patterns(names: Optional[list[str]] = None, role_words: Optional[list[str]] = None) -> dict[str, re.Pattern[str]]:
+def _patterns(
+    names: list[str] | None = None, role_words: list[str] | None = None
+) -> dict[str, re.Pattern[str]]:
     """Detection regexes for the configured principal name(s) and role words; cached per set."""
     names = principal_names() if names is None else names
     alt = "|".join(re.escape(n) for n in names) or r"(?!x)x"
@@ -153,7 +164,7 @@ def _patterns(names: Optional[list[str]] = None, role_words: Optional[list[str]]
         r"|({P}|{C}|principal)(['’]s)? (approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
         r"|(awaiting|waiting (on|for)|needs?|requires?|blocked on|blocked pending|pending) ({P}|the {C}|{C}|principal|(the )?human)"
         r"|(approval|decision|sign[- ]?off|input|answer|reply|go|ok) from ({P}|the {C}|{C}|(the )?principal|(the )?human|you)"
-        r"|(can['’]?t|cannot) \w+( \w+)? without (your|({P}|the {C}|{C}|(the )?principal)(['’]s)?) "
+        r"|(can['’]?t|cannot|can not) \w+( \w+)? without (your|({P}|the {C}|{C}|(the )?principal)(['’]s)?) "
         r"(approval|decision|sign[- ]?off|input|answer|go|ok)"
         r"|^\W*please (approve|decide|choose|pick|confirm|sign)"
         r"|(awaiting|waiting (on|for)|needs?|requires?|blocked (on|pending)|pending) your "
@@ -165,12 +176,14 @@ def _patterns(names: Optional[list[str]] = None, role_words: Optional[list[str]]
         r"|({P}|{C}|principal) (approved|authorized|authorised|signed off)"
         r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,20}(route|access|path|executor)"
         r"|(credentials?|api[- ]?keys?|tokens?) (are |is )?(dead|expired|missing|needed|required|revoked))\b",
-        re.I,
+        re.IGNORECASE,
     )
     # Weaker cue, trusted only together with an explicit needs_input kind.
-    pats["_NAMES"] = _c(r"\b({P}|{C}|principal|human)\b", re.I)
+    pats["_NAMES"] = _c(r"\b({P}|{C}|principal|human)\b", re.IGNORECASE)
     # The supervisor/ops "stop" style blocks name the principal without asking anything.
-    pats["_ORDER"] = _c(r"^\s*({P}|{C})\s+(\d{1,2}:\d{2}|says|said|orders?|ordered)\b", re.I)
+    pats["_ORDER"] = _c(
+        r"^\s*({P}|{C})\s+(\d{1,2}:\d{2}|says|said|orders?|ordered)\b", re.IGNORECASE
+    )
 
     pats["_ASK_STRONG"] = _c(
         r"\b(need(s)? (your|you to)|your (call|decision|approval|go|ok|sign[- ]?off|pick|answer)"
@@ -180,16 +193,16 @@ def _patterns(names: Optional[list[str]] = None, role_words: Optional[list[str]]
         r"|(picks?|options?|choices?|decisions?|questions?) for (you|the {C}|{P})"
         r"|reply needed|your (pick|answer|word)|({C}|{P})(['’]s)? (call|pick|decision|word)"
         r"|decision packet)\b",
-        re.I,
+        re.IGNORECASE,
     )
     # Asks that do not need a question mark to be an ask (decision packets, option lists).
     pats["_ASK_PACKET"] = _c(
         r"\b((picks?|options?|choices?|decisions?|questions?) for (you|the {C}|{P})"
         r"|decision packet(?! (?:was |is )?(?:archived|closed|resolved|answered|sent|done))"
         r"|reply needed|which (one|option|choice) (do|would|should) (you|I|we)|waiting (on|for) your (call|decision|word))\b",
-        re.I,
+        re.IGNORECASE,
     )
-    pats["_YOU"] = _c(r"\b(you|your|{P}|{C})\b", re.I)
+    pats["_YOU"] = _c(r"\b(you|your|{P}|{C})\b", re.IGNORECASE)
     _PATTERN_CACHE[key] = pats
     return pats
 
@@ -201,14 +214,14 @@ def hermes_home() -> Path:
         from hermes_constants import get_hermes_home  # type: ignore
 
         home = Path(get_hermes_home())
-    except Exception:
+    except Exception:  # noqa: BLE001 - fall back if Hermes constants cannot be imported
         home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
     if home.parent.name == "profiles":
         home = home.parent.parent
     return home
 
 
-def data_dir(home: Optional[Path] = None) -> Path:
+def data_dir(home: Path | None = None) -> Path:
     d = (home or hermes_home()) / "plugin-data" / "unbl0ck"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -216,16 +229,19 @@ def data_dir(home: Optional[Path] = None) -> Path:
 
 # --- hidden items -------------------------------------------------------------------------
 
-def _hidden_path(home: Optional[Path]) -> Path:
+
+def _hidden_path(home: Path | None) -> Path:
     return data_dir(home) / "hidden.json"
 
 
-STATE_LOCK_TIMEOUT = 5.0   # seconds to wait for the state lock before giving up
-_STATE_LOCK = threading.Lock()   # shared state, including filed outside items, is read-modify-write
+STATE_LOCK_TIMEOUT = 5.0  # seconds to wait for the state lock before giving up
+_STATE_LOCK = (
+    threading.Lock()
+)  # shared state, including filed outside items, is read-modify-write
 
 
 @contextmanager
-def _state_lock(home: Optional[Path]):
+def _state_lock(home: Path | None):
     """Serialise a read-modify-write of UNBL0CK's state files across threads AND processes
     (the dashboard backend, the agent plugin and a plugin host can all write them)."""
     deadline = time.monotonic() + STATE_LOCK_TIMEOUT
@@ -242,11 +258,13 @@ def _state_lock(home: Optional[Path]):
                         break
                     except BlockingIOError:
                         if time.monotonic() >= deadline:
-                            raise TimeoutError("unbl0ck: state lock busy (another process holds it)")
+                            raise TimeoutError(
+                                "unbl0ck: state lock busy (another process holds it)"
+                            )
                         time.sleep(0.02)
             yield
         finally:
-            os.close(fd)   # closing the descriptor drops the flock
+            os.close(fd)  # closing the descriptor drops the flock
     finally:
         _STATE_LOCK.release()
 
@@ -257,23 +275,29 @@ def _read_json(p: Path) -> dict[str, Any]:
     except FileNotFoundError:
         return {}
     except Exception as exc:  # noqa: BLE001 - a corrupt file must not break the queue, but say so
-        log.warning("unbl0ck: ignoring unreadable %s: %s: %s", p.name, type(exc).__name__, exc)
+        log.warning(
+            "unbl0ck: ignoring unreadable %s: %s: %s", p.name, type(exc).__name__, exc
+        )
         return {}
     return data if isinstance(data, dict) else {}
 
 
 def _write_json(p: Path, data: dict[str, Any]) -> None:
     tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)   # waits hold prompt text
+    fd = os.open(
+        tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+    )  # waits hold prompt text
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(json.dumps(data, indent=1, sort_keys=True))
         tmp.replace(p)
     finally:
-        tmp.unlink(missing_ok=True)   # gone after a successful replace; removed after a failed write
+        tmp.unlink(
+            missing_ok=True
+        )  # gone after a successful replace; removed after a failed write
 
 
-def load_hidden(home: Optional[Path] = None) -> dict[str, str]:
+def load_hidden(home: Path | None = None) -> dict[str, str]:
     return _read_json(_hidden_path(home))
 
 
@@ -289,6 +313,7 @@ class Visibility(str, Enum):
     unhide on SHOWN is refused (returns False). RESURFACED shows like SHOWN; its stale
     entry is dropped by the next hide or unhide, or by the size cap.
     """
+
     SHOWN = "shown"
     HIDDEN = "hidden"
     RESURFACED = "resurfaced"
@@ -303,7 +328,7 @@ def visibility(hidden: dict[str, Any], item_id: str, version: str) -> Visibility
 _HIDDEN_KEEP = 1000
 
 
-def hide(item_id: str, version: str, home: Optional[Path] = None) -> None:
+def hide(item_id: str, version: str, home: Path | None = None) -> None:
     item_id, version = str(item_id or ""), str(version or "")
     if not item_id or len(item_id) > 300 or len(version) > 200:
         raise ValueError("item id and version must be short strings")
@@ -311,12 +336,14 @@ def hide(item_id: str, version: str, home: Optional[Path] = None) -> None:
         hidden = load_hidden(home)
         hidden.pop(item_id, None)
         hidden[item_id] = version
-        if len(hidden) > _HIDDEN_KEEP:   # oldest hides first out; the store never grows unbounded
+        if (
+            len(hidden) > _HIDDEN_KEEP
+        ):  # oldest hides first out; the store never grows unbounded
             hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
         _write_json(_hidden_path(home), hidden)
 
 
-def unhide(item_id: str, home: Optional[Path] = None) -> bool:
+def unhide(item_id: str, home: Path | None = None) -> bool:
     """Undo "Not for me". Returns whether the item was hidden."""
     with _state_lock(home):
         hidden = load_hidden(home)
@@ -333,15 +360,18 @@ def unhide(item_id: str, home: Optional[Path] = None) -> bool:
 # keeps showing it (tier "release_failed") and answer_card may retry the release without
 # posting the answer twice.
 
-def _pending_path(home: Optional[Path]) -> Path:
+
+def _pending_path(home: Path | None) -> Path:
     return data_dir(home) / "pending-release.json"
 
 
-def load_pending_releases(home: Optional[Path] = None) -> dict[str, str]:
+def load_pending_releases(home: Path | None = None) -> dict[str, str]:
     return _read_json(_pending_path(home))
 
 
-def _set_pending_release(item_id: str, version: Optional[str], home: Optional[Path] = None) -> None:
+def _set_pending_release(
+    item_id: str, version: str | None, home: Path | None = None
+) -> None:
     with _state_lock(home):
         data = load_pending_releases(home)
         if version is None:
@@ -370,11 +400,11 @@ BLUF_SYSTEM = (
 )
 
 
-def _bluf_path(home: Optional[Path]) -> Path:
+def _bluf_path(home: Path | None) -> Path:
     return data_dir(home) / "bluf.json"
 
 
-def load_blufs(home: Optional[Path] = None) -> dict[str, dict[str, str]]:
+def load_blufs(home: Path | None = None) -> dict[str, dict[str, str]]:
     return _read_json(_bluf_path(home))
 
 
@@ -394,8 +424,12 @@ def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str,
     return dict(ranked[-_BLUF_KEEP:])
 
 
-def save_bluf(item_id: str, version: str, bluf: str, why: str, home: Optional[Path] = None) -> None:
-    with _state_lock(home):   # read-modify-write: concurrent workers must not drop each other's entries
+def save_bluf(
+    item_id: str, version: str, bluf: str, why: str, home: Path | None = None
+) -> None:
+    with _state_lock(
+        home
+    ):  # read-modify-write: concurrent workers must not drop each other's entries
         data = load_blufs(home)
         data.pop(item_id, None)
         data[item_id] = {
@@ -410,7 +444,7 @@ def save_bluf(item_id: str, version: str, bluf: str, why: str, home: Optional[Pa
 
 def prune_blufs(
     items: list[dict[str, Any]],
-    home: Optional[Path] = None,
+    home: Path | None = None,
     *,
     preserve_prefixes: tuple[str, ...] = (),
 ) -> None:
@@ -432,36 +466,75 @@ def prune_blufs(
             _write_json(_bluf_path(home), kept)
 
 
-def attach_blufs(items: list[dict[str, Any]], home: Optional[Path] = None) -> list[dict[str, Any]]:
+def attach_blufs(
+    items: list[dict[str, Any]], home: Path | None = None
+) -> list[dict[str, Any]]:
     """Set ``bluf``/``bluf_why`` from the cache when it matches the item's current version."""
     cache = load_blufs(home)
     for it in items:
         hit = cache.get(it["id"])
-        if isinstance(hit, dict) and hit.get("version") == it["version"] and hit.get("bluf"):
+        if (
+            isinstance(hit, dict)
+            and hit.get("version") == it["version"]
+            and hit.get("bluf")
+        ):
             it["bluf"], it["bluf_why"] = hit["bluf"], hit.get("why") or ""
     return items
 
 
-def bluf_messages(item: dict[str, Any], comments: Optional[list[dict[str, Any]]] = None) -> list[dict[str, str]]:
-    card: dict[str, Any] = {"title": item.get("title"), "text": str(item.get("ask") or "")[:6000], "owner": item.get("owner")}
+def bluf_messages(
+    item: dict[str, Any], comments: list[dict[str, Any]] | None = None
+) -> list[dict[str, str]]:
+    card: dict[str, Any] = {
+        "title": item.get("title"),
+        "text": str(item.get("ask") or "")[:6000],
+        "owner": item.get("owner"),
+    }
     if comments:
         card["recent_comments"] = [
-            {"author": str(c.get("author") or ""), "text": str(c.get("body") or "")[:600]} for c in comments[-6:]
+            {
+                "author": str(c.get("author") or ""),
+                "text": str(c.get("body") or "")[:600],
+            }
+            for c in comments[-6:]
         ]
     card = _ask_card_view(card)  # same redaction as Ask: no home dir, no secrets (F4)
     return [
         {"role": "system", "content": BLUF_SYSTEM},
-        {"role": "user", "content": "CARD (untrusted):\n```json\n" + json.dumps(card, ensure_ascii=False) + "\n```"},
+        {
+            "role": "user",
+            "content": "CARD (untrusted):\n```json\n"
+            + json.dumps(card, ensure_ascii=False)
+            + "\n```",
+        },
     ]
 
 
-_BLUF_THINK_RE = re.compile(r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", re.S | re.I)
+_BLUF_THINK_RE = re.compile(
+    r"<think(?:ing)?>.*?(?:</think(?:ing)?>|\Z)", re.DOTALL | re.IGNORECASE
+)
 
 
-_BLUF_PLACEHOLDERS = frozenset({
-    "tbd", "todo", "n/a", "na", "none", "null", "placeholder", "bluf", "summary", "answer",
-    "your answer", "one sentence", "example", "value", "string", "text",
-})
+_BLUF_PLACEHOLDERS = frozenset(
+    {
+        "tbd",
+        "todo",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "placeholder",
+        "bluf",
+        "summary",
+        "answer",
+        "your answer",
+        "one sentence",
+        "example",
+        "value",
+        "string",
+        "text",
+    }
+)
 
 
 def _real_bluf(value: Any) -> bool:
@@ -494,9 +567,13 @@ def parse_bluf(text: str) -> tuple[str, str]:
                 r"(?:for\s+)?(?:an?\s+)?(?:(?:example|sample|format|schema)\b|e\.g\.)"
                 r"[^\n:]{0,40}:\s*(?:```[a-z0-9_-]*\s*)?$"
             )
-            is_example = re.search(rf"(?:^|\n)[ \t]*{example_label}", prefix, re.IGNORECASE)
+            is_example = re.search(
+                rf"(?:^|\n)[ \t]*{example_label}", prefix, re.IGNORECASE
+            )
             if data is not None and not is_example:
-                is_example = re.search(rf"(?:^|\n|[ \t]){example_label}", prefix, re.IGNORECASE)
+                is_example = re.search(
+                    rf"(?:^|\n|[ \t]){example_label}", prefix, re.IGNORECASE
+                )
             raw_bluf = obj.get("bluf")
             # Keep the last real answer: a model may restate or correct itself.
             if not is_example and isinstance(raw_bluf, str) and _real_bluf(raw_bluf):
@@ -511,7 +588,11 @@ def parse_bluf(text: str) -> tuple[str, str]:
 
 def recent_comments(item: dict[str, Any], limit: int = 6) -> list[dict[str, Any]]:
     """The last few comments on a Kanban card, so a summary can skip what is already settled."""
-    if item.get("source") != "kanban" or not item.get("board") or not item.get("task_id"):
+    if (
+        item.get("source") != "kanban"
+        or not item.get("board")
+        or not item.get("task_id")
+    ):
         return []
     from hermes_cli import kanban_db  # type: ignore
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
@@ -524,7 +605,10 @@ def recent_comments(item: dict[str, Any], limit: int = 6) -> list[dict[str, Any]
             ).fetchall()
             return [{"author": r[0], "body": r[1]} for r in reversed(rows)]
         except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-            return [{"author": c.author, "body": c.body} for c in kanban_db.list_comments(conn, item["task_id"])[-limit:]]
+            return [
+                {"author": c.author, "body": c.body}
+                for c in kanban_db.list_comments(conn, item["task_id"])[-limit:]
+            ]
 
 
 # --- classification (pure) -----------------------------------------------------------------
@@ -536,7 +620,7 @@ _NEGATION = re.compile(
     r"isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
     r"don['’]?t|doesn['’]?t|didn['’]?t|won['’]?t|"
     r"can['’]?t|cannot|no longer|no new)\b",
-    re.I,
+    re.IGNORECASE,
 )
 _PERMISSION_BEFORE_GATE = re.compile(
     r"\b(?:no problem|nothing stops us|no reason to (?:hold|wait|pause|stop)|free to|"
@@ -562,7 +646,7 @@ _HISTORICAL_HOLD_UNTIL = re.compile(
     r"\b(?:was|were|had been)\s+(?:held|paused|blocked|waiting|pending)\b.{0,40}\buntil\b",
     re.IGNORECASE,
 )
-_CONDITIONAL_GATE = re.compile(r"\b(?:without|until)\b", re.I)
+_CONDITIONAL_GATE = re.compile(r"\b(?:without|until)\b", re.IGNORECASE)
 # Characters that make a name part of a path, slug, env var or email instead of a
 # standalone word: /home/ada/..., ada/fleet, Ada-reserved, ada@example.com.
 _TOKEN_GLUE = "/\\-_@"
@@ -570,21 +654,24 @@ _TOKEN_GLUE = "/\\-_@"
 
 # A clause ends at sentence or clause punctuation; negation never reaches across it
 # ("Cannot proceed: needs <role word> approval" is an ask).
-_CLAUSE_END = re.compile(r"[,.;:!?\n]|\s[-–—]\s|\s+(?:and|but|or|so)\s+", re.I)
+_CLAUSE_END = re.compile(r"[,.;:!?\n]|\s[-–—]\s|\s+(?:and|but|or|so)\s+", re.IGNORECASE)
 # After the phrase, only "... is not needed/required" undoes it; any other negation
 # there ("Needs your approval. Not urgent.") belongs to something else.
 _POST_NEGATION = re.compile(
-    r"^\s*(?:is|are|was|were)?\s*(?:not|no longer|n['’]t)\s+(?:needed|required|necessary|wanted)\b", re.I
+    r"^\s*(?:is|are|was|were)?\s*(?:not|no longer|n['’]t)\s+(?:needed|required|necessary|wanted)\b",
+    re.IGNORECASE,
 )
-_DENIAL_BEFORE_UNTIL = re.compile(r"\b(?:no|not)\b.{0,40}\bneeded\b", re.I)
-_WITHOUT_UNNEEDED = re.compile(r"\bbeing\s+(?:needed|required|necessary|wanted)\b", re.I)
+_DENIAL_BEFORE_UNTIL = re.compile(r"\b(?:no|not)\b.{0,40}\bneeded\b", re.IGNORECASE)
+_WITHOUT_UNNEEDED = re.compile(
+    r"\bbeing\s+(?:needed|required|necessary|wanted)\b", re.IGNORECASE
+)
 
 
 def _match_is_negated(text: str, match: re.Match[str]) -> bool:
     """Does a negation govern this gate phrase within its clause?"""
-    head = text[:match.start()]
+    head = text[: match.start()]
     cuts = list(_CLAUSE_END.finditer(head))
-    clause = head[cuts[-1].end():] if cuts else head
+    clause = head[cuts[-1].end() :] if cuts else head
     near = " ".join(clause.split()[-3:])
     if match.group().lower().startswith("until "):
         clause += match.group()
@@ -594,18 +681,18 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
     conditional_matches = list(_CONDITIONAL_GATE.finditer(clause))
     if conditional_matches:
         candidate = conditional_matches[-1]
-        words_between = clause[candidate.end():].split()
+        words_between = clause[candidate.end() :].split()
         if len(words_between) <= 6:
             conditional = candidate
-    before_conditional = clause[:conditional.start()] if conditional else ""
+    before_conditional = clause[: conditional.start()] if conditional else ""
     permission = bool(
         conditional
         and _PERMISSION_BEFORE_GATE.search(before_conditional)
         and not _NEGATED_PERMISSION.search(before_conditional)
     )
-    after = text[match.end():]
+    after = text[match.end() :]
     end = _CLAUSE_END.search(after)
-    after = after[:end.start()] if end else after
+    after = after[: end.start()] if end else after
     historical_hold = bool(
         conditional
         and conditional.group().lower() == "until"
@@ -627,14 +714,19 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
         )
     )
     gate_condition = bool(conditional and not denial)
-    return bool(denial or (_NEGATION.search(near) and not gate_condition)
-                or _POST_NEGATION.search(after))
+    return bool(
+        denial
+        or (_NEGATION.search(near) and not gate_condition)
+        or _POST_NEGATION.search(after)
+    )
 
 
 def _match_is_standalone(text: str, match: re.Match[str]) -> bool:
     before = text[match.start() - 1] if match.start() else ""
     after = text[match.end()] if match.end() < len(text) else ""
-    return not (before and before in _TOKEN_GLUE) and not (after and after in _TOKEN_GLUE)
+    return not (before and before in _TOKEN_GLUE) and not (
+        after and after in _TOKEN_GLUE
+    )
 
 
 def _any_gate(reason: str, pats: dict[str, re.Pattern[str]]) -> bool:
@@ -654,11 +746,11 @@ def _any_name(reason: str, pats: dict[str, re.Pattern[str]]) -> bool:
 _YOUR_GATE = re.compile(
     r"\b(?:need|needs|awaiting|waiting (?:on|for)|requires?|pending) your "
     r"(?:approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)\b",
-    re.I,
+    re.IGNORECASE,
 )
 
 
-def kanban_needs_you(reason: str, kind: Optional[str]) -> Optional[str]:
+def kanban_needs_you(reason: str, kind: str | None) -> str | None:
     """Why a blocked card's latest block is waiting on the principal, or None."""
     reason = (reason or "").strip()
     reason = re.sub(
@@ -675,7 +767,11 @@ def kanban_needs_you(reason: str, kind: Optional[str]) -> Optional[str]:
     if pats["_ORDER"].match(reason):
         # A relayed order is a stop, not a question, unless it asks *you* for something
         # ("<role word> says: need your approval for the spend").
-        return "Block reason names a decision for you" if _YOUR_GATE.search(reason) else None
+        return (
+            "Block reason names a decision for you"
+            if _YOUR_GATE.search(reason)
+            else None
+        )
     if _any_gate(reason, pats):
         return "Block reason names a decision for you"
     if (kind or "") == "needs_input" and _any_name(reason, pats):
@@ -683,13 +779,13 @@ def kanban_needs_you(reason: str, kind: Optional[str]) -> Optional[str]:
     return None
 
 
-_URL = re.compile(r"\bhttps?://\S+", re.I)
+_URL = re.compile(r"\bhttps?://\S+", re.IGNORECASE)
 _CLOSER = re.compile(
     r"(?:\s|^)(?:anything else(?: (?:you need|I can (?:do|help with)))?|is there anything else[^?]*"
     r"|(?:let me know|hope (?:this|that) helps)[^?.!]*)[?.!]?\s*$",
-    re.I,
+    re.IGNORECASE,
 )
-_ANSWERED = re.compile(r"(?:because|answer:|a:|it was|the answer)\b", re.I)
+_ANSWERED = re.compile(r"(?:because|answer:|a:|it was|the answer)\b", re.IGNORECASE)
 
 
 def chat_asks_you(text: str) -> bool:
@@ -708,26 +804,27 @@ def chat_asks_you(text: str) -> bool:
     if pats["_ASK_PACKET"].search(text[-4000:]):
         return True
     for match in pats["_ASK_STRONG"].finditer(tail):
-        if "?" in tail[match.end():match.end() + 300]:
+        if "?" in tail[match.end() : match.end() + 300]:
             return True
     if "?" not in tail[-400:] or not pats["_YOU"].search(tail[-400:]):
         return False
     # A question the turn goes on to answer ("Why did it fail? Because ...") is not an ask.
-    rest = tail[tail.rfind("?") + 1:].strip()
+    rest = tail[tail.rfind("?") + 1 :].strip()
     return len(rest) <= 120 and not _ANSWERED.match(rest)
 
 
 def _excerpt(text: str, n: int = 480) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
-    return text if len(text) <= n else "…" + text[-(n - 1):]
+    return text if len(text) <= n else "…" + text[-(n - 1) :]
 
 
 def _excerpt_head(text: str, n: int = 480) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
-    return text if len(text) <= n else text[:n - 1] + "…"
+    return text if len(text) <= n else text[: n - 1] + "…"
 
 
 # --- Kanban source -------------------------------------------------------------------------
+
 
 def _boards() -> list[str]:
     from hermes_cli import kanban_db_boards as kb  # type: ignore
@@ -740,15 +837,19 @@ def _boards() -> list[str]:
     return out or ["default"]
 
 
-def _latest_block_event(events: Iterable[Any]) -> Optional[Any]:
+def _latest_block_event(events: Iterable[Any]) -> Any | None:
     """The newest block-family event; ``triage`` cards carry ``block_loop_detected``."""
     return next(
-        (e for e in reversed(list(events)) if e.kind in ("blocked", "block_loop_detected")),
+        (
+            e
+            for e in reversed(list(events))
+            if e.kind in ("blocked", "block_loop_detected")
+        ),
         None,
     )
 
 
-def _latest_block(conn: Any, kanban_db: Any, task_id: str) -> Optional[Any]:
+def _latest_block(conn: Any, kanban_db: Any, task_id: str) -> Any | None:
     """The newest block-family event, read with one indexed query instead of loading the
     card's whole event history (a long-lived card has thousands)."""
     try:
@@ -766,7 +867,9 @@ def _same_author(a: Any, b: Any) -> bool:
     return str(a or "").casefold() == str(b or "").casefold()
 
 
-def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, since: int) -> bool:
+def _answered_since(
+    conn: Any, kanban_db: Any, task_id: str, author: str, since: int
+) -> bool:
     """Has *author* commented since the block began? The one test for "answered", used by
     the queue and by answer_card. Names compare in Python (casefold) on both paths: SQLite's
     LOWER() folds ASCII only, so "ZOË" and "Zoë" used to differ on the fast path alone."""
@@ -786,21 +889,24 @@ def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, since:
 class CardStatus(str, Enum):
     """The Kanban card statuses UNBL0CK acts on (Kanban owns the full set and every write).
 
-        BLOCKED   --answer-->            BLOCKED  (answered: stays listed with a release action)
-        BLOCKED   --release (answered)-> Kanban's unblock_task, no second comment
-        BLOCKED   --answer + release-->  Kanban's unblock_task moves it out of HELD
-        SCHEDULED --answer [+ release]-> as BLOCKED (answerable, never listed)
-        TRIAGE    --answer-->            TRIAGE
-        TRIAGE    --answer + release-->  refused: a block loop is not ours to release
-        any other status --answer-->     refused
+    BLOCKED   --answer-->            BLOCKED  (answered: stays listed with a release action)
+    BLOCKED   --release (answered)-> Kanban's unblock_task, no second comment
+    BLOCKED   --answer + release-->  Kanban's unblock_task moves it out of HELD
+    SCHEDULED --answer [+ release]-> as BLOCKED (answerable, never listed)
+    TRIAGE    --answer-->            TRIAGE
+    TRIAGE    --answer + release-->  refused: a block loop is not ours to release
+    any other status --answer-->     refused
     """
+
     BLOCKED = "blocked"
     SCHEDULED = "scheduled"
     TRIAGE = "triage"
 
 
-QUEUE_STATUSES = (CardStatus.BLOCKED, CardStatus.TRIAGE)   # listed in the queue
-HELD_STATUSES = frozenset(s.value for s in CardStatus)     # answerable; "still held" after unblock
+QUEUE_STATUSES = (CardStatus.BLOCKED, CardStatus.TRIAGE)  # listed in the queue
+HELD_STATUSES = frozenset(
+    s.value for s in CardStatus
+)  # answerable; "still held" after unblock
 RELEASABLE_STATUSES = frozenset({CardStatus.BLOCKED.value, CardStatus.SCHEDULED.value})
 
 
@@ -810,15 +916,17 @@ def check_answerable(task_id: str, status: Any, *, release: bool) -> None:
     if status not in HELD_STATUSES:
         raise RuntimeError(f"card {task_id} is {status}, not blocked")
     if release and status not in RELEASABLE_STATUSES:
-        raise ValueError("triage cards cannot be unblocked from UNBL0CK; answer without unblocking")
+        raise ValueError(
+            "triage cards cannot be unblocked from UNBL0CK; answer without unblocking"
+        )
 
 
-def _block_since(block: Optional[Any], task: Any) -> Any:
+def _block_since(block: Any | None, task: Any) -> Any:
     """When the current block began: its event, else the card's creation."""
     return block.created_at if block else task.created_at
 
 
-def stuck_reason(reason: str, kind: Optional[str], block: Any) -> str:
+def stuck_reason(reason: str, kind: str | None, block: Any) -> str:
     """One plain line for a blocked card whose block names no ask for the principal."""
     reason = (reason or "").strip()
     if block is None:
@@ -833,8 +941,8 @@ def stuck_reason(reason: str, kind: Optional[str], block: Any) -> str:
 
 
 def kanban_items(
-    boards: Optional[Iterable[str]] = None,
-    errors: Optional[list[str]] = None,
+    boards: Iterable[str] | None = None,
+    errors: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Blocked cards that need the principal, plus block-loop ``triage`` cards.
 
@@ -846,7 +954,7 @@ def kanban_items(
 
     items: list[dict[str, Any]] = []
     author = principal_author()
-    pending: Optional[dict[str, str]] = None   # read only when an answered card turns up
+    pending: dict[str, str] | None = None  # read only when an answered card turns up
     for board in boards or _boards():
         try:
             conn = kbc.connect(board=board)
@@ -856,7 +964,11 @@ def kanban_items(
             continue
         try:
             with closing(conn):
-                tasks = [t for st in QUEUE_STATUSES for t in kanban_db.list_tasks(conn, status=st.value)]
+                tasks = [
+                    t
+                    for st in QUEUE_STATUSES
+                    for t in kanban_db.list_tasks(conn, status=st.value)
+                ]
                 for task in tasks:
                     block = _latest_block(conn, kanban_db, task.id)
                     payload = (block.payload or {}) if block else {}
@@ -867,7 +979,11 @@ def kanban_items(
                         # Anything blocked is a NEED to unblock. No ask for the principal was
                         # recorded, so say why it is stuck instead of dropping it silently.
                         tier = "stuck"
-                        why = stuck_reason(reason, payload.get("kind") or getattr(task, "block_kind", None), block)
+                        why = stuck_reason(
+                            reason,
+                            payload.get("kind") or getattr(task, "block_kind", None),
+                            block,
+                        )
                     since = _block_since(block, task)
                     # Answered cards leave the queue in both tiers, so a card the queue shows
                     # is exactly a card answer_card accepts.
@@ -880,30 +996,37 @@ def kanban_items(
                             # front of you so the release can be retried.
                             tier = "release_failed"
                             why = "Your answer is posted, but the card could not be unblocked; retry the release"
-                        elif str(getattr(task.status, "value", task.status)) in RELEASABLE_STATUSES:
+                        elif (
+                            str(getattr(task.status, "value", task.status))
+                            in RELEASABLE_STATUSES
+                        ):
                             # Answered and kept blocked: nothing more to answer, but it must stay
                             # reachable so it can be released later.
                             tier = "answered"
                             why = "You answered and kept it blocked; release it when it is ready"
                         else:
                             continue  # answered triage card: nothing left for you to do here
-                    items.append({
-                        "id": f"kanban:{board}:{task.id}",
-                        "version": version,
-                        "source": "kanban",
-                        "board": board,
-                        "task_id": task.id,
-                        "title": task.title,
-                        "ask": reason,
-                        "why": why,
-                        "tier": tier,
-                        "owner": task.assignee,
-                        "priority": task.priority,
-                        "status": task.status,
-                        "block_kind": payload.get("kind") or getattr(task, "block_kind", None),
-                        "block_recurrences": payload.get("recurrences") or getattr(task, "block_recurrences", 0),
-                        "since": since,
-                    })
+                    items.append(
+                        {
+                            "id": f"kanban:{board}:{task.id}",
+                            "version": version,
+                            "source": "kanban",
+                            "board": board,
+                            "task_id": task.id,
+                            "title": task.title,
+                            "ask": reason,
+                            "why": why,
+                            "tier": tier,
+                            "owner": task.assignee,
+                            "priority": task.priority,
+                            "status": task.status,
+                            "block_kind": payload.get("kind")
+                            or getattr(task, "block_kind", None),
+                            "block_recurrences": payload.get("recurrences")
+                            or getattr(task, "block_recurrences", 0),
+                            "since": since,
+                        }
+                    )
         except Exception as exc:  # noqa: BLE001 - per-board failure must be visible
             if errors is not None:
                 errors.append(f"kanban[{board}]: {type(exc).__name__}: {exc}")
@@ -911,6 +1034,7 @@ def kanban_items(
 
 
 # --- Chat source ---------------------------------------------------------------------------
+
 
 def _state_dbs(home: Path) -> list[tuple[str, Path]]:
     out = []
@@ -927,7 +1051,7 @@ def _state_dbs(home: Path) -> list[tuple[str, Path]]:
 _BOARD_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
 
 
-def normalize_board_slug(slug: Any) -> Optional[str]:
+def normalize_board_slug(slug: Any) -> str | None:
     """Lowercase + strip a board slug; None for empty; ValueError for an invalid one."""
     s = str(slug).strip().lower() if slug is not None else ""
     if not s:
@@ -940,7 +1064,9 @@ def normalize_board_slug(slug: Any) -> Optional[str]:
     return s
 
 
-_BOT_NAME_CACHE: dict[str, tuple[tuple[int, int], str]] = {}   # profile.yaml path -> ((mtime_ns, size), title or "")
+_BOT_NAME_CACHE: dict[
+    str, tuple[tuple[int, int], str]
+] = {}  # profile.yaml path -> ((mtime_ns, size), title or "")
 
 
 def _bot_name(home: Path, profile: str) -> str:
@@ -983,7 +1109,9 @@ def _scan_bot_title(lines: list[str]) -> str:
 # platforms where other people can message the bot too.
 LOCAL_PLATFORMS = ("desktop", "cli", "tui", "local", "gui")
 
-_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+_UNSAFE_CHARS = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]"
+)
 
 
 def _clean(value: Any, n: int) -> str:
@@ -992,10 +1120,12 @@ def _clean(value: Any, n: int) -> str:
     return " ".join(_UNSAFE_CHARS.sub(" ", str(value or "")).split())[:n]
 
 
-def chat_owner_ids(settings: Optional[dict[str, Any]] = None) -> set[str]:
+def chat_owner_ids(settings: dict[str, Any] | None = None) -> set[str]:
     """Your user ids on gateway platforms (setting ``owner_user_ids``, comma-separated). When
     set, a Discord/Telegram/... chat with anyone else is not shown as asking you."""
-    raw = (settings if settings is not None else _settings()).get("owner_user_ids") or os.environ.get("UNBL0CK_OWNER_IDS", "")
+    raw = (settings if settings is not None else _settings()).get(
+        "owner_user_ids"
+    ) or os.environ.get("UNBL0CK_OWNER_IDS", "")
     if isinstance(raw, (list, tuple)):
         raw = ",".join(map(str, raw))
     return {x.strip() for x in str(raw).split(",") if x.strip()}
@@ -1011,7 +1141,17 @@ def _chat_with(platform: str, display_name: Any, me: set[str]) -> str:
 
 # Sessions a person types into. Everything else (Kanban workers, cron, subagents, one-shot
 # runs, agent-to-agent calls) is agents talking to agents, so its questions are not for you.
-CHAT_MACHINE_SOURCES = ("kanban", "cron", "subagent", "oneshot", "tool", "batch", "a2a", "delegate", "delegation")
+CHAT_MACHINE_SOURCES = (
+    "kanban",
+    "cron",
+    "subagent",
+    "oneshot",
+    "tool",
+    "batch",
+    "a2a",
+    "delegate",
+    "delegation",
+)
 # In a shared channel the bot may be asking someone else; there the ask must name you.
 CHAT_GROUP_TYPES = ("group", "channel", "thread", "supergroup", "forum")
 
@@ -1021,9 +1161,9 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def chat_items(
-    home: Optional[Path] = None,
+    home: Path | None = None,
     days: int = CHAT_WINDOW_DAYS,
-    errors: Optional[list[str]] = None,
+    errors: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
     last visible turn is the bot asking you something you have not answered."""
@@ -1035,7 +1175,9 @@ def chat_items(
     me = {n.lower() for n in principal_names()}
     for profile, db in _state_dbs(home):
         try:
-            conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+            conn = sqlite3.connect(
+                db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2
+            )
         except sqlite3.Error as exc:
             if errors is not None:
                 errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
@@ -1044,46 +1186,68 @@ def chat_items(
             try:
                 cols = _columns(conn, "sessions")
                 if not cols:
-                    continue   # a profile that never chatted has no sessions table yet
+                    continue  # a profile that never chatted has no sessions table yet
                 where = ["COALESCE(s.archived,0)=0"] if "archived" in cols else []
                 args: list[Any] = []
                 if "hidden" in cols:
                     where.append("COALESCE(s.hidden,0)=0")
                 if "source" in cols:
-                    where.append(f"COALESCE(s.source,'') NOT IN ({','.join('?' * len(CHAT_MACHINE_SOURCES))})")
+                    where.append(
+                        f"COALESCE(s.source,'') NOT IN ({','.join('?' * len(CHAT_MACHINE_SOURCES))})"
+                    )
                     args += CHAT_MACHINE_SOURCES
-                else:   # an old schema: only Bot Mode chats can be told apart
+                else:  # an old schema: only Bot Mode chats can be told apart
                     where.append(f"s.title IN ({','.join('?' * len(CHAT_TITLES))})")
                     args += CHAT_TITLES
                 if "parent_session_id" in cols:
                     # A compressed chat continues in a child session; only the newest link counts.
-                    where.append("NOT EXISTS (SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id"
-                                 + (f" AND COALESCE(c.source,'') NOT IN ({','.join('?' * len(CHAT_MACHINE_SOURCES))})" if "source" in cols else "")
-                                 + ")")
+                    where.append(
+                        "NOT EXISTS (SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id"
+                        + (
+                            f" AND COALESCE(c.source,'') NOT IN ({','.join('?' * len(CHAT_MACHINE_SOURCES))})"
+                            if "source" in cols
+                            else ""
+                        )
+                        + ")"
+                    )
                     if "source" in cols:
                         args += CHAT_MACHINE_SOURCES
                 if "last_activity_at" in cols and "started_at" in cols:
                     where.append("COALESCE(s.last_activity_at, s.started_at, 0) >= ?")
                     args.append(since)
-                pick = ", ".join(f"s.{c}" if c in cols else "NULL" for c in ("source", "chat_type", "user_id", "display_name"))
+                pick = ", ".join(
+                    f"s.{c}" if c in cols else "NULL"
+                    for c in ("source", "chat_type", "user_id", "display_name")
+                )
                 mcols = _columns(conn, "messages")
                 sessions = conn.execute(
-                    f"SELECT s.id, s.title, {pick} FROM sessions s WHERE {' AND '.join(where) or '1'}", args
+                    f"SELECT s.id, s.title, {pick} FROM sessions s WHERE {' AND '.join(where) or '1'}",
+                    args,
                 ).fetchall()
             except sqlite3.Error as exc:
                 if errors is not None and "no such" not in str(exc):
                     errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
                 continue
             # Only the columns this profile's schema has: an old schema must not fail per session.
-            last_sql = ("SELECT id, role, content, timestamp FROM messages WHERE session_id=? "
-                        "AND role IN ('user','assistant') AND content IS NOT NULL AND TRIM(content) != '' "
-                        + ("AND COALESCE(display_kind,'') != 'hidden' " if "display_kind" in mcols else "")
-                        + ("AND COALESCE(active,1)=1 " if "active" in mcols else "")
-                        + "ORDER BY timestamp DESC, id DESC LIMIT 1")
+            last_sql = (
+                "SELECT id, role, content, timestamp FROM messages WHERE session_id=? "
+                "AND role IN ('user','assistant') AND content IS NOT NULL AND TRIM(content) != '' "
+                + (
+                    "AND COALESCE(display_kind,'') != 'hidden' "
+                    if "display_kind" in mcols
+                    else ""
+                )
+                + ("AND COALESCE(active,1)=1 " if "active" in mcols else "")
+                + "ORDER BY timestamp DESC, id DESC LIMIT 1"
+            )
             for sid, title, platform, chat_type, user_id, display_name in sessions:
                 platform = str(platform or "")
-                if (owners and platform and platform.lower() not in LOCAL_PLATFORMS
-                        and str(user_id or "") not in owners):
+                if (
+                    owners
+                    and platform
+                    and platform.lower() not in LOCAL_PLATFORMS
+                    and str(user_id or "") not in owners
+                ):
                     # A gateway chat with someone other than you, or with nobody known: when you
                     # set owner_user_ids, only chats proven to be yours are shown (and summarised).
                     continue
@@ -1092,39 +1256,51 @@ def chat_items(
                 except sqlite3.Error as exc:
                     if errors is not None:
                         errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
-                    break   # same schema for every session: say it once
+                    break  # same schema for every session: say it once
                 if not row:
                     continue
                 mid, role, content, ts = row
-                if role != "assistant" or (ts or 0) < since or not chat_asks_you(content):
+                if (
+                    role != "assistant"
+                    or (ts or 0) < since
+                    or not chat_asks_you(content)
+                ):
                     continue
-                if str(chat_type or "").lower() in CHAT_GROUP_TYPES and not names.search(str(content)[-900:]):
+                if str(
+                    chat_type or ""
+                ).lower() in CHAT_GROUP_TYPES and not names.search(str(content)[-900:]):
                     continue
                 bot_chat = title in CHAT_TITLES
-                where_ = "Bot Chat" if bot_chat else (f"{_platform_label(platform)} chat" if platform else "chat")
-                items.append({
-                    "id": f"chat:{profile}:{sid}",
-                    "version": str(mid),
-                    "source": "chat",
-                    "profile": profile,
-                    "session_id": sid,
-                    "platform": platform,
-                    "bot_chat": bot_chat,
-                    "chat_title": "" if bot_chat else _clean(title, 120),
-                    "chat_with": _chat_with(platform, display_name, me),
-                    "title": f"{_bot_name(home, profile)} is asking you",
-                    "ask": _excerpt(content),
-                    "why": f"Last turn in this {where_} is a question for you",
-                    "owner": profile,
-                    "priority": 0,
-                    "since": int(ts or 0),
-                })
+                where_ = (
+                    "Bot Chat"
+                    if bot_chat
+                    else (f"{_platform_label(platform)} chat" if platform else "chat")
+                )
+                items.append(
+                    {
+                        "id": f"chat:{profile}:{sid}",
+                        "version": str(mid),
+                        "source": "chat",
+                        "profile": profile,
+                        "session_id": sid,
+                        "platform": platform,
+                        "bot_chat": bot_chat,
+                        "chat_title": "" if bot_chat else _clean(title, 120),
+                        "chat_with": _chat_with(platform, display_name, me),
+                        "title": f"{_bot_name(home, profile)} is asking you",
+                        "ask": _excerpt(content),
+                        "why": f"Last turn in this {where_} is a question for you",
+                        "owner": profile,
+                        "priority": 0,
+                        "since": int(ts or 0),
+                    }
+                )
     return items
 
 
 # --- Pairing source (stock gateway pairing store) ------------------------------------------
 
-PAIRING_TTL = 3600   # gateway/pairing.py CODE_TTL_SECONDS: a code is dead after an hour
+PAIRING_TTL = 3600  # gateway/pairing.py CODE_TTL_SECONDS: a code is dead after an hour
 
 
 def _pairing_profiles(home: Path) -> list[str]:
@@ -1134,7 +1310,10 @@ def _pairing_profiles(home: Path) -> list[str]:
     out: list[str] = []
     cands = [("default", home / "platforms" / "pairing"), ("default", home / "pairing")]
     for prof in sorted((home / "profiles").glob("*/")):
-        cands += [(prof.name, prof / "platforms" / "pairing"), (prof.name, prof / "pairing")]
+        cands += [
+            (prof.name, prof / "platforms" / "pairing"),
+            (prof.name, prof / "pairing"),
+        ]
     for profile, d in cands:
         try:
             real = d.resolve()
@@ -1148,12 +1327,16 @@ def _pairing_profiles(home: Path) -> list[str]:
 
 
 def _stock_pairing_store(profile: str):
-    from gateway.pairing import PairingStore   # stock Hermes; present wherever the plugin runs
+    from gateway.pairing import (
+        PairingStore,
+    )  # stock Hermes; present wherever the plugin runs
+
     return PairingStore(profile=profile)
 
 
-def pairing_items(home: Optional[Path] = None, errors: Optional[list[str]] = None,
-                  store=None) -> list[dict[str, Any]]:
+def pairing_items(
+    home: Path | None = None, errors: list[str] | None = None, store=None
+) -> list[dict[str, Any]]:
     """People who messaged a bot and are waiting for you to let them in.
 
     Goes through the gateway's public ``PairingStore.list_pending()``, which returns a
@@ -1166,7 +1349,7 @@ def pairing_items(home: Optional[Path] = None, errors: Optional[list[str]] = Non
     for profile in _pairing_profiles(home):
         try:
             pending = store(profile).list_pending()
-        except Exception as exc:   # an old Hermes without the API, or a locked store: skip, say so
+        except Exception as exc:  # noqa: BLE001 - an old Hermes API or locked store means skip
             if errors is not None:
                 errors.append(f"pairing[{profile}]: {type(exc).__name__}")
             continue
@@ -1175,36 +1358,51 @@ def pairing_items(home: Optional[Path] = None, errors: Optional[list[str]] = Non
                 continue
             platform = str(info.get("platform") or "")
             age = info.get("age_minutes")
-            if (not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", platform)
-                    or not isinstance(age, int) or isinstance(age, bool)
-                    or age * 60 > PAIRING_TTL or age < -5):
-                continue   # expired, or stamped in the future (clock skew or a forged file)
+            if (
+                not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", platform)
+                or not isinstance(age, int)
+                or isinstance(age, bool)
+                or age * 60 > PAIRING_TTL
+                or age < -5
+            ):
+                continue  # expired, or stamped in the future (clock skew or a forged file)
             rid = str(info.get("request_id") or "")
             modern = re.fullmatch(r"[0-9a-f]{16}", rid) is not None
             who = _clean(info.get("user_name"), 60) or "Someone new"
             ident = rid if modern else f"legacy:{info.get('user_id', '')}:{who}"
-            key = hashlib.sha256(f"{profile}:{platform}:{ident}".encode()).hexdigest()[:16]
+            key = hashlib.sha256(f"{profile}:{platform}:{ident}".encode()).hexdigest()[
+                :16
+            ]
             bot = _bot_name(home, profile) if profile != "default" else "your bot"
             minutes = max(1, PAIRING_TTL // 60 - max(age, 0))
             # A modern request id is the admin-only handle `hermes pairing approve` accepts.
             # A legacy entry has no id (its key was the code), so it gets no command.
-            approve = (f"hermes {'' if profile == 'default' else f'-p {profile} '}pairing approve {platform} {rid}"
-                       if modern else "")
-            items.append({
-                "id": f"pairing:{profile}:{platform}:{key}",
-                "version": key,
-                "source": "pairing",
-                "profile": profile,
-                "platform": platform,
-                "title": f"{who} wants to talk to {bot} on {_platform_label(platform)}",
-                "ask": ("They messaged the bot and got a pairing code. Nothing they send reaches an agent "
-                        "until you approve them on the dashboard's Pairing page or with hermes pairing approve."),
-                "approve_command": approve,
-                "why": f"The request expires in {minutes} min" if minutes > 1 else "The request expires within a minute",
-                "owner": profile,
-                "priority": 1,
-                "since": int(now - max(age, 0) * 60),
-            })
+            approve = (
+                f"hermes {'' if profile == 'default' else f'-p {profile} '}pairing approve {platform} {rid}"
+                if modern
+                else ""
+            )
+            items.append(
+                {
+                    "id": f"pairing:{profile}:{platform}:{key}",
+                    "version": key,
+                    "source": "pairing",
+                    "profile": profile,
+                    "platform": platform,
+                    "title": f"{who} wants to talk to {bot} on {_platform_label(platform)}",
+                    "ask": (
+                        "They messaged the bot and got a pairing code. Nothing they send reaches an agent "
+                        "until you approve them on the dashboard's Pairing page or with hermes pairing approve."
+                    ),
+                    "approve_command": approve,
+                    "why": f"The request expires in {minutes} min"
+                    if minutes > 1
+                    else "The request expires within a minute",
+                    "owner": profile,
+                    "priority": 1,
+                    "since": int(now - max(age, 0) * 60),
+                }
+            )
     return items
 
 
@@ -1216,7 +1414,9 @@ _WAIT_KINDS = {
     "sudo": "needs your admin password",
 }
 _SAFE_ID = re.compile(r"^[0-9a-f]{8,64}$")
-WAIT_MAX_AGE = 86400   # no human prompt legitimately stays open a day; a missed resolve hook does
+WAIT_MAX_AGE = (
+    86400  # no human prompt legitimately stays open a day; a missed resolve hook does
+)
 
 
 def _num(value: Any) -> float:
@@ -1226,13 +1426,13 @@ def _num(value: Any) -> float:
         return 0.0
 
 
-def _waits_dir(home: Optional[Path] = None) -> Path:
+def _waits_dir(home: Path | None = None) -> Path:
     d = data_dir(home) / "waits"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _proc_start(pid: int) -> Optional[str]:
+def _proc_start(pid: int) -> str | None:
     """Start time of *pid*, so a recycled PID is not mistaken for the waiter.
 
     Linux reads the kernel start tick from /proc. Elsewhere (macOS, the BSDs) it asks
@@ -1251,7 +1451,10 @@ def _proc_start(pid: int) -> Optional[str]:
 
         out = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(int(pid))],
-            capture_output=True, text=True, timeout=2, check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
             env={"PATH": "/bin:/usr/bin", "LC_ALL": "C"},
         ).stdout.strip()
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -1259,7 +1462,7 @@ def _proc_start(pid: int) -> Optional[str]:
     return out or None
 
 
-def _alive(pid: int, start: Optional[str]) -> bool:
+def _alive(pid: int, start: str | None) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1281,7 +1484,7 @@ def _profile_of(home: Path) -> str:
     return own.name if own.parent.name == "profiles" else "default"
 
 
-def record_wait(home: Optional[Path] = None, **payload: Any) -> None:
+def record_wait(home: Path | None = None, **payload: Any) -> None:
     """``on_human_input_request``: remember an open wait. Never raises (observer contract)."""
     try:
         rid = str(payload.get("request_id") or "")
@@ -1305,7 +1508,7 @@ def record_wait(home: Optional[Path] = None, **payload: Any) -> None:
         log.debug("unbl0ck: could not record wait: %s", exc)
 
 
-def clear_wait(home: Optional[Path] = None, **payload: Any) -> None:
+def clear_wait(home: Path | None = None, **payload: Any) -> None:
     """``on_human_input_resolved``: the wait ended (answered, timed out or failed)."""
     try:
         rid = str(payload.get("request_id") or "")
@@ -1315,7 +1518,12 @@ def clear_wait(home: Optional[Path] = None, **payload: Any) -> None:
         log.debug("unbl0ck: could not clear wait: %s", exc)
 
 
-_PLATFORM_LABELS = {"desktop": "Hermes Desktop", "cli": "the Hermes CLI", "tui": "the Hermes TUI", "api_server": "the API"}
+_PLATFORM_LABELS = {
+    "desktop": "Hermes Desktop",
+    "cli": "the Hermes CLI",
+    "tui": "the Hermes TUI",
+    "api_server": "the API",
+}
 
 
 def _platform_label(platform: str) -> str:
@@ -1333,11 +1541,12 @@ class WaitState(str, Enum):
 
     OPEN is the only state ever shown.
     """
+
     OPEN = "open"
     STALE = "stale"
 
 
-def wait_state(f: Path, rec: dict[str, Any], now: Optional[float] = None) -> WaitState:
+def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitState:
     """Classify one wait record read from *f* (an empty dict means unreadable)."""
     now = time.time() if now is None else now
     try:
@@ -1345,14 +1554,21 @@ def wait_state(f: Path, rec: dict[str, Any], now: Optional[float] = None) -> Wai
     except (TypeError, ValueError):
         pid = 0
     rid = str(rec.get("request_id") or "")
-    if (not rec or pid <= 0 or not _SAFE_ID.match(rid) or f.stem != rid
-            or now - _num(rec.get("since")) > WAIT_MAX_AGE
-            or not _alive(pid, rec.get("proc_start"))):
+    if (
+        not rec
+        or pid <= 0
+        or not _SAFE_ID.match(rid)
+        or f.stem != rid
+        or now - _num(rec.get("since")) > WAIT_MAX_AGE
+        or not _alive(pid, rec.get("proc_start"))
+    ):
         return WaitState.STALE
     return WaitState.OPEN
 
 
-def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) -> list[dict[str, Any]]:
+def wait_items(
+    home: Path | None = None, errors: list[str] | None = None
+) -> list[dict[str, Any]]:
     """Open live prompts. A wait whose process is gone is deleted, not shown."""
     home = home or hermes_home()
     items: list[dict[str, Any]] = []
@@ -1368,21 +1584,25 @@ def wait_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) 
         profile = str(rec.get("profile") or "default")
         who = _bot_name(home, profile) if profile != "default" else "An agent"
         platform = str(rec.get("platform") or "")
-        items.append({
-            "id": f"prompt:{rid}",
-            "version": rid,
-            "source": "prompt",
-            "kind": kind,
-            "profile": profile,
-            "session_id": str(rec.get("session_id") or ""),
-            "platform": platform,
-            "title": f"{who} {_WAIT_KINDS.get(kind, 'is waiting on you')}",
-            "ask": _excerpt(str(rec.get("prompt") or "")) or "(prompt text withheld by Hermes)",
-            "why": "Its run is paused until you answer" + (f" in {_platform_label(platform)}." if platform else "."),
-            "owner": profile,
-            "priority": 1,   # a live wait is holding a running agent
-            "since": int(_num(rec.get("since"))),
-        })
+        items.append(
+            {
+                "id": f"prompt:{rid}",
+                "version": rid,
+                "source": "prompt",
+                "kind": kind,
+                "profile": profile,
+                "session_id": str(rec.get("session_id") or ""),
+                "platform": platform,
+                "title": f"{who} {_WAIT_KINDS.get(kind, 'is waiting on you')}",
+                "ask": _excerpt(str(rec.get("prompt") or ""))
+                or "(prompt text withheld by Hermes)",
+                "why": "Its run is paused until you answer"
+                + (f" in {_platform_label(platform)}." if platform else "."),
+                "owner": profile,
+                "priority": 1,  # a live wait is holding a running agent
+                "since": int(_num(rec.get("since"))),
+            }
+        )
     return items
 
 
@@ -1395,23 +1615,29 @@ _FILED_ID = re.compile(r"outside:filed:([a-f0-9]{32})\Z")
 _FOLDER_ID = re.compile(r"outside:folder:[a-f0-9]{64}\Z")
 
 
-def _outside_dir(home: Optional[Path] = None) -> Path:
+def _outside_dir(home: Path | None = None) -> Path:
     d = data_dir(home) / "outside"
     d.mkdir(mode=0o700, exist_ok=True)
     return d
 
 
-def _outside_field(args: dict[str, Any], name: str, limit: int, *, required: bool = False) -> str:
+def _outside_field(
+    args: dict[str, Any], name: str, limit: int, *, required: bool = False
+) -> str:
     value = args.get(name, "")
     if not isinstance(value, str) or (required and not value.strip()):
-        raise ValueError(f"{name} must be {'a non-empty string' if required else 'a string'}")
+        raise ValueError(
+            f"{name} must be {'a non-empty string' if required else 'a string'}"
+        )
     if name == "body" and len(value) > limit:
         marker = "\n[truncated]"
-        return value[:limit - len(marker)] + marker
+        return value[: limit - len(marker)] + marker
     return value[:limit]
 
 
-def file_outside(args: dict[str, Any], home: Optional[Path] = None, **kwargs: Any) -> dict[str, Any]:
+def file_outside(
+    args: dict[str, Any], home: Path | None = None, **kwargs: Any
+) -> dict[str, Any]:
     """File/update one agent claim, or resolve one of our own records. No external actions."""
     action = args.get("action", "file")
     if action not in ("file", "resolve"):
@@ -1424,16 +1650,20 @@ def file_outside(args: dict[str, Any], home: Optional[Path] = None, **kwargs: An
         if "body" not in args:
             raise ValueError("body is required (an empty string is allowed)")
         fields = {
-            "kind": kind, "title": _outside_field(args, "title", 160, required=True),
+            "kind": kind,
+            "title": _outside_field(args, "title", 160, required=True),
             "text": _outside_field(args, "body", 8000),
             "act_where": _outside_field(args, "act_where", 120, required=True),
-            "ref": _outside_field(args, "ref", 300), "dedupe_key": key,
+            "ref": _outside_field(args, "ref", 300),
+            "dedupe_key": key,
             "profile": str(kwargs.get("profile") or ""),
             "session_id": str(kwargs.get("session_id") or ""),
         }
     else:
         item_id = args.get("id", "")
-        if item_id and (not isinstance(item_id, str) or not _FILED_ID.fullmatch(item_id)):
+        if item_id and (
+            not isinstance(item_id, str) or not _FILED_ID.fullmatch(item_id)
+        ):
             raise ValueError("id must identify an agent-filed outside item")
         if bool(item_id) == bool(key):
             raise ValueError("resolve requires either id or dedupe_key")
@@ -1444,38 +1674,63 @@ def file_outside(args: dict[str, Any], home: Optional[Path] = None, **kwargs: An
         if action == "resolve" and item_id:
             match = d / (_FILED_ID.fullmatch(item_id).group(1) + ".json")
         elif key:
-            match = next((f for f in files if not f.is_symlink() and _read_json(f).get("dedupe_key") == key), None)
+            match = next(
+                (
+                    f
+                    for f in files
+                    if not f.is_symlink() and _read_json(f).get("dedupe_key") == key
+                ),
+                None,
+            )
         if action == "resolve":
             if match is None or not match.is_file() or match.is_symlink():
                 raise LookupError("No filed outside item matches that id or dedupe_key")
             match.unlink()
             return {"ok": True, "resolved": True, "id": f"outside:filed:{match.stem}"}
         if match is None and len(files) >= _OUTSIDE_LIMIT:
-            raise ValueError("Outside queue is full (200 filed items); resolve an item before filing another")
+            raise ValueError(
+                "Outside queue is full (200 filed items); resolve an item before filing another"
+            )
         old = _read_json(match) if match else {}
         record_id = match.stem if match else uuid.uuid4().hex
         item_id = f"outside:filed:{record_id}"
-        version = hashlib.sha256(json.dumps(fields, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-        rec = {**fields, "id": item_id, "version": version, "source": "outside", "origin": "filed",
-               "tier": "normal", "since": old.get("since") or time.time()}
+        version = hashlib.sha256(
+            json.dumps(fields, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()
+        rec = {
+            **fields,
+            "id": item_id,
+            "version": version,
+            "source": "outside",
+            "origin": "filed",
+            "tier": "normal",
+            "since": old.get("since") or time.time(),
+        }
         _write_json(d / f"{record_id}.json", rec)
         return {"ok": True, "id": item_id, "version": version}
 
 
-def _folder_outside_item(f: Path, root: Path, expected: os.stat_result) -> Optional[dict[str, Any]]:
+def _folder_outside_item(
+    f: Path, root: Path, expected: os.stat_result
+) -> dict[str, Any] | None:
     # Recheck containment at read time. O_NOFOLLOW and fstat also reject a leaf swapped for
     # a symlink, FIFO or device after the directory scan; never block on a special file.
     if f.is_symlink() or f.resolve().parent != root:
         return None
-    fd = os.open(f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    fd = os.open(
+        f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    )
     with os.fdopen(fd, "rb") as fh:
         st = os.fstat(fh.fileno())
-        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (expected.st_dev, expected.st_ino):
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
             return None
         raw = fh.read(_OUTSIDE_READ_LIMIT)
         after = os.fstat(fh.fileno())
         if (st.st_mtime_ns, st.st_size) != (after.st_mtime_ns, after.st_size):
-            return None   # the next poll reads a coherent version
+            return None  # the next poll reads a coherent version
     to = ""
     if f.suffix.lower() == ".eml":
         msg = BytesParser(policy=policy.default).parsebytes(raw)
@@ -1494,17 +1749,31 @@ def _folder_outside_item(f: Path, root: Path, expected: os.stat_result) -> Optio
         kind, where = "draft", "Your mail app → Drafts"
     else:
         text = raw.decode("utf-8", errors="replace")
-        title = next((line.strip()[:160] for line in text.splitlines() if line.strip()), f.name[:160])
+        title = next(
+            (line.strip()[:160] for line in text.splitlines() if line.strip()),
+            f.name[:160],
+        )
         kind, where = "notes", "Your notes app"
     return {
         "id": "outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest(),
-        "version": f"{st.st_mtime_ns}:{st.st_size}", "source": "outside", "tier": "normal",
-        "origin": "folder", "kind": kind, "title": title, "text": text, "to": to,
-        "since": st.st_mtime, "act_where": where, "ref": str(f), "path": f.name,
+        "version": f"{st.st_mtime_ns}:{st.st_size}",
+        "source": "outside",
+        "tier": "normal",
+        "origin": "folder",
+        "kind": kind,
+        "title": title,
+        "text": text,
+        "to": to,
+        "since": st.st_mtime,
+        "act_where": where,
+        "ref": str(f),
+        "path": f.name,
     }
 
 
-def outside_items(home: Optional[Path] = None, errors: Optional[list[str]] = None) -> list[dict[str, Any]]:
+def outside_items(
+    home: Path | None = None, errors: list[str] | None = None
+) -> list[dict[str, Any]]:
     """Our filed records plus bounded, non-recursive reads of explicitly watched folders."""
     errors = errors if errors is not None else []
     items = []
@@ -1512,8 +1781,12 @@ def outside_items(home: Optional[Path] = None, errors: Optional[list[str]] = Non
         if f.is_symlink():
             continue
         rec = _read_json(f)
-        if (rec.get("id") == f"outside:filed:{f.stem}" and _FILED_ID.fullmatch(rec["id"])
-                and rec.get("origin") == "filed" and rec.get("kind") in _OUTSIDE_KINDS):
+        if (
+            rec.get("id") == f"outside:filed:{f.stem}"
+            and _FILED_ID.fullmatch(rec["id"])
+            and rec.get("origin") == "filed"
+            and rec.get("kind") in _OUTSIDE_KINDS
+        ):
             items.append(rec)
     raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
     seen: set[Path] = set()
@@ -1530,7 +1803,11 @@ def outside_items(home: Optional[Path] = None, errors: Optional[list[str]] = Non
             seen.add(root)
             candidates = []
             for f in root.iterdir():
-                if f.name.startswith(".") or f.suffix.lower() not in (".eml", ".md", ".txt"):
+                if f.name.startswith(".") or f.suffix.lower() not in (
+                    ".eml",
+                    ".md",
+                    ".txt",
+                ):
                     continue
                 try:
                     st = f.lstat()
@@ -1551,11 +1828,17 @@ def outside_items(home: Optional[Path] = None, errors: Optional[list[str]] = Non
     for it in items:
         it["ask"] = it.get("text") or "(No text supplied.)"
         it["excerpt"] = _excerpt_head(it["ask"])
-        it["why"] = "Filed by agent; act in the original app." if it["origin"] == "filed" else "From a watched folder; act in the original app."
+        it["why"] = (
+            "Filed by agent; act in the original app."
+            if it["origin"] == "filed"
+            else "From a watched folder; act in the original app."
+        )
     return items
 
 
-def done_outside(item_id: str, version: str, home: Optional[Path] = None) -> dict[str, Any]:
+def done_outside(
+    item_id: str, version: str, home: Path | None = None
+) -> dict[str, Any]:
     """Done only deletes our own record; folder items are hidden at the version read."""
     match = _FILED_ID.fullmatch(item_id)
     if match:
@@ -1565,7 +1848,9 @@ def done_outside(item_id: str, version: str, home: Optional[Path] = None) -> dic
             if not rec or f.is_symlink():
                 raise LookupError("Filed outside item no longer exists")
             if rec.get("version") != version:
-                raise RuntimeError("Outside item changed; refresh before marking it Done")
+                raise RuntimeError(
+                    "Outside item changed; refresh before marking it Done"
+                )
             f.unlink()
         return {"ok": True, "deleted": True}
     if not _FOLDER_ID.fullmatch(item_id):
@@ -1583,7 +1868,10 @@ SOURCE_ORDER = {s: i for i, s in enumerate(SOURCES)}
 # Sources whose text is already one plain line; a model summary would only add latency and cost.
 NO_BLUF_SOURCES = ("prompt", "pairing")
 
-def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) -> dict[str, Any]:
+
+def build_queue(
+    home: Path | None = None, *, include_hidden: bool = False
+) -> dict[str, Any]:
     home = home or hermes_home()
     errors: list[str] = []
     items: list[dict[str, Any]] = []
@@ -1629,17 +1917,30 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
         log.warning(
             "unbl0ck: could not prune summary cache: %s: %s", type(exc).__name__, exc
         )
-    shown = [i for i in items
-             if include_hidden or visibility(hidden, i["id"], i["version"]) is not Visibility.HIDDEN]
+    shown = [
+        i
+        for i in items
+        if include_hidden
+        or visibility(hidden, i["id"], i["version"]) is not Visibility.HIDDEN
+    ]
     # Same order as the panel: live prompts (a run is paused), pairing requests (expire within
     # the hour), Kanban, outside Hermes, chats; inside a source, higher priority first, then newest.
-    shown.sort(key=lambda i: (SOURCE_ORDER.get(i.get("source"), 9), i.get("tier") in ("stuck", "answered"), -(_num(i.get("priority"))), -(_num(i.get("since")))))
+    shown.sort(
+        key=lambda i: (
+            SOURCE_ORDER.get(i.get("source"), 9),
+            i.get("tier") in ("stuck", "answered"),
+            -(_num(i.get("priority"))),
+            -(_num(i.get("since"))),
+        )
+    )
     attach_blufs(shown, home)
     counts = {
         "asks": sum(1 for i in shown if i.get("tier") not in ("stuck", "answered")),
         "answered": sum(1 for i in shown if i.get("tier") == "answered"),
         "stuck": sum(1 for i in shown if i.get("tier") == "stuck"),
-        "stuck_by_why": dict(collections.Counter(i["why"] for i in shown if i.get("tier") == "stuck")),
+        "stuck_by_why": dict(
+            collections.Counter(i["why"] for i in shown if i.get("tier") == "stuck")
+        ),
     }
     return {
         "generated_at": int(time.time()),
@@ -1656,10 +1957,14 @@ def build_queue(home: Optional[Path] = None, *, include_hidden: bool = False) ->
 class UnblockFailed(RuntimeError):
     """The answer was written but the card could not be released; never claim otherwise."""
 
-    def __init__(self, task_id: str, comment_id: Optional[int]):
+    def __init__(self, task_id: str, comment_id: int | None):
         self.task_id = task_id
         self.comment_id = comment_id
-        posted = f"answer was posted as comment {comment_id}" if comment_id else "your answer is already posted"
+        posted = (
+            f"answer was posted as comment {comment_id}"
+            if comment_id
+            else "your answer is already posted"
+        )
         super().__init__(
             f"{posted}, but card {task_id} could not be unblocked; it is still blocked. "
             "Retry the release from the queue."
@@ -1670,7 +1975,9 @@ class StaleAnswer(RuntimeError):
     """The card was blocked again after the human read it."""
 
 
-def _unblock_task_at_version(conn: Any, kanban_db: Any, task_id: str, version: str) -> bool:
+def _unblock_task_at_version(
+    conn: Any, kanban_db: Any, task_id: str, version: str
+) -> bool:
     """Perform Hermes' native unblock transition in the same txn as its version check.
 
     Hermes' public helper owns its transaction, so calling it after a separate check leaves a
@@ -1686,7 +1993,8 @@ def _unblock_task_at_version(conn: Any, kanban_db: Any, task_id: str, version: s
         if current_version != version:
             raise StaleAnswer(
                 f"card {task_id} has a newer block; your answer was posted, but the new question "
-                "remains blocked; refresh to see it")
+                "remains blocked; refresh to see it"
+            )
 
         status = str(getattr(current.status, "value", current.status))
         if status not in {"blocked", "scheduled"}:
@@ -1694,10 +2002,14 @@ def _unblock_task_at_version(conn: Any, kanban_db: Any, task_id: str, version: s
         now = int(time.time())
         resume_status = (
             kanban_db._resume_status_from_events(conn, task_id)
-            if status == "blocked" else "ready"
+            if status == "blocked"
+            else "ready"
         )
         kanban_db._reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            conn,
+            task_id,
+            statuses=("blocked", "scheduled"),
+            now=now,
             note="invariant recovery on unblock",
         )
         landing_status = kanban_db._landing_status_after_parents(conn, task_id)
@@ -1715,7 +2027,9 @@ def _unblock_task_at_version(conn: Any, kanban_db: Any, task_id: str, version: s
         if cur.rowcount != 1:
             return False
         kanban_db._append_event(
-            conn, task_id, "unblocked",
+            conn,
+            task_id,
+            "unblocked",
             (
                 {"status": new_status, "resume_status": resume_status}
                 if new_status != "ready" or resume_status != "ready"
@@ -1725,8 +2039,15 @@ def _unblock_task_at_version(conn: Any, kanban_db: Any, task_id: str, version: s
         return True
 
 
-def answer_card(board: str, task_id: str, text: str, *, release: bool,
-                version: Optional[str] = None, home: Optional[Path] = None) -> dict[str, Any]:
+def answer_card(
+    board: str,
+    task_id: str,
+    text: str,
+    *,
+    release: bool,
+    version: str | None = None,
+    home: Path | None = None,
+) -> dict[str, Any]:
     """Unblock through native Kanban, then comment as the principal if asked.
 
     *version* is the queue item's version the human read (the block event id). It is required to
@@ -1746,7 +2067,7 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
         raise ValueError("queue version is required to release a card")
     author = principal_author()
     item_id = f"kanban:{board}:{task_id}"
-    comment_id: Optional[int] = None
+    comment_id: int | None = None
     post_answer = False
     with closing(kbc.connect(board=board)) as conn:
         if kanban_db.get_task(conn, task_id) is None:
@@ -1763,12 +2084,15 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
             current_version = str(block.id if block else since)
             if version is not None and str(version) != current_version:
                 raise StaleAnswer(
-                    f"card {task_id} was blocked again after you read it; refresh to see the new question")
+                    f"card {task_id} was blocked again after you read it; refresh to see the new question"
+                )
             # The same "answered since this block" test the queue uses.
             already_answered = _answered_since(conn, kanban_db, task_id, author, since)
             if already_answered:
                 if not release:
-                    raise RuntimeError(f"card {task_id} was already answered since it was blocked")
+                    raise RuntimeError(
+                        f"card {task_id} was already answered since it was blocked"
+                    )
                 if text:
                     prior = kanban_db.list_comments(conn, task_id)
                     post_answer = not any(
@@ -1783,7 +2107,9 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
             # Post before releasing so a resumed worker always sees the answer. A retry after a
             # failed release finds this comment and does not post it again.
             if post_answer:
-                comment_id = kanban_db.add_comment(conn, task_id, author=author, body=text)
+                comment_id = kanban_db.add_comment(
+                    conn, task_id, author=author, body=text
+                )
         released = False
         if release:
             release_failed = False
@@ -1791,10 +2117,16 @@ def answer_card(board: str, task_id: str, text: str, *, release: bool,
                 released = True
             else:
                 latest = kanban_db.get_task(conn, task_id)
-                if latest is None or str(getattr(latest.status, "value", latest.status)) in HELD_STATUSES:
+                if (
+                    latest is None
+                    or str(getattr(latest.status, "value", latest.status))
+                    in HELD_STATUSES
+                ):
                     release_failed = True
                 else:
-                    released = True  # another actor released it; do not claim it was ours
+                    released = (
+                        True  # another actor released it; do not claim it was ours
+                    )
             if release_failed:
                 _set_pending_release(item_id, current_version, home)
                 raise UnblockFailed(task_id, comment_id)
@@ -1838,7 +2170,11 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
     for event in reversed(events):
         if event.kind == "pr_acceptance":
             receipt = _event_payload(event)
-            pr = {**receipt, "reference": pr.get("reference") if pr else None, "since": event.created_at}
+            pr = {
+                **receipt,
+                "reference": pr.get("reference") if pr else None,
+                "since": event.created_at,
+            }
             break
 
     body = getattr(task, "body", None)
@@ -1871,9 +2207,11 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
             "event_id": getattr(block, "id", None),
             "kind": block_payload.get("kind") or getattr(task, "block_kind", None),
             "reason": str(block_payload.get("reason") or ""),
-            "recurrences": block_payload.get("recurrences") or getattr(task, "block_recurrences", 0),
+            "recurrences": block_payload.get("recurrences")
+            or getattr(task, "block_recurrences", 0),
             "limit": block_payload.get("limit"),
-            "since": getattr(block, "created_at", None) or getattr(task, "created_at", None),
+            "since": getattr(block, "created_at", None)
+            or getattr(task, "created_at", None),
         },
         "comments": [
             {
@@ -1898,7 +2236,9 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
             }
             for e in recent
         ],
-        "last_run": None if run is None else {
+        "last_run": None
+        if run is None
+        else {
             "id": run.id,
             "profile": getattr(run, "profile", None),
             "status": getattr(run, "status", None),
@@ -2008,15 +2348,26 @@ _ASK_SECRET_PATTERNS = (
         r"\1 is [redacted]",
     ),
     # JWTs and home-directory shapes of any user (the current user's own home is handled in _ask_redact)
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"), "[redacted]"),
+    (
+        re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*"),
+        "[redacted]",
+    ),
     (re.compile(r"(?<![\w.])/(?:Users|home)/[^/\s\"'`]+(?=/|\s|$|[\"'`)\],;:])"), "~"),
     (re.compile(r"(?i)\b[A-Z]:\\Users\\[^\\\s\"'`]+"), "~"),
     # Well-known token shapes
     (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"), "[redacted]"),
-    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"), "[redacted]"),
+    (
+        re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"),
+        "[redacted]",
+    ),
     (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "[redacted]"),
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted]"),
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"), "[redacted]"),
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+        ),
+        "[redacted]",
+    ),
 )
 
 _ASK_SECRET_KEY = (
@@ -2024,22 +2375,24 @@ _ASK_SECRET_KEY = (
     r"private[_-]?key|credential|authorization|cookie|auth)s?"
 )
 _ASK_SECRET_KEY_RE = re.compile(r"(?<![A-Za-z0-9_.-])" + _ASK_SECRET_KEY, re.IGNORECASE)
+_ASK_NON_SECRET_AUTH_KEYS = frozenset({"author", "authors", "authored", "authority"})
 _ASK_SECRET_ASSIGNMENT = re.compile(
-    rf'''(?ix)(?<![A-Za-z0-9_.-])(?P<key_quote>["']?)(?P<key>{_ASK_SECRET_KEY})(?P=key_quote)'''
-    r'''(?P<sep>\s*[=:]\s*)(?:(?P<double>"(?:\\.|[^"\\])*(?:"|\Z))|'''
-    r'''(?P<single>'(?:\\.|[^'\\])*(?:'|\Z))|(?P<structured>(?:\[|\{)[\s\S]*)|'''
-    r'''(?P<bare>[^\s"',;}\]]+))'''
+    rf"""(?ix)(?<![A-Za-z0-9_.-])(?P<key_quote>["']?)(?P<key>{_ASK_SECRET_KEY})(?P=key_quote)"""
+    r"""(?P<sep>\s*[=:]\s*)(?:(?P<double>"(?:\\.|[^"\\])*(?:"|\Z))|"""
+    r"""(?P<single>'(?:\\.|[^'\\])*(?:'|\Z))|(?P<structured>(?:\[|\{)[\s\S]*)|"""
+    r"""(?P<bare>[^\s"',;}\]]+))"""
 )
 
 _ASK_AUTH_HEADER = re.compile(
     r"(?im)(?P<prefix>\b(?:proxy-)?authorization\s*:\s*)(?P<value>[^\r\n]*)"
 )
 _ASK_QUOTED_AUTH_HEADER = re.compile(
-    r'''(?i)(?P<prefix>(?P<quote>["'])(?:proxy-)?authorization\s*:\s*)'''
-    r'''(?P<value>.*?)(?P=quote)'''
+    r"""(?i)(?P<prefix>(?P<quote>["'])(?:proxy-)?authorization\s*:\s*)"""
+    r"""(?P<value>.*?)(?P=quote)"""
 )
 _ASK_AUTH_PROSE = re.compile(
-    r"^(?:header\s+(?:missing|is|was|wasn't|doesn't)|flow\s+(?:is|was|looks|seems))\b", re.I
+    r"^(?:header\s+(?:missing|is|was|wasn't|doesn't)|flow\s+(?:is|was|looks|seems))\b",
+    re.IGNORECASE,
 )
 
 
@@ -2069,7 +2422,7 @@ def _ask_redact_embedded_json(text: str) -> str:
     out: list[str] = []
     i = 0
     while i < len(text):
-        if text[i] == '"' and text[i + 1:i + 2] in ("{", "["):
+        if text[i] == '"' and text[i + 1 : i + 2] in ("{", "["):
             try:
                 value, end = decoder.raw_decode(text, i)
             except ValueError:
@@ -2081,7 +2434,11 @@ def _ask_redact_embedded_json(text: str) -> str:
                     embedded = None
                 if isinstance(embedded, (dict, list)):
                     safe = _ask_card_view(embedded)
-                    out.append(json.dumps(json.dumps(safe, ensure_ascii=False), ensure_ascii=False))
+                    out.append(
+                        json.dumps(
+                            json.dumps(safe, ensure_ascii=False), ensure_ascii=False
+                        )
+                    )
                     i = end
                     continue
         if text[i] in "{[":
@@ -2105,12 +2462,23 @@ def _ask_redact_assignment(match: re.Match[str]) -> str:
         and not match.group("key_quote")
     ):
         value = next(
-            (match.group(name) for name in ("double", "single", "bare") if match.group(name)), ""
+            (
+                match.group(name)
+                for name in ("double", "single", "bare")
+                if match.group(name)
+            ),
+            "",
         )
         prose = value.strip("\"' ")
         if prose.lower() in {"header", "flow"} or _ASK_AUTH_PROSE.match(prose):
             return match.group(0)
-    quote = '"' if match.group("double") is not None else "'" if match.group("single") is not None else ""
+    quote = (
+        '"'
+        if match.group("double") is not None
+        else "'"
+        if match.group("single") is not None
+        else ""
+    )
     value = f"{quote}[redacted]{quote}"
     return f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}{match.group('sep')}{value}"
 
@@ -2130,7 +2498,9 @@ def _ask_redact(text: str) -> str:
 ASK_CARD_CONTEXT_LIMIT = 24000
 
 
-def _ask_card_view(value: Any, _key: str = "", _text_budget: Optional[list[int]] = None) -> Any:
+def _ask_card_view(
+    value: Any, _key: str = "", _text_budget: list[int] | None = None
+) -> Any:
     """A copy of the card fit to send to an LLM: no workspace path, no home dir, no secrets.
 
     The operator asked about the card, not about their filesystem or credentials, so the Ask
@@ -2141,10 +2511,14 @@ def _ask_card_view(value: Any, _key: str = "", _text_budget: Optional[list[int]]
         for k, v in value.items():
             if _key == "workspace" and k == "path":
                 continue
-            if _ASK_SECRET_KEY_RE.search(str(k)):
+            key = str(k)
+            if (
+                key.casefold() not in _ASK_NON_SECRET_AUTH_KEYS
+                and _ASK_SECRET_KEY_RE.search(key)
+            ):
                 out[k] = "[redacted]"
                 continue
-            out[k] = _ask_card_view(v, str(k), _text_budget)
+            out[k] = _ask_card_view(v, key, _text_budget)
         return out
     if isinstance(value, (list, tuple)):
         return [_ask_card_view(v, _key, _text_budget) for v in value]
@@ -2162,10 +2536,10 @@ def _ask_card_view(value: Any, _key: str = "", _text_budget: Optional[list[int]]
 ASK_PROMPT_BUDGET = 40000
 
 
-ASK_HISTORY_TURNS = 6   # default number of prior chat turns sent with an Ask
+ASK_HISTORY_TURNS = 6  # default number of prior chat turns sent with an Ask
 
 
-def ask_history_turns(settings: Optional[dict[str, Any]] = None) -> int:
+def ask_history_turns(settings: dict[str, Any] | None = None) -> int:
     """Prior turns an Ask sends (setting ``ask_history_turns``; bad or non-positive values use the default)."""
     raw = (settings if settings is not None else _settings()).get("ask_history_turns")
     try:
@@ -2175,9 +2549,15 @@ def ask_history_turns(settings: Optional[dict[str, Any]] = None) -> int:
     return n if n > 0 else ASK_HISTORY_TURNS
 
 
-def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]], turns: Optional[int] = None) -> list[dict[str, str]]:
+def build_ask_messages(
+    card: dict[str, Any], history: Iterable[dict[str, Any]], turns: int | None = None
+) -> list[dict[str, str]]:
     """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns."""
-    context = json.dumps(_ask_card_view(card, _text_budget=[ASK_CARD_CONTEXT_LIMIT]), ensure_ascii=False, default=str)
+    context = json.dumps(
+        _ask_card_view(card, _text_budget=[ASK_CARD_CONTEXT_LIMIT]),
+        ensure_ascii=False,
+        default=str,
+    )
     if len(context) > ASK_CARD_CONTEXT_LIMIT:
         context = context[:ASK_CARD_CONTEXT_LIMIT] + "…[truncated]"
     messages: list[dict[str, str]] = [
@@ -2192,7 +2572,9 @@ def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]], 
     ]
     used = sum(len(m["content"]) for m in messages)
     kept: list[dict[str, str]] = []
-    for item in reversed(list(history)[-(ask_history_turns() if turns is None else turns):]):   # newest first
+    for item in reversed(
+        list(history)[-(ask_history_turns() if turns is None else turns) :]
+    ):  # newest first
         role = item.get("role") if isinstance(item, dict) else None
         content = item.get("content") if isinstance(item, dict) else None
         if role not in ("user", "assistant") or not isinstance(content, str):
@@ -2204,7 +2586,7 @@ def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]], 
         if len(content) > room:
             if kept or room <= 0:
                 break
-            content = content[:room]   # the newest turn is always sent, trimmed to fit
+            content = content[:room]  # the newest turn is always sent, trimmed to fit
         kept.append({"role": role, "content": content})
         used += len(content)
     messages.extend(reversed(kept))
@@ -2212,6 +2594,7 @@ def build_ask_messages(card: dict[str, Any], history: Iterable[dict[str, Any]], 
 
 
 # --- Pocket pack (TV / X55 card format) ----------------------------------------------------
+
 
 def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     """The queue in the Pocket card format, for gadgets that opt in. Written next to the
@@ -2222,38 +2605,93 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     for it in asks[:limit]:
         if it["source"] == "kanban":
             options = [
-                {"label": "Answer + unblock", "send": f"Answer and unblock {it['task_id']}", "effect": "Card resumes", "tone": "primary"},
-                {"label": "Keep hold", "send": f"Keep {it['task_id']} blocked", "effect": "No change", "tone": "neutral"},
+                {
+                    "label": "Answer + unblock",
+                    "send": f"Answer and unblock {it['task_id']}",
+                    "effect": "Card resumes",
+                    "tone": "primary",
+                },
+                {
+                    "label": "Keep hold",
+                    "send": f"Keep {it['task_id']} blocked",
+                    "effect": "No change",
+                    "tone": "neutral",
+                },
             ]
         elif it["source"] == "pairing":
-            options = [{"label": "Review request", "send": "Open pairing requests", "effect": "Approve or ignore on the Pairing page", "tone": "primary"}]
+            options = [
+                {
+                    "label": "Review request",
+                    "send": "Open pairing requests",
+                    "effect": "Approve or ignore on the Pairing page",
+                    "tone": "primary",
+                }
+            ]
         elif it["source"] == "prompt":
-            where = _platform_label(it.get("platform") or "") if it.get("platform") else "the session"
-            options = [{"label": "Answer there", "send": f"Answer the prompt in {where}", "effect": "The run resumes", "tone": "primary"}]
+            where = (
+                _platform_label(it.get("platform") or "")
+                if it.get("platform")
+                else "the session"
+            )
+            options = [
+                {
+                    "label": "Answer there",
+                    "send": f"Answer the prompt in {where}",
+                    "effect": "The run resumes",
+                    "tone": "primary",
+                }
+            ]
         elif it["source"] == "outside":
             where = it.get("act_where") or "the original app"
-            options = [{"label": "Act there", "send": f"Act in {where}", "effect": "Review in the original app", "tone": "primary"}]
+            options = [
+                {
+                    "label": "Act there",
+                    "send": f"Act in {where}",
+                    "effect": "Review in the original app",
+                    "tone": "primary",
+                }
+            ]
         elif it["source"] == "chat" and it.get("bot_chat"):
-            options = [{"label": "Open chat", "send": f"Open {it['profile']} Bot Chat", "effect": "Reply in the chat", "tone": "primary"}]
+            options = [
+                {
+                    "label": "Open chat",
+                    "send": f"Open {it['profile']} Bot Chat",
+                    "effect": "Reply in the chat",
+                    "tone": "primary",
+                }
+            ]
         else:
-            where = _platform_label(it.get("platform") or "") if it.get("platform") else "the chat"
-            options = [{"label": "Answer there", "send": f"Answer in {where}", "effect": f"Reply in {where}", "tone": "primary"}]
-        cards.append({
-            "id": it["id"],
-            "kind": "decide",
-            "title": it["title"][:90],
-            "short": (it.get("bluf") or it["ask"])[:160],
-            "choices": [o["label"] for o in options],
-            "task_id": it.get("task_id", ""),
-            "options": options,
-            "prompt": it["ask"],
-            "why_now": it["why"],
-            "owner": it.get("owner") or "",
-            "authority": pocket_authority(),
-            "reversibility": "reversible",
-            "evidence": [it["id"]],
-            "ttl_s": 3600,
-        })
+            where = (
+                _platform_label(it.get("platform") or "")
+                if it.get("platform")
+                else "the chat"
+            )
+            options = [
+                {
+                    "label": "Answer there",
+                    "send": f"Answer in {where}",
+                    "effect": f"Reply in {where}",
+                    "tone": "primary",
+                }
+            ]
+        cards.append(
+            {
+                "id": it["id"],
+                "kind": "decide",
+                "title": it["title"][:90],
+                "short": (it.get("bluf") or it["ask"])[:160],
+                "choices": [o["label"] for o in options],
+                "task_id": it.get("task_id", ""),
+                "options": options,
+                "prompt": it["ask"],
+                "why_now": it["why"],
+                "owner": it.get("owner") or "",
+                "authority": pocket_authority(),
+                "reversibility": "reversible",
+                "evidence": [it["id"]],
+                "ttl_s": 3600,
+            }
+        )
     return {
         "version": 1,
         "pack_id": f"unblock-{now}",
@@ -2264,7 +2702,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     }
 
 
-def write_pocket_pack(queue: dict[str, Any], home: Optional[Path] = None) -> Path:
+def write_pocket_pack(queue: dict[str, Any], home: Path | None = None) -> Path:
     p = data_dir(home) / "pocket-pack.json"
     _write_json(p, pocket_pack(queue))
     return p

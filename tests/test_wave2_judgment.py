@@ -1,5 +1,6 @@
 """Wave 2: sound is off for a fresh profile (U9) and org role words live only in
 one config default (U8)."""
+
 import json
 import re
 import shutil
@@ -18,7 +19,7 @@ NODE = shutil.which("node")
 def _sfx_block():
     s = SRC.read_text()
     a = s.index("let sfxOnNow")
-    return s[a:s.index("// ── X55 draw_ascii_field")]
+    return s[a : s.index("// ── X55 draw_ascii_field")]
 
 
 def _run_sfx(stored):
@@ -35,7 +36,13 @@ const afterGesture = made
 setSfx(true); sfx.boot()
 console.log(JSON.stringify({{ afterGesture, afterToggle: made }}))
 """
-    out = subprocess.run([NODE, "--input-type=module", "-e", harness], capture_output=True, text=True, timeout=30)
+    out = subprocess.run(
+        [NODE, "--input-type=module", "-e", harness],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout.strip().splitlines()[-1])
 
@@ -63,9 +70,17 @@ def test_u9_source_and_build_default_to_off():
 
 
 # --- U8
-ROLE_WORD = re.compile(r"\bCEO\b", re.I)
-SHIPPED = ["needs.py", "jobs.py", "__init__.py", "plugin.yaml", "README.md", "dashboard/plugin_api.py",
-           "desktop/src/plugin.src.js", "desktop/plugin.js"]
+ROLE_WORD = re.compile(r"\bCEO\b", re.IGNORECASE)
+SHIPPED = [
+    "needs.py",
+    "jobs.py",
+    "__init__.py",
+    "plugin.yaml",
+    "README.md",
+    "dashboard/plugin_api.py",
+    "desktop/src/plugin.src.js",
+    "desktop/plugin.js",
+]
 
 
 def test_u8_role_words_appear_only_in_the_config_default():

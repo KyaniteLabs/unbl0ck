@@ -1,5 +1,6 @@
 """F4: the Ask payload sent to the LLM must not carry the workspace path, the operator's
 home directory, or secret-looking strings from run/failure errors, comments or events."""
+
 import json
 import os
 import time
@@ -13,12 +14,32 @@ GH = "ghp_" + "b" * 36
 
 def _card():
     return {
-        "id": "kanban:b:t1", "title": "Deploy", "body": "please ship",
+        "id": "kanban:b:t1",
+        "title": "Deploy",
+        "body": "please ship",
         "last_failure_error": f"Traceback in {HOME}/work/app/run.py: auth failed token={SENTINEL_KEY}",
-        "workspace": {"kind": "worktree", "path": f"{HOME}/work/app", "branch": "feat/x",
-                      "project_id": "p1", "completion_contract": None},
-        "comments": [{"id": 1, "author": "a", "body": f"use Authorization: Bearer {GH}", "created_at": 1}],
-        "events": [{"id": 2, "kind": "x", "payload": {"cmd": "git push https://user:hunter2@example.com/r.git"}}],
+        "workspace": {
+            "kind": "worktree",
+            "path": f"{HOME}/work/app",
+            "branch": "feat/x",
+            "project_id": "p1",
+            "completion_contract": None,
+        },
+        "comments": [
+            {
+                "id": 1,
+                "author": "a",
+                "body": f"use Authorization: Bearer {GH}",
+                "created_at": 1,
+            }
+        ],
+        "events": [
+            {
+                "id": 2,
+                "kind": "x",
+                "payload": {"cmd": "git push https://user:hunter2@example.com/r.git"},
+            }
+        ],
         "last_run": {"summary": "ok", "error": f"password=hunter2 at {HOME}/.config/x"},
         "block": {"reason": "needs a decision"},
     }
@@ -50,13 +71,19 @@ def test_non_bearer_authorization_headers_redacted():
     card = _card()
     card["comments"] = [
         {"body": "Authorization: ApiKey synthetic-api-key-abcdef0123456789"},
-        {"body": 'Authorization: Digest username="synthetic", nonce="synthetic-nonce-123456789"'},
+        {
+            "body": 'Authorization: Digest username="synthetic", nonce="synthetic-nonce-123456789"'
+        },
         {"body": "Proxy-Authorization: ApiKey synthetic-proxy-key-abcdef0123456789"},
         {"body": "authorization=synthetic-auth-key-abcdef0123456789"},
     ]
     payload = json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False)
-    for secret in ("synthetic-api-key-abcdef0123456789", "synthetic-nonce-123456789",
-                   "synthetic-proxy-key-abcdef0123456789", "synthetic-auth-key-abcdef0123456789"):
+    for secret in (
+        "synthetic-api-key-abcdef0123456789",
+        "synthetic-nonce-123456789",
+        "synthetic-proxy-key-abcdef0123456789",
+        "synthetic-auth-key-abcdef0123456789",
+    ):
         assert secret not in payload
 
 
@@ -72,10 +99,14 @@ def test_json_secret_keys_and_quoted_values_redacted_from_ask_and_bluf():
     card = {
         "title": "Review the deployment",
         "ask": embedded,
-        "events": [{"payload": {
-            "Authorization": "synthetic-event-auth-value-0003",
-            "details": {"api_key": "synthetic-event-api-key-value-0004"},
-        }}],
+        "events": [
+            {
+                "payload": {
+                    "Authorization": "synthetic-event-auth-value-0003",
+                    "details": {"api_key": "synthetic-event-api-key-value-0004"},
+                }
+            }
+        ],
     }
     comments = [{"body": embedded}]
     payloads = {
@@ -95,6 +126,26 @@ def test_json_secret_keys_and_quoted_values_redacted_from_ask_and_bluf():
             assert secret not in payload, f"{label} leaked {secret}"
     assert "synthetic-event-auth-value-0003" not in payloads["Ask"]
     assert "synthetic-event-api-key-value-0004" not in payloads["Ask"]
+
+
+def test_auth_credential_keys_redacted_without_redacting_person_fields():
+    card = {
+        "author": "Ada",
+        "authors": ["Ada", "Grace"],
+        "authored": "by Ada",
+        "authority": "owner",
+        "auth": "synthetic-auth-value-0201",
+        "auth_token": "synthetic-auth-token-0202",
+        "authentication": "synthetic-authentication-value-0203",
+        "authorization": "synthetic-authorization-value-0204",
+    }
+
+    safe = needs._ask_card_view(card)
+
+    for key in ("author", "authors", "authored", "authority"):
+        assert safe[key] == card[key]
+    for key in ("auth", "auth_token", "authentication", "authorization"):
+        assert safe[key] == "[redacted]"
 
 
 def test_cookie_shell_credentials_and_password_phrases_redacted_from_ask_and_bluf():
@@ -178,12 +229,18 @@ def test_authorization_headers_with_any_scheme_and_nested_secret_values_are_reda
     )
     for payload in payloads:
         for secret in (
-            "synthetic-no-scheme-auth-0101", "synthetic-bot-auth-0102",
-            "synthetic-ssws-auth-0103", "synthetic-negotiate-auth-0104",
-            "synthetic-ntlm-auth-0105", "synthetic-aws-auth-0106",
-            "synthetic-aws-signature-0107", "synthetic-bare-auth-0108",
-            "synthetic-nested-token-0109", "synthetic-nested-pw-0110",
-            "synthetic-escaped-json-token-0111", "synthetic-yaml-private-key-0112",
+            "synthetic-no-scheme-auth-0101",
+            "synthetic-bot-auth-0102",
+            "synthetic-ssws-auth-0103",
+            "synthetic-negotiate-auth-0104",
+            "synthetic-ntlm-auth-0105",
+            "synthetic-aws-auth-0106",
+            "synthetic-aws-signature-0107",
+            "synthetic-bare-auth-0108",
+            "synthetic-nested-token-0109",
+            "synthetic-nested-pw-0110",
+            "synthetic-escaped-json-token-0111",
+            "synthetic-yaml-private-key-0112",
         ):
             assert secret not in payload, secret
 
@@ -207,11 +264,16 @@ def test_cookie_and_command_line_credentials_are_redacted():
     )
     for payload in payloads:
         for secret in (
-            "synthetic-set-cookie-0201", "synthetic-curl-cookie-0202",
-            "synthetic-long-cookie-0203", "synthetic-glued-user-0204",
-            "synthetic-equals-user-0205", "synthetic-mysql-password-0206",
-            "synthetic-sshpass-password-0207", "synthetic-docker-password-0208",
-            "synthetic-auth-value-0209", "synthetic-passphrase-0210",
+            "synthetic-set-cookie-0201",
+            "synthetic-curl-cookie-0202",
+            "synthetic-long-cookie-0203",
+            "synthetic-glued-user-0204",
+            "synthetic-equals-user-0205",
+            "synthetic-mysql-password-0206",
+            "synthetic-sshpass-password-0207",
+            "synthetic-docker-password-0208",
+            "synthetic-auth-value-0209",
+            "synthetic-passphrase-0210",
         ):
             assert secret not in payload, secret
 
@@ -232,7 +294,8 @@ def test_cookie_keys_in_recursive_and_embedded_mappings_are_redacted():
     )
     for payload in payloads:
         for secret in (
-            "synthetic-json-cookie-0301", "synthetic-python-cookie-0302",
+            "synthetic-json-cookie-0301",
+            "synthetic-python-cookie-0302",
             "synthetic-map-cookie-0303",
         ):
             assert secret not in payload, secret
@@ -249,7 +312,10 @@ def test_large_harmless_card_body_redacts_within_budget():
 def test_clipped_embedded_secret_assignments_are_redacted_before_sending():
     secret = "synthetic-clipped-nested-token-0401"
     body = '{"tokens": ["' + secret + '"], "note": "' + "x" * 25000 + '"}'
-    payload = json.dumps(needs.build_ask_messages({"title": "Review", "body": body}, []), ensure_ascii=False)
+    payload = json.dumps(
+        needs.build_ask_messages({"title": "Review", "body": body}, []),
+        ensure_ascii=False,
+    )
     assert secret not in payload
 
 

@@ -1,6 +1,6 @@
 import re
-import unittest
 import subprocess
+import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +31,7 @@ class DesktopContract(unittest.TestCase):
         self.assertIn("Discuss in chat", src)
         self.assertIn("host.composer.setDraft", src)
         self.assertIn("TL;DR", src)
-        self.assertIn("askSend(false, TLDR_ASK)", src)   # one click asks; no typing
+        self.assertIn("askSend(false, TLDR_ASK)", src)  # one click asks; no typing
         # An answered card that is still blocked offers a release, not a second answer.
         self.assertIn("item.tier === 'answered'", src)
         self.assertIn("Release (unbl0ck)", src)
@@ -44,8 +44,7 @@ class DesktopContract(unittest.TestCase):
         self.assertIn("'■ ANSWERED'", built)
 
     def test_chip_renders_the_ask_count_from_queue_data(self):
-        src = (ROOT / "desktop" / "src" / "plugin.src.js").read_text()
-        script = r'''const fs = require('fs');
+        script = r"""const fs = require('fs');
 const src = fs.readFileSync(process.argv[1], 'utf8');
 const helper = src.match(/function askCount\(q\) \{[^\n]*\}/)?.[0] || 'function askCount(q) { return q.count; }';
 const chip = src.match(/function Chip\(\) \{[\s\S]*?\n\}/)?.[0];
@@ -55,12 +54,16 @@ const render = new Function('jsx', 'useValue', '$queue', `${helper}; return (${c
   jsx, () => ({count: 10, counts: {asks: 1}}), Symbol('queue'));
 const result = render();
 if (result.children !== '◆ 1 NEEDS YOU') throw new Error(`unexpected chip: ${result.children}`);
-'''
-        subprocess.run(["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
-                       check=True, capture_output=True, text=True)
+"""
+        subprocess.run(
+            ["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     def test_discuss_in_chat_loads_detail_for_the_current_card_version(self):
-        script = r'''const fs = require('fs');
+        script = r"""const fs = require('fs');
 const src = fs.readFileSync(process.argv[1], 'utf8');
 const seedStart = src.indexOf('const seedDraft =');
 const seedEnd = src.indexOf('\n\nfunction CardDetail', seedStart);
@@ -83,14 +86,19 @@ const run = new Function('env', `with(env) { ${src.slice(seedStart, seedEnd)}; $
   if (loads !== 1) throw new Error(`stale detail was reused; current detail loads: ${loads}`);
   if (!draft.includes('current description') || draft.includes('old description')) throw new Error(`wrong draft context: ${draft}`);
 })().catch(e => { console.error(e); process.exitCode = 1; });
-'''
+"""
         for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
             with self.subTest(path=path.name):
-                result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True)
+                result = subprocess.run(
+                    ["node", "-e", script, str(path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_outside_cards_render_safe_text_and_send_done_to_the_backend(self):
-        script = r'''
+        script = r"""
 const fs = require('fs');
 const src = fs.readFileSync(process.argv[1], 'utf8');
 const views = src.slice(src.indexOf('function Item('), src.indexOf('function Chip('));
@@ -138,14 +146,19 @@ const base = {id: 'outside:filed:1', version: 'v1', source: 'outside', kind: 'dr
   const page = text(Page({ctx, refresh}));
   if (!(page.indexOf('KANBAN.CARDS') < page.indexOf('OUTSIDE.HERMES') && page.indexOf('OUTSIDE.HERMES') < page.lastIndexOf('CHATS'))) throw new Error('outside group is missing or out of order');
 })().catch(e => { console.error(e); process.exitCode = 1 });
-'''
+"""
         for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
             with self.subTest(path=path.name):
-                result = subprocess.run(["node", "-e", script, str(path)], capture_output=True, text=True)
+                result = subprocess.run(
+                    ["node", "-e", script, str(path)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_oldest_age_ignores_stuck_and_answered_cards(self):
-        script = r'''const fs = require('fs');
+        script = r"""const fs = require('fs');
 const src = fs.readFileSync(process.argv[1], 'utf8');
 const helper = src.match(/function oldestAskSince\(items\) \{[\s\S]*?\n\}/)?.[0];
 if (!helper) throw new Error('oldest ask helper missing');
@@ -157,22 +170,32 @@ const since = oldestAskSince([
   {tier: 'ask', since: 40}
 ]);
 if (since !== 30) throw new Error(`oldest ask timestamp was ${since}`);
-'''
-        subprocess.run(["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
-                       check=True, capture_output=True, text=True)
+"""
+        subprocess.run(
+            ["node", "-e", script, str(ROOT / "desktop" / "src" / "plugin.src.js")],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
     def test_every_answer_post_sends_the_card_version(self):
         # A stricter static check than the substrings above (not a render test; see F20 notes): each
         # /kanban/answer call's body, in the source and the built file, must carry `version`.
         for name in ("src/plugin.src.js", "plugin.js"):
             text = (ROOT / "desktop" / name).read_text()
-            calls = re.findall(r"ctx\.rest\('/kanban/answer',\s*\{(.*?)\n\s*\}\)", text, re.S)
-            self.assertGreaterEqual(len(calls), 2, name)   # answer and release
+            calls = re.findall(
+                r"ctx\.rest\('/kanban/answer',\s*\{(.*?)\n\s*\}\)", text, re.DOTALL
+            )
+            self.assertGreaterEqual(len(calls), 2, name)  # answer and release
             for body in calls:
-                self.assertRegex(body, r"body:\s*\{[^}]*\bversion:\s*(?:item\.version|answerVersion)\b", name)
+                self.assertRegex(
+                    body,
+                    r"body:\s*\{[^}]*\bversion:\s*(?:item\.version|answerVersion)\b",
+                    name,
+                )
 
     def test_refreshed_kanban_card_keeps_drafts_stale_and_rejects_old_suggestions(self):
-        script = r'''const fs = require('fs');
+        script = r"""const fs = require('fs');
 const src = fs.readFileSync(process.argv[1], 'utf8');
 const views = src.slice(src.indexOf('function Item('), src.indexOf('function Chip('));
 const node = (type, props) => ({type, props});
@@ -221,11 +244,14 @@ const base = {id: 'kanban:board:task', task_id: 'task', board: 'board', source: 
   if (!oldSuggestion?.props.disabled) throw new Error('old Ask suggestion remained usable');
   if (requests.some(r => r.url === '/kanban/answer')) throw new Error('stale answer reached the backend');
 })().catch(e => { console.error(e); process.exitCode = 1; });
-'''
+"""
         for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
             with self.subTest(path=path.name):
                 result = subprocess.run(
-                    ["node", "-e", script, str(path)], check=False, capture_output=True, text=True
+                    ["node", "-e", script, str(path)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
 

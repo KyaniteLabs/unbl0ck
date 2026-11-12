@@ -2,7 +2,9 @@
 Hermes. It honours the public ``list_pending()`` contract (request_id, user_id, user_name,
 age_minutes; never the code) over the same on-disk layout, so the plugin is tested
 against the API, not the files. test_pairing_stock.py checks the real store when present."""
-import json, time
+
+import json
+import time
 from pathlib import Path
 
 TTL = 3600
@@ -11,6 +13,7 @@ TTL = 3600
 def factory(home: Path):
     def make(profile: str):
         return FakeStore(home if profile == "default" else home / "profiles" / profile)
+
     return make
 
 
@@ -31,15 +34,24 @@ class FakeStore:
                 c = v.get("created_at") if isinstance(v, dict) else None
                 if not isinstance(c, (int, float)) or time.time() - c > TTL:
                     continue
-                modern = isinstance(v.get("hash"), str) and isinstance(v.get("salt"), str)
-                out.append({"platform": p, "request_id": str(k) if modern else "",
-                            "user_id": v.get("user_id", ""), "user_name": v.get("user_name", ""),
-                            "age_minutes": int((time.time() - c) / 60)})
+                modern = isinstance(v.get("hash"), str) and isinstance(
+                    v.get("salt"), str
+                )
+                out.append(
+                    {
+                        "platform": p,
+                        "request_id": str(k) if modern else "",
+                        "user_id": v.get("user_id", ""),
+                        "user_name": v.get("user_name", ""),
+                        "age_minutes": int((time.time() - c) / 60),
+                    }
+                )
         return out
 
 
 class patched:
     """Point the plugin's default store at the fake for code paths that build it themselves."""
+
     def __init__(self, needs, home):
         self.needs, self.make = needs, factory(home)
 
