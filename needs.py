@@ -634,20 +634,32 @@ _NEGATION = re.compile(
     re.IGNORECASE,
 )
 _PERMISSION_BEFORE_GATE = re.compile(
-    r"(?:\b(?:no problem|nothing stops us)"
+    r"(?:\b(?:no problem|no issue|nothing stops us)"
     r"(?:\s+(?:shipping|merging|releasing|deploying|proceeding|continuing))?"
     r"|\bno reason to (?:hold|wait|pause|stop)"
-    r"|\bfree to (?:ship|merge|release|deploy|proceed)"
-    r"|\bsafe to (?:ship|merge|release|deploy|proceed)"
-    r"|\b(?:can|may)\s+(?:ship|merge|release|deploy|proceed|continue)"
-    r"|\b(?:we|i|they)\s+(?:can|may)\s+(?:ship|merge|release|deploy|proceed|continue)"
-    r"|\b(?:we|i|they)\s+(?:ship|merge|release|deploy|proceed|continue)\b"
+    r"|\bfree to (?:ship|merge|release|deploy|proceed|launch|publish|roll out)"
+    r"|\bsafe to (?:ship|merge|release|deploy|proceed|launch|publish|roll out)"
+    r"|\bok to (?:ship|merge|release|deploy|proceed|launch|publish|roll out)"
+    r"|\b(?:can|may)\s+(?:ship|merge|release|deploy|proceed|continue|launch|publish|roll out|go ahead|move forward)"
+    r"|\b(?:we|i|they|you|the team|team)\s+(?:can|may)\s+"
+    r"(?:(?:now|today|safely|easily|quickly)\s+)?"
+    r"(?:ship|merge|release|deploy|proceed|continue|launch|publish|roll out|go ahead|move forward|do|make|finish|complete)"
+    r"|\b(?:we|i|they)\s+will\s+(?:(?:safely|easily|quickly)\s+)?"
+    r"(?:ship|merge|release|deploy|proceed|continue|launch|publish|roll out|go ahead|move forward)"
+    r"|\bwill\s+(?:ship|merge|release|deploy|proceed|continue|launch|publish|roll out|go ahead|move forward)\b"
+    r"|\b(?:i|we|they)\s+will\s+(?:keep\s+|continue to\s+)?(?:retry|try)\w*\b"
+    r"|\b(?:going ahead|moving forward)\b"
+    r"|\bthis is (?:fine|okay|ok|safe)\b"
+    r"|\bthis\s+can\s+go\s+out\b"
+    r"|\b(?:we|i|they)\s+(?:ship|merge|release|deploy|proceed|continue|launch|publish|roll out)\b"
     r"|\b(?:we|i|they)\s+(?:(?:am|is|are|was|were)\s+)?"
-    r"(?:proceeding|continuing|continued|went ahead|proceeded|done|fixed(?: it)?|resolved|"
+    r"(?:proceeding|continuing|continued|went ahead|proceeded|shipping|merging|releasing|"
+    r"deploying|launching|publishing|rolling out|going ahead|moving forward|done|fixed(?: it)?|resolved|"
     r"shipped|works|worked|merged|released|deployed)"
+    r"|\b(?:completed|finished|landed)\b"
     r"|\b(?:is|are|was|were)\s+(?:done|fixed|resolved)"
     r"|\b(?:continuing|proceeding|continued|proceeded|done|fixed(?: it)?|resolved|shipped|works|worked|merged|released|deployed)"
-    r"|^\s*(?:ship|merge|release|deploy|proceed))\s*$",
+    r"|^\s*(?:ship|merge|release|deploy|proceed))",
     re.IGNORECASE,
 )
 _NEGATED_PERMISSION = re.compile(
@@ -656,15 +668,24 @@ _NEGATED_PERMISSION = re.compile(
     r"may\s+not|can\s+not|will\s+not|do\s+not|does\s+not|did\s+not|should\s+not)\b"
     r"(?:\s+\w+){0,8}\s+(?:proceed\w*|continu\w*|ship\w*|merg\w*|releas\w*|"
     r"deploy\w*|done|fix\w*|resolv\w*|go\s+out)\b"
+    r"|\bno\s+(?:new\s+)?(?:deployments?|changes?|releases?|merges?)\s+"
+    r"(?:can|may|will)\s+(?:proceed|go\s+out|be\s+(?:shipped|merged|released|deployed))\b"
+    r"|\bnothing(?:\s+\w+){0,3}\s+(?:i|we|they)\s+can\s+do\b"
     r"|\b(?:can|may|will|do)\s+(?:do\s+)?nothing\b",
     re.IGNORECASE,
 )
 _GATE_PROHIBITION = re.compile(
-    r"\b(?:(?:is|are|was|were)\s+(?:not\s+allowed|blocked|forbidden)|breaks\s+policy)\b",
+    r"\b(?:(?:is|are|was|were)\s+(?:not\s+allowed|blocked|forbidden|prohibited|not\s+permitted)|"
+    r"(?:would\s+)?violate(?:s|d)?\s+policy|breaks\s+policy)\b",
     re.IGNORECASE,
 )
 _HISTORICAL_HOLD_UNTIL = re.compile(
     r"\b(?:was|were|had been)\s+(?:held|paused|blocked|waiting|pending)\b.{0,40}\buntil\b",
+    re.IGNORECASE,
+)
+_HISTORICAL_GATE_MENTION = re.compile(
+    r"\b(?:unrelated to\b|decision already (?:landed|made|arrived)\b|"
+    r"approved already\b|valid until\b|(?:cron|job|schedule)\b.{0,80}\bexpires?\b)",
     re.IGNORECASE,
 )
 _CONDITIONAL_GATE = re.compile(r"\b(?:without|until)\b", re.IGNORECASE)
@@ -682,9 +703,30 @@ _POST_NEGATION = re.compile(
     r"^\s*(?:is|are|was|were)?\s*(?:not|no longer|n['’]t)\s+(?:needed|required|necessary|wanted)\b",
     re.IGNORECASE,
 )
+_NEGATED_NAMED_GATE = re.compile(
+    r"\b(?:[A-Z][\w'-]*['’]?s?\s+)?(?:approval|decision|sign[- ]?off|review|input)\b"
+    r".{0,30}\b(?:isn't|wasn't|aren't|weren't|is\s+not|was\s+not|are\s+not|"
+    r"were\s+not|not|no\s+longer)\s+(?:needed|required|necessary|wanted)\b",
+    re.IGNORECASE,
+)
 _DENIAL_BEFORE_UNTIL = re.compile(r"\b(?:no|not)\b.{0,40}\bneeded\b", re.IGNORECASE)
+_NOT_WAITING_UNTIL = re.compile(r"\b(?:not|no longer)\s+waiting\b", re.IGNORECASE)
 _WITHOUT_UNNEEDED = re.compile(
     r"\bbeing\s+(?:needed|required|necessary|wanted)\b", re.IGNORECASE
+)
+_QUESTION_OR_UNCERTAIN = re.compile(
+    r"(?:^\s*|[.!?;]\s*)(?:(?:may|can|could|should|would|will|do|does|did|is|are|was|were)\s+"
+    r"(?:i|we|you|they|he|she|it|this|that)\b|what|who|when|where|why|how|which)\b|"
+    r"(?:^|[.!?;]\s*)(?:is|are|was|were)\s+(?:proceeding|shipping|merging|deploying|"
+    r"releasing|continuing)\s+(?:allowed|possible|safe|okay|ok|permitted)\b|"
+    r"\b(?:whether|unsure|not sure|tell me|decide|asks?\s+if)\b|^\s*question\s*:",
+    re.IGNORECASE,
+)
+_PERMISSION_STATUS_TAIL = re.compile(
+    r"\b(?:is|are|was|were|not|never|impossible|blocked|forbidden|prohibited|frozen|"
+    r"stuck|paused|pending|waiting|waits?|stopped|halted|deferred|queued|unable|refusing|"
+    r"held|hold|parked|idle|on\s+hold|too\s+risky)\b",
+    re.IGNORECASE,
 )
 
 
@@ -705,12 +747,30 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
         words_between = clause[candidate.end() :].split()
         if len(words_between) <= 6:
             conditional = candidate
-    before_conditional = clause[: conditional.start()] if conditional else ""
+    before_conditional = clause[: conditional.start()] if conditional else clause
     permission_clause = re.split(
         r"\b(?:yet|while|although|whereas)\b", before_conditional, flags=re.IGNORECASE
     )[-1]
-    permission_match = _PERMISSION_BEFORE_GATE.search(permission_clause.strip())
-    if permission_match and permission_clause.strip()[permission_match.end() :].strip():
+    permission_text = permission_clause.strip()
+    permission_match = _PERMISSION_BEFORE_GATE.search(permission_text)
+    if permission_match:
+        remainder = permission_text[permission_match.end() :].split()
+        # Objects and short time adverbs commonly follow the permission verb.
+        # A much longer tail is more likely a separate status clause.
+        if len(remainder) > 6 or _PERMISSION_STATUS_TAIL.search(" ".join(remainder)):
+            permission_match = None
+    if permission_match and (
+        text.rstrip().endswith("?") or _QUESTION_OR_UNCERTAIN.search(text)
+    ):
+        permission_match = None
+    if (
+        permission_match
+        and conditional
+        and conditional.group().lower() == "until"
+        and re.search(
+            r"\b(?:done|fixed|resolved)\b", permission_match.group(), re.IGNORECASE
+        )
+    ):
         permission_match = None
     if permission_match and re.match(
         r"^\s*is\s+it\s+safe\s+to\b", permission_clause, re.IGNORECASE
@@ -725,6 +785,15 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
         and not _NEGATED_PERMISSION.search(before_conditional)
         and not _GATE_PROHIBITION.search(after_clause)
     )
+    if (
+        permission_match
+        and re.match(
+            r"(?i)^(?:no problem|no issue|nothing stops us|no reason to|free to|safe to|ok to)\b",
+            permission_match.group().strip(),
+        )
+        and not _NEGATED_PERMISSION.search(before_conditional)
+    ):
+        return True
     after = after[: end.start()] if end else after
     historical_hold = bool(
         conditional
@@ -744,9 +813,16 @@ def _match_is_negated(text: str, match: re.Match[str]) -> bool:
                 conditional.group().lower() == "until"
                 and _DENIAL_BEFORE_UNTIL.search(before_conditional)
             )
+            or (
+                conditional.group().lower() == "until"
+                and _NOT_WAITING_UNTIL.search(before_conditional)
+            )
         )
     )
     gate_condition = bool(conditional and not denial)
+    gate_context = f"{clause} {match.group()} {after_clause}"
+    if _HISTORICAL_GATE_MENTION.search(" ".join(gate_context.split())):
+        return True
     return bool(
         denial
         or (_NEGATION.search(near) and not gate_condition)
@@ -770,8 +846,13 @@ def _any_gate(reason: str, pats: dict[str, re.Pattern[str]]) -> bool:
 
 
 def _any_name(reason: str, pats: dict[str, re.Pattern[str]]) -> bool:
+    negated_gates = list(_NEGATED_NAMED_GATE.finditer(reason))
     return any(
-        not _match_is_negated(reason, m) and _match_is_standalone(reason, m)
+        not _match_is_negated(reason, m)
+        and _match_is_standalone(reason, m)
+        and not any(
+            g.start() <= m.start() and m.end() <= g.end() for g in negated_gates
+        )
         for m in pats["_NAMES"].finditer(reason)
     )
 
@@ -794,6 +875,7 @@ def kanban_needs_you(reason: str, kind: str | None) -> str | None:
     )
     reason = re.sub(r"\bwon['’]t\b", "will not", reason, flags=re.IGNORECASE)
     reason = re.sub(r"\bcan['’]t\b", "can not", reason, flags=re.IGNORECASE)
+    reason = re.sub(r"\b(we|i|they)['’]ll\b", r"\1 will", reason, flags=re.IGNORECASE)
     pats = _patterns()
     if not reason:
         return None
@@ -2311,8 +2393,9 @@ ASK_SYSTEM = (
 )
 
 _ASK_SECRET_KEY = (
-    r"(?:[a-z0-9][a-z0-9_.-]{0,62}[_.-])?(?:password|passwd|passphrase|pass|pwd|pw|secret|token|"
-    r"api[_-]?key|access[_-]?key|private[_-]?key|credential|authentication|authorization|cookie|auth)s?"
+    r"[a-z0-9_.-]{0,64}?(?P<secret_word>password|passwd|passphrase|pass|pwd|pw|secret|token|"
+    r"api[_-]?key|access[_-]?key|private[_-]?key|credential|authentication|authorization|cookie|auth)"
+    r"[a-z0-9_.-]{0,32}"
 )
 
 
@@ -2347,12 +2430,6 @@ _ASK_SECRET_PATTERNS = (
     ),
     (
         re.compile(
-            r"""(?im)(^[ \t]*|\n[ \t]*|(?:-H\s+['"]))(?P<header>(?:set-?)?cookie)\s*:\s*[^\r\n'"]*"""
-        ),
-        r"\1\g<header>: [redacted]",
-    ),
-    (
-        re.compile(
             r"(?i)(\bcurl\b[^\r\n]*?\s(?:--user|-u)(?:=|\s+)?)"
             r"""(?:"[^"\r\n]*:[^"\r\n]*"|'[^'\r\n]*:[^'\r\n]*'|[^:\s'\"]+:[^\s'\"]+)"""
         ),
@@ -2367,24 +2444,11 @@ _ASK_SECRET_PATTERNS = (
     ),
     (
         re.compile(
-            r"(\b(?:mysql|sshpass|docker\s+login)\b[^;\r\n]*?\s-p(?:=|\s+)?)"
+            r"(?i)(\b(?:mysql|mysqldump|mariadb|sshpass|docker\s+login)\b"
+            r"[^;\r\n]*?\s-(?-i:p)(?:=|\s+)?)"
             r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s'\"]+)"""
         ),
         r"\1[redacted]",
-    ),
-    (
-        re.compile(
-            rf"(?im)(^[ \t]*(?:-\s*)?name\s*:\s*[\"']?{_ASK_SECRET_KEY}(?![A-Za-z0-9_.-])[\"']?\s*\r?\n"
-            r"[ \t]+value\s*:\s*)[^\r\n]+"
-        ),
-        r"\1[redacted]",
-    ),
-    (
-        re.compile(
-            rf"(?im)(^[ \t]*{_ASK_SECRET_KEY}(?![A-Za-z0-9_.-])\s*:\s*[|>][-+]?[ \t]*\r?\n)"
-            r"(?:[ \t]+[^\r\n]*(?:\r?\n|$))+"
-        ),
-        r"\1[redacted]\n",
     ),
     (
         re.compile(
@@ -2405,6 +2469,10 @@ _ASK_SECRET_PATTERNS = (
     (re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}\b"), "[redacted]"),
     (re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b"), "[redacted]"),
     (re.compile(r"\bnpm_[A-Za-z0-9]{16,}\b"), "[redacted]"),
+    (re.compile(r"\bhf_[A-Za-z0-9]{8,}\b"), "[redacted]"),
+    (re.compile(r"\bSG\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})*"), "[redacted]"),
+    (re.compile(r"\bdop_v1_[A-Za-z0-9_-]{8,}\b"), "[redacted]"),
+    (re.compile(r"\bwhsec_[A-Za-z0-9_-]{8,}\b"), "[redacted]"),
     (
         re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{20,}"),
         "[redacted]",
@@ -2423,42 +2491,153 @@ _ASK_SECRET_KEY_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])" + _ASK_SECRET_KEY + r"(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
-_ASK_NON_SECRET_AUTH_KEYS = frozenset({"author", "authors", "authored", "authority"})
+_ASK_NON_SECRET_AUTH_KEYS = frozenset(
+    {
+        "author",
+        "authors",
+        "authored",
+        "authority",
+        "auth_mode",
+        "auth_method",
+        "authentication_method",
+        "oauth",
+        "oauth_scopes",
+        "tokenizer",
+        "max_tokens",
+        "passed",
+        "bypass",
+    }
+)
 _ASK_SECRET_ASSIGNMENT = re.compile(
-    rf"""(?ix)(?<![A-Za-z0-9_.-])(?P<key_quote>["']?)(?P<key>{_ASK_SECRET_KEY})(?P=key_quote)(?![A-Za-z0-9_.-])"""
-    r"""(?P<sep>\s*[=:]\s*)(?:(?P<double>"(?:\\.|[^"\\])*(?:"|\Z))|"""
-    r"""(?P<single>'(?:\\.|[^'\\])*(?:'|\Z))|(?P<structured>\[[^\]\r\n]*\]|\{[^}\r\n]*\})|"""
-    r"""(?P<bare>[^\s"',;}\]]+))"""
+    rf"""(?ix)(?<![A-Za-z0-9_.-])(?P<flag>--)?(?P<key_open>\\*["']?)(?P<key>{_ASK_SECRET_KEY})(?P<key_close>\\*["']?)(?![A-Za-z0-9_.-])"""
+    r"""(?P<sep>[ \t]*[=:][ \t]*|[ \t]+)"""
 )
 
 _ASK_AUTH_HEADER = re.compile(
-    r"(?im)(?P<prefix>\b(?:proxy-)?authorization\s*:\s*)(?P<value>[^\r\n]*)"
+    r"(?im)(?P<prefix>(?:^|[\r\n{,][ \t]*)(?:proxy-)?authorization\s*:\s*)"
+    r"(?P<value>[^\r\n]*)"
 )
 _ASK_QUOTED_AUTH_HEADER = re.compile(
     r"""(?i)(?P<prefix>(?P<quote>["'])(?:proxy-)?authorization\s*:\s*)"""
     r"""(?P<value>.*?)(?P=quote)"""
 )
 _ASK_AUTH_PROSE = re.compile(
-    r"^(?:header\s+(?:missing|is|was|wasn't|doesn't)|flow\s+(?:is|was|looks|seems))\b",
+    r"^(?:header\s+(?:missing|is|was|wasn't|doesn't)|flow\s+(?:is|was|looks|seems)|"
+    r"pending\b|none\b|required\b|needs?\b|need\b|must\b|should\b|broken\b|"
+    r"legal\s+review\b|(?:may|can|should)\s+(?:i|we|you)\b|"
+    r"missing\b|failed\b|failing\b|invalid\b|the\s+\w+\s+(?:needs?|needs\s+to|is|was)\b|"
+    r"[a-z][a-z'-]*\s+(?:must|should|needs?|requires?|is|was|can|may|will)\b)",
     re.IGNORECASE,
+)
+_ASK_AUTH_SCHEME_VALUE = re.compile(
+    r"(?i)^(?:JWT|Api-Key|OAuth|SharedKey|AWS|Bearer|Key)"
+    r"(?::[ \t]*|[ \t]+)(?P<token>[^\s\r\n]+)"
+)
+_ASK_BARE_AUTH_SCHEME_LINE = re.compile(
+    r"(?im)(?P<indent>^[ \t]*)(?P<scheme>JWT|Api-Key|OAuth|SharedKey|AWS|Bearer|Key)"
+    r"(?P<separator>:[ \t]*|[ \t]+)(?P<token>[^\s\r\n]+)(?P<tail>[^\r\n]*)"
 )
 
 
+_ASK_SHORT_SECRET_WORDS = frozenset({"pass", "pw"})
+
+
+def _ask_cookie_prose(value: str) -> bool:
+    value = value.strip().strip("\"' ")
+    words = value.split()
+    return bool(
+        len(words) >= 3
+        and not re.search(r"[=:;]", value)
+        and re.search(
+            r"\b(?:banner|copy|pending|review|notice|policy|consent|message|text|"
+            r"wording|checkout|legal|the|a|an)\b",
+            value,
+            re.IGNORECASE,
+        )
+    )
+
+
+_ASK_COOKIE_HEADER = re.compile(
+    r"""(?im)(?P<prefix>^[ \t]*|(?:-H\s+['"]"))(?P<header>(?:set-?)?cookie)\s*:\s*(?P<value>[^\r\n'"]*)"""
+)
+
+
+def _ask_redact_cookie_headers(text: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        if _ask_cookie_prose(match.group("value")):
+            return match.group(0)
+        return f"{match.group('prefix')}{match.group('header')}: [redacted]"
+
+    return _ASK_COOKIE_HEADER.sub(replace, text)
+
+
+def _ask_secret_word(key: str) -> str | None:
+    normalized = str(key).casefold().strip().strip("\"'")
+    normalized = normalized.removeprefix("--")
+    if normalized in _ASK_NON_SECRET_AUTH_KEYS:
+        return None
+    if normalized.startswith("author_"):
+        following = _ASK_SECRET_KEY_RE.search(normalized[len("author_") :])
+        if following is None:
+            return None
+        return following.group("secret_word").casefold()
+    match = _ASK_SECRET_KEY_RE.search(normalized)
+    return match.group("secret_word").casefold() if match else None
+
+
+def _ask_secret_value_shape(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    value = value.strip().strip("\"'")
+    return len(value) >= 8 and not any(char.isspace() for char in value)
+
+
+def _ask_is_secret_key(key: str, value: Any = None) -> bool:
+    word = _ask_secret_word(key)
+    if word is None:
+        return False
+    if (
+        word in {"auth", "authentication", "authorization", "cookie"}
+        and isinstance(value, str)
+        and _ASK_AUTH_PROSE.match(value.strip().strip("\"' "))
+    ):
+        return False
+    if word == "cookie" and isinstance(value, str) and _ask_cookie_prose(value):
+        return False
+    if (
+        word == "token"
+        and isinstance(value, str)
+        and re.match(
+            r"(?i)^the\s+(?:design|api)\s+token\b", value.strip().strip("\"' ")
+        )
+    ):
+        return False
+    if (
+        word == "secret"
+        and isinstance(value, str)
+        and re.match(r"(?i)^none\b", value.strip().strip("\"' "))
+    ):
+        return False
+    return word not in _ASK_SHORT_SECRET_WORDS or _ask_secret_value_shape(value)
+
+
 def _ask_auth_redaction(value: str) -> str | None:
-    """Redact credential-shaped Authorization values, leaving prose intact."""
+    """Redact Authorization values unless they read like ordinary status prose."""
     value = value.strip().strip("\"'")
     if _ASK_AUTH_PROSE.match(value):
         return None
-    if re.match(
-        r"(?i)^(?:bearer|basic|token|apikey|digest|bot|ssws|negotiate|ntlm|"
-        r"aws4-hmac-sha256)\s+\S+",
-        value,
-    ):
-        return "[redacted]"
-    token = re.match(r"[A-Za-z0-9._~+/=-]{16,}", value)
-    if token:
-        return "[redacted]" + value[token.end() :]
-    return None
+    scheme = _ASK_AUTH_SCHEME_VALUE.match(value)
+    if scheme:
+        token = scheme.group("token")
+        if (
+            _ask_secret_value_shape(token)
+            or any(char.isdigit() for char in token)
+            or ":" in token
+            or (len(token) == 1 and token.isupper())
+        ):
+            return "[redacted]"
+        return None
+    return "[redacted]" if value else None
 
 
 def _ask_redact_authorization_headers(text: str) -> str:
@@ -2477,7 +2656,210 @@ def _ask_redact_authorization_headers(text: str) -> str:
             return match.group(0)
         return f"{match.group('prefix')}{redacted}"
 
-    return _ASK_AUTH_HEADER.sub(line, text)
+    text = _ASK_AUTH_HEADER.sub(line, text)
+
+    def bare_scheme(match: re.Match[str]) -> str:
+        scheme_value = (
+            f"{match.group('scheme')}{match.group('separator')}{match.group('token')}"
+        )
+        if _ask_auth_redaction(scheme_value) is None:
+            return match.group(0)
+        return (
+            f"{match.group('indent')}{match.group('scheme')}"
+            f"{match.group('separator')}[redacted]{match.group('tail')}"
+        )
+
+    return _ASK_BARE_AUTH_SCHEME_LINE.sub(bare_scheme, text)
+
+
+_ASK_YAML_FIELD = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<dash>-\s*)?(?P<quote>[\"']?)"
+    r"(?P<key>[A-Za-z0-9_.-]+)(?P=quote)\s*:\s*(?P<value>[^\r\n]*)"
+)
+_ASK_YAML_BLOCK = re.compile(
+    r"^(?P<style>[|>](?:[+-][1-9]?|[1-9][+-]?)?)(?P<tail>[ \t]*(?:#.*)?)$"
+)
+
+
+def _ask_yaml_field(line: str) -> re.Match[str] | None:
+    return _ASK_YAML_FIELD.match(line.rstrip("\r\n"))
+
+
+def _ask_yaml_indent(match: re.Match[str]) -> int:
+    return len(match.group("indent")) + len(match.group("dash") or "")
+
+
+def _ask_yaml_scalar_end(lines: list[str], index: int, indent: int) -> tuple[int, str]:
+    end = index + 1
+    scalar_indent: int | None = None
+    first_value = ""
+    while end < len(lines):
+        body = lines[end].rstrip("\r\n")
+        if not body.strip():
+            next_line = end + 1
+            while next_line < len(lines) and not lines[next_line].strip():
+                next_line += 1
+            if next_line >= len(lines):
+                break
+            next_body = lines[next_line].rstrip("\r\n")
+            next_indent = len(next_body) - len(next_body.lstrip(" \t"))
+            if next_indent <= indent or (
+                scalar_indent is not None and next_indent < scalar_indent
+            ):
+                break
+            end += 1
+            continue
+        content_indent = len(body) - len(body.lstrip(" \t"))
+        if content_indent <= indent or (
+            scalar_indent is not None and content_indent < scalar_indent
+        ):
+            break
+        if scalar_indent is None:
+            scalar_indent = content_indent
+        if not first_value:
+            first_value = body.strip()
+        end += 1
+    return end, first_value
+
+
+def _ask_flow_secret_values(text: str) -> str:
+    quoted_value = r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,}]+"""
+    name_first = re.compile(
+        rf"""(?ix)(?P<before>["']?(?:name|key)["']?\s*:\s*["']?)(?P<name>{_ASK_SECRET_KEY})"""
+        rf"""(?P<after>["']?\s*,\s*["']?(?:value|val|default)["']?\s*:\s*)(?P<value>{quoted_value})"""
+    )
+    value_first = re.compile(
+        rf"""(?ix)(?P<before>["']?(?:value|val|default)["']?\s*:\s*)(?P<value>{quoted_value})"""
+        rf"""(?P<between>\s*,\s*["']?(?:name|key)["']?\s*:\s*["']?)(?P<name>{_ASK_SECRET_KEY})(?P<endquote>["']?)"""
+    )
+
+    def replacement(raw: str) -> str:
+        quote = raw[0] if raw[:1] in ('"', "'") else ""
+        return f"{quote}[redacted]{quote}"
+
+    def first(match: re.Match[str]) -> str:
+        if not _ask_is_secret_key(match.group("name"), match.group("value")):
+            return match.group(0)
+        return f"{match.group('before')}{match.group('name')}{match.group('after')}{replacement(match.group('value'))}"
+
+    def last(match: re.Match[str]) -> str:
+        if not _ask_is_secret_key(match.group("name"), match.group("value")):
+            return match.group(0)
+        return f"{match.group('before')}{replacement(match.group('value'))}{match.group('between')}{match.group('name')}{match.group('endquote')}"
+
+    return value_first.sub(last, name_first.sub(first, text))
+
+
+def _ask_redact_yaml(text: str) -> str:
+    text = _ask_flow_secret_values(text)
+    lines = text.splitlines(keepends=True)
+    fields = [_ask_yaml_field(line) for line in lines]
+    paired_values: dict[int, str] = {}
+    for index, field in enumerate(fields):
+        if field is None or field.group("key").casefold() not in {"name", "key"}:
+            continue
+        name = field.group("value").strip().strip("\"'")
+        if _ask_secret_word(name) is None:
+            continue
+        base_indent = _ask_yaml_indent(field)
+        paired = False
+        for direction in (1, -1):
+            for distance in range(1, 9):
+                candidate_index = index + direction * distance
+                if not 0 <= candidate_index < len(fields):
+                    break
+                candidate = fields[candidate_index]
+                if candidate is None:
+                    continue
+                candidate_key = candidate.group("key").casefold()
+                candidate_indent = _ask_yaml_indent(candidate)
+                if candidate_key in {"name", "key"} and candidate_indent == base_indent:
+                    break
+                if (
+                    candidate_key in {"value", "val", "default"}
+                    and candidate_indent == base_indent
+                ):
+                    paired_values[candidate_index] = name
+                    paired = True
+                    break
+                if candidate.group("dash") and candidate_indent <= base_indent:
+                    break
+            if paired:
+                break
+
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        field = fields[index]
+        if field is None:
+            out.append(lines[index])
+            index += 1
+            continue
+        key = field.group("key")
+        raw_value = field.group("value")
+        paired_name = paired_values.get(index)
+        direct_secret = _ask_secret_word(key) is not None
+        if direct_secret and raw_value.lstrip().startswith(('"', "'")):
+            out.append(lines[index])
+            index += 1
+            continue
+        if (direct_secret or paired_name is not None) and raw_value.lstrip().startswith(
+            ("[", "{")
+        ):
+            out.append(lines[index])
+            index += 1
+            continue
+        scalar = _ASK_YAML_BLOCK.fullmatch(raw_value.strip())
+        collection = raw_value.strip() == "" and (
+            direct_secret or paired_name is not None
+        )
+        scalar_end = index + 1
+        scalar_value = ""
+        if scalar or collection:
+            scalar_end, scalar_value = _ask_yaml_scalar_end(
+                lines, index, _ask_yaml_indent(field)
+            )
+            collection = collection and scalar_end > index + 1
+        if (
+            field.group("quote")
+            and paired_name is None
+            and not scalar
+            and not collection
+        ):
+            out.append(lines[index])
+            index += 1
+            continue
+        if not direct_secret and paired_name is None:
+            out.append(lines[index])
+            index += 1
+            continue
+        secret_name = paired_name if paired_name is not None else key
+        secret_word = _ask_secret_word(secret_name)
+        if (
+            paired_name is None
+            and secret_word in {"authorization", "cookie"}
+            and _ASK_AUTH_PROSE.match(raw_value)
+        ):
+            out.append(lines[index])
+            index += 1
+            continue
+        if not _ask_is_secret_key(
+            secret_name, scalar_value if scalar or collection else raw_value
+        ):
+            out.extend(lines[index:scalar_end])
+            index = scalar_end
+            continue
+        line_without_newline = lines[index].rstrip("\r\n")
+        newline = lines[index][len(line_without_newline) :]
+        before_value = line_without_newline[: field.start("value")]
+        if scalar or collection:
+            tail = scalar.group("tail") if scalar else ""
+            out.append(f"{before_value}[redacted]{tail}{newline}")
+            index = scalar_end
+            continue
+        out.append(f"{before_value}[redacted]{newline}")
+        index += 1
+    return "".join(out)
 
 
 def _ask_json_container_end(text: str, start: int) -> int | None:
@@ -2485,19 +2867,20 @@ def _ask_json_container_end(text: str, start: int) -> int | None:
     if start >= len(text) or text[start] not in "[{":
         return None
     expected = ["]" if text[start] == "[" else "}"]
-    quoted = escaped = False
+    quote: str | None = None
+    escaped = False
     for i in range(start + 1, len(text)):
         char = text[i]
-        if quoted:
+        if quote:
             if escaped:
                 escaped = False
             elif char == "\\":
                 escaped = True
-            elif char == '"':
-                quoted = False
+            elif char == quote:
+                quote = None
             continue
-        if char == '"':
-            quoted = True
+        if char in "\"'":
+            quote = char
         elif char == "[":
             expected.append("]")
         elif char == "{":
@@ -2509,6 +2892,105 @@ def _ask_json_container_end(text: str, start: int) -> int | None:
             if not expected:
                 return i + 1
     return None
+
+
+def _ask_quoted_end(text: str, start: int) -> int:
+    quote = text[start]
+    escaped = False
+    for i in range(start + 1, len(text)):
+        char = text[i]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == quote:
+            return i + 1
+    return len(text)
+
+
+def _ask_assignment_value_end(text: str, start: int) -> int:
+    if start >= len(text):
+        return start
+    if text[start] == "\\":
+        quote_start = start
+        while quote_start < len(text) and text[quote_start] == "\\":
+            quote_start += 1
+        if quote_start < len(text) and text[quote_start] in "\"'":
+            quote = text[quote_start]
+            for end in range(quote_start + 1, len(text)):
+                if text[end] != quote:
+                    continue
+                slashes = end - 1
+                while slashes >= start and text[slashes] == "\\":
+                    slashes -= 1
+                if end - slashes > 1:
+                    return end + 1
+        line_end = text.find("\n", start)
+        return line_end if line_end >= 0 else len(text)
+    if text[start] in "\"'":
+        return _ask_quoted_end(text, start)
+    if text[start] in "[{":
+        end = _ask_json_container_end(text, start)
+        if end is not None:
+            return end
+    end = start
+    while end < len(text) and text[end] not in " \t\r\n,;}]":
+        end += 1
+    return end
+
+
+def _ask_redact_assignments(text: str) -> str:
+    out: list[str] = []
+    cursor = 0
+    for match in _ASK_SECRET_ASSIGNMENT.finditer(text):
+        if match.start() < cursor:
+            continue
+        key = (match.group("flag") or "") + match.group("key")
+        if not match.group("flag") and not re.search(r"[=:]", match.group("sep")):
+            continue
+        start = match.end()
+        end = _ask_assignment_value_end(text, start)
+        if text[start : start + 1] in "[{" and end > start:
+            line_end = text.find("\n", end)
+            suffix = text[end : line_end if line_end >= 0 else len(text)]
+            extra = re.match(
+                r"[ \t]+(?P<value>[A-Za-z0-9_.-]{1,32}(?:=[^ \t,;]+)?)", suffix
+            )
+            if extra and (
+                "=" in extra.group("value")
+                or re.search(r"[0-9_-]", extra.group("value"))
+            ):
+                end += extra.end()
+        if end <= start:
+            continue
+        raw = text[start:end]
+        line_end = text.find("\n", start)
+        prose_value = text[start : line_end if line_end >= 0 else len(text)].strip()
+        colon = match.group("sep").lstrip().startswith(":")
+        key_value = prose_value if colon and not match.group("flag") else raw
+        if not _ask_is_secret_key(key, key_value):
+            continue
+        word = _ask_secret_word(key)
+        value = raw.strip().strip("\"' ")
+        if value.casefold() == "[redacted]":
+            continue
+        if (
+            word == "authorization"
+            and colon
+            and not match.group("flag")
+            and _ask_auth_redaction(prose_value) is None
+        ):
+            continue
+        if word == "cookie" and colon and _ask_cookie_prose(prose_value):
+            continue
+        out.append(text[cursor:start])
+        quote = raw[0] if raw[:1] in ('"', "'") else ""
+        out.append(f"{quote}[redacted]{quote}")
+        cursor = end
+    if not out:
+        return text
+    out.append(text[cursor:])
+    return "".join(out)
 
 
 def _ask_redact_embedded_json(text: str) -> str:
@@ -2523,13 +3005,14 @@ def _ask_redact_embedded_json(text: str) -> str:
         if text[i] == '"' and text[i + 1 : i + 2] in ("{", "["):
             attempts += 1
             if attempts > 128:
-                out.append("[redacted]")
+                out.append(text[i:])
                 break
             try:
                 value, end = decoder.raw_decode(text, i)
             except RecursionError:
                 out.append(json.dumps("[redacted]"))
-                break
+                i = _ask_quoted_end(text, i)
+                continue
             except ValueError:
                 value = None
             if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
@@ -2557,7 +3040,7 @@ def _ask_redact_embedded_json(text: str) -> str:
         if text[i] in "{[":
             attempts += 1
             if attempts > 128:
-                out.append("[redacted]")
+                out.append(text[i:])
                 break
             try:
                 value, end = decoder.raw_decode(text, i)
@@ -2581,66 +3064,17 @@ def _ask_redact_embedded_json(text: str) -> str:
     return "".join(out)
 
 
-def _ask_redact_assignment(match: re.Match[str]) -> str:
-    if match.group("key").lower() == "cookies" and match.group(
-        "sep"
-    ).lstrip().startswith(":"):
-        value = next(
-            (
-                match.group(name)
-                for name in ("double", "single", "structured", "bare")
-                if match.group(name)
-            ),
-            "",
-        )
-        if "=" not in value:
-            return match.group(0)
-    if (
-        match.group("key").lower().startswith("authorization")
-        and match.group("sep").lstrip().startswith(":")
-        and not match.group("key_quote")
-    ):
-        value = next(
-            (
-                match.group(name)
-                for name in ("double", "single", "structured", "bare")
-                if match.group(name)
-            ),
-            "",
-        )
-        prose = value.strip("\"' ")
-        if _ask_auth_redaction(prose) is None:
-            return match.group(0)
-    raw_value = next(
-        (
-            match.group(name)
-            for name in ("double", "single", "structured", "bare")
-            if match.group(name)
-        ),
-        "",
-    )
-    if raw_value.strip().strip("\"' ").casefold() == "[redacted]":
-        return match.group(0)
-    quote = (
-        '"'
-        if match.group("double") is not None
-        else "'"
-        if match.group("single") is not None
-        else ""
-    )
-    value = f"{quote}[redacted]{quote}"
-    return f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}{match.group('sep')}{value}"
-
-
 def _ask_redact(text: str) -> str:
     home = os.path.expanduser("~")
     if home and home not in ("/", "~"):
         text = text.replace(home, "~")
     for pattern, repl in _ASK_SECRET_PATTERNS:
         text = pattern.sub(repl, text)
+    text = _ask_redact_cookie_headers(text)
     text = _ask_redact_authorization_headers(text)
+    text = _ask_redact_yaml(text)
     text = _ask_redact_embedded_json(text)
-    text = _ASK_SECRET_ASSIGNMENT.sub(_ask_redact_assignment, text)
+    text = _ask_redact_assignments(text)
     return text
 
 
@@ -2657,20 +3091,20 @@ def _ask_card_view(
     and drops or redacts what could leak (F4)."""
     if isinstance(value, dict):
         out: dict[str, Any] = {}
-        named_secret = isinstance(value.get("name"), str) and bool(
-            _ASK_SECRET_KEY_RE.search(value["name"])
+        named_secret = any(
+            str(field).casefold() in {"name", "key"}
+            and isinstance(field_value, str)
+            and _ask_secret_word(field_value) is not None
+            for field, field_value in value.items()
         )
         for k, v in value.items():
             if _key == "workspace" and k == "path":
                 continue
             key = str(k)
-            if named_secret and key.casefold() == "value":
+            if named_secret and key.casefold() in {"value", "val", "default"}:
                 out[k] = "[redacted]"
                 continue
-            if (
-                key.casefold() not in _ASK_NON_SECRET_AUTH_KEYS
-                and _ASK_SECRET_KEY_RE.search(key)
-            ):
+            if _ask_is_secret_key(key, v):
                 out[k] = "[redacted]"
                 continue
             out[k] = _ask_card_view(v, key, _text_budget)

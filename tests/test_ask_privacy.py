@@ -498,3 +498,310 @@ def test_caller_card_not_mutated():
     before = json.dumps(c, sort_keys=True)
     needs.build_ask_messages(c, [])
     assert json.dumps(c, sort_keys=True) == before
+
+
+def _round9_payloads(body):
+    card = {"title": "Review deployment", "body": body}
+    comments = [{"body": body}]
+    return (
+        json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
+        json.dumps(needs.bluf_messages(card, comments), ensure_ascii=False),
+    )
+
+
+def test_round9_camel_glued_suffix_json_and_flag_secret_keys_are_redacted():
+    body = (
+        "accessToken: R9_ACCESS_TOKEN_SECRET\n"
+        "clientSecret=R9_CLIENT_SECRET_SECRET\n"
+        "dbPassword: R9_DB_PASSWORD_SECRET\n"
+        "authToken=R9_AUTH_TOKEN_SECRET\n"
+        "mysecret=R9_GLUED_SECRET\n"
+        "dbpassword=R9_GLUED_PASSWORD_SECRET\n"
+        "SECRET_KEY: R9_SECRET_KEY_SECRET\n"
+        "SECRET_KEY_BASE=R9_SECRET_KEY_BASE_SECRET\n"
+        "password1: R9_PASSWORD1_SECRET\n"
+        "token_value: R9_TOKEN_VALUE_SECRET\n"
+        "password_plain=R9_PASSWORD_PLAIN_SECRET\n"
+        "--token=R9_FLAG_TOKEN_SECRET\n"
+        "--password=R9_FLAG_PASSWORD_SECRET\n"
+        "--password R9_FLAG_PASSWORD_SPACE_SECRET\n"
+        "--api-key=R9_FLAG_API_KEY_SECRET\n"
+        "--client-secret=R9_FLAG_CLIENT_SECRET\n"
+        "PGPASSWORD=R9_PG_PASSWORD_SECRET psql\n"
+        '--password={"nested":{"sid":"R9_NESTED_FLAG_SECRET"}}\n'
+        '{"accessToken":"R9_JSON_ACCESS_TOKEN_SECRET", '
+        '"secretKey":"R9_JSON_SECRET_KEY_SECRET", '
+        '"client_secret_key":"R9_JSON_CLIENT_SECRET_KEY_SECRET"}'
+    )
+    secrets = (
+        "R9_ACCESS_TOKEN_SECRET",
+        "R9_CLIENT_SECRET_SECRET",
+        "R9_DB_PASSWORD_SECRET",
+        "R9_AUTH_TOKEN_SECRET",
+        "R9_GLUED_SECRET",
+        "R9_GLUED_PASSWORD_SECRET",
+        "R9_SECRET_KEY_SECRET",
+        "R9_SECRET_KEY_BASE_SECRET",
+        "R9_PASSWORD1_SECRET",
+        "R9_TOKEN_VALUE_SECRET",
+        "R9_PASSWORD_PLAIN_SECRET",
+        "R9_FLAG_TOKEN_SECRET",
+        "R9_FLAG_PASSWORD_SECRET",
+        "R9_FLAG_PASSWORD_SPACE_SECRET",
+        "R9_FLAG_API_KEY_SECRET",
+        "R9_FLAG_CLIENT_SECRET",
+        "R9_PG_PASSWORD_SECRET",
+        "R9_NESTED_FLAG_SECRET",
+        "R9_JSON_ACCESS_TOKEN_SECRET",
+        "R9_JSON_SECRET_KEY_SECRET",
+        "R9_JSON_CLIENT_SECRET_KEY_SECRET",
+    )
+    for payload in _round9_payloads(body):
+        for secret in secrets:
+            assert secret not in payload, secret
+
+
+def test_round9_authorization_schemes_and_short_values_are_redacted():
+    schemes = (
+        "Splunk R9_SPLUNK_SECRET",
+        "JWT R9_JWT_SECRET",
+        "Api-Key R9_API_KEY_SECRET",
+        "OAuth R9_OAUTH_SECRET",
+        "SharedKey acct:R9_SHARED_KEY_SECRET",
+        "AWS AKID:R9_AWS_SECRET",
+        "PVEAPIToken=u@pam!t=R9_PVE_SECRET",
+        "Bearer: R9_BEARER_SECRET",
+        "R9_SHORT_RAW_SECRET",
+    )
+    body = "\n".join(f"Authorization: {value}" for value in schemes)
+    body += (
+        "\nAuthorization: pending legal review"
+        "\nAuthorization: Ada must approve the spend before Friday"
+        "\nAuthorization: none"
+        "\nauthorization: required from Ada"
+    )
+    for payload in _round9_payloads(body):
+        for value in schemes:
+            secret = value.rsplit(" ", 1)[-1].split("=")[-1].split(":")[-1]
+            assert secret not in payload, secret
+        assert "Authorization: pending legal review" in payload
+        assert "Authorization: Ada must approve the spend before Friday" in payload
+        assert "Authorization: none" in payload
+        assert "authorization: required from Ada" in payload
+
+
+def test_round9_bare_auth_scheme_tokens_are_redacted_from_ask_and_bluf():
+    cases = (
+        ("Api-Key SYNTH_X2", "Api-Key [redacted]"),
+        ("SharedKey acct:SYNTH_X4", "SharedKey [redacted]"),
+        ("AWS AKID:SYNTH_X5", "AWS [redacted]"),
+        ("Bearer: SYNTH_X7", "Bearer: [redacted]"),
+        ("OAuth SYNTH_X9", "OAuth [redacted]"),
+        ("JWT SYNTH_Y1", "JWT [redacted]"),
+        ("Key SYNTH_KEY_SECRET", "Key [redacted]"),
+        ("Key: SYNTH_KEY_COLON_SECRET", "Key: [redacted]"),
+        ("Bearer S", "Bearer [redacted]"),
+    )
+    body = "\n".join(line for line, _ in cases)
+
+    for payload in _round9_payloads(body):
+        for line, redacted_line in cases:
+            assert line not in payload
+            assert redacted_line in payload
+
+
+def test_round9_bare_auth_scheme_prose_remains_readable_in_ask_and_bluf():
+    prose = (
+        "Bearer bones\n"
+        "Key point\n"
+        "OAuth is an authorization framework\n"
+        "JWT tokens are short-lived"
+    )
+
+    for payload in _round9_payloads(prose):
+        for line in prose.splitlines():
+            assert line in payload
+
+
+def test_round9_existing_short_credential_forms_remain_redacted():
+    cases = (
+        ("Authorization: Splunk S", "Authorization: [redacted]"),
+        ("Api-Key: S", "Api-Key: [redacted]"),
+        ("X-Api-Key: S", "X-Api-Key: [redacted]"),
+        ("PVEAPIToken=u@pam!t=S", "PVEAPIToken=[redacted]"),
+        ("PGPASSWORD=S", "PGPASSWORD=[redacted]"),
+    )
+    body = "\n".join(line for line, _ in cases)
+
+    for payload in _round9_payloads(body):
+        for line, redacted_line in cases:
+            assert line not in payload
+            assert redacted_line in payload
+
+
+def test_round9_balanced_credentials_redaction_keeps_following_questions():
+    body = (
+        'credentials: {"primary":{"user":"bob"}, '
+        '"secondary":{"sid":"R9_NESTED_CREDENTIAL_SECRET"}}\n'
+        "credentials = {'a': {'b': 1}, 'k': 'R9_SINGLE_QUOTE_SECRET'}\n"
+        'log payload={\\"token\\": \\"R9_ESCAPED_JSON_SECRET\\"} KEEPME\n'
+        "Question: should we keep this question?"
+    )
+    for payload in _round9_payloads(body):
+        assert "R9_NESTED_CREDENTIAL_SECRET" not in payload
+        assert "R9_SINGLE_QUOTE_SECRET" not in payload
+        assert "R9_ESCAPED_JSON_SECRET" not in payload
+        assert "KEEPME" in payload
+        assert "Question: should we keep this question?" in payload
+
+
+def test_round9_yaml_block_scalar_headers_blank_lines_and_sequence_items_are_redacted():
+    body = (
+        "password: | # from the vault\n  R9_YAML_COMMENT_SECRET\n\n"
+        "password: |2\n  R9_YAML_INDENT_SECRET\n"
+        "password: |\n  first\n\n  R9_YAML_BLANK_SECRET\n"
+        "- password: |\n    R9_YAML_SEQUENCE_SECRET\n"
+        "tokens:\n  - R9_YAML_TOKEN_LIST_SECRET\n  - other\n"
+        "secrets:\n  api: R9_YAML_SECRET_MAP_SECRET\n"
+        'tokens: [\n  "R9_YAML_FLOW_LIST_SECRET"\n]\n'
+        "Question: keep this YAML question?"
+    )
+    for payload in _round9_payloads(body):
+        for secret in (
+            "R9_YAML_COMMENT_SECRET",
+            "R9_YAML_INDENT_SECRET",
+            "R9_YAML_BLANK_SECRET",
+            "R9_YAML_SEQUENCE_SECRET",
+            "R9_YAML_TOKEN_LIST_SECRET",
+            "R9_YAML_SECRET_MAP_SECRET",
+            "R9_YAML_FLOW_LIST_SECRET",
+        ):
+            assert secret not in payload, secret
+        assert "Question: keep this YAML question?" in payload
+
+
+def test_round9_json_scan_budget_keeps_checklists_links_logs_and_questions():
+    bodies = (
+        ("-[x]" * 140) + " token:TOKEN12345 Question: kept?",
+        ("[]()" * 130) + " token:TOKEN12345 Question: kept?",
+        ("[I]{0}" * 70) + " token:TOKEN12345 Question: kept?",
+    )
+    for body in bodies:
+        for payload in _round9_payloads(body):
+            assert "TOKEN12345" not in payload
+            assert "Question: kept?" in payload
+            assert body[:3] in payload
+
+
+def test_round9_cookie_values_redact_without_equals_but_keep_prose():
+    body = (
+        "cookies: R9_COOKIE_SECRET\n"
+        "Cookies: session-R9_SESSION_COOKIE_SECRET\n"
+        "cookies: sid:R9_SID_COOKIE_SECRET\n"
+        "Cookies: the banner needs review\n"
+        "cookies: banner copy pending KEEPME"
+    )
+    for payload in _round9_payloads(body):
+        for secret in (
+            "R9_COOKIE_SECRET",
+            "R9_SESSION_COOKIE_SECRET",
+            "R9_SID_COOKIE_SECRET",
+        ):
+            assert secret not in payload
+        assert "Cookies: the banner needs review" in payload
+        assert "cookies: banner copy pending KEEPME" in payload
+
+
+def test_round9_secret_labels_preserve_cookie_and_authorization_prose():
+    body = (
+        "Cookie: banner copy needs legal approval\n"
+        "Pending authorization: legal review of the vendor contract\n"
+        "Need authorization: may I spend $200 on the API?\n"
+        "auth_method: oauth2\n"
+        "Token: the design token names changed\n"
+        "Secret: none of this is urgent"
+    )
+    for payload in _round9_payloads(body):
+        assert "Cookie: banner copy needs legal approval" in payload
+        assert "Pending authorization: legal review of the vendor contract" in payload
+        assert "Need authorization: may I spend $200 on the API?" in payload
+        assert "auth_method: oauth2" in payload
+        assert "Token: the design token names changed" in payload
+        assert "Secret: none of this is urgent" in payload
+
+
+def test_round9_mysql_password_flags_cover_case_and_client_variants():
+    body = (
+        "MYSQL -pR9_MYSQL_SECRET db\n"
+        "mysqldump -pR9_DUMP_SECRET db\n"
+        "mariadb -p R9_MARIADB_SECRET db\n"
+        "Docker login -p R9_DOCKER_SECRET\n"
+        "mysql -P 3306 db"
+    )
+    for payload in _round9_payloads(body):
+        for secret in (
+            "R9_MYSQL_SECRET",
+            "R9_DUMP_SECRET",
+            "R9_MARIADB_SECRET",
+            "R9_DOCKER_SECRET",
+        ):
+            assert secret not in payload
+        assert "mysql -P 3306 db" in payload
+
+
+def test_round9_pass_and_pw_require_credential_shaped_values():
+    body = (
+        "pass: 12 fail: 0\n"
+        "tests pass: yes\n"
+        "pw: n/a\n"
+        "pass: R9_PASS_CREDENTIAL_SECRET\n"
+        "pw: R9_PW_CREDENTIAL_SECRET"
+    )
+    for payload in _round9_payloads(body):
+        assert "pass: 12 fail: 0" in payload
+        assert "tests pass: yes" in payload
+        assert "pw: n/a" in payload
+        assert "R9_PASS_CREDENTIAL_SECRET" not in payload
+        assert "R9_PW_CREDENTIAL_SECRET" not in payload
+
+
+def test_round9_secret_name_value_layouts_and_token_prefixes_are_redacted():
+    body = (
+        "  - name: SECRET_KEY\n    valueFrom: secretKeyRef\n    value: R9_NAME_VALUE_SECRET\n"
+        "  value: R9_VALUE_BEFORE_NAME_SECRET\n  name: DB_PASSWORD\n"
+        "{name: DB_PASSWORD, value: R9_FLOW_VALUE_SECRET}\n"
+        "Name: API_TOKEN\nvalueFrom: secretKeyRef\nValue: R9_CAPITAL_VALUE_SECRET\n"
+        "Name: API_TOKEN\nValue: |2\n  R9_NAMED_BLOCK_SECRET\n"
+        '{"Value":"R9_JSON_VALUE_BEFORE_SECRET", "Name":"DB_PASSWORD"}\n'
+        '{"key":"DB_PASSWORD", "value":"R9_JSON_KEY_VALUE_SECRET"}\n'
+        '{"name":"DB_PASSWORD", "val":"R9_JSON_VAL_SECRET"}\n'
+        '{"name":"DB_PASSWORD", "default":"R9_JSON_DEFAULT_SECRET"}\n'
+        "hf_R9HF12345678\nSG.R9SG12345678\n"
+        "SG.R9SGDOT12345678.R9SGSECRET12345678\n"
+        "dop_v1_R9DOP12345678\nwhsec_R9WHSEC12345678"
+    )
+    secrets = (
+        "R9_NAME_VALUE_SECRET",
+        "R9_VALUE_BEFORE_NAME_SECRET",
+        "R9_FLOW_VALUE_SECRET",
+        "R9_CAPITAL_VALUE_SECRET",
+        "R9_NAMED_BLOCK_SECRET",
+        "R9_JSON_VALUE_BEFORE_SECRET",
+        "R9_JSON_KEY_VALUE_SECRET",
+        "R9_JSON_VAL_SECRET",
+        "R9_JSON_DEFAULT_SECRET",
+        "hf_R9HF12345678",
+        "SG.R9SG12345678",
+        "R9SGDOT12345678",
+        "R9SGSECRET12345678",
+        "dop_v1_R9DOP12345678",
+        "whsec_R9WHSEC12345678",
+    )
+    for payload in _round9_payloads(body):
+        for secret in secrets:
+            assert secret not in payload, secret
+
+    safe = needs._ask_card_view(
+        {"Name": "DB_PASSWORD", "Value": "R9_DIRECT_CAPITAL_SECRET"}
+    )
+    assert safe["Value"] == "[redacted]"
