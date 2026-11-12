@@ -262,6 +262,19 @@ class WaitMachine(unittest.TestCase):
         del r["proc_start"]
         self.assertIs(needs.wait_state(self.f, r, 1060), needs.WaitState.OPEN)
 
+    def test_proc_start_without_procfs_runs_only_ps_without_a_shell(self):
+        # The README discloses this one subprocess; keep it to a fixed ps argv, no shell.
+        with mock.patch("pathlib.Path.read_text", side_effect=OSError), \
+                mock.patch("pathlib.Path.exists", return_value=False), \
+                mock.patch.object(needs.os, "name", "posix"), \
+                mock.patch("subprocess.run") as run:
+            run.return_value.stdout = "Wed Nov 11 10:00:00 2026\n"
+            self.assertEqual(needs._proc_start(12345), "Wed Nov 11 10:00:00 2026")
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["ps", "-o", "lstart=", "-p", "12345"])
+        self.assertNotIn("shell", kwargs)
+        self.assertEqual(kwargs["env"], {"PATH": "/bin:/usr/bin", "LC_ALL": "C"})
+
     def test_transitions_through_the_hooks(self):
         needs.record_wait(self.home, request_id=RID, kind="clarify", prompt="Which?")   # -> OPEN
         self.assertEqual([i["id"] for i in needs.wait_items(self.home)], [f"prompt:{RID}"])

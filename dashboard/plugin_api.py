@@ -342,6 +342,8 @@ def outside_done(body: Hide):
         raise HTTPException(status_code=400, detail=str(exc))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="busy, retry")
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 

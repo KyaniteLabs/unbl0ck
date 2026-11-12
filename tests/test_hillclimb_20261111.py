@@ -92,6 +92,19 @@ def test_bluf_payload_redacted():
     assert "Deploy" in content and "failed in" in content
 
 
+def test_bluf_payload_redacts_non_bearer_authorization_headers():
+    item = {"title": "Deploy", "ask": "Authorization: ApiKey synthetic-api-key-abcdef0123456789 "
+            "authorization=synthetic-auth-key-abcdef0123456789"}
+    comments = [
+        {"body": 'Authorization: Digest username="synthetic", nonce="synthetic-nonce-123456789"'},
+        {"body": "Proxy-Authorization: ApiKey synthetic-proxy-key-abcdef0123456789"},
+    ]
+    content = needs.bluf_messages(item, comments)[1]["content"]
+    for secret in ("synthetic-api-key-abcdef0123456789", "synthetic-nonce-123456789",
+                   "synthetic-proxy-key-abcdef0123456789", "synthetic-auth-key-abcdef0123456789"):
+        assert secret not in content
+
+
 # --- F26: the plugin no longer calls kanban_db's private slug normalizer
 
 SLUG_INPUTS = ["demo", " Demo ", "UPPER", "a", "0a", "a-b_c", "-lead", "_lead", "", "   ", None, "a" * 64,

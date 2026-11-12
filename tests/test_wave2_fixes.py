@@ -59,6 +59,17 @@ def test_u4_state_lock_gives_up_at_the_deadline(tmp_path, monkeypatch):
         pass
 
 
+def test_outside_done_maps_busy_state_lock_to_conflict(api):
+    def busy(*args, **kwargs):
+        raise TimeoutError("unbl0ck: state lock busy")
+
+    api._needs = lambda: types.SimpleNamespace(done_outside=busy)
+    with _client(api) as client:
+        response = client.post("/outside/done", json={"id": "outside:item", "version": "v1"})
+    assert response.status_code == 409
+    assert response.json()["detail"] == "busy, retry"
+
+
 @pytest.fixture
 def api(tmp_path):
     spec = importlib.util.spec_from_file_location("ub_api_w2", ROOT / "dashboard/plugin_api.py")
