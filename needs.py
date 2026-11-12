@@ -637,7 +637,7 @@ def chat_asks_you(text: str) -> bool:
 
 def _excerpt(text: str, n: int = 480) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
-    return text if len(text) <= n else "…" + text[-n:]
+    return text if len(text) <= n else "…" + text[-(n - 1):]
 
 
 # --- Kanban source -------------------------------------------------------------------------
