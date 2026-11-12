@@ -867,6 +867,7 @@ function CardDetail({ data, loading, error }) {
 
 function Item({ ctx, item, n, refresh, askEnabled }) {
   const [answer, setAnswer] = useState('')
+  const [answerVersion, setAnswerVersion] = useState(item.version)
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState(false)
   const [done, setDone] = useState(false)
@@ -878,6 +879,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const [outsideTextLoading, setOutsideTextLoading] = useState(false)
   const [askOpen, setAskOpen] = useState(false)
   const [askMsgs, setAskMsgs] = useState([])
+  const [askVersion, setAskVersion] = useState(item.version)
   const [askInput, setAskInput] = useState('')
   const [askBusy, setAskBusy] = useState(false)
   const [askError, setAskError] = useState('')
@@ -886,6 +888,8 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const isPrompt = item.source === 'prompt'
   const isPairing = item.source === 'pairing'
   const isOutside = item.source === 'outside'
+  const answerStale = isKanban && !!answer.trim() && answerVersion !== item.version
+  const askStale = askVersion !== item.version
   const platformName = platformLabel(item.platform)
   // Desktop can open its own sessions (and CLI/TUI ones, which share the store). A Telegram or
   // Discord chat is answered in Telegram or Discord.
@@ -966,11 +970,10 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
       setBusy(false)
     }
   }
-  const send = release =>
-    run(
+  const send = release => answerStale ? Promise.resolve(null) : run(
       () => ctx.rest('/kanban/answer', {
         method: 'POST',
-        body: { board: item.board, task_id: item.task_id, text: answer, release, version: item.version }
+        body: { board: item.board, task_id: item.task_id, text: answer, release, version: answerVersion }
       }),
       r => (triage
         ? `Answered ${item.task_id} (triage)`
@@ -996,16 +999,19 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const outsideDone = () => run(
     () => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null
   )
-  const ready = !busy && answer.trim().length > 0
+  const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
   const outsideBody = outsideText?.__version === item.version ? outsideText.text : item.ask
 
   const askSend = async (retry = false, preset = '') => {
     const q = preset || askInput.trim()
     if (askBusy || (!retry && !q)) return
-    const next = retry ? askMsgs : [...askMsgs, { role: 'user', content: q }]
+    const next = askStale
+      ? [{ role: 'user', content: retry ? TLDR_ASK : q }]
+      : retry ? askMsgs : [...askMsgs, { role: 'user', content: q }]
     if (!next.length || next[next.length - 1].role !== 'user') return
     setAskMsgs(next)
+    setAskVersion(item.version)
     if (!retry && !preset) setAskInput('')
     setAskBusy(true)
     setAskError('')
@@ -1033,7 +1039,8 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const lastAssistant = askMsgs.reduce((index, m, i) => (m.role === 'assistant' ? i : index), -1)
   const lastSuggestion = lastAssistant >= 0 ? replyPlain(askMsgs[lastAssistant].content) : ''
   const useAsAnswer = () => {
-    if (!lastSuggestion) return
+    if (!lastSuggestion || askStale || answerStale) return
+    setAnswerVersion(item.version)
     setAnswer(prev => (prev.trim() ? `${prev.trim()}\n\n${lastSuggestion}` : lastSuggestion))
     sfx.play('move')
   }
@@ -1122,11 +1129,15 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
           disabled: busy,
           placeholder: 'Your answer. It is posted on the card as you.',
           'aria-label': `Answer for ${item.task_id}`,
-          onChange: e => setAnswer(e.target.value),
+          onChange: e => {
+            setAnswer(e.target.value)
+            if (!answerStale || !e.target.value.trim()) setAnswerVersion(item.version)
+          },
           onKeyDown: e => {
             if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && ready) { e.preventDefault(); saysKeep ? send(false) : sendPrimary() }
           }
         }),
+        answerStale ? jsx('div', { className: 'ub-hint', role: 'status', children: 'This draft is for an older version of this card. Clear it before answering the refreshed question.' }) : null,
         saysKeep ? jsx('div', { className: 'ub-hint', role: 'status', children: 'Your answer says to keep it blocked, so ⌘/Ctrl + Enter now means ANSWER, KEEP BLOCKED.' }) : null,
         jsxs('div', { className: 'ub-btns', children: answerButtons }),
         jsxs('div', { className: 'ub-btns tools', children: tools })
@@ -1189,6 +1200,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
             className: 'hd',
             children: [jsx('span', { children: 'TL;DR' }), jsx('span', { children: 'READ-ONLY · NEVER ACTS' })]
           }),
+          askStale ? jsx('div', { className: 'ub-hint', role: 'status', children: 'This card changed. Ask again for its current version before using an answer suggestion.' }) : null,
           jsxs('div', {
             className: 'ub-msgs',
             children: [
@@ -1199,7 +1211,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
                       jsx('div', { className: 'who', children: m.role === 'user' ? 'YOU' : 'UNBL0CK' }),
                       jsx('p', { children: m.role === 'assistant' ? replyParts(m.content) : m.content === TLDR_ASK ? 'TL;DR' : m.content }),
                       m.role === 'assistant' && i === lastAssistant
-                        ? jsx('div', { className: 'use', children: button({ kind: 'ghost', onClick: useAsAnswer, children: 'Use as answer' }) })
+                        ? jsx('div', { className: 'use', children: button({ kind: 'ghost', disabled: askStale || answerStale, onClick: useAsAnswer, children: 'Use as answer' }) })
                         : null
                     ]
                   }, i))

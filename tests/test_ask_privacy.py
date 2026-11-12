@@ -59,6 +59,37 @@ def test_non_bearer_authorization_headers_redacted():
         assert secret not in payload
 
 
+def test_json_secret_keys_and_quoted_values_redacted_from_ask_and_bluf():
+    embedded = (
+        '{"Authorization": "synthetic-json-auth-value-0001", '
+        '"api_key": "synthetic-json-api-key-value-0002", '
+        '"password": "synthetic quoted password value with spaces"}'
+    )
+    card = {
+        "title": "Review the deployment",
+        "ask": embedded,
+        "events": [{"payload": {
+            "Authorization": "synthetic-event-auth-value-0003",
+            "details": {"api_key": "synthetic-event-api-key-value-0004"},
+        }}],
+    }
+    comments = [{"body": embedded}]
+    payloads = {
+        "Ask": json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
+        "BLUF": json.dumps(needs.bluf_messages(card, comments), ensure_ascii=False),
+    }
+    secrets = (
+        "synthetic-json-auth-value-0001",
+        "synthetic-json-api-key-value-0002",
+        "synthetic quoted password value with spaces",
+    )
+    for label, payload in payloads.items():
+        for secret in secrets:
+            assert secret not in payload, f"{label} leaked {secret}"
+    assert "synthetic-event-auth-value-0003" not in payloads["Ask"]
+    assert "synthetic-event-api-key-value-0004" not in payloads["Ask"]
+
+
 def test_useful_context_kept():
     p = _payload()
     for s in ("Deploy", "please ship", "needs a decision", "feat/x", "auth failed"):
