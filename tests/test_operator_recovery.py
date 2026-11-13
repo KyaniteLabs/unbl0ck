@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HARNESS = r"""
 const fs = require('fs'), assert = require('node:assert/strict');
 const src = fs.readFileSync(process.argv[1], 'utf8');
-const views = src.slice(src.indexOf('function Item('), src.indexOf('function Chip('));
+const views = src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
 const node = (type, props, key) => ({type,props,key}), noop=()=>{};
 let state=[],cursor=0,undo={id:'outside:1',title:'Draft',at:Date.now()}, refreshes=0, failures=0;
 const env={
@@ -57,6 +57,34 @@ const ctx={rest:async()=>{throw new Error('answer posted but release failed')}};
 const render=()=>{cursor=0;return Item({ctx,item,n:1,refresh,askEnabled:false})};
 all(render()).find(n=>n?.type==='textarea').props.onChange({target:{value:'Monday'}});
 (async()=>{await find(render(),'Answer + unbl0ck').onClick();assert.equal(failures,1);assert.equal(refreshes,1)})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_source_fault_remount_preserves_answer_and_original_question_version(self):
+        self.run_views(r"""
+const ctx={rest:async()=>({ok:true})};
+const render=()=>{cursor=0;return Item({ctx,item,n:1,refresh,askEnabled:false})};
+const input=()=>all(render()).find(n=>n?.type==='textarea').props;
+input().onChange({target:{value:'Monday, after the launch review'}});
+state=[]; // source failed and the card unmounted
+assert.equal(input().value,'Monday, after the launch review');
+state=[];item.version='2'; // it returned with a new blocking question
+assert.equal(input().value,'Monday, after the launch review');
+assert.equal(find(render(),'Answer + unbl0ck').disabled,true);
+input().onChange({target:{value:''}});
+input().onChange({target:{value:'New answer'}});
+assert.equal(find(render(),'Answer + unbl0ck').disabled,false);
+(async()=>{await find(render(),'Answer + unbl0ck').onClick();state=[];assert.equal(input().value,'')})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_answer_draft_cache_is_bounded_expires_and_keeps_cards_separate(self):
+        self.run_views(r"""
+const store=new Function('env',`with(env){${views};return{readAnswerDraft,rememberAnswerDraft,answerDrafts};}`)(env);
+for(let i=0;i<105;i++)store.rememberAnswerDraft('card:'+i,'answer '+i,'v1');
+assert.equal(store.answerDrafts.size,100);assert.equal(store.readAnswerDraft('card:0'),undefined);
+assert.equal(store.readAnswerDraft('card:104').text,'answer 104');
+store.answerDrafts.get('card:104').at=Date.now()-31*60*1000;
+assert.equal(store.readAnswerDraft('card:104'),undefined);
+store.rememberAnswerDraft('card:103','','v1');assert.equal(store.readAnswerDraft('card:103'),undefined);
 """)
 
     def test_long_ask_conversation_bounds_request_without_dropping_display(self):

@@ -870,9 +870,30 @@ function CardDetail({ data, loading, error }) {
   })
 }
 
+// Session memory only: source faults and route remounts must not discard a typed answer.
+// Keep the original version so recovering a changed question cannot authorize a stale reply.
+const ANSWER_DRAFT_TTL = 30 * 60 * 1000
+const answerDrafts = new Map()
+function readAnswerDraft(id) {
+  const cutoff = Date.now() - ANSWER_DRAFT_TTL
+  for (const [key, draft] of answerDrafts) if (draft.at < cutoff) answerDrafts.delete(key)
+  return answerDrafts.get(id)
+}
+function rememberAnswerDraft(id, text, version) {
+  answerDrafts.delete(id)
+  if (text.trim()) answerDrafts.set(id, { text, version, at: Date.now() })
+  while (answerDrafts.size > 100) answerDrafts.delete(answerDrafts.keys().next().value)
+}
+
 function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
-  const [answer, setAnswer] = useState('')
-  const [answerVersion, setAnswerVersion] = useState(item.version)
+  const savedDraft = readAnswerDraft(item.id)
+  const [answer, setAnswer] = useState(savedDraft?.text || '')
+  const [answerVersion, setAnswerVersion] = useState(savedDraft?.version ?? item.version)
+  const updateAnswer = (text, version) => {
+    rememberAnswerDraft(item.id, text, version)
+    setAnswer(text)
+    setAnswerVersion(version)
+  }
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState(false)
   const [done, setDone] = useState(false)
@@ -982,7 +1003,9 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
       setBusy(false)
     }
   }
-  const send = release => answerStale ? Promise.resolve(null) : run(
+  const send = async release => {
+    if (answerStale) return null
+    const result = await run(
       () => ctx.rest('/kanban/answer', {
         method: 'POST',
         body: { board: item.board, task_id: item.task_id, text: answer, release, version: answerVersion }
@@ -993,6 +1016,9 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
           ? `Answered and unblocked ${item.task_id}`
           : `Answered ${item.task_id} (kept blocked)`)
     )
+    if (result) updateAnswer('', item.version)
+    return result
+  }
   const sendPrimary = () => send(!triage)
   // Answered already (kept blocked, or the release failed): only the release is left to do.
   const answered = isKanban && !triage && (item.tier === 'answered' || item.tier === 'release_failed')
@@ -1071,8 +1097,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const lastSuggestion = lastAssistant >= 0 ? replyPlain(askMsgs[lastAssistant].content) : ''
   const useAsAnswer = () => {
     if (!lastSuggestion || askStale || answerStale) return
-    setAnswerVersion(item.version)
-    setAnswer(prev => (prev.trim() ? `${prev.trim()}\n\n${lastSuggestion}` : lastSuggestion))
+    updateAnswer(answer.trim() ? `${answer.trim()}\n\n${lastSuggestion}` : lastSuggestion, item.version)
     sfx.play('move')
   }
   const discussInChat = async () => {
@@ -1161,8 +1186,8 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
           placeholder: 'Your answer. It is posted on the card as you.',
           'aria-label': `Answer for ${item.task_id}`,
           onChange: e => {
-            setAnswer(e.target.value)
-            if (!answerStale || !e.target.value.trim()) setAnswerVersion(item.version)
+            const text = e.target.value
+            updateAnswer(text, !answerStale || !text.trim() ? item.version : answerVersion)
           },
           onKeyDown: e => {
             if (e.key === 'Enter' && !e.nativeEvent?.isComposing && (e.metaKey || e.ctrlKey) && ready) { e.preventDefault(); saysKeep ? send(false) : sendPrimary() }
