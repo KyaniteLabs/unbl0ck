@@ -70,7 +70,8 @@ const render=()=>{cursor=0;return Item({ctx,item,n:1,refresh,askEnabled:true})};
   all(render()).find(n=>n?.type==='textarea'&&n.props['aria-label']==='Ask a follow-up').props.onChange({target:{value:'Follow up '+i}});
   await find(render(),'Send').onClick();
  }
- assert.equal(sizes.length,31);assert.ok(Math.max(...sizes)<=20,'history must fit the API bound');
+ assert.equal(sizes.length,31);assert.ok(Math.max(...sizes)<=50,'history must fit the API bound');
+ assert.equal(sizes[20],41,'configured history above 20 must remain available to the server');
  assert.ok(all(render()).filter(n=>n?.props?.className==='ub-msg assistant').length===31,'visible conversation must remain intact');
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)

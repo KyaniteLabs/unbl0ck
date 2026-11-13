@@ -1038,9 +1038,9 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     setAskBusy(true)
     setAskError('')
     try {
-      // The server uses the latest 20 messages. Keep the visible conversation intact while
-      // bounding each request so a long conversation never hits the API message limit.
-      let r = await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next.slice(-20) } })
+      // Keep displayed history intact while respecting the API's 50-message transport
+      // limit. The server applies the configured model history window within that bound.
+      let r = await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next.slice(-50) } })
       const t0 = Date.now()   // the model can outlast the desktop's 30 s request limit: poll the background job
       while (r && r.pending && r.job) {
         if (Date.now() - t0 > 150000) throw new Error('The model took too long (over 150 s)')
