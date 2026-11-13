@@ -19,6 +19,7 @@ Ask job, one per question::
                             |                                  ^
                             +------fail----> ERROR --consume---+
     any state --expire (older than TTL_S)--> (absent)
+    settled results remain repeatably readable, subject to MAX_SETTLED retention.
 
     consume is refused while PENDING; finish/fail are refused unless PENDING (a late
     worker for an expired job is a no-op, never a resurrection).
@@ -133,6 +134,7 @@ class AskJobs:
     """``{job: {"status", "started", ...}}``. Every write goes through one named transition."""
 
     TTL_S = 900
+    MAX_SETTLED = 128
 
     def __init__(self, clock: Optional[Callable[[], float]] = None):
         self._clock = clock or (lambda: time.time())
@@ -172,6 +174,9 @@ class AskJobs:
                 raise IllegalTransition(f"ask job {job} is already {st['status'].value}")
             # One new record, swapped in whole: a poller never sees a status without its reply.
             self._jobs[job] = {"started": st["started"], **out}
+            settled = [k for k, v in self._jobs.items() if v["status"] in ASK_SETTLED]
+            for key in settled[:-self.MAX_SETTLED]:
+                self._jobs.pop(key, None)
             return True
 
     def consume(self, job: str) -> dict[str, Any]:

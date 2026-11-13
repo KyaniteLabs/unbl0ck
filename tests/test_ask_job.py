@@ -55,7 +55,7 @@ class AskJobTest(unittest.TestCase):
                 break
             time.sleep(0.05)
         self.assertEqual(p["reply"], "Pick A")
-        self.assertEqual(self.c.get(f"/card/ask/{job}").status_code, 404)  # consumed
+        self.assertEqual(self.c.get(f"/card/ask/{job}").json(), p)  # safe to retry a lost response
 
     def _ask_with(self, text):
         seen = {}
@@ -95,6 +95,26 @@ class AskJobTest(unittest.TestCase):
             r, _ = self._ask_with(text)
             self.assertEqual(r.status_code, 502)
             self.assertIn("returned no answer text", r.json()["detail"])
+
+    def test_poll_envelope_distinguishes_model_failure_from_transport_failure(self):
+        self.api._ASK_JOBS.create("failed")
+        self.api._ASK_JOBS.fail("failed", "model call failed: ValueError")
+        self.assertEqual(self.c.get("/card/ask/failed").status_code, 502)
+        first = self.c.get("/card/ask/failed?poll=true")
+        self.assertEqual(first.status_code, 200)
+        self.assertFalse(first.json()["ok"])
+        self.assertEqual(self.c.get("/card/ask/failed?poll=true").json(), first.json())
+
+    def test_retention_is_bounded_without_evicting_pending_work(self):
+        table = self.api._ASK_JOBS
+        table.create("pending")
+        for i in range(table.MAX_SETTLED + 5):
+            table.create(str(i))
+            table.finish(str(i), "A")
+        self.assertEqual(len(table), table.MAX_SETTLED + 1)
+        self.assertIsNotNone(table.get("pending"))
+        self.assertIsNone(table.get("0"))
+        self.assertEqual(table.get(str(table.MAX_SETTLED + 4))["reply"], "A")
 
 
 if __name__ == "__main__":

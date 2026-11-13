@@ -889,6 +889,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const [askInput, setAskInput] = useState('')
   const [askBusy, setAskBusy] = useState(false)
   const [askError, setAskError] = useState('')
+  const [askJob, setAskJob] = useState(null)
   const askEnd = useRef(null)
   const isKanban = item.source === 'kanban'
   const isPrompt = item.source === 'prompt'
@@ -1039,13 +1040,18 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     try {
       // Keep displayed history intact while respecting the API's 50-message transport
       // limit. The server applies the configured model history window within that bound.
-      let r = await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next.slice(-50) } })
+      let r = retry && !askStale && askJob?.version === item.version
+        ? { pending: true, job: askJob.id }
+        : await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next.slice(-50) } })
       const t0 = Date.now()   // the model can outlast the desktop's 30 s request limit: poll the background job
       while (r && r.pending && r.job) {
+        setAskJob({ id: r.job, version: item.version })
         if (Date.now() - t0 > 150000) throw new Error('The model took too long (over 150 s)')
         await new Promise(res => setTimeout(res, 1500))
-        r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job))
+        r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true')
       }
+      setAskJob(null)
+      if (r?.ok === false) throw new Error(String(r.detail || 'The model could not answer'))
       const reply = String(r?.reply || '').trim()
       if (!reply) throw new Error('The model returned an empty answer')
       setAskMsgs([...next, { role: 'assistant', content: reply }])
@@ -1053,6 +1059,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     } catch (e) {
       sfx.play('err')
       const msg = String(e?.message || e)
+      if (/unknown or expired ask job/.test(msg)) setAskJob(null)
       // An unknown job means the gateway restarted mid-answer: the work is gone, not slow.
       setAskError(/unknown or expired ask job/.test(msg) ? 'The gateway restarted while the model was answering. Retry to ask again.' : msg)
     } finally {

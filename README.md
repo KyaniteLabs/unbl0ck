@@ -110,6 +110,8 @@ Source read failures mark the queue incomplete while healthy sources remain usab
 
 If plugin settings cannot be read, UNBL0CK retains the last known identity settings and disables model features, chat collection and Kanban answers until the configuration is readable again. The queue reports the settings fault; it does not silently switch to broader defaults.
 
+Ask results can be polled repeatedly after a lost response. Retry resumes the same job after a transport failure; a completed model failure permits a new attempt. Results live in memory for at most 15 minutes, with at most 128 completed results retained.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
