@@ -1,5 +1,7 @@
 # Changelog
 
+- Keep settings read failures from widening chat visibility, model disclosure or answer identity; resume configured behavior after repair.
+
 ## Unreleased
 
 - **Recovery survives a temporary outage.** Failed Undo keeps its retry control and cannot submit twice while pending. Failed answers refresh the queue immediately so a posted answer with a failed release shows its recovery action. Long TL;DR conversations keep their displayed history while respecting the API's 50-message transport limit.
