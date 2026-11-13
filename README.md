@@ -1,5 +1,7 @@
 # UNBL0CK
 
+Maintainers: [external PRs can request Security Hermes review through the signed review relay](docs/security-review-link.md). Delivery is separate from approval; activation requires live gateway and review-identity verification.
+
 Agents get stuck waiting on you, and those questions end up scattered across Kanban boards, chats and other apps. UNBL0CK gathers them into one queue: every blocked Kanban card waiting on your answer, every chat on any platform (Desktop, CLI, TUI, Telegram, Discord and the rest) whose last turn is the bot asking you something, every agent paused right now on a clarify question, a command approval or an admin password prompt, every new person waiting for you to approve their pairing request, and mail drafts, call notes or other items outside Hermes filed by your agent or read from watched folders.
 
 To answer a card, type into the queue. UNBL0CK posts your answer as a comment through native Kanban and, if you choose, unblocks the card. A chat opens straight from the queue. Each card leads with a one-line summary of what you must decide, and the original text is one click away. Nothing is decided for you and silence never counts as a yes. UNBL0CK adds no ranking of its own: cards keep their board priority, newest first within it.
