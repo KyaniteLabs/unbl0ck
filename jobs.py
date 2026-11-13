@@ -173,6 +173,9 @@ class AskJobs:
             if st["status"] is not AskState.PENDING:
                 raise IllegalTransition(f"ask job {job} is already {st['status'].value}")
             # One new record, swapped in whole: a poller never sees a status without its reply.
+            # Dict order must follow completion, not creation: a slow pending job can
+            # otherwise evict itself immediately when newer jobs have already settled.
+            self._jobs.pop(job)
             self._jobs[job] = {"started": st["started"], **out}
             settled = [k for k, v in self._jobs.items() if v["status"] in ASK_SETTLED]
             for key in settled[:-self.MAX_SETTLED]:
