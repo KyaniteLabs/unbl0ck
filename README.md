@@ -56,6 +56,10 @@ Mail drafts waiting to be sent and call notes waiting to be read appear under **
 
 Each card shows **Act in:** and its reference so you can finish in the original app. **Done** deletes an agent-filed record from UNBL0CK. For folder cards, **Done — hides until the file changes** hides that file's current version, exactly as **Not for me** does. UNBL0CK never moves, edits or deletes your watched files. Both kinds offer **Not for me** and the existing BLUF summary with **+ Full text**. With summaries enabled, call notes get a bottom line so you can decide what needs reading.
 
+Use **Search queue** and the source selector to find a card by title, preview, app, recipient or reference. Search uses text already loaded in the queue; it does not fetch full exports or call your model. The status count keeps showing the whole queue, and filtering preserves typed answers and open conversations. **Clear filters** restores the list; **Esc** clears the search box. Every card has a keyboard-accessible **+ Full text** button, including when summaries are off. Failed full-text and Context requests have inline retry controls. Folder **Done** also offers the 12-second **Undo**; deleting an agent-filed record does not.
+
+Mail body selection excludes attachments and attached messages. HTML-only drafts keep the no-plain-text-body notice. An export larger than 256 KiB shows a preview-limit notice so you know to read the complete file in its original app.
+
 ## Disclosure
 
 The things you would want to know before installing:
@@ -99,6 +103,10 @@ the panel's blink, wink and talk geometry comes from the Hermes Gadget SDK (MIT)
 are SIL OFL 1.1; the Share Tech Mono subset is renamed UB Tech Mono because the original
 reserves the name "Share". See [NOTICE](NOTICE). UNBL0CK is an independent project by
 KyaniteLabs, not endorsed by Nous Research.
+
+## Failure recovery
+
+Source read failures mark the queue incomplete while healthy sources remain usable. Corrupt prompt records are preserved for repair. Visibility changes refuse to overwrite corrupt state, and watched folders disclose when their 200-file limit omits older exports. Model summaries show a fallback notice when unavailable; at most two summaries and four Ask calls run at once. A busy Ask returns a retryable error instead of joining an unbounded backlog.
 
 ## License
 

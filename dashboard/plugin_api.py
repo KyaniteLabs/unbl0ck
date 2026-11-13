@@ -19,6 +19,7 @@ import importlib.util
 import logging
 import re
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -165,11 +166,14 @@ def queue():
     n = _needs()
     q = n.build_queue()
     ctx = _loaded_ctx()
-    if q.get("bluf_enabled") and ctx is not None and hasattr(ctx, "llm"):
+    if q.get("bluf_enabled"):
         for it in q["items"]:
             if (not it.get("bluf") and it.get("source") not in getattr(n, "NO_BLUF_SOURCES", ())
                     and it.get("tier") not in ("stuck", "answered")):   # not asks: no model call each
-                _queue_bluf(n, ctx, it)
+                if ctx is not None and hasattr(ctx, "llm"):
+                    _queue_bluf(n, ctx, it)
+                else:
+                    it["bluf_status"] = "unavailable"
     # Outside files can be 256 KiB apiece and their source limits allow many per folder.
     # Keep the polled queue compact; the desktop fetches a full body only when opened.
     for item in q.get("items", []):
@@ -183,16 +187,39 @@ def queue():
 # Lifecycle (pending / failed / retry) is jobs.BlufJobs; see the diagram there.
 _BLUF_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="unbl0ck-bluf")
 _BLUF_JOBS = jobs.BlufJobs()
+_BLUF_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _run_with_slot(slots, worker, *args):
+    """Bound actual submitted work, including work whose client stopped polling."""
+    try:
+        return worker(*args)
+    finally:
+        slots.release()
 
 
 def _queue_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
     key = (item["id"], item["version"])
-    if _BLUF_JOBS.start(key):
-        item["bluf_pending"] = True
-        _BLUF_POOL.submit(_run_bluf, n, ctx, dict(item))
-    elif _BLUF_JOBS.is_pending(key):
+    if _BLUF_JOBS.is_pending(key) and not _BLUF_JOBS.can_start(key):
         item["bluf_pending"] = True   # still running: keep saying so on every poll
-    # else failed recently: show the raw text, retry later
+        return
+    if not _BLUF_JOBS.can_start(key):
+        item["bluf_status"] = "failed"
+        return
+    if not _BLUF_SLOTS.acquire(blocking=False):
+        item["bluf_status"] = "waiting"
+        return
+    if not _BLUF_JOBS.start(key):
+        _BLUF_SLOTS.release()
+        return
+    try:
+        _BLUF_POOL.submit(_run_with_slot, _BLUF_SLOTS, _run_bluf, n, ctx, dict(item))
+        item["bluf_pending"] = True
+    except Exception as exc:  # no stranded pending job when the executor rejects work
+        _BLUF_SLOTS.release()
+        _BLUF_JOBS.fail(key, type(exc).__name__)
+        item["bluf_status"] = "failed"
+        log.warning("unbl0ck: could not submit summary: %s", type(exc).__name__)
 
 
 def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
@@ -265,14 +292,24 @@ def card_ask(body: CardAsk):
     # The model often needs longer than the desktop's 30 s request limit, so run it in the
     # background and let the client poll GET /card/ask/{job}.
     job = uuid.uuid4().hex
-    _ASK_JOBS.create(job)
-    _ASK_POOL.submit(_run_ask, job, ctx, messages)
+    if not _ASK_SLOTS.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="Ask is busy. Retry when an active answer finishes.", headers={"Retry-After": "15"})
+    try:
+        _ASK_JOBS.create(job)
+        _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, job, ctx, messages)
+    except Exception as exc:
+        _ASK_SLOTS.release()
+        _ASK_JOBS.fail(job, "could not start Ask")
+        _ASK_JOBS.consume(job)
+        log.warning("unbl0ck: could not submit Ask: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Ask could not start. Retry in a moment.") from exc
     return {"ok": True, "pending": True, "job": job}
 
 
 # Lifecycle (pending -> done | error -> consumed, or expired) is jobs.AskJobs.
 _ASK_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unbl0ck-ask")
 _ASK_JOBS = jobs.AskJobs()
+_ASK_SLOTS = threading.BoundedSemaphore(4)
 
 
 def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
@@ -351,6 +388,10 @@ def hide(body: Hide):
         _needs().hide(body.id, body.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="busy, retry")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     return {"ok": True}
 
 
@@ -374,7 +415,12 @@ class Unhide(BaseModel):
 
 @router.post("/unhide")
 def unhide(body: Unhide):
-    return {"ok": True, "restored": _needs().unhide(body.id)}
+    try:
+        return {"ok": True, "restored": _needs().unhide(body.id)}
+    except TimeoutError:
+        raise HTTPException(status_code=409, detail="busy, retry")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 @router.get("/pack")

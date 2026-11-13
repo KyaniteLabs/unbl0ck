@@ -140,8 +140,10 @@ class AskJobs:
         self._jobs: dict[str, dict[str, Any]] = {}
 
     def get(self, job: str) -> Optional[dict[str, Any]]:
-        st = self._jobs.get(job)
-        return None if st is None else dict(st)
+        with self._lock:
+            self._expire()
+            st = self._jobs.get(job)
+            return None if st is None else dict(st)
 
     def create(self, job: str) -> None:
         """absent -> PENDING (after expiring old jobs)."""
@@ -162,6 +164,7 @@ class AskJobs:
 
     def _settle(self, job: str, out: dict[str, Any]) -> bool:
         with self._lock:
+            self._expire()
             st = self._jobs.get(job)
             if st is None:
                 return False
@@ -174,6 +177,7 @@ class AskJobs:
     def consume(self, job: str) -> dict[str, Any]:
         """DONE | ERROR -> absent, returning the settled record."""
         with self._lock:
+            self._expire()
             st = self._jobs.get(job)
             if st is None:
                 raise KeyError(job)

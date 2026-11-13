@@ -64,7 +64,7 @@ ${Object.entries(FONTS)
 .ub-list{display:flex;flex-direction:column;gap:14px}
 .ub-card{position:relative;padding:1px;background:var(--steel);
   clip-path:polygon(0 0,calc(100% - 18px) 0,100% 18px,100% 100%,18px 100%,0 calc(100% - 18px))}
-.ub-card>.in{background:var(--panel);padding:18px 22px 18px 18px;display:grid;grid-template-columns:56px 1fr;gap:4px 18px;
+.ub-card>.in{background:var(--panel);padding:18px 22px 18px 18px;display:grid;grid-template-columns:56px minmax(0,1fr);gap:4px 18px;
   clip-path:polygon(0 0,calc(100% - 17px) 0,100% 17px,100% 100%,17px 100%,0 calc(100% - 17px))}
 .ub-card>.in>:not(.ub-idx){grid-column:2}
 .ub-card:hover,.ub-card:focus-within{background:var(--amber)}
@@ -74,12 +74,12 @@ ${Object.entries(FONTS)
 .ub-card.prompt .ub-idx{color:var(--amber)}
 .ub-card.pairing .ub-idx{color:var(--mag)}
 .ub-top{display:flex;justify-content:space-between;align-items:baseline;gap:14px}
-.ub-h{font-weight:700;font-size:22px;line-height:1.15;letter-spacing:.01em;text-transform:uppercase;color:var(--text);margin:0}
+.ub-h{font-weight:700;font-size:22px;line-height:1.15;letter-spacing:.01em;text-transform:uppercase;color:var(--text);margin:0;min-width:0;overflow-wrap:anywhere}
 .ub-age{flex:none;font-family:var(--mono);font-size:14px;letter-spacing:.08em;color:var(--dim)}
 .ub-age.warn{color:var(--amber)}.ub-age.stale{color:var(--mag)}
-.ub-meta{font-family:var(--mono);font-size:13.5px;letter-spacing:.06em;color:var(--dim);text-transform:uppercase}
+.ub-meta{font-family:var(--mono);font-size:13.5px;letter-spacing:.06em;color:var(--dim);text-transform:uppercase;overflow-wrap:anywhere}
 .ub-meta em{font-style:normal;color:var(--cyan)}
-.ub-ask{margin:8px 0 2px;font-size:18px;font-weight:500;line-height:1.45;color:var(--muted);white-space:pre-wrap;
+.ub-ask{margin:8px 0 2px;font-size:18px;font-weight:500;line-height:1.45;color:var(--muted);white-space:pre-wrap;overflow-wrap:anywhere;
   max-height:5.8em;overflow:hidden;cursor:pointer;-webkit-mask-image:linear-gradient(#000 3.6em,transparent 5.8em);mask-image:linear-gradient(#000 3.6em,transparent 5.8em)}
 .ub-ask.open{max-height:none;-webkit-mask-image:none;mask-image:none;cursor:default}
 .ub-bluf{margin:10px 0 4px;font-size:21px;font-weight:600;line-height:1.35;color:var(--text)}
@@ -210,6 +210,11 @@ ${Object.entries(FONTS)
 .ub-pet:hover{border-color:var(--amber)}
 /* ── status strip: tiles + SFX + ticker ── */
 .ub-strip{display:flex;gap:10px;flex-wrap:wrap;align-items:stretch;margin:18px 0 0}
+.ub-filter{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 14px}
+.ub-filter input,.ub-filter select{min-width:0;max-width:100%;height:40px;padding:8px 12px;border:1px solid var(--steel);border-radius:0;background:var(--base);color:var(--text);font:500 17px var(--disp)}
+.ub-filter input{flex:1 1 240px}.ub-filter input::placeholder{color:var(--dim)}
+.ub-filter input:focus,.ub-filter select:focus{outline:2px solid var(--amber);outline-offset:2px}
+.ub-filter-status{font-family:var(--mono);font-size:12px;color:var(--label);margin-bottom:14px}
 .ub-sfx{display:flex;align-items:center;gap:8px}
 .ub-sfx .bars{display:inline-flex;gap:2px;align-items:flex-end;height:14px}
 .ub-sfx .bars i{display:block;width:3px;background:currentColor;animation:ub-eq .9s ease-in-out infinite}
@@ -241,7 +246,7 @@ ${Object.entries(FONTS)
 @media (max-width:760px){.ub-hero{grid-template-columns:1fr}.ub-pet{display:none}.ub-banner{font-size:9px}.ub-water{display:none}}
 @media (max-width:380px){.ub-banner{font-size:8px}}
 @media (max-width:640px){.ub-wrap{padding:20px 16px 40px}
-  .ub-card>.in{grid-template-columns:1fr}.ub-idx{display:none}.ub-card>.in>:not(.ub-idx){grid-column:1}
+  .ub-card>.in{grid-template-columns:minmax(0,1fr)}.ub-idx{display:none}.ub-card>.in>:not(.ub-idx){grid-column:1}
   .ub-ta{height:72px}.ub-btns.tools{margin-left:-10px}.ub-btns.tools .ub-btn{padding:0 10px;height:34px;font-size:14px}}
 .ub.fx-off *,.ub.fx-off *::before,.ub.fx-off *::after{animation:none!important;transition:none!important}
 .ub.fx-off .ub-grain,.ub.fx-off .ub-banner .c,.ub.fx-off .ub-banner .m{display:none}
@@ -864,7 +869,7 @@ function CardDetail({ data, loading, error }) {
   })
 }
 
-function Item({ ctx, item, n, refresh, askEnabled }) {
+function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const [answer, setAnswer] = useState('')
   const [answerVersion, setAnswerVersion] = useState(item.version)
   const [busy, setBusy] = useState(false)
@@ -876,6 +881,8 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
   const [detailError, setDetailError] = useState('')
   const [outsideText, setOutsideText] = useState(null)
   const [outsideTextLoading, setOutsideTextLoading] = useState(false)
+  const [outsideTextError, setOutsideTextError] = useState('')
+  const [outsideTextRetry, setOutsideTextRetry] = useState(0)
   const [askOpen, setAskOpen] = useState(false)
   const [askMsgs, setAskMsgs] = useState([])
   const [askVersion, setAskVersion] = useState(item.version)
@@ -904,19 +911,20 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     ctx.rest(`/card?id=${encodeURIComponent(item.id)}`)
       .then(d => { if (alive) setDetail({ ...d, __version: item.version }) })
       .catch(e => { if (alive) setDetailError(String(e?.message || e)) })
-      .finally(() => setDetailLoading(false))
+      .finally(() => { if (alive) setDetailLoading(false) })
     return () => { alive = false }
   }, [item.version, detailOpen])
   useEffect(() => {
     if (!isOutside || !open || outsideText?.__version === item.version) return
     let alive = true
     setOutsideTextLoading(true)
+    setOutsideTextError('')
     ctx.rest(`/outside/text?id=${encodeURIComponent(item.id)}&version=${encodeURIComponent(item.version)}`)
       .then(d => { if (alive) setOutsideText({ text: d.text, __version: item.version }) })
-      .catch(e => { if (alive) host.notifyError(e, 'UNBL0CK: could not load full text') })
+      .catch(e => { if (alive) setOutsideTextError(String(e?.message || e)) })
       .finally(() => { if (alive) setOutsideTextLoading(false) })
     return () => { alive = false }
-  }, [item.id, item.version, isOutside, open])
+  }, [item.id, item.version, isOutside, open, outsideTextRetry])
   useEffect(() => {
     if (askEnd.current) askEnd.current.scrollIntoView({ block: 'nearest' })
   }, [askMsgs, askBusy])
@@ -995,12 +1003,23 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     const r = await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
     if (r) $undo.set({ id: item.id, title: item.title, at: Date.now() })
   }
-  const outsideDone = () => run(
-    () => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null
-  )
+  const outsideDone = async () => {
+    const r = await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null)
+    if (r?.hidden) $undo.set({ id: item.id, title: item.title, at: Date.now() })
+  }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
   const outsideBody = outsideText?.__version === item.version ? outsideText.text : item.ask
+  const fullTextStatus = open && isOutside
+    ? outsideTextLoading
+      ? jsx('div', { className: 'ub-pending', role: 'status', children: '◇ LOADING FULL TEXT' })
+      : outsideTextError
+        ? jsxs('div', { className: 'ub-btns', children: [
+            jsx('div', { className: 'ub-fault', role: 'alert', children: `Full text could not load: ${outsideTextError}` }),
+            button({ kind: 'ghost', onClick: () => setOutsideTextRetry(n => n + 1), children: 'Retry full text' })
+          ] })
+        : null
+    : null
 
   const askSend = async (retry = false, preset = '') => {
     const q = preset || askInput.trim()
@@ -1133,7 +1152,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
             if (!answerStale || !e.target.value.trim()) setAnswerVersion(item.version)
           },
           onKeyDown: e => {
-            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && ready) { e.preventDefault(); saysKeep ? send(false) : sendPrimary() }
+            if (e.key === 'Enter' && !e.nativeEvent?.isComposing && (e.metaKey || e.ctrlKey) && ready) { e.preventDefault(); saysKeep ? send(false) : sendPrimary() }
           }
         }),
         answerStale ? jsx('div', { className: 'ub-hint', role: 'status', children: 'This draft is for an older version of this card. Clear it before answering the refreshed question.' }) : null,
@@ -1189,7 +1208,10 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
       ].filter(Boolean)
 
   const detailNode = detailOpen
-    ? jsx(CardDetail, { data: detail, loading: detailLoading, error: detailError })
+    ? jsxs('div', { children: [
+        jsx(CardDetail, { data: detail, loading: detailLoading, error: detailError }),
+        detailError ? button({ kind: 'ghost', disabled: detailLoading, onClick: loadDetail, children: 'Retry context' }) : null
+      ] })
     : null
   const askNode = askOpen && askEnabled
     ? jsxs('div', {
@@ -1235,9 +1257,10 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
                 value: askInput,
                 rows: 1,
                 disabled: askBusy,
+                'aria-label': 'Ask a follow-up',
                 placeholder: 'Ask a follow-up… (Enter sends, Shift+Enter adds a line)',
                 onChange: e => setAskInput(e.target.value),
-                onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); askSend() } }
+                onKeyDown: e => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent?.isComposing) { e.preventDefault(); askSend() } }
               }),
               button({ kind: 'primary', disabled: askBusy || !askInput.trim(), onClick: () => askSend(), children: 'Send' })
             ]
@@ -1247,6 +1270,7 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
     : null
 
   return jsx('section', {
+    hidden,
     className: `ub-card ${isKanban ? 'kanban' : isPrompt ? 'prompt' : isPairing ? 'pairing' : isOutside ? 'chat outside' : 'chat'}${done ? ' done' : ''}${done === 'kept' ? ' kept' : ''}`,
     style: { '--i': n - 1 },
     tabIndex: -1,
@@ -1282,16 +1306,18 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
               jsx('p', { className: 'ub-bluf', children: item.bluf }),
               item.bluf_why ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.bluf_why] }) : null,
               open ? jsx('p', { className: 'ub-ask open', children: isOutside ? outsideBody : item.ask }) : null,
-              open && isOutside && outsideTextLoading ? jsx('div', { className: 'ub-pending', children: '◇ LOADING FULL TEXT' }) : null,
+              fullTextStatus,
               jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' })
             ]
           : [
               item.bluf_pending ? jsx('div', { className: 'ub-pending', children: '◇ SUMMARIZING' }) : null,
+              item.bluf_status ? jsx('div', { className: 'ub-hint', role: 'note', children: item.bluf_status === 'waiting' ? 'Summary waiting for capacity; showing original text.' : 'Summary unavailable; showing original text.' }) : null,
               jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: isOutside ? (open ? outsideBody : item.ask) : item.ask }),
-              open && isOutside && outsideTextLoading ? jsx('div', { className: 'ub-pending', children: '◇ LOADING FULL TEXT' }) : null,
-              isOutside ? jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' }) : null,
+              fullTextStatus,
+              jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' }),
               item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null
             ]),
+        isOutside && item.truncated ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This export exceeds 256 KiB. Only the beginning is shown; read the complete text in the original app.' }) : null,
         jsx('div', { className: 'ub-act', children: actions }),
         detailNode || askNode ? jsxs('div', { className: 'ub-detail', children: [detailNode, askNode] }) : null
       ]
@@ -1301,6 +1327,8 @@ function Item({ ctx, item, n, refresh, askEnabled }) {
 
 function Page({ ctx, refresh }) {
   const q = useValue($queue)
+  const [query, setQuery] = useState('')
+  const [source, setSource] = useState('all')
   useEffect(() => { if (Date.now() - (q.at || 0) > 10000) refresh() }, [])   // opening the page shows fresh data
   const fx = useValue($fxOn)
   const undo = useValue($undo)
@@ -1320,6 +1348,16 @@ function Page({ ctx, refresh }) {
       host.notifyError(e, 'UNBL0CK: could not undo')
     }
   }
+  const terms = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean)
+  const filtered = source !== 'all' || terms.length > 0
+  // Search the text already in the queue; typing never fetches files or calls the model.
+  const visible = q.items.filter(i => {
+    if (source !== 'all' && i.source !== source) return false
+    const text = [i.title, i.ask, i.bluf, i.why, i.act_where, i.ref, i.to, i.task_id, i.board, i.owner, i.profile, i.chat_title, i.chat_with].filter(Boolean).join(' ').toLocaleLowerCase()
+    return terms.every(term => text.includes(term))
+  })
+  const visibleIds = new Set(visible.map(i => i.id))
+  // Hide filtered cards without unmounting them: drafts and open conversations survive.
   const kanban = q.items.filter(i => i.source === 'kanban')
   const kanbanAsks = kanban.filter(i => i.tier !== 'stuck' && i.tier !== 'answered')
   const kanbanStuck = kanban.filter(i => i.tier === 'stuck')
@@ -1328,6 +1366,7 @@ function Page({ ctx, refresh }) {
   const outside = q.items.filter(i => i.source === 'outside')
   const prompts = q.items.filter(i => i.source === 'prompt')
   const pairing = q.items.filter(i => i.source === 'pairing')
+  const clearFilters = () => { setQuery(''); setSource('all') }
   const oldest = oldestAskSince(q.items)
   const oldestH = oldest ? (Date.now() / 1000 - oldest) / 3600 : 0
   let n = 0
@@ -1337,21 +1376,24 @@ function Page({ ctx, refresh }) {
           collapsed
             ? jsx('details', {
                 className: 'ub-group',
+                hidden: !items.some(i => visibleIds.has(i.id)),
+                open: filtered ? true : undefined,
                 children: [jsx('summary', {
                   className: 'ub-sec',
                   style: { cursor: 'pointer', listStyle: 'none' },
                   children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
-                }), jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false }, item.id)) })]
-              })
+                }), jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })]
+              }, label)
             : jsxs('div', {
+                hidden: !items.some(i => visibleIds.has(i.id)),
                 children: [
                   jsxs('div', {
                     className: 'ub-sec',
                     children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
                   }),
-                  jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false }, item.id)) })
+                  jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })
                 ]
-              })
+              }, label)
         ]
       : []
 
@@ -1425,6 +1467,15 @@ function Page({ ctx, refresh }) {
           }),
           q.fault ? jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'LINK FAULT \\\\ ' }), q.fault] }) : null,
           ...(q.errors || []).map(err => jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'SOURCE FAULT \\\\ ' }), err] }, err)),
+          jsxs('div', { className: 'ub-filter', role: 'search', 'aria-label': 'Filter the queue', children: [
+            jsx('input', { type: 'search', value: query, placeholder: 'Find a card by title, preview, app or reference…', 'aria-label': 'Search queue', onChange: e => setQuery(e.target.value), onKeyDown: e => { if (e.key === 'Escape') { setQuery(''); e.stopPropagation() } } }),
+            jsx('select', { value: source, 'aria-label': 'Source', onChange: e => setSource(e.target.value), children: [
+              ['all', 'All sources'], ['prompt', 'Live prompts'], ['pairing', 'Access requests'], ['kanban', 'Kanban'], ['outside', 'Outside Hermes'], ['chat', 'Chats']
+            ].map(([value, label]) => jsx('option', { value, children: label }, value)) }),
+            filtered ? button({ kind: 'ghost', onClick: clearFilters, children: 'Clear filters' }) : null
+          ] }),
+          filtered ? jsx('div', { className: 'ub-filter-status', role: 'status', children: `${visible.length} of ${q.items.length} cards shown · search uses titles and previews` }) : null,
+          filtered && !visible.length && !q.loading ? jsx('div', { className: 'ub-clear', children: jsx('span', { children: 'No cards match these filters. Clear filters to see the queue.' }) }) : null,
           undo
             ? jsxs('div', {
                 className: 'ub-undo',
@@ -1456,13 +1507,14 @@ function Page({ ctx, refresh }) {
 function Chip() {
   const q = useValue($queue)
   const count = askCount(q)
-  if (!count) return null
+  const incomplete = !!q.fault || !!q.errors?.length
+  if (!count && !incomplete) return null
   return jsx('button', {
     type: 'button',
     className: q.fresh ? 'ub-chip new' : 'ub-chip',
     onClick: () => host.navigate(PATH),
-    title: 'Open UNBL0CK',
-    children: `◆ ${count} ${count === 1 ? 'NEEDS' : 'NEED'} YOU`
+    title: incomplete ? 'Open UNBL0CK · The queue is incomplete' : 'Open UNBL0CK',
+    children: count ? `◆ ${count} ${count === 1 ? 'NEEDS' : 'NEED'} YOU` : '◆ QUEUE INCOMPLETE'
   })
 }
 
@@ -1479,11 +1531,14 @@ export default {
     let follow = 0
     let lastErr = ''
     let inflight = null
+    let disposed = false
     const refresh = () => (inflight ||= load().finally(() => { inflight = null }))
     const load = async () => {
+      if (disposed) return
       clearTimeout(follow)
       try {
         const q = await ctx.rest('/queue')
+        if (disposed) return
         // Summaries land a few seconds after a new item appears: look again soon instead of
         // making the user wait a whole poll interval.
         if ((q.items || []).some(i => i.bluf_pending)) follow = setTimeout(refresh, 6000)
@@ -1496,6 +1551,7 @@ export default {
         lastErr = errKey
         $queue.set({ ...q, fresh, fault: '', loading: false, at: Date.now() })
       } catch (e) {
+        if (disposed) return
         // Keep the last good queue: a transient fetch fault must not wipe the list
         // or tell the user that nothing is blocked.
         const prev = $queue.get() || {}
@@ -1516,6 +1572,7 @@ export default {
     const onVisible = () => { if (!document.hidden && Date.now() - ($queue.get().at || 0) > 10000) refresh() }
     document.addEventListener('visibilitychange', onVisible)
     ctx.onDispose(() => {
+      disposed = true
       clearInterval(timer)
       clearTimeout(follow)
       document.removeEventListener('visibilitychange', onVisible)
