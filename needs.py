@@ -1899,6 +1899,15 @@ def _folder_outside_item(
         text = "(No text/plain body; HTML is not displayed.)"
         # MIME body selection skips attachments, including attached messages. Walking
         # every plain-text part can otherwise present an appendix as an HTML draft.
+        # An exported file may instead be labelled inline; a filename still makes it
+        # a separate document. Exclude those subtrees before native body selection,
+        # preserving multipart/alternative and multipart/related root semantics.
+        for candidate in msg.walk():
+            if candidate.get_filename() is not None:
+                if "Content-Disposition" in candidate:
+                    candidate.replace_header("Content-Disposition", "attachment")
+                else:
+                    candidate["Content-Disposition"] = "attachment"
         part = msg.get_body(preferencelist=("plain",))
         if part is not None:
             payload = part.get_payload(decode=True) or b""
