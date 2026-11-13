@@ -69,15 +69,15 @@ def _load_settings() -> dict[str, Any]:
     _SETTINGS_ERROR = None
     try:
         from hermes_cli.config import load_config_readonly  # type: ignore
-    except ImportError:  # unit tests and bare installs run without Hermes
-        return {}
-    try:
-        entries = (load_config_readonly().get("plugins") or {}).get("entries") or {}
+        config = load_config_readonly()
+        if getattr(config, "read_error", None) is not None:
+            raise RuntimeError("Hermes configuration could not be read")
+        entries = (config.get("plugins") or {}).get("entries") or {}
         return dict((entries.get("unbl0ck") or {}).get("settings") or {})
     except Exception as exc:  # noqa: BLE001 - a broken config must not take the queue down
         _SETTINGS_ERROR = f"settings: {type(exc).__name__}; could not read plugin settings; model features disabled until repaired"
         log.warning(
-            "unbl0ck: could not read plugin settings: %s: %s", type(exc).__name__, exc
+            "unbl0ck: could not read plugin settings: %s", type(exc).__name__
         )
         # Identity and disclosure settings must never silently widen after a read fault.
         # Preserve the last known configuration, and suspend all model calls until repair.
