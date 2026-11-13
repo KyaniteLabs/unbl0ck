@@ -973,6 +973,9 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
       sfx.play('err')
       petEmit('err')
       host.notifyError(e, 'UNBL0CK: that did not go through')
+      // An answer may have been posted before its release failed. Re-read the source so
+      // recovery actions and changed questions appear without waiting for the next poll.
+      await refresh()
       return null
     } finally {
       setBusy(false)
@@ -1035,7 +1038,9 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     setAskBusy(true)
     setAskError('')
     try {
-      let r = await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next } })
+      // Keep displayed history intact while respecting the API's 50-message transport
+      // limit. The server applies the configured model history window within that bound.
+      let r = await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next.slice(-50) } })
       const t0 = Date.now()   // the model can outlast the desktop's 30 s request limit: poll the background job
       while (r && r.pending && r.job) {
         if (Date.now() - t0 > 150000) throw new Error('The model took too long (over 150 s)')
@@ -1333,20 +1338,28 @@ function Page({ ctx, refresh }) {
   useEffect(() => { if (Date.now() - (q.at || 0) > 10000) refresh() }, [])   // opening the page shows fresh data
   const fx = useValue($fxOn)
   const undo = useValue($undo)
+  const [undoBusy, setUndoBusy] = useState(false)
   useEffect(() => {
-    if (!undo) return
+    if (!undo || undoBusy) return
     const t = setTimeout(() => $undo.set(null), Math.max(0, UNDO_MS - (Date.now() - undo.at)))
     return () => clearTimeout(t)
-  }, [undo])
+  }, [undo, undoBusy])
   const undoHide = async () => {
     const u = undo
-    $undo.set(null)
+    if (!u || undoBusy) return
+    setUndoBusy(true)
     try {
       await ctx.rest('/unhide', { method: 'POST', body: { id: u.id } })
+      if ($undo.get()?.at === u.at) $undo.set(null)
       sfx.play('move')
       await refresh()
     } catch (e) {
+      // Keep a failed restoration available for another full retry window. A different
+      // hide action may have replaced this one while the request was pending.
+      if ($undo.get()?.at === u.at) $undo.set({ ...u, at: Date.now() })
       host.notifyError(e, 'UNBL0CK: could not undo')
+    } finally {
+      setUndoBusy(false)
     }
   }
   const terms = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean)
@@ -1483,7 +1496,7 @@ function Page({ ctx, refresh }) {
                 role: 'status',
                 children: [
                   jsxs('span', { children: [jsx('b', { children: 'HIDDEN \\\\ ' }), undo.title] }),
-                  button({ kind: 'ghost', onClick: undoHide, children: 'Undo' })
+                  button({ kind: 'ghost', disabled: undoBusy, onClick: undoHide, children: 'Undo' })
                 ]
               }, undo.at)
             : null,
