@@ -75,3 +75,22 @@ const render=()=>{cursor=0;return Item({ctx,item,n:1,refresh,askEnabled:true})};
  assert.ok(all(render()).filter(n=>n?.props?.className==='ub-msg assistant').length===31,'visible conversation must remain intact');
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)
+
+    def test_transient_poll_failure_retries_the_same_job_without_another_model_call(self):
+        self.run_views(r"""
+let posts=0,polls=0;
+env.setTimeout=fn=>{fn();return 1};
+const ctx={rest:async path=>{
+ if(path==='/card/ask'){posts++;return{pending:true,job:'saved'}}
+ assert.equal(path,'/card/ask/saved?poll=true');
+ if(++polls===1)throw new Error('temporary transport failure');
+ return{ok:true,reply:'Recovered answer'};
+}};
+const render=()=>{cursor=0;return Item({ctx,item,n:1,refresh,askEnabled:true})};
+(async()=>{
+ find(render(),'TL;DR').onClick();await new Promise(r=>setImmediate(r));
+ await find(render(),'Retry').onClick();
+ assert.equal(posts,1);assert.equal(polls,2);
+ assert.ok(all(render()).some(n=>n?.props?.className==='ub-msg assistant'));
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")

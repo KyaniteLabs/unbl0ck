@@ -1,5 +1,7 @@
 # Changelog
 
+- Recover Ask results after interrupted polling without repeating model work; bound completed-result retention.
+
 - Keep settings read failures from widening chat visibility, model disclosure or answer identity; resume configured behavior after repair.
 
 ## Unreleased

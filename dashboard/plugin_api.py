@@ -306,7 +306,7 @@ def card_ask(body: CardAsk):
     return {"ok": True, "pending": True, "job": job}
 
 
-# Lifecycle (pending -> done | error -> consumed, or expired) is jobs.AskJobs.
+# Lifecycle and bounded retention of repeatably readable results are jobs.AskJobs.
 _ASK_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unbl0ck-ask")
 _ASK_JOBS = jobs.AskJobs()
 _ASK_SLOTS = threading.BoundedSemaphore(4)
@@ -347,17 +347,17 @@ def ask_reply_text(text: Any) -> str:
 
 
 @router.get("/card/ask/{job}")
-def card_ask_result(job: str):
+def card_ask_result(job: str, poll: bool = False):
     st = _ASK_JOBS.get(job)
     if st is None:
         raise HTTPException(status_code=404, detail="unknown or expired ask job")
     if st["status"] is jobs.AskState.PENDING:
         return {"ok": True, "pending": True, "job": job, "elapsed": round(time.time() - st["started"], 1)}
-    try:
-        st = _ASK_JOBS.consume(job)
-    except KeyError:   # a concurrent poll consumed it first
-        raise HTTPException(status_code=404, detail="unknown or expired ask job")
+    # A GET must remain repeatable: a lost HTTP response must not destroy model work.
+    # Results expire through the job table's bounded lifetime instead of being consumed.
     if st["status"] is jobs.AskState.ERROR:
+        if poll:
+            return {"ok": False, "detail": st["detail"]}
         raise HTTPException(status_code=502, detail=st["detail"])
     return {k: st[k] for k in ("ok", "reply", "provider", "model")}
 
