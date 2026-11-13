@@ -48,7 +48,7 @@ for (const q of [{count:0,errors:['unavailable']},{count:0,fault:'offline'}]) {
         script = r"""
 const fs = require('fs'), assert = require('node:assert/strict');
 const src = fs.readFileSync(process.argv[1], 'utf8');
-const views = src.slice(src.indexOf('function Item('), src.indexOf('function Chip('));
+const views = src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
 const node = (type, props, key) => ({type, props, key}), noop = () => {};
 let state = [], cursor = 0, undo;
 const env = {
