@@ -1005,6 +1005,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   }
   const send = async release => {
     if (answerStale) return null
+    const submittedDraft = answerDrafts.get(item.id)
     const result = await run(
       () => ctx.rest('/kanban/answer', {
         method: 'POST',
@@ -1016,7 +1017,9 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
           ? `Answered and unblocked ${item.task_id}`
           : `Answered ${item.task_id} (kept blocked)`)
     )
-    if (result) updateAnswer('', item.version)
+    // A source fault can remount this card and accept a newer draft while this
+    // request is in flight. Its late completion owns only the submitted record.
+    if (result && answerDrafts.get(item.id) === submittedDraft) updateAnswer('', item.version)
     return result
   }
   const sendPrimary = () => send(!triage)
