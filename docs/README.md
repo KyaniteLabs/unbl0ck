@@ -9,6 +9,7 @@ the behavior; link to it rather than copying recovery or review rules into anoth
 | [Operator guide](operator-guide.md) | Actions, failure recovery, retention and source limits |
 | [Architecture](architecture.md) | Module boundaries, API contracts and state ownership |
 | [Verification](verification.md) | Reproducible checks, operator coverage and evidence limits |
+| [Release assessment](release-readiness.md) | Dated release recommendation, candidate scope and remaining acceptance |
 | [Security review link](security-review-link.md) | Request protocol, activation, authenticated verdicts and merge gate |
 | [Visual canon](../design/CANON.md) | Design tokens, layout and generated visual assets |
 
