@@ -43,6 +43,35 @@ class ExportedMail(OutsideFixture):
         (item,) = needs.build_queue()["items"]
         self.assertEqual(item["text"].strip(), "The actual draft body")
 
+    def test_inline_named_text_file_does_not_replace_an_html_body(self):
+        self.watch()
+        msg = EmailMessage()
+        msg.set_content("<p>Actual HTML body</p>", subtype="html")
+        msg.add_attachment("APPENDIX TEXT", subtype="plain", filename="appendix.txt", disposition="inline")
+        (self.folder / "draft.eml").write_bytes(msg.as_bytes())
+        (item,) = needs.build_queue()["items"]
+        self.assertEqual(item["text"], "(No text/plain body; HTML is not displayed.)")
+
+    def test_inline_named_part_before_real_plain_alternative_is_skipped(self):
+        self.watch()
+        msg = EmailMessage()
+        msg.set_content("Actual plain body")
+        msg.add_alternative("<p>Actual HTML body</p>", subtype="html")
+        msg.add_attachment("APPENDIX TEXT", filename="appendix.txt", disposition="inline")
+        msg.set_payload(list(reversed(msg.get_payload())))
+        (self.folder / "draft.eml").write_bytes(msg.as_bytes())
+        (item,) = needs.build_queue()["items"]
+        self.assertEqual(item["text"].strip(), "Actual plain body")
+
+    def test_related_resource_is_not_selected_in_place_of_its_root(self):
+        self.watch()
+        msg = EmailMessage()
+        msg.set_content("<p>Actual HTML body</p>", subtype="html")
+        msg.add_related("Inline text resource", subtype="plain", cid="resource")
+        (self.folder / "draft.eml").write_bytes(msg.as_bytes())
+        (item,) = needs.build_queue()["items"]
+        self.assertEqual(item["text"], "(No text/plain body; HTML is not displayed.)")
+
     def test_preview_reports_truncation_only_when_bytes_were_omitted(self):
         self.watch()
         for size in (needs._OUTSIDE_READ_LIMIT, needs._OUTSIDE_READ_LIMIT + 1):
