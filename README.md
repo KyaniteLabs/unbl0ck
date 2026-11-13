@@ -1,6 +1,7 @@
 # UNBL0CK
 
-Maintainers: [external PRs can request Security Hermes review through the signed review relay](docs/security-review-link.md). Delivery is separate from approval; activation requires live gateway and review-identity verification.
+See the [canonical documentation map](docs/README.md) for operator recovery, architecture,
+verification, and the [Security Hermes review link](docs/security-review-link.md).
 
 Agents get stuck waiting on you, and those questions end up scattered across Kanban boards, chats and other apps. UNBL0CK gathers them into one queue: every blocked Kanban card waiting on your answer, every chat on any platform (Desktop, CLI, TUI, Telegram, Discord and the rest) whose last turn is the bot asking you something, every agent paused right now on a clarify question, a command approval or an admin password prompt, every new person waiting for you to approve their pairing request, and mail drafts, call notes or other items outside Hermes filed by your agent or read from watched folders.
 
@@ -60,6 +61,10 @@ Each card shows **Act in:** and its reference so you can finish in the original 
 
 Use **Search queue** and the source selector to find a card by title, preview, app, recipient or reference. Search uses text already loaded in the queue; it does not fetch full exports or call your model. The status count keeps showing the whole queue, and filtering preserves typed answers and open conversations. **Clear filters** restores the list; **Esc** clears the search box. Every card has a keyboard-accessible **+ Full text** button, including when summaries are off. Failed full-text and Context requests have inline retry controls. Folder **Done** also offers the 12-second **Undo**; deleting an agent-filed record does not.
 
+Typed answers also survive temporary source failure in bounded session memory, with
+their original question version. See the [operator guide](docs/operator-guide.md) for
+retention, stale-draft recovery and the watched-folder selection limit.
+
 Mail body selection excludes attachments and attached messages. HTML-only drafts keep the no-plain-text-body notice. An export larger than 256 KiB shows a preview-limit notice so you know to read the complete file in its original app.
 
 ## Disclosure
@@ -108,11 +113,11 @@ KyaniteLabs, not endorsed by Nous Research.
 
 ## Failure recovery
 
-Source read failures mark the queue incomplete while healthy sources remain usable. Corrupt prompt records are preserved for repair. Visibility changes refuse to overwrite corrupt state, and watched folders disclose when their 200-file limit omits older exports. Model summaries show a fallback notice when unavailable; at most two summaries and four Ask calls run at once. A busy Ask returns a retryable error instead of joining an unbounded backlog.
-
-If plugin settings cannot be read, UNBL0CK retains the last known identity settings and disables model features, chat collection and Kanban answers until the configuration is readable again. The queue reports the settings fault; it does not silently switch to broader defaults.
-
-Ask results can be polled repeatedly after a lost response. Retry resumes the same job after a transport failure; a completed model failure permits a new attempt. Results live in memory for at most 15 minutes, with at most 128 completed results retained.
+The [operator guide](docs/operator-guide.md#recover-from-a-fault) owns the recovery
+procedures and retention limits. Source failures are visible; settings uncertainty
+suspends chat collection, model features and Kanban answers until repaired. Healthy
+sources remain usable. See [verification](docs/verification.md) for tested paths and
+the live checks still required before acceptance.
 
 ## License
 
