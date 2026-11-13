@@ -1,10 +1,12 @@
 # Changelog
 
-- Recover Ask results after interrupted polling without repeating model work; bound completed-result retention.
-
-- Keep settings read failures from widening chat visibility, model disclosure or answer identity; resume configured behavior after repair.
-
 ## Unreleased
+
+- **Interrupted Ask responses are recoverable.** Retry polling the same completed job without repeating model work. Completed-result retention is bounded and follows completion order, so a slow job is not immediately evicted by newer requests.
+- **Unreadable settings fail closed.** Read errors, parser error markers and loader import failures cannot widen chat visibility, model disclosure or answer identity. Configured behavior resumes after repair.
+- **Typed answers survive a source outage.** Session drafts retain their original question version; a late completion from an old card cannot erase a newer draft. Drafts remain in memory for up to 30 minutes after editing and do not survive a page reload.
+- **Mail selection excludes named MIME parts.** Inline parts with filenames cannot replace the message body; alternative and related message structures retain their body-selection rules.
+- **Canonical guides cover recovery and review.** Operator, architecture and verification references document the actual limits. A signed external-PR Security Hermes relay is included for owner activation; acknowledgements do not count as review approval, and live activation remains unverified.
 
 - **Recovery survives a temporary outage.** Failed Undo keeps its retry control and cannot submit twice while pending. Failed answers refresh the queue immediately so a posted answer with a failed release shows its recovery action. Long TL;DR conversations keep their displayed history while respecting the API's 50-message transport limit.
 - **Failures stay visible and recoverable.** Corrupt source records, schema/config failures and folder limits mark the queue incomplete. Unreadable prompt records survive inspection, stale cleanup cannot hide healthy prompts, and visibility writes refuse corrupt state. Summary fallback status is explicit; model work has bounded admission, rejected submissions cannot strand jobs, and Ask expiry works without a new request.

@@ -18,11 +18,11 @@ relay rejects ignored/coalesced/delivered responses and mismatched acknowledgeme
 Native `accepted` can mean a hook consumed the request, and `duplicate` can also come
 from non-durable routes. Neither proves an admitted session or a completed review.
 
-Four bounded attempts handle transport faults and 5xx responses. For429, the relay
-honors Retry-After up to120seconds, including HTTP dates; without it, it waits61seconds
-so the native30-per-minute limiter cannot starve later PRs on every reconciliation.
+Four bounded attempts handle transport faults and 5xx responses. For 429, the relay
+honors Retry-After up to 120 seconds, including HTTP dates; without it, it waits 61 seconds
+so the native 30-per-minute limiter cannot starve later PRs on every reconciliation.
 Longer requested delays fail visibly for a later run. Workflow concurrency serializes
-reconciliation. The PR and review pagination bounds are each1,000; exceeding either
+reconciliation. The PR and review pagination bounds are each 1,000; exceeding either
 fails visibly rather than silently dropping the remainder.
 
 The relay checks GitHub reviews before posting. Only a submitted `APPROVED` or
@@ -53,7 +53,7 @@ changes are needed by this patch.
    origin plus `/p/security/webhooks/github-pr-security`, and
    `HERMES_SECURITY_WEBHOOK_SECRET` to that same secret. Never put either in a PR or log.
 3. Security's profile must have its own authenticated GitHub identity and review SOP.
-   Verify that identity can submit PR reviews, then set the repository Actions variable
+   Verify that identity can submit PR reviews independently of the PR author, then set the repository Actions variable
    `HERMES_SECURITY_GITHUB_USER_ID` to its GitHub numeric account ID. Do not infer the
    identity from display names, authorship or ordinary comments. An absent/invalid ID
    prevents relay initialization.
@@ -65,6 +65,18 @@ changes are needed by this patch.
    must stay non-green. Verify a failed Security review never becomes a pass.
 
 Until those live checks pass, this is built and tested but **not activated**.
+
+### Bootstrap before the first merge
+
+The workflow cannot run from the default branch until it has been reviewed and landed.
+That does not waive Security review of this patch. The live gateway owner can install
+the inspected route and run `python scripts/security_review.py --pr NUMBER --include-drafts`
+from the reviewed, pinned checkout, supplying the same four environment values used by
+the workflow (a read-only GitHub token, webhook URL, signing secret and verified account
+ID). The initial run stays nonzero/pending until Security submits its review; rerun to
+verify the exact-pair verdict. Then follow the normal independent-review/CI/merge gates.
+If the existing Security credential belongs to the PR author, owner setup of a separate
+review identity is required; do not substitute a self-approval or a generic comment.
 
 ## Review and merge gate
 
