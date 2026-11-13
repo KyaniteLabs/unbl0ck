@@ -108,6 +108,8 @@ KyaniteLabs, not endorsed by Nous Research.
 
 Source read failures mark the queue incomplete while healthy sources remain usable. Corrupt prompt records are preserved for repair. Visibility changes refuse to overwrite corrupt state, and watched folders disclose when their 200-file limit omits older exports. Model summaries show a fallback notice when unavailable; at most two summaries and four Ask calls run at once. A busy Ask returns a retryable error instead of joining an unbounded backlog.
 
+If plugin settings cannot be read, UNBL0CK retains the last known identity settings and disables model features, chat collection and Kanban answers until the configuration is readable again. The queue reports the settings fault; it does not silently switch to broader defaults.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

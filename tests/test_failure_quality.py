@@ -21,7 +21,9 @@ class SourceFailures(OutsideFixture):
     def test_settings_failure_marks_the_queue_incomplete(self):
         with patch.object(outside_needs, "_SETTINGS_ERROR", None):
             with patch("hermes_cli.config.load_config_readonly", side_effect=ValueError("broken config")):
-                assert outside_needs._load_settings() == {}
+                failed = outside_needs._load_settings()
+                assert failed["bluf_enabled"] is False
+                assert failed["ask_enabled"] is False
             assert any(e.startswith("settings:") for e in outside_needs.build_queue()["errors"])
             with patch("hermes_cli.config.load_config_readonly", return_value={}):
                 outside_needs._load_settings()
@@ -109,6 +111,39 @@ def test_chat_schema_failure_is_reported_but_unused_database_is_allowed():
         assert needs.chat_items(home, errors=errors) == []
         assert errors and "chat[default]" in errors[0]
         conn.close()
+
+
+@pytest.mark.parametrize("previous", [{}, {"principal_name": "Ada", "owner_user_ids": "telegram:42", "comment_author": "Ada", "bluf_enabled": False, "ask_enabled": False}])
+def test_settings_read_fault_never_widens_identity_or_model_disclosure(previous):
+    # Other legacy suites replace needs._settings at collection time. Exercise a fresh
+    # production module so the real cache and configuration loader are covered together.
+    spec = importlib.util.spec_from_file_location("ub_settings_fault", Path(__file__).parents[1] / "needs.py")
+    subject = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(subject)
+    with patch.object(subject, "_SETTINGS_CACHE", [0.0, previous]):
+        with patch("hermes_cli.config.load_config_readonly", side_effect=ValueError("broken config")):
+            failed = subject._settings()
+        assert failed["bluf_enabled"] is False
+        assert failed["ask_enabled"] is False
+        for key, value in previous.items():
+            assert failed[key] == value
+        errors = []
+        with patch.object(subject.sqlite3, "connect") as connect:
+            assert subject.chat_items(Path("/unused"), errors=errors) == []
+            connect.assert_not_called()
+        assert any(e.startswith("chat:") for e in errors)
+        with patch("hermes_cli.kanban_db_connect.connect") as connect:
+            with pytest.raises(RuntimeError, match="repair them before answering"):
+                subject.answer_card("default", "t", "Approved", release=False, version="v1")
+            connect.assert_not_called()
+        # A repaired config restores the configured behavior at the next cache refresh.
+        subject._SETTINGS_CACHE[0] = 0.0
+        repaired = {"principal_name": "Grace", "bluf_enabled": True, "ask_enabled": True}
+        with patch("hermes_cli.config.load_config_readonly", return_value={"plugins": {"entries": {"unbl0ck": {"settings": repaired}}}}):
+            assert subject._settings() == repaired
+        assert subject._SETTINGS_ERROR is None
+        assert subject.principal_author() == "Grace"
+        assert subject.bluf_enabled() and subject.ask_enabled()
 
 
 def test_release_refuses_corrupt_recovery_state_before_touching_the_card():

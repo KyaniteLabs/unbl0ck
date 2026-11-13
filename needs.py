@@ -75,11 +75,13 @@ def _load_settings() -> dict[str, Any]:
         entries = (load_config_readonly().get("plugins") or {}).get("entries") or {}
         return dict((entries.get("unbl0ck") or {}).get("settings") or {})
     except Exception as exc:  # noqa: BLE001 - a broken config must not take the queue down
-        _SETTINGS_ERROR = f"settings: {type(exc).__name__}; could not read plugin settings; using defaults"
+        _SETTINGS_ERROR = f"settings: {type(exc).__name__}; could not read plugin settings; model features disabled until repaired"
         log.warning(
             "unbl0ck: could not read plugin settings: %s: %s", type(exc).__name__, exc
         )
-        return {}
+        # Identity and disclosure settings must never silently widen after a read fault.
+        # Preserve the last known configuration, and suspend all model calls until repair.
+        return {**_SETTINGS_CACHE[1], "bluf_enabled": False, "ask_enabled": False}
 
 
 def _settings() -> dict[str, Any]:
@@ -1320,6 +1322,10 @@ def chat_items(
     names = _patterns()["_NAMES"]
     owners = chat_owner_ids()
     me = {n.lower() for n in principal_names()}
+    if _SETTINGS_ERROR:
+        if errors is not None:
+            errors.append("chat: unavailable until plugin settings can be read")
+        return []
     for profile, db in _state_dbs(home):
         try:
             conn = sqlite3.connect(
@@ -2236,6 +2242,8 @@ def answer_card(
         # turn a successful action into a late, misleading failure or be overwritten.
         load_pending_releases(home, strict=True)
     author = principal_author()
+    if _SETTINGS_ERROR:
+        raise RuntimeError("could not read plugin settings; repair them before answering")
     item_id = f"kanban:{board}:{task_id}"
     comment_id: int | None = None
     post_answer = False
