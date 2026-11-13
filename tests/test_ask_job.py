@@ -116,6 +116,17 @@ class AskJobTest(unittest.TestCase):
         self.assertIsNone(table.get("0"))
         self.assertEqual(table.get(str(table.MAX_SETTLED + 4))["reply"], "A")
 
+    def test_slow_completion_survives_a_full_settled_result_cache(self):
+        table = self.api._ASK_JOBS
+        table.create("slow")
+        for i in range(table.MAX_SETTLED):
+            table.create(str(i))
+            table.finish(str(i), "fast")
+        self.assertTrue(table.finish("slow", "finally"))
+        self.assertEqual(table.get("slow")["reply"], "finally")
+        self.assertIsNone(table.get("0"))
+        self.assertEqual(len(table), table.MAX_SETTLED)
+
 
 if __name__ == "__main__":
     unittest.main()
