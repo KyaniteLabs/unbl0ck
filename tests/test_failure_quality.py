@@ -1,6 +1,7 @@
 """Failure injection: an incomplete queue and unavailable work must stay visible."""
 
 import importlib.util
+import builtins
 import json
 import sqlite3
 import sys
@@ -114,14 +115,25 @@ def test_chat_schema_failure_is_reported_but_unused_database_is_allowed():
 
 
 @pytest.mark.parametrize("previous", [{}, {"principal_name": "Ada", "owner_user_ids": "telegram:42", "comment_author": "Ada", "bluf_enabled": False, "ask_enabled": False}])
-def test_settings_read_fault_never_widens_identity_or_model_disclosure(previous):
+@pytest.mark.parametrize("fault", ["raised", "sentinel", "import"])
+def test_settings_read_fault_never_widens_identity_or_model_disclosure(previous, fault):
     # Other legacy suites replace needs._settings at collection time. Exercise a fresh
     # production module so the real cache and configuration loader are covered together.
     spec = importlib.util.spec_from_file_location("ub_settings_fault", Path(__file__).parents[1] / "needs.py")
     subject = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(subject)
     with patch.object(subject, "_SETTINGS_CACHE", [0.0, previous]):
-        with patch("hermes_cli.config.load_config_readonly", side_effect=ValueError("broken config")):
+        from hermes_cli.config import FailedConfigRead
+        original_import = builtins.__import__
+        def import_config(name, *args, **kwargs):
+            if name == "hermes_cli.config":
+                raise ImportError("broken config dependency")
+            return original_import(name, *args, **kwargs)
+        failure = patch("builtins.__import__", side_effect=import_config) if fault == "import" else patch(
+            "hermes_cli.config.load_config_readonly",
+            **({"return_value": FailedConfigRead(previous, error=ValueError("broken config"))} if fault == "sentinel" else {"side_effect": ValueError("broken config")}),
+        )
+        with failure:
             failed = subject._settings()
         assert failed["bluf_enabled"] is False
         assert failed["ask_enabled"] is False
