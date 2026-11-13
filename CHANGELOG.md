@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Recovery survives a temporary outage.** Failed Undo keeps its retry control and cannot submit twice while pending. Failed answers refresh the queue immediately so a posted answer with a failed release shows its recovery action. Long TL;DR conversations keep their displayed history while bounding model requests to the latest 20 messages.
 - **Failures stay visible and recoverable.** Corrupt source records, schema/config failures and folder limits mark the queue incomplete. Unreadable prompt records survive inspection, stale cleanup cannot hide healthy prompts, and visibility writes refuse corrupt state. Summary fallback status is explicit; model work has bounded admission, rejected submissions cannot strand jobs, and Ask expiry works without a new request.
 - **Find cards in a large queue.** Search titles, previews, apps and references, or filter by source. Typed answers survive filtering, and the status count still covers the whole queue.
 - **Read and recover in place.** Every card has a keyboard-accessible full-text toggle. Full-text and Context failures have retry controls; folder Done can be undone for 12 seconds. Long subjects and unbroken text wrap on small screens, and text composition no longer submits an unfinished answer or Ask.
