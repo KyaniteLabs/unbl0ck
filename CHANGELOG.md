@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.1 (2026-11-14)
+
 - **Interrupted Ask responses are recoverable.** Retry polling the same completed job without repeating model work. Completed-result retention is bounded and follows completion order, so a slow job is not immediately evicted by newer requests.
 - **Unreadable settings fail closed.** Read errors, parser error markers and loader import failures cannot widen chat visibility, model disclosure or answer identity. Concurrent refreshes share one settled read; another caller's repair cannot erase an in-flight caller's fault. Configured behavior resumes after repair.
 - **Typed answers survive a source outage.** Session drafts retain their original question version; a late completion from an old card cannot erase a newer draft. Drafts remain in memory for up to 30 minutes after editing and do not survive a page reload.
