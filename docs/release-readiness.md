@@ -15,7 +15,8 @@ correct body. These changes address reproduced failures in the operator's work.
 
 Include the corrected stack through [PR29](https://github.com/KyaniteLabs/unbl0ck/pull/29)
 and the canonical documentation in [PR30](https://github.com/KyaniteLabs/unbl0ck/pull/30),
-plus the final settings-race correction at `fac9710e18d37b56aefcb9399e15057ca3659d46`.
+plus the final settings-race correction in [PR31](https://github.com/KyaniteLabs/unbl0ck/pull/31)
+at `fac9710e18d37b56aefcb9399e15057ca3659d46`.
 Earlier layers have corrections above them; assess the complete integration rather
 than treating PR23 alone as the release candidate. Freeze additional feature work
 for this candidate, while continuing to fix any acceptance defect that is reproduced.

@@ -80,10 +80,12 @@ passed 401 tests with no skips in the same pinned runtime, with the same upstrea
 deprecation warning.
 
 Independent review found no remaining material source findings in
-`89597e3..fac9710`, including the immediate correction over `8fbd0a0`. Six bounded
-concurrency/repair probes and 11 settings tests passed independently without skips.
-Desktop, jobs/API, MIME and relay source files were verified unchanged, so their
-earlier execution evidence is reused, not represented as a new rendered run. The
+`89597e3..fac9710`, including the immediate correction over `8fbd0a0`. Independent
+probes covered cold/last-good concurrent faults, chat/answer snapshots across repair,
+and real-parser failure, repair and subsequent failure. Eleven settings tests passed
+independently without skips. Previously exercised Desktop, jobs/API, MIME-selection
+and relay paths are unchanged by this correction; their earlier execution evidence is
+reused, not represented as a new rendered run. The
 397-test run above is historical evidence and does not cover this later correction.
 
 ## Acceptance still requiring live evidence
