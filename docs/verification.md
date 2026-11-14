@@ -38,12 +38,12 @@ does not prove focus, accessible controls or the operator journey in a browser.
 | Full text / Context / search / keys | `test_desktop_quality`, `test_desktop_contract`, rendered operator checks | Retry controls work; filters preserve mounted state; Escape and focus follow the documented order |
 | Typed answer recovery | `test_operator_recovery`, rendered partial-source checks | Card disappears and returns with draft intact; changed question keeps recovered draft disabled |
 | Summary / Ask | `test_bluf*`, `test_ask_job`, `test_ask_privacy`, `test_state_machines`, rendered operator checks | Bounded admission; reasoning stripped; lost terminal response can be collected with no second model POST |
-| Config read failure and repair | `test_failure_quality`, independent actual Hermes parser probes | Raised, marked-dictionary and import failures fail closed, both cold and after a good config; repair restores configured behavior |
+| Config read failure and repair | `test_failure_quality`, independent actual Hermes parser probes | Raised, marked-dictionary and import failures fail closed, both cold and after a good config; concurrent refresh shares one settled read; another caller's repair cannot erase an in-flight fault |
 | Security relay / installer | `test_security_review`, workflow lint | Native signature/limiter compatibility; pending stays non-green; exact authenticated current review required; foreign routes preserved |
 
 ## Observed evidence: 2026-11-13
 
-The cumulative application source at `b43b0ed58d89f4060387290dffddc77b6b80f165`
+The earlier cumulative application source at `b43b0ed58d89f4060387290dffddc77b6b80f165`
 passed 397 tests with no skips in a disposable runtime using the pinned Hermes source.
 There was one upstream Starlette/httpx deprecation warning. The generated Desktop
 artifact was rebuilt and exercised. Workflow lint and the outgoing staged leak scans
@@ -68,6 +68,23 @@ contract, Ask result consumption and completion ordering, Undo, answer draft los
 MIME selection, and webhook acknowledgement/rate-limit ambiguity. It is a separate
 review lane from Security Hermes. Current per-PR review and CI state must be checked
 live before landing; this document is not an evergreen approval of later commits.
+
+A final independent review reproduced a further settings race in the documentation
+stack at `8fbd0a0`: concurrent failed refreshes could clear the shared error before
+another caller checked it, exposing unrelated chats. A subsequent repair could also
+erase an in-flight caller's fault. The correction at
+`fac9710e18d37b56aefcb9399e15057ca3659d46` serializes refresh and binds settings to
+their fault for each chat/answer call. The cold-cache and last-good concurrent-fault
+regressions both failed on the preceding source. The corrected cumulative suite
+passed 401 tests with no skips in the same pinned runtime, with the same upstream
+deprecation warning.
+
+Independent review found no remaining material source findings in
+`89597e3..fac9710`, including the immediate correction over `8fbd0a0`. Six bounded
+concurrency/repair probes and 11 settings tests passed independently without skips.
+Desktop, jobs/API, MIME and relay source files were verified unchanged, so their
+earlier execution evidence is reused, not represented as a new rendered run. The
+397-test run above is historical evidence and does not cover this later correction.
 
 ## Acceptance still requiring live evidence
 

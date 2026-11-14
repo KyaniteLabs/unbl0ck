@@ -14,13 +14,17 @@ correct body. These changes address reproduced failures in the operator's work.
 ## Candidate scope and evidence
 
 Include the corrected stack through [PR29](https://github.com/KyaniteLabs/unbl0ck/pull/29)
-and the canonical documentation in [PR30](https://github.com/KyaniteLabs/unbl0ck/pull/30).
+and the canonical documentation in [PR30](https://github.com/KyaniteLabs/unbl0ck/pull/30),
+plus the final settings-race correction at `fac9710e18d37b56aefcb9399e15057ca3659d46`.
 Earlier layers have corrections above them; assess the complete integration rather
 than treating PR23 alone as the release candidate. Freeze additional feature work
 for this candidate, while continuing to fix any acceptance defect that is reproduced.
 
-The cumulative application source `b43b0ed` passed 397 tests without skips and all 16
-native plugin-validator checks. Twelve rendered recovery scenarios passed through
+The corrected cumulative application source `fac9710` passed 401 tests without skips.
+Independent review reproduced a concurrent settings fault in the preceding stack and
+verified that the correction keeps each caller bound to its own settings/fault snapshot.
+The earlier source `b43b0ed` passed all 16 native plugin-validator checks; the final
+candidate still requires its own hosted gate. Twelve rendered recovery scenarios passed through
 the actual plugin API and native stores. Independent review reproduced important
 faults and verified their corrections. These results support preparing a candidate;
 they do not prove the packaged Desktop, production providers or live Security relay.

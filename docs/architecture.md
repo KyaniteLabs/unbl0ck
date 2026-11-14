@@ -22,6 +22,9 @@ Queue reads isolate failures by source. Settings failures are different: an unce
 identity must not widen chat collection or resume model disclosure. Both raised loader
 errors and Hermes' `FailedConfigRead.read_error` marker enter the fail-closed path.
 Recovery resumes configured behavior only after a successful settings read.
+Settings refresh and cache publication are serialized. Chat collection and answers
+capture settings and their error together, so another caller's refresh or repair
+cannot erase an in-flight caller's fault or change its identity snapshot.
 
 Chat databases are opened read-only. Watched files are checked for containment,
 regular-file type and identity before use; changed files are retried on a later poll.
