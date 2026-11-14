@@ -101,7 +101,7 @@ const run = new Function('env', `with(env) { ${src.slice(seedStart, seedEnd)}; $
         script = r"""
 const fs = require('fs');
 const src = fs.readFileSync(process.argv[1], 'utf8');
-const views = src.slice(src.indexOf('function Item('), src.indexOf('function Chip('));
+const views = src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
 const node = (type, props) => ({type, props});
 const noop = () => {};
 const env = {
@@ -197,7 +197,7 @@ if (since !== 30) throw new Error(`oldest ask timestamp was ${since}`);
     def test_refreshed_kanban_card_keeps_drafts_stale_and_rejects_old_suggestions(self):
         script = r"""const fs = require('fs');
 const src = fs.readFileSync(process.argv[1], 'utf8');
-const views = src.slice(src.indexOf('function Item('), src.indexOf('function Chip('));
+const views = src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
 const node = (type, props) => ({type, props});
 const noop = () => {};
 let slots = [], cursor = 0;

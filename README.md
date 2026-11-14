@@ -1,5 +1,8 @@
 # UNBL0CK
 
+See the [canonical documentation map](docs/README.md) for operator recovery, architecture,
+verification, and the [Security Hermes review link](docs/security-review-link.md).
+
 Agents get stuck waiting on you, and those questions end up scattered across Kanban boards, chats and other apps. UNBL0CK gathers them into one queue: every blocked Kanban card waiting on your answer, every chat on any platform (Desktop, CLI, TUI, Telegram, Discord and the rest) whose last turn is the bot asking you something, every agent paused right now on a clarify question, a command approval or an admin password prompt, every new person waiting for you to approve their pairing request, and mail drafts, call notes or other items outside Hermes filed by your agent or read from watched folders.
 
 To answer a card, type into the queue. UNBL0CK posts your answer as a comment through native Kanban and, if you choose, unblocks the card. A chat opens straight from the queue. Each card leads with a one-line summary of what you must decide, and the original text is one click away. Nothing is decided for you and silence never counts as a yes. UNBL0CK adds no ranking of its own: cards keep their board priority, newest first within it.
@@ -56,6 +59,14 @@ Mail drafts waiting to be sent and call notes waiting to be read appear under **
 
 Each card shows **Act in:** and its reference so you can finish in the original app. **Done** deletes an agent-filed record from UNBL0CK. For folder cards, **Done — hides until the file changes** hides that file's current version, exactly as **Not for me** does. UNBL0CK never moves, edits or deletes your watched files. Both kinds offer **Not for me** and the existing BLUF summary with **+ Full text**. With summaries enabled, call notes get a bottom line so you can decide what needs reading.
 
+Use **Search queue** and the source selector to find a card by title, preview, app, recipient or reference. Search uses text already loaded in the queue; it does not fetch full exports or call your model. The status count keeps showing the whole queue, and filtering preserves typed answers and open conversations. **Clear filters** restores the list; **Esc** clears the search box. Every card has a keyboard-accessible **+ Full text** button, including when summaries are off. Failed full-text and Context requests have inline retry controls. Folder **Done** also offers the 12-second **Undo**; deleting an agent-filed record does not.
+
+Typed answers also survive temporary source failure in bounded session memory, with
+their original question version. See the [operator guide](docs/operator-guide.md) for
+retention, stale-draft recovery and the watched-folder selection limit.
+
+Mail body selection excludes attachments and attached messages. HTML-only drafts keep the no-plain-text-body notice. An export larger than 256 KiB shows a preview-limit notice so you know to read the complete file in its original app.
+
 ## Disclosure
 
 The things you would want to know before installing:
@@ -99,6 +110,14 @@ the panel's blink, wink and talk geometry comes from the Hermes Gadget SDK (MIT)
 are SIL OFL 1.1; the Share Tech Mono subset is renamed UB Tech Mono because the original
 reserves the name "Share". See [NOTICE](NOTICE). UNBL0CK is an independent project by
 KyaniteLabs, not endorsed by Nous Research.
+
+## Failure recovery
+
+The [operator guide](docs/operator-guide.md#recover-from-a-fault) owns the recovery
+procedures and retention limits. Source failures are visible; settings uncertainty
+suspends chat collection, model features and Kanban answers until repaired. Healthy
+sources remain usable. See [verification](docs/verification.md) for tested paths and
+the live checks still required before acceptance.
 
 ## License
 

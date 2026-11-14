@@ -16,10 +16,11 @@ def _needs():
 
 def _summary(limit: int = 12) -> str:
     q = _needs().build_queue()
-    if not q["count"]:
+    if not q["count"] and not q["errors"]:
         return "Nothing is blocked on you."
     asks = [it for it in q["items"] if it.get("tier") not in ("stuck", "answered")]
-    lines = [f"{q['count']} thing(s) waiting on you:"]
+    lines = [f"{q['count']} thing(s) waiting on you:" if q["count"]
+             else "No asks detected; the queue is incomplete."]
     for it in asks[:limit]:
         where = (f"{it['board']}:{it['task_id']}" if it["source"] == "kanban"
                  else f"{it.get('kind') or 'prompt'} {it['profile']}" if it["source"] == "prompt"
@@ -46,9 +47,12 @@ LOCAL_SURFACES = frozenset({"cli", "tui", "desktop", "local"})
 
 def _count_only() -> str:
     q = _needs().build_queue()
-    if not q["count"]:
+    if not q["count"] and not q["errors"]:
         return "Nothing is blocked on you."
-    return (f"{q['count']} thing(s) waiting on you. Open UNBL0CK in Hermes Desktop or run "
+    lead = f"{q['count']} thing(s) waiting on you. " if q["count"] else ""
+    if q["errors"]:
+        lead += "The queue is incomplete. "
+    return (lead + "Open UNBL0CK in Hermes Desktop or run "
             "hermes unbl0ck on the machine to see them.")
 
 
@@ -66,12 +70,13 @@ def _setup_cli(parser):
 
 def _cli(args):
     import json
+    import sys
 
     n = _needs()
     if args.json or args.pack:
         q = n.build_queue()
         if args.pack:
-            print(f"pack: {n.write_pocket_pack(q)}")
+            print(f"pack: {n.write_pocket_pack(q)}", file=sys.stderr if args.json else sys.stdout)
         if args.json:
             print(json.dumps(q, indent=1))
         return
