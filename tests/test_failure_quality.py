@@ -7,7 +7,9 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -156,6 +158,115 @@ def test_settings_read_fault_never_widens_identity_or_model_disclosure(previous,
         assert subject._SETTINGS_ERROR is None
         assert subject.principal_author() == "Grace"
         assert subject.bluf_enabled() and subject.ask_enabled()
+
+
+@pytest.mark.parametrize("previous", [{}, {"owner_user_ids": "telegram:42"}])
+def test_concurrent_settings_faults_never_expose_chats(previous):
+    from hermes_cli.config import FailedConfigRead
+
+    spec = importlib.util.spec_from_file_location("ub_settings_race", Path(__file__).parents[1] / "needs.py")
+    subject = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(subject)
+    first_fault, resume_first = threading.Event(), threading.Event()
+    second_started, second_loading, finish_second = (threading.Event() for _ in range(3))
+    calls = []
+
+    def read_config():
+        calls.append(True)
+        if len(calls) == 2:
+            second_loading.set()
+            assert finish_second.wait(5), "second loader was not released"
+        return FailedConfigRead(previous, error=ValueError("broken config"))
+
+    def warn(*args):
+        if not first_fault.is_set():
+            first_fault.set()
+            assert resume_first.wait(5), "first fault was not released"
+
+    def refresh():
+        second_started.set()
+        return subject._settings()
+
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d)
+        with sqlite3.connect(home / "state.db") as conn:
+            conn.execute("CREATE TABLE sessions (id TEXT, title TEXT, source TEXT, user_id TEXT, chat_type TEXT, display_name TEXT)")
+            conn.execute("CREATE TABLE messages (id INTEGER, session_id TEXT, role TEXT, content TEXT, timestamp REAL)")
+            for n, owner in enumerate(("42", "43"), 1):
+                conn.execute("INSERT INTO sessions VALUES (?, 'Bot Chat', 'telegram', ?, 'dm', 'Other')", (str(n), owner))
+                conn.execute("INSERT INTO messages VALUES (?, ?, 'assistant', 'Should I use Monday?', ?)", (n, str(n), time.time()))
+        errors = []
+        with patch.object(subject, "_SETTINGS_CACHE", [0.0, previous]), patch(
+            "hermes_cli.config.load_config_readonly", side_effect=read_config
+        ), patch.object(subject.log, "warning", side_effect=warn), ThreadPoolExecutor(max_workers=2) as pool:
+            try:
+                collector = pool.submit(subject.chat_items, home, errors=errors)
+                assert first_fault.wait(5), "collector did not reach the settings fault"
+                waiter = pool.submit(refresh)
+                assert second_started.wait(5), "concurrent caller did not start"
+                # Broken code starts a second loader and clears the fault while the
+                # first caller is paused. Correct code waits for that first refresh.
+                second_loading.wait(0.25)
+                resume_first.set()
+                items = collector.result(timeout=5)
+                finish_second.set()
+                failed_settings = waiter.result(timeout=5)
+            finally:
+                resume_first.set()
+                finish_second.set()
+        assert items == []
+        assert any(e.startswith("chat:") for e in errors)
+        assert failed_settings["ask_enabled"] is False
+        assert len(calls) == 1, "concurrent callers must share the settled cache"
+
+
+@pytest.mark.parametrize("action", ["chat", "answer"])
+def test_settings_repair_cannot_clear_an_inflight_callers_fault(action):
+    from hermes_cli.config import FailedConfigRead
+
+    spec = importlib.util.spec_from_file_location("ub_settings_repair_race", Path(__file__).parents[1] / "needs.py")
+    subject = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(subject)
+    real_snapshot = subject._settings_state
+    snapshot_ready, resume = threading.Event(), threading.Event()
+    config = [FailedConfigRead({}, error=ValueError("broken config"))]
+    errors = []
+
+    def paused_snapshot():
+        state = real_snapshot()
+        snapshot_ready.set()
+        assert resume.wait(5), "faulted caller was not released"
+        return state
+
+    def act():
+        if action == "chat":
+            return subject.chat_items(Path("/unused"), errors=errors)
+        return subject.answer_card("default", "t", "Approved", release=False, version="v1")
+
+    with patch("hermes_cli.config.load_config_readonly", side_effect=lambda: config[0]), patch.object(
+        subject, "_settings_state", side_effect=paused_snapshot
+    ), patch.object(subject.sqlite3, "connect") as chat_db, patch(
+        "hermes_cli.kanban_db_connect.connect"
+    ) as kanban_db, ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            caller = pool.submit(act)
+            assert snapshot_ready.wait(5), "caller did not capture its faulted settings"
+            repaired = {"principal_name": "Ada", "owner_user_ids": "telegram:42"}
+            config[0] = {"plugins": {"entries": {"unbl0ck": {"settings": repaired}}}}
+            subject._SETTINGS_CACHE[0] = 0.0
+            assert subject._settings() == repaired
+            assert subject._SETTINGS_ERROR is None
+            resume.set()
+            if action == "chat":
+                assert caller.result(timeout=5) == []
+                assert any(e.startswith("chat:") for e in errors)
+            else:
+                with pytest.raises(RuntimeError, match="repair them before answering"):
+                    caller.result(timeout=5)
+            chat_db.assert_not_called()
+            kanban_db.assert_not_called()
+        finally:
+            resume.set()
 
 
 def test_release_refuses_corrupt_recovery_state_before_touching_the_card():

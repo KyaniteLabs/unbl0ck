@@ -62,18 +62,18 @@ log = logging.getLogger("unbl0ck")
 _SETTINGS_TTL = 5.0
 _SETTINGS_CACHE: list[Any] = [0.0, {}]
 _SETTINGS_ERROR: str | None = None
+_SETTINGS_LOCK = threading.RLock()
 
 
 def _load_settings() -> dict[str, Any]:
     global _SETTINGS_ERROR
-    _SETTINGS_ERROR = None
     try:
         from hermes_cli.config import load_config_readonly  # type: ignore
         config = load_config_readonly()
         if getattr(config, "read_error", None) is not None:
             raise RuntimeError("Hermes configuration could not be read")
         entries = (config.get("plugins") or {}).get("entries") or {}
-        return dict((entries.get("unbl0ck") or {}).get("settings") or {})
+        settings = dict((entries.get("unbl0ck") or {}).get("settings") or {})
     except Exception as exc:  # noqa: BLE001 - a broken config must not take the queue down
         _SETTINGS_ERROR = f"settings: {type(exc).__name__}; could not read plugin settings; model features disabled until repaired"
         log.warning(
@@ -82,14 +82,23 @@ def _load_settings() -> dict[str, Any]:
         # Identity and disclosure settings must never silently widen after a read fault.
         # Preserve the last known configuration, and suspend all model calls until repair.
         return {**_SETTINGS_CACHE[1], "bluf_enabled": False, "ask_enabled": False}
+    _SETTINGS_ERROR = None
+    return settings
 
 
 def _settings() -> dict[str, Any]:
     """Plugin settings, cached for a few seconds: one queue build checks them per card."""
-    now = time.monotonic()
-    if now - _SETTINGS_CACHE[0] > _SETTINGS_TTL:
-        _SETTINGS_CACHE[:] = [now, _load_settings()]
-    return _SETTINGS_CACHE[1]
+    with _SETTINGS_LOCK:
+        if time.monotonic() - _SETTINGS_CACHE[0] > _SETTINGS_TTL:
+            settings = _load_settings()
+            _SETTINGS_CACHE[:] = [time.monotonic(), settings]
+        return _SETTINGS_CACHE[1]
+
+
+def _settings_state() -> tuple[dict[str, Any], str | None]:
+    """Bind identity/disclosure settings to the fault from that same refresh."""
+    with _SETTINGS_LOCK:
+        return _settings(), _SETTINGS_ERROR
 
 
 def principal_names(settings: dict[str, Any] | None = None) -> list[str]:
@@ -1319,13 +1328,14 @@ def chat_items(
     home = home or hermes_home()
     since = time.time() - days * 86400
     items: list[dict[str, Any]] = []
-    names = _patterns()["_NAMES"]
-    owners = chat_owner_ids()
-    me = {n.lower() for n in principal_names()}
-    if _SETTINGS_ERROR:
+    settings, settings_error = _settings_state()
+    if settings_error:
         if errors is not None:
             errors.append("chat: unavailable until plugin settings can be read")
         return []
+    names = _patterns(principal_names(settings), role_words(settings))["_NAMES"]
+    owners = chat_owner_ids(settings)
+    me = {n.lower() for n in principal_names(settings)}
     for profile, db in _state_dbs(home):
         try:
             conn = sqlite3.connect(
@@ -2250,9 +2260,10 @@ def answer_card(
         # Check recovery state before posting or releasing, so a damaged record cannot
         # turn a successful action into a late, misleading failure or be overwritten.
         load_pending_releases(home, strict=True)
-    author = principal_author()
-    if _SETTINGS_ERROR:
+    settings, settings_error = _settings_state()
+    if settings_error:
         raise RuntimeError("could not read plugin settings; repair them before answering")
+    author = principal_author(settings)
     item_id = f"kanban:{board}:{task_id}"
     comment_id: int | None = None
     post_answer = False
