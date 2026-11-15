@@ -75,7 +75,7 @@ class StateFileSafety(Home):
         needs.hide("chat:p:s", "1", self.home)
         self.assertEqual(victim.read_text(), "keep me")
         self.assertFalse(target.is_symlink())
-        self.assertEqual(json.loads(target.read_text()), {"chat:p:s": "1"})
+        self.assertEqual(needs.load_hidden(self.home), {"chat:p:s": "1"})
 
     def test_a_leftover_temp_file_does_not_loosen_the_permissions(self):
         """01-029: an existing 0644 temp file is replaced, not reused with its old mode."""
@@ -112,7 +112,7 @@ class StateFileSafety(Home):
         with patch.object(os, "replace", flaky):
             needs.hide("chat:p:s", "1", self.home)
         self.assertGreaterEqual(calls["n"], 4)
-        self.assertEqual(json.loads((self.data / "hidden.json").read_text()), {"chat:p:s": "1"})
+        self.assertEqual(needs.load_hidden(self.home), {"chat:p:s": "1"})
         self.assertEqual([p.name for p in self.data.glob("*.tmp")], [])
 
     def test_a_replace_that_never_succeeds_still_fails_and_cleans_up(self):
@@ -196,19 +196,19 @@ class StateSchemaAndRetention(Home):
         with patch.object(needs, "build_queue", lambda *a, **kw: queue):
             with self.assertRaises(needs.StaleHide):
                 needs.hide("kanban:b:t", "1", self.home)
-            self.assertEqual(json.loads((self.data / "hidden.json").read_text()), {"kanban:b:t": "2"})
+            self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "2"})
             needs.hide("kanban:b:t", "2", self.home)  # the same version is a no-op repeat
         # The card moved on to version 3 and the person hides what they see now: allowed.
         queue = {"items": [{"id": "kanban:b:t", "version": "3"}]}
         with patch.object(needs, "build_queue", lambda *a, **kw: queue):
             needs.hide("kanban:b:t", "3", self.home)
-        self.assertEqual(json.loads((self.data / "hidden.json").read_text()), {"kanban:b:t": "3"})
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "3"})
 
     def test_hiding_still_works_when_the_item_cannot_be_looked_up(self):
         needs.hide("kanban:b:t", "2", self.home)
         with patch.object(needs, "build_queue", side_effect=OSError("boom")):
             needs.hide("kanban:b:t", "1", self.home)
-        self.assertEqual(json.loads((self.data / "hidden.json").read_text()), {"kanban:b:t": "1"})
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "1"})
 
     def test_legacy_null_and_empty_hidden_values_are_still_supported(self):
         (self.data / "hidden.json").write_text(json.dumps({"a": None, "b": ""}))

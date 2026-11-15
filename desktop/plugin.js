@@ -886,8 +886,13 @@ const newAskRequestId = () => {
 // Local dismissals the human can still undo, newest first, bounded. A second dismissal
 // no longer replaces the first. The server keeps a filed record only for a short period,
 // so an entry can outlive its record; Undo then says so instead of pretending.
+// seq is taken when the human clicks, not when the response arrives: a late response for an older
+// dismissal of this item must not displace the entry (and Undo token) of a newer one.
+let undoSeq = 0
 function undoPush(entry) {
-  const rest = ($undo.get?.() || []).filter(u => u.id !== entry.id)
+  const list = $undo.get?.() || []
+  if (list.some(u => u.id === entry.id && (u.seq || 0) > (entry.seq || 0))) return
+  const rest = list.filter(u => u.id !== entry.id)
   $undo.set([entry, ...rest].slice(0, 5))
 }
 const answerDrafts = new Map()
@@ -1059,12 +1064,14 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
       r => (r && r.released ? `Unblocked ${item.task_id}` : `Could not unblock ${item.task_id}`)
     )
   const hide = async () => {
+    const seq = ++undoSeq
     await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn',
-      r => { if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: item.version }) })
+      r => { if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: r.token, seq }) })
   }
   const outsideDone = async () => {
+    const seq = ++undoSeq
     await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'ok',
-      r => { if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.done ? r.token : item.version }) })
+      r => { if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.token, seq }) })
   }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
@@ -1470,7 +1477,7 @@ function Page({ ctx, refresh }) {
     if (!u || undoBusy) return
     setUndoBusy(true)
     // A late response may only touch its own dismissal: the same item can resurface and be dismissed again meanwhile.
-    const same = x => x.id === u.id && x.at === u.at
+    const same = x => x.id === u.id && x.at === u.at && x.token === u.token && x.seq === u.seq
     const drop = () => $undo.set(($undo.get() || []).filter(x => !same(x)))
     try {
       const r = await ctx.rest('/unhide', { method: 'POST', body: u.token ? { id: u.id, token: u.token } : { id: u.id } })

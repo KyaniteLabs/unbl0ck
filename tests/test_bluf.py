@@ -555,7 +555,7 @@ class StaleSummaryWrites(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
             started_old = time.time() - 5
-            needs.save_bluf("kanban:b:t", "v2", "New question.", "Waits.", home)
+            needs.save_bluf("kanban:b:t", "v2", "New question.", "Waits.", home, started_at=time.time() - 1)
             needs.save_bluf("kanban:b:t", "v1", "Old question.", "Waits.", home, started_at=started_old)
             self.assertEqual(needs.load_blufs(home)["kanban:b:t"]["version"], "v2")
 

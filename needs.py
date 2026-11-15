@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import itertools
 import math
 import json
 import logging
@@ -408,10 +409,31 @@ def _hidden_entry_ok(value: Any) -> bool:
     return value is None or isinstance(value, str)
 
 
-def load_hidden(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, str]:
+# A hide stores ``version`` plus a per-dismissal token (``version \x1f token``), so an Undo can
+# name this dismissal and not just the content version two dismissals share. Entries written
+# before tokens existed hold the bare version, which stays their token.
+_HIDDEN_TOKEN = re.compile(r"(.*)\x1f([0-9a-f]{32})\Z", re.S)
+
+
+def _split_hidden(value: Any) -> tuple[Any, str | None]:
+    """(version, token) of one stored hidden entry; the token is None for a bare version."""
+    if isinstance(value, str):
+        match = _HIDDEN_TOKEN.fullmatch(value)
+        if match:
+            return match.group(1), match.group(2)
+    return value, None
+
+
+def _load_hidden_raw(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, Any]:
     return _read_json(
         _hidden_path(home), errors=errors, strict=strict, entry_ok=_hidden_entry_ok
     )
+
+
+def load_hidden(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, str]:
+    """``{item_id: version}``; the dismissal tokens are not part of this view."""
+    raw = _load_hidden_raw(home, errors=errors, strict=strict)
+    return {item_id: _split_hidden(value)[0] for item_id, value in raw.items()}
 
 
 class Visibility(str, Enum):
@@ -456,9 +478,10 @@ def _current_version(item_id: str, home: Path | None) -> str | None:
     return None
 
 
-def hide(item_id: str, version: str, home: Path | None = None) -> None:
+def hide(item_id: str, version: str, home: Path | None = None) -> str:
+    """Hide one version. Returns the token naming this dismissal, for ``unhide``."""
     item_id, version = str(item_id or ""), str(version or "")
-    if not item_id or len(item_id) > 300 or len(version) > 300:
+    if not item_id or len(item_id) > 300 or len(version) > 300 or "\x1f" in version:
         raise ValueError("item id and version must be short strings")
     # An older tab's "Not for me" must not replace a newer dismissal. Checked outside the
     # lock because the queue build takes it.
@@ -468,62 +491,83 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
         if current is not None and current != version:
             raise StaleHide("the card changed since this view; refresh before hiding it")
     with _state_lock(home):
-        hidden = load_hidden(home, strict=True)
+        hidden = _load_hidden_raw(home, strict=True)
         hidden.pop(item_id, None)
-        hidden[item_id] = version
+        token = uuid.uuid4().hex
+        hidden[item_id] = f"{version}\x1f{token}"
         if (
             len(hidden) > _HIDDEN_KEEP
         ):  # oldest hides first out; the store never grows unbounded
             hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
         _write_json(_hidden_path(home), hidden, ordered=True)
+        return token
 
 
 def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:
     """Undo "Not for me" or a local Done. Returns whether anything was restored.
 
-    ``token`` names the dismissal being undone: the version that was hidden, or the ``token``
-    a Done returned. A caller holding one may only restore that dismissal: a newer one (the
-    item resurfaced with changed content and was dismissed again) is left alone and the
-    answer is False. Without a token every dismissal of the id is restored (older callers).
+    ``token`` names the dismissal being undone: the token ``hide`` or a Done returned. It
+    identifies one dismissal, not a content version, so a consumed token never authorizes
+    removing a later dismissal of the same unchanged item. A hide whose version is no longer
+    the card's current one hid nothing, so undoing it restores nothing (False). Without a token
+    every dismissal of the id is restored (older callers).
     A filed record dismissed twice (Done in one tab, "Not for me" in another) carries both
     markers; one matching token clears both, under one lock, so the card cannot stay hidden
-    behind the marker the undo did not name."""
+    behind the marker the undo did not name. Restoring a Done record counts against the
+    filed-item cap; a full queue refuses with RuntimeError and leaves the Done in place."""
     item_id = str(item_id)
     token = None if token is None else str(token)
     filed = _FILED_ID.fullmatch(item_id)
+    current: str | None = None
+    if token is not None and not filed:
+        # Outside the lock: the queue build takes it. None means unknown, which is not "changed".
+        current = _current_version(item_id, home)
     with _state_lock(home):
-        hidden = load_hidden(home, strict=True)
-        rec = f = None
+        hidden = _load_hidden_raw(home, strict=True)
+        rec: dict[str, Any] = {}
+        f = None
+        d = None
         if filed:
             d = _outside_dir(home)
-            _purge_done(d)
+            _purge_logged(d)
             f = d / (filed.group(1) + ".json")
             if not f.is_symlink() and f.is_file():
                 rec = _read_json(f)
+            current = str(rec.get("version")) if rec else None
         done = bool(rec) and _is_done(rec)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
         is_hidden = item_id in hidden
-        if token is not None:
-            matches = (done and token in (_done_token(rec), str(rec.get("version")))) or (
-                is_hidden and hidden[item_id] == token
-            )
-            if not matches:
+        h_version, h_token = _split_hidden(hidden.get(item_id))
+        # The marker only hides the card while it names the card's current version.
+        h_applies = is_hidden and (current is None and not filed or str(h_version) == current)
+        if token is None:
+            if not done and not is_hidden:
                 return False
-        if not done and not is_hidden:
-            return False
-        clear_done, clear_hidden = done, is_hidden
-        if token is not None and done and is_hidden and hidden[item_id] != str(rec.get("version")):
-            # The two markers belong to different versions of the item (hidden at v1, Done at v2).
-            # A token for one never authorizes removing the other's newer dismissal.
-            if token == hidden[item_id]:
+            clear_done, clear_hidden = done, is_hidden
+        else:
+            d_match = done and token == _done_token(rec)
+            h_match = is_hidden and token == (h_token if h_token is not None else h_version)
+            if not (d_match or h_match):
                 return False
-            clear_hidden = False
+            if h_match and not d_match and not h_applies:
+                return False  # the dismissal it names no longer hides anything
+            clear_done = d_match or (h_match and done and h_applies)
+            clear_hidden = h_match or (d_match and h_applies)
+        if clear_done:
+            files, over = _filed_files(d)
+            if over:
+                raise RuntimeError(_TOO_MANY_FILED)
+            if _count_active(files, skip=f) >= _OUTSIDE_LIMIT:
+                raise RuntimeError(
+                    f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before undoing Done"
+                )
         # Hidden marker first: if the second write fails the Done token still matches on retry.
         if clear_hidden:
             del hidden[item_id]
             _write_json(_hidden_path(home), hidden, ordered=True)
         if clear_done:
-            rec.pop("done_at")
+            rec.pop("done_at", None)
+            rec.pop("done_token", None)
             _write_json(f, rec)
         return True
 
@@ -648,9 +692,11 @@ def save_bluf(
     started_at: float | None = None,
     fp: str | None = None,
 ) -> None:
-    """Cache one summary. ``started_at`` is when the model request began: if a summary for a
-    different version of the item was saved after that, this one is superseded and is dropped,
-    so a slow request for an old question cannot replace the newer question's summary."""
+    """Cache one summary. ``started_at`` is when the model request began. A request that began
+    before the one behind the cached summary of a different version is superseded and dropped,
+    so a slow request for an old question cannot replace the newer question's summary. Start
+    order decides, not completion order: the older request finishing first must not make the
+    newer one look stale. A summary saved without a start time is never treated as newer."""
     with _state_lock(
         home
     ):  # read-modify-write: concurrent workers must not drop each other's entries
@@ -660,7 +706,7 @@ def save_bluf(
             started_at is not None
             and isinstance(existing, dict)
             and existing.get("version") != version
-            and _num(existing.get("at")) > started_at
+            and _num(existing.get("started_at")) > started_at
         ):
             return
         data.pop(item_id, None)
@@ -668,8 +714,10 @@ def save_bluf(
             "version": version,
             "bluf": bluf,
             "why": why,
-            "at": int(time.time()),
+            "at": time.time(),  # not truncated: a sub-second order against observed_at must hold
         }
+        if started_at is not None:
+            entry["started_at"] = started_at
         if fp is not None:
             entry["fp"] = fp
         data[item_id] = entry
@@ -2399,37 +2447,144 @@ def _outside_field(
 
 
 def _done_token(rec: dict[str, Any]) -> str:
-    """Names one Done: a later Done of the same record gets a new token."""
-    return repr(rec.get("done_at"))
+    """Names one Done. It is random per Done, so a clock that repeats or steps back cannot make
+    two dismissals share a token; a record written before tokens existed falls back to its time."""
+    token = rec.get("done_token")
+    return token if isinstance(token, str) and token else repr(rec.get("done_at"))
+
+
+def _done_at(rec: dict[str, Any]) -> float | None:
+    """The Done time, or None when there is none or it is not a real finite time (a boolean is
+    an int to Python, and NaN or infinity never compare as expired)."""
+    value = rec.get("done_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
 
 
 def _is_done(rec: dict[str, Any]) -> bool:
-    return isinstance(rec.get("done_at"), (int, float))
+    return _done_at(rec) is not None
 
 
-def _purge_done(d: Path, now: float | None = None) -> int:
+def _bad_done(rec: dict[str, Any]) -> bool:
+    """A done_at that is present but unusable: preserved and reported, never deleted."""
+    return rec.get("done_at") is not None and _done_at(rec) is None
+
+
+_FILED_NAME = re.compile(r"[a-f0-9]{32}\.json\Z")
+# One cleanup or listing reads at most this many entries and runs at most this long, so a folder
+# full of files cannot make every Done, filing or poll read all of them first.
+_PURGE_SCAN_LIMIT = 1000
+_PURGE_SECONDS = 2.0
+_TOO_MANY_FILED = (
+    f"the filed outside folder holds more than {_PURGE_SCAN_LIMIT} entries; repair or remove the extra files"
+)
+
+
+def _is_filed_record(f: Path, rec: dict[str, Any]) -> bool:
+    """One of our records: named for its id and filed by an agent (not any JSON file in the folder)."""
+    return (
+        bool(_FILED_NAME.fullmatch(f.name))
+        and rec.get("id") == f"outside:filed:{f.stem}"
+        and rec.get("origin") == "filed"
+    )
+
+
+def _filed_files(d: Path) -> tuple[list[Path], bool]:
+    """At most ``_PURGE_SCAN_LIMIT`` filed-record paths of *d*, and whether there were more."""
+    with os.scandir(d) as entries:
+        names = [Path(e.path) for e in itertools.islice((e for e in entries if e.name.endswith(".json")), _PURGE_SCAN_LIMIT + 1)]
+    names.sort(key=lambda p: p.name)
+    return names[:_PURGE_SCAN_LIMIT], len(names) > _PURGE_SCAN_LIMIT
+
+
+def _count_active(files: list[Path], skip: Path | None = None) -> int:
+    return sum(1 for f in files if f != skip and not f.is_symlink() and not _is_done(_read_json(f)))
+
+
+def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = None) -> int:
     """Delete done records past the undo window and the oldest beyond the keep limit.
+
+    Only a file named for its record id, carrying that id, filed by an agent and with a real
+    ``done_at`` is ever deleted; anything else (a stray JSON file, a boolean or non-finite
+    ``done_at``) is left for repair and reported. A clock that stepped back leaves a record
+    stamped in the future: its window restarts from now instead of the record being treated
+    as invalid. Reads at most ``_PURGE_SCAN_LIMIT`` entries and stops after ``_PURGE_SECONDS``.
+    A removal that fails does not stop the rest; it is added to *errors*.
 
     Call with the state lock held. Returns how many records were deleted."""
     now = time.time() if now is None else now
+    errors = [] if errors is None else errors
+    deadline = time.monotonic() + _PURGE_SECONDS
     done: list[tuple[float, Path]] = []
-    removed = 0
-    for f in d.glob("*.json"):
-        if f.is_symlink():
-            continue
-        rec = _read_json(f)
-        if not _is_done(rec):
-            continue
-        if now - rec["done_at"] > OUTSIDE_UNDO_SECONDS or rec["done_at"] > now + 60:
+    removed = failed = scanned = 0
+
+    def remove(f: Path) -> None:
+        nonlocal removed, failed
+        try:
             f.unlink(missing_ok=True)
             removed += 1
-        else:
-            done.append((rec["done_at"], f))
+        except OSError:
+            failed += 1
+
+    try:
+        scan = os.scandir(d)
+    except OSError as exc:
+        errors.append(f"outside: could not list filed records: {type(exc).__name__}")
+        return 0
+    with scan as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            if scanned >= _PURGE_SCAN_LIMIT or time.monotonic() > deadline:
+                errors.append("outside: retention cleanup stopped early; some filed records were not checked")
+                break
+            scanned += 1
+            f = Path(entry.path)
+            if f.is_symlink():
+                continue
+            rec = _read_json(f)
+            if not _is_filed_record(f, rec):
+                continue
+            if _bad_done(rec):
+                errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
+                continue
+            done_at = _done_at(rec)
+            if done_at is None:
+                continue
+            if done_at > now:
+                # The clock stepped back since this Done: keep the record and restart its window.
+                try:
+                    rec["done_token"] = _done_token(rec)
+                    rec["done_at"] = now
+                    _write_json(f, rec)
+                except OSError:
+                    failed += 1
+                done_at = now
+            if now - done_at > OUTSIDE_UNDO_SECONDS:
+                remove(f)
+            else:
+                done.append((done_at, f))
     done.sort()
     for _, f in done[: max(0, len(done) - _OUTSIDE_DONE_KEEP)]:
-        f.unlink(missing_ok=True)
-        removed += 1
+        remove(f)
+    if failed:
+        errors.append(
+            f"outside: could not remove {failed} expired done record(s); their text stays until a later cleanup succeeds"
+        )
     return removed
+
+
+def _purge_logged(d: Path) -> int:
+    """Cleanup for a caller that must not fail because of it: returns how many problems it hit."""
+    errors: list[str] = []
+    try:
+        _purge_done(d, errors=errors)
+    except OSError as exc:
+        errors.append(f"outside: retention cleanup failed: {type(exc).__name__}")
+    for error in errors:
+        log.warning("unbl0ck: %s", error)
+    return len(errors)
 
 
 def file_outside(
@@ -2471,8 +2626,12 @@ def file_outside(
             raise ValueError("resolving by id requires the version returned when it was filed")
     with _state_lock(home):
         d = _outside_dir(home)
-        _purge_done(d)
-        files = _list_files(d, ".json")  # a listing that fails must not look like "no match"
+        _purge_logged(d)  # best effort: an undeletable expired record must not block unrelated work
+        files: list[Path] = []
+        if key:  # an id names its record directly: no listing, no scan of the whole folder
+            files, over = _filed_files(d)  # a listing that fails must not look like "no match"
+            if over:
+                raise RuntimeError(_TOO_MANY_FILED)
         match = None
         if action == "resolve" and item_id:
             match = d / (_FILED_ID.fullmatch(item_id).group(1) + ".json")
@@ -2506,15 +2665,10 @@ def file_outside(
                     raise StaleAnswer("the filed item changed since you filed it; re-read it first")
             match.unlink()
             return {"ok": True, "resolved": True, "id": f"outside:filed:{match.stem}"}
-        if match is None and len(files) >= _OUTSIDE_LIMIT:
-            # Done records waiting out their undo window do not count against the cap.
-            active = sum(1 for f in files if not f.is_symlink() and not _is_done(_read_json(f)))
-        else:
-            active = 0
-        if match is None and active >= _OUTSIDE_LIMIT:
-            raise ValueError(
-                "Outside queue is full (200 filed items); resolve an item before filing another"
-            )
+        if action == "file" and not key:
+            files, over = _filed_files(d)
+            if over:
+                raise RuntimeError(_TOO_MANY_FILED)
         old = _read_json(match, strict=True) if match else {}
         record_id = match.stem if match else uuid.uuid4().hex
         item_id = f"outside:filed:{record_id}"
@@ -2535,8 +2689,18 @@ def file_outside(
         }
         # Re-filing identical content does not undo a local Done; a changed claim is new
         # work for the human and resurfaces.
-        if _is_done(old) and old.get("version") == version:
+        stays_done = _is_done(old) and old.get("version") == version
+        # A new record, or a Done one that this filing reactivates, adds to the active count.
+        # (Done records waiting out their undo window do not count against the cap.)
+        if (match is None or (_is_done(old) and not stays_done)) and len(files) >= _OUTSIDE_LIMIT:
+            if _count_active(files, skip=match) >= _OUTSIDE_LIMIT:
+                raise ValueError(
+                    f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before filing another"
+                )
+        if stays_done:
             rec["done_at"] = old["done_at"]
+            if "done_token" in old:
+                rec["done_token"] = old["done_token"]
         _write_json(d / f"{record_id}.json", rec)
         return {"ok": True, "id": item_id, "version": version}
 
@@ -2644,15 +2808,22 @@ def _folder_outside_item(
 
 
 def outside_items(
-    home: Path | None = None, errors: list[str] | None = None
+    home: Path | None = None,
+    errors: list[str] | None = None,
+    retained: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Our filed records plus bounded, non-recursive reads of explicitly watched folders."""
+    """Our filed records plus bounded, non-recursive reads of explicitly watched folders.
+
+    ``retained``, when given, receives ``{id: version}`` of the records kept only for Undo, so
+    the caller can keep their cached summaries instead of treating them as gone."""
     errors = errors if errors is not None else []
     items = []
     done_seen = False
     outside = _outside_dir(home)
     try:
-        filed = _list_files(outside, ".json")
+        filed, over = _filed_files(outside)
+        if over:
+            errors.append(f"outside: more than {_PURGE_SCAN_LIMIT} filed entries; only the first {_PURGE_SCAN_LIMIT} are read")
     except OSError as exc:
         errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
         filed = []
@@ -2663,6 +2834,11 @@ def outside_items(
         rec = _read_json(f, errors=errors, source="outside")
         if _is_done(rec):
             done_seen = True  # locally Done, waiting out its undo window; not in the queue
+            if retained is not None and _is_filed_record(f, rec) and isinstance(rec.get("version"), str):
+                retained[rec["id"]] = rec["version"]
+            continue
+        if _bad_done(rec):
+            errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
             continue
         if (
             rec.get("id") == f"outside:filed:{f.stem}"
@@ -2680,9 +2856,13 @@ def outside_items(
     if done_seen:
         try:
             with _state_lock(home):
-                _purge_done(_outside_dir(home))
-        except (OSError, TimeoutError, RuntimeError):
-            pass  # cleanup retries on the next poll or the next Done
+                _purge_done(_outside_dir(home), errors=errors)
+            if retained is not None:  # what the cleanup just deleted is gone, not retained
+                for item_id in [i for i in retained if not (outside / (i.rsplit(":", 1)[1] + ".json")).exists()]:
+                    del retained[item_id]
+        except (OSError, TimeoutError, RuntimeError) as exc:
+            # Reported, not swallowed: the text stays on disk until a later poll succeeds.
+            errors.append(f"outside: retention cleanup did not run: {type(exc).__name__}; it retries on the next poll")
     raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
     seen: set[Path] = set()
     for name in str(raw).split(","):
@@ -2823,7 +3003,7 @@ def done_outside(
     if match:
         with _state_lock(home):
             d = _outside_dir(home)
-            _purge_done(d)
+            cleanup_failed = _purge_logged(d)
             f = d / (match.group(1) + ".json")
             if f.is_symlink():
                 raise SourceUnavailable("filed outside record is not a regular file")
@@ -2839,14 +3019,20 @@ def done_outside(
                 )
             if not _is_done(rec):
                 rec["done_at"] = time.time()
+                rec["done_token"] = uuid.uuid4().hex
                 _write_json(f, rec)
-                _purge_done(d)  # enforce the keep limit now that this one counts
+                # The Done is committed. Enforcing the keep limit is best effort: a failure there
+                # is reported in the reply, never as a failed Done the client could not undo.
+                cleanup_failed += _purge_logged(d)
             token = _done_token(rec)
-        return {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS, "token": token}
+        reply = {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS, "token": token}
+        if cleanup_failed:
+            reply["cleanup_failed"] = cleanup_failed
+        return reply
     if not _FOLDER_ID.fullmatch(item_id):
         raise ValueError("id must identify an outside item")
-    hide(item_id, version, home)
-    return {"ok": True, "hidden": True, "local_only": True}
+    token = hide(item_id, version, home)
+    return {"ok": True, "hidden": True, "local_only": True, "token": token}
 
 
 # --- the queue -----------------------------------------------------------------------------
@@ -2867,6 +3053,7 @@ def build_queue(
     errors: list[str] = []
     items: list[dict[str, Any]] = []
     outside_source_failed = False
+    outside_retained: dict[str, str] = {}  # Done records waiting out Undo: not shown, still known
     # One broken source must not hide the other; one broken board must not hide the
     # rest of Kanban (kanban_items records ``kanban[board]: …`` itself).
     try:
@@ -2886,7 +3073,7 @@ def build_queue(
     except Exception as exc:  # noqa: BLE001
         errors.append(f"pairing: {type(exc).__name__}: {exc}")
     try:
-        items.extend(outside_items(home, errors=errors))
+        items.extend(outside_items(home, errors=errors, retained=outside_retained))
     except Exception as exc:  # noqa: BLE001
         outside_source_failed = True
         errors.append(f"outside: {type(exc).__name__}: {exc}")
@@ -2905,7 +3092,12 @@ def build_queue(
         # Folder ids are shared across profiles, but their configured folders are not.
         preserve_prefixes += ("outside:folder:",)
     try:
-        prune_blufs(items, home, preserve_prefixes=preserve_prefixes, observed_at=observed_at)
+        prune_blufs(
+            items + [{"id": i, "version": v} for i, v in outside_retained.items()],
+            home,
+            preserve_prefixes=preserve_prefixes,
+            observed_at=observed_at,
+        )
     except (OSError, TimeoutError, RuntimeError) as exc:
         # RuntimeError: a damaged cache is left for repair, not rewritten.
         log.warning(

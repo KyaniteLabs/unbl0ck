@@ -7,9 +7,9 @@ GET  /source/text?id=&version=   full text for one current chat or live-prompt i
 GET  /card/ask/{job}         poll a running Ask
 POST /card/ask               ask the configured model about one card (multi-turn)
 POST /kanban/answer          {board, task_id, text, release, version}: comment as the principal, optionally unblock
-POST /hide                   {id, version}: "Not for me" until the source changes
-POST /unhide                 {id}: undo "Not for me"
-POST /outside/done           {id, version}: delete a filed record or hide a watched file version
+POST /hide                   {id, version}: "Not for me" until the source changes; returns the Undo token
+POST /unhide                 {id, token?}: undo "Not for me" or a local Done
+POST /outside/done           {id, version}: local, undoable Done for a filed record or a watched file version; returns the Undo token
 GET  /pack                   the queue as a Pocket-format card pack (read-only)
 POST /pack                   the same pack, also written to plugin-data/unbl0ck/pocket-pack.json
 """
@@ -520,14 +520,14 @@ def answer(body: Answer, response: Response):
 def hide(body: Hide):
     _bounded(id=body.id, version=body.version)
     try:
-        _needs().hide(body.id, body.version)
+        token = _needs().hide(body.id, body.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except TimeoutError:
         raise HTTPException(status_code=409, detail="busy, retry")
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return {"ok": True}
+    return {"ok": True, "token": token}
 
 
 @router.post("/outside/done")

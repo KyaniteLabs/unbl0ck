@@ -125,8 +125,8 @@ class ApiQA(unittest.TestCase):
             self.c.post("/hide", json={"id": "", "version": "1"}).status_code, 400
         )
         self.assertEqual(
-            self.c.post("/hide", json={"id": "chat:p:s", "version": "1"}).json(),
-            {"ok": True},
+            self.c.post("/hide", json={"id": "chat:p:s", "version": "1"}).json()["ok"],
+            True,
         )
 
 
