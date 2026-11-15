@@ -222,6 +222,18 @@ class ReadOnlyExport(unittest.TestCase):
                 self.assertRegex(option["send"], r"^(Open|Answer|Act) ")
                 self.assertNotRegex(option["send"], r"(?i)approve .*telegram|code")
 
+    def test_pack_says_when_a_source_could_not_be_read(self):
+        # Bug: a queue built with unreadable sources exported as an empty, complete pack, so a
+        # gadget showed "nothing needs you" while a source had failed. Counts only, no details.
+        ok = needs.pocket_pack({"items": [], "errors": []})
+        self.assertTrue(ok["complete"])
+        self.assertEqual(ok["omitted"]["unread_sources"], 0)
+        bad = needs.pocket_pack({"items": [], "errors": ["kanban: boards/x.db: OperationalError; could not read"]})
+        self.assertFalse(bad["complete"])
+        self.assertEqual(bad["omitted"]["unread_sources"], 1)
+        self.assertNotIn("OperationalError", repr(bad))
+        self.assertNotIn("boards/x.db", repr(bad))
+
 
 if __name__ == "__main__":
     unittest.main()

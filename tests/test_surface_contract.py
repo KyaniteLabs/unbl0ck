@@ -110,7 +110,7 @@ class IntentionalDifferences(unittest.TestCase):
 
     def test_pack_discloses_what_it_left_out_as_counts(self):
         pack = needs.pocket_pack(self.q)
-        self.assertEqual(pack["omitted"], {"asks": 6, "stuck": 2, "answered": 1, "see": "Open UNBL0CK in Hermes Desktop"})
+        self.assertEqual(pack["omitted"], {"asks": 6, "stuck": 2, "answered": 1, "unread_sources": 0, "see": "Open UNBL0CK in Hermes Desktop"})
         blob = json.dumps(pack["omitted"])
         self.assertNotIn(SECRET_TEXT, blob)
         self.assertNotIn("Card ", blob)

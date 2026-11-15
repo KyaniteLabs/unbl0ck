@@ -9,7 +9,7 @@ and performs explicit human-selected actions; it does not run a separate service
 | `plugin.yaml` | Plugin manifest, feature settings and host entry points |
 | `__init__.py` | Registration, local/messaging slash command, CLI, filing tool and prompt hooks |
 | `needs.py` | Settings, five source collectors, detection, versioned mutations, redaction, persisted state and Pocket pack |
-| `jobs.py` | In-memory Summary and Ask lifecycle tables, locks, expiry and bounded result retention |
+| `jobs.py` | Summary and Ask lifecycle tables (in memory), the Ask restart journal (one small file per job), locks, expiry and bounded result retention |
 | `dashboard/plugin_api.py` | Validated HTTP inputs, background execution, capacity admission and explicit HTTP failure contracts |
 | `desktop/src/plugin.src.js` | Desktop queue, local drafts, actions, recovery controls and host SDK integration |
 | `desktop/build.py` | Reproducible font/token inlining into `desktop/plugin.js` and `design/unbl0ck.css` |
@@ -53,17 +53,17 @@ control and are not a standalone public API.
 | `GET /outside/text` | Current bounded outside text; matching item version required |
 | `GET /source/text` | Full text of one current chat or live-prompt record, read on demand; version required (409 if stale, 404 if gone, 503 if the source cannot be read, 403 for password prompts) |
 | `POST /card/ask` | Validated question history; returns a job ID immediately or an explicit admission error |
-| `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502; a job recovered after a restart as `unknown` or `not_submitted` uses 409; a mismatched `card` is 404 |
+| `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502; a job recovered after a restart as `unknown` or `not_submitted` uses 409; a `card` that differs from the one the job was created for is 404; without `card` the job id alone answers (it is an unguessable 128-bit id) |
 | `GET /card/ask/{job}?poll=true&card=<id>` | Same job, with every outcome encoded for the client: `state` is `pending`, `complete`, `failed`, `unknown` or `not_submitted` (`resubmit_safe` only when nothing was sent) |
 | `DELETE /card/ask/{job}` | Deletes the job and its restart marker now |
 | `POST /kanban/answer` | Versioned native comment and optional release; stale version 409 with no comment or release; empty version 400; unversioned comment-only answers still work for older callers (response `versioned:false`, `Warning: 299` header) unless `require_answer_version` is on (428, nothing written); the response reports the block `version` applied; settings uncertainty prevents writes |
-| `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID (also restores a filed record marked done; `restored:false` when nothing was restorable). Identifiers (and `board`/`task_id` on `/card`, `/kanban/answer`, `/outside/done`) are limited to 300 characters with no control characters (400); a malformed or non-Kanban `id`, or one that disagrees with `board`/`task_id`, is rejected instead of retargeted |
+| `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID (also restores a filed record marked done; `restored:false` when nothing was restorable). Identifiers (and `board`/`task_id` on `/card`, `/kanban/answer`, `/outside/done`) are limited to 300 characters with no control characters (400 from the route's own check; a JSON body field over the limit on `/kanban/answer` or `/card/ask` is rejected earlier by request validation with 422); a malformed or non-Kanban `id`, or one that disagrees with `board`/`task_id`, is rejected instead of retargeted |
 | `POST /outside/done` | Local, reversible Done: mark a filed record done (kept up to 15 minutes, at most 25) or hide a folder item version; `local_only:true`; nothing is sent or completed externally |
 | `GET /pack`, `POST /pack` | Read pack representation, or explicitly write it |
 
 POST Answer/Ask models bound card identifiers to 300 characters, answers/message text
 to 20,000, and Ask history to 50 messages. Outside-text checks also bound its ID/version
-to 300; GET Card does not apply the same length limit. Invalid/stale/missing references fail instead of targeting a
+to 300; GET Card applies the same 300-character limit to `id`, `board` and `task_id` (400). Invalid/stale/missing references fail instead of targeting a
 different item. Ask capacity returns 429; unavailable model infrastructure returns 503;
 unknown/expired jobs return 404. Not every error is retryable without refreshing.
 
@@ -83,7 +83,7 @@ turns the matching columns off in the payload and in behavior.
 | `outside` | yes | no | yes | yes |
 | `chat` | yes | no | yes | yes |
 
-Notes. `outside` covers agent-filed items and watched-folder files; both are read for every profile (filed items live in one shared folder and record their profile only for dedupe). Full-text search reads
+Notes. `outside` covers agent-filed items and watched-folder files; both are read for every profile (filed items live in one shared folder; the filing profile is recorded as provenance and scopes `dedupe_key`). Full-text search reads
 local text and never calls a model; it skips password prompts and returns ids, versions and
 counts only. Summaries and Ask run the card text, comments and owner through the same
 redaction (secrets, home directory and workspace path); the operator's own typed Ask
@@ -112,7 +112,7 @@ as private. Settings and source files remain owned by their original application
 | `recovery/*.bak` | Byte-for-byte copies of a shared state file, written only when an operator runs `recovery.py preserve` or `restore --apply` (directory 0700, files 0600). They hold the same private content as the file they copy and are never deleted by the plugin; remove them yourself when no longer needed |
 | `pocket-pack.json` | Written only on explicit pack request |
 | Summary jobs | Process memory; restart loses pending work and results |
-| `ask/*.json` | Owner-only (0600/0700) Ask restart markers, capped at 256, 15-minute retention; no card or question text; answer text only with `ask_persist_replies` (default off) |
+| `ask/<profile>/*.json` | Owner-only (0600/0700) Ask restart markers, capped at 256, 15-minute retention; no card or question text; answer text only with `ask_persist_replies` (default off) |
 | Ask jobs | Process memory plus the marker above; a restart recovers `not_submitted`, `unknown`, `failed` or (opt-in) `complete`, and never resends |
 | Answer drafts | Desktop session memory, 100 entries, 30 minutes after last edit; original question version retained |
 | Ask conversations | Desktop session memory, 100 entries, 30 minutes after last activity; question version and outstanding job retained; never written to disk |

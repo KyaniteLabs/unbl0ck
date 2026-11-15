@@ -39,6 +39,8 @@ except ImportError:  # Windows: no cross-process lock to probe
 MAX_STORE_BYTES = 16 * 1024 * 1024
 RECOVERY_DIR = "recovery"
 LOCK_NAME = ".state.lock"
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # absent on Windows
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 BACKUP_NAME = re.compile(r"^(?P<stem>hidden|pending-release|bluf)-[A-Za-z0-9._-]{1,80}\.bak$")
 
 
@@ -92,9 +94,11 @@ def _writer_active(d: Path) -> bool | None:
     if fcntl is None:
         return None
     try:
-        fd = os.open(d / LOCK_NAME, os.O_RDWR)
+        fd = os.open(d / LOCK_NAME, os.O_RDWR | _NOFOLLOW | _NONBLOCK)
+    except FileNotFoundError:
+        return False  # no lock file: nobody has ever held it
     except OSError:
-        return False
+        return None  # unreadable or a link: we cannot say, and never claim "no writer"
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -158,7 +162,7 @@ def diagnose(home: Path | None = None) -> dict[str, Any]:
     return {
         "stores": stores,
         "writer_active": writer,
-        "lock_check": "unavailable on this platform" if writer is None else "ok",
+        "lock_check": "could not be checked here" if writer is None else "ok",
         "backups": _list_backups(d),
         "note": "Counts only. A held lock is never cleared; wait for the writer or stop it in its owning installation.",
     }
@@ -168,6 +172,8 @@ def _recovery_dir(d: Path, create: bool) -> Path | None:
     r = d / RECOVERY_DIR
     if r.is_symlink():
         raise RuntimeError("recovery directory is a symlink; refusing to use it")
+    if r.exists() and not r.is_dir():
+        raise RuntimeError("recovery path is not a directory; refusing to use it")
     if not r.exists():
         if not create:
             return None
@@ -388,15 +394,21 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--apply", action="store_true")
     a = ap.parse_args(argv)
     home = Path(a.home) if a.home else None
-    if a.cmd == "diagnose":
-        out = diagnose(home)
-        bad = any(s["status"] not in ("healthy", "absent") for s in out["stores"])
-    elif a.cmd == "preserve":
-        out = preserve(a.store, home)
-        bad = out["status"] != "preserved"
-    else:
-        out = restore(a.store, a.backup, home, apply=a.apply)
-        bad = out["status"] not in ("restored", "dry_run")
+    try:
+        if a.cmd == "diagnose":
+            out = diagnose(home)
+            bad = any(s["status"] not in ("healthy", "absent") for s in out["stores"])
+        elif a.cmd == "preserve":
+            out = preserve(a.store, home)
+            bad = out["status"] != "preserved"
+        else:
+            out = restore(a.store, a.backup, home, apply=a.apply)
+            bad = out["status"] not in ("restored", "dry_run")
+    except (OSError, RuntimeError) as exc:
+        # A damaged layout (a file where the recovery directory belongs, a link) is a refusal
+        # with a fixed sentence and the error class, never a traceback or a path.
+        out = {"status": "refused", "reason": f"the state directory layout is not safe to use ({type(exc).__name__}); inspect it by hand"}
+        bad = True
     print(json.dumps(out, indent=1, sort_keys=True))
     return 1 if bad else 0
 

@@ -289,5 +289,38 @@ class FiledCap(OutsideFixture):
         self.assertFalse(any("agent-filed items are waiting" in e for e in needs.build_queue()["errors"]))
 
 
+class RetentionEvictsOldestNotAlphabetical(unittest.TestCase):
+    """The keep limits drop the OLDEST entries, also after the file was written and read back."""
+
+    def test_hidden_cap_evicts_the_oldest_dismissal_even_when_its_name_sorts_last(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            for n in range(needs._HIDDEN_KEEP):
+                needs.hide(f"chat:z{n:04d}", "v", home)  # the oldest entries sort LAST by name
+            needs.hide("chat:a-newer", "v", home)
+            needs.hide("chat:a-newest", "v", home)
+            hidden = needs.load_hidden(home)
+            self.assertEqual(len(hidden), needs._HIDDEN_KEEP)
+            self.assertIn("chat:a-newer", hidden)
+            self.assertIn("chat:a-newest", hidden)
+            self.assertNotIn("chat:z0000", hidden)
+            self.assertNotIn("chat:z0001", hidden)
+            self.assertIn("chat:z0002", hidden)
+
+    def test_pending_release_cap_evicts_the_oldest_record_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            for n in range(needs._HIDDEN_KEEP):
+                needs._set_pending_release(f"kanban:b:z{n:04d}", "1", home)
+            needs._set_pending_release("kanban:b:a-newer", "1", home)
+            needs._set_pending_release("kanban:b:a-newest", "1", home)
+            pending = needs.load_pending_releases(home)
+            self.assertEqual(len(pending), needs._HIDDEN_KEEP)
+            self.assertIn("kanban:b:a-newer", pending)
+            self.assertIn("kanban:b:a-newest", pending)
+            self.assertNotIn("kanban:b:z0000", pending)
+            self.assertNotIn("kanban:b:z0001", pending)
+
+
 if __name__ == "__main__":
     unittest.main()
