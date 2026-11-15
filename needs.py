@@ -3741,6 +3741,20 @@ def _css_font_kind(value: str) -> str | None:
     return None
 
 
+_CSS_DISPLAY_WORDS = frozenset(
+    "block inline run-in flow flow-root table flex grid ruby list-item contents math inline-block "
+    "inline-table inline-flex inline-grid table-row-group table-header-group table-footer-group "
+    "table-row table-cell table-column-group table-column table-caption ruby-base ruby-text "
+    "ruby-base-container ruby-text-container".split()
+)
+
+
+def _css_display_shows(value: str) -> bool:
+    """Whether an inline ``display`` value is a real one that overrides the ``hidden`` attribute."""
+    words = value.split()
+    return value in ("initial", "unset", "inherit") or 0 < len(words) <= 3 and all(w in _CSS_DISPLAY_WORDS for w in words)
+
+
 def _css_could_hide(name: str, value: str) -> bool:
     return (
         (name == "display" and value == "none")
@@ -3861,16 +3875,19 @@ class _InertText(html.parser.HTMLParser):
         elif gone is None:
             a = {k: (v or "") for k, v in attrs}
             d = _css_declarations(a.get("style", ""))
+            disp = d.get("display", [])
             clip = any(v in ("hidden", "clip", "scroll", "auto") for p in _CSS_OVERFLOW for v in d.get(p, ()))
             cause = (
-                "display" if "none" in d.get("display", ())
-                else "hidden" if "hidden" in a and "display" not in d
+                "display" if "none" in disp
+                else "hidden" if "hidden" in a and not (disp and all(map(_css_display_shows, disp)))
                 else "opacity" if any(_css_zero(v) for v in d.get("opacity", ()))
                 else "clip" if clip and any(_css_zero(v) for p in _CSS_SIZES for v in d.get(p, ()))
                 else None
             )
             if cause:
-                gone = _Region(cause, any(len(set(d.get(p, ()))) > 1 for p in _CSS_CAUSES[cause]))
+                # ``hidden`` beside a display value the converter does not know is a doubt, not a show.
+                doubt = cause == "hidden" and bool(disp)
+                gone = _Region(cause, doubt or any(len(set(d.get(p, ()))) > 1 for p in _CSS_CAUSES[cause]))
                 own = (gone,)
             else:
                 vis, v_own = _css_inherited(d.get("visibility", []), vis, "visibility", _css_vis_kind)

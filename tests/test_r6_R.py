@@ -14,6 +14,13 @@ class HtmlHiding(unittest.TestCase):
         )
         self.assertNotIn("SECRET", text)
 
+    def test_an_unknown_display_value_does_not_silently_override_hidden(self):
+        """R6-012: ``display:bogus`` showed hidden text with no note."""
+        text, notes = needs._html_convert('<div hidden style="display:bogus">HIDDEN</div>', 1000)
+        self.assertTrue("HIDDEN" not in text or needs._HTML_STYLE_NOTE in notes, (text, notes))
+        text, notes = needs._html_convert('<div hidden style="display:block">SHOWN</div>', 1000)
+        self.assertEqual((text, notes), ("SHOWN", []))
+
 
 if __name__ == "__main__":
     unittest.main()
