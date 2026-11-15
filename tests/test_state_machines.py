@@ -321,8 +321,11 @@ class WaitMachine(unittest.TestCase):
         del r["proc_start"]
         self.assertIs(needs.wait_state(self.f, r, 1060), needs.WaitState.OPEN)
 
-    def test_proc_start_without_procfs_runs_only_ps_without_a_shell(self):
-        # The README discloses this one subprocess; keep it to a fixed ps argv, no shell.
+    def test_proc_start_without_procfs_calls_ps_with_a_fixed_argv_and_no_shell(self):
+        # Characterization of the one subprocess the README discloses: when /proc is missing,
+        # _proc_start calls ps with this argv and environment and no shell. It mocks
+        # subprocess.run, so it cannot show that nothing else runs; test_subprocess_sites.py
+        # checks that this is the only subprocess use in the shipped code.
         with (
             mock.patch("pathlib.Path.read_text", side_effect=OSError),
             mock.patch("pathlib.Path.exists", return_value=False),
