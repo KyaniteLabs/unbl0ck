@@ -333,6 +333,87 @@ const render=(it,scope)=>{cursor=0;return store.Item({ctx,item:it,n:1,refresh,as
 """)
 
 
+
+class RetryRetries(NodeCase):
+    def test_retry_after_the_conversation_was_dropped_while_answering_asks_again(self):
+        """R5-desk-007 A (class G): the loss message offers Retry, and Retry must send a request."""
+        self.run_views(r"""
+const posts=[];
+const ctx={rest:(url,o)=>{if(url!=='/card/ask')return Promise.resolve({});posts.push(o.body.messages);
+  return posts.length===1?new Promise(()=>{}):Promise.resolve({ok:true,reply:'Fresh answer.'})}};
+const it={...item,id:'kanban:default:rt1',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ find(mount(ctx,it),'TL;DR').onClick();
+ await new Promise(r=>setTimeout(r,5));
+ store.askSessions.delete(it.id);                 // evicted while the model is answering
+ mount(ctx,it);tick();                            // the observer interval reports the loss
+ const lost=mount(ctx,it);
+ assert.ok(texts(lost).includes('dropped from session memory'),texts(lost));
+ await find(lost,'Retry').onClick();
+ assert.equal(posts.length,2,'Retry must send a request');
+ assert.equal(posts[1].length,1,'only the retried message is sent, never the lost history');
+ assert.ok(texts(mount(ctx,it)).includes('Fresh answer.'));
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_retry_after_a_refused_follow_up_sends_the_follow_up_again(self):
+        """R5-desk-007 B (class G): the rolled-back history ends in an assistant turn; Retry still has to act."""
+        self.run_views(r"""
+const posts=[];
+const ctx={rest:async(url,o)=>{if(url!=='/card/ask')return{};posts.push(o.body.messages);
+  if(posts.length===2)throw Object.assign(new Error('422 refused'),{status:422});
+  return{ok:true,reply:'Reply '+posts.length+'.'}}};
+const it={...item,id:'kanban:default:rt2',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ await find(mount(ctx,it),'TL;DR').onClick();
+ area(mount(ctx,it)).onChange({target:{value:'my follow-up'}});
+ await find(mount(ctx,it),'Send').onClick();
+ assert.equal(posts.length,2);
+ assert.ok(texts(mount(ctx,it)).includes('refused'));
+ await find(mount(ctx,it),'Retry').onClick();
+ assert.equal(posts.length,3,'Retry must send a request');
+ const last=posts[2][posts[2].length-1];
+ assert.deepEqual([last.role,last.content],['user','my follow-up']);
+ assert.ok(texts(mount(ctx,it)).includes('Reply 3.'));
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_no_retry_button_is_shown_when_there_is_nothing_to_retry(self):
+        """R5-desk-007 (class G): a fault with an assistant turn last and an empty input has nothing to resend."""
+        self.run_views(r"""
+const ctx={rest:async()=>({ok:true,reply:'Reply.'})};
+const it={...item,id:'kanban:default:rt3',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ await find(mount(ctx,it),'TL;DR').onClick();
+ store.updateAskSession(it.id,{error:'Something odd'});
+ state=[];
+ const t=mount(ctx,it);
+ assert.ok(texts(t).includes('Something odd'));
+ assert.ok(!all(t).some(n=>n?.type==='button'&&all(n.props.children).includes('Retry')),'a Retry that cannot act must not be offered');
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_retry_after_a_refused_first_ask_asks_again(self):
+        """R5-desk-007 (class G): a first request refused outright leaves no history; Retry still acts."""
+        self.run_views(r"""
+const posts=[];
+const ctx={rest:async(url,o)=>{if(url!=='/card/ask')return{};posts.push(o.body.messages);
+  if(posts.length===1)throw Object.assign(new Error('422 refused'),{status:422});
+  return{ok:true,reply:'Now answered.'}}};
+const it={...item,id:'kanban:default:rt4',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ await find(mount(ctx,it),'TL;DR').onClick();
+ await find(mount(ctx,it),'Retry').onClick();
+ assert.equal(posts.length,2,'Retry must send a request');
+ assert.ok(texts(mount(ctx,it)).includes('Now answered.'));
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
 class Stack06Docs(unittest.TestCase):
     def test_docs_name_the_text_that_makes_advice_stale_and_the_retry_id(self):
         text = " ".join((ROOT / "docs/operator-guide.md").read_text().split())

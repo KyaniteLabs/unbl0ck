@@ -1212,7 +1212,15 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
         : null
     : null
 
+  const lastTurn = askMsgs.length ? askMsgs[askMsgs.length - 1].role : ''
+  // Retry resends the last user turn. After a refused follow-up the history is rolled back to an
+  // assistant turn and the refused text is back in the input, so that text is what Retry resends.
+  const canRetry = askStale || !askMsgs.length || lastTurn === 'user' || !!askInput.trim()
   const askSend = async (retry = false, preset = '') => {
+    if (retry && !askStale && (lastTurn === 'assistant' || !askMsgs.length)) {
+      if (askInput.trim()) retry = false
+      else if (lastTurn === 'assistant') return
+    }
     const q = preset || askInput.trim()
     if (askBusy || (!retry && !q)) return
     // The server refuses a longer message with 422. Refuse it here first, so it never enters
@@ -1223,10 +1231,14 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
     }
     // A conversation that expired from session memory while this card stayed mounted is gone:
     // it is neither shown nor sent again.
-    const held = askMsgs.length && !readAskSession(askId) ? [] : askMsgs
+    const gone = askMsgs.length > 0 && !readAskSession(askId)
+    const held = gone ? [] : askMsgs
+    // A Retry of a conversation that was dropped while it was answering resends only the turn that
+    // was lost, never the history that left session memory.
+    const lostTurn = gone && lastTurn === 'user' ? [askMsgs[askMsgs.length - 1]] : []
     const built = askStale
       ? [{ role: 'user', content: retry ? TLDR_ASK : q }]
-      : retry ? held : [...held, { role: 'user', content: q }]
+      : retry ? (held.length ? held : lostTurn.length ? lostTurn : [{ role: 'user', content: TLDR_ASK }]) : [...held, { role: 'user', content: q }]
     if (!built.length || built[built.length - 1].role !== 'user') return
     const { msgs: next, dropped } = boundAsk(built)
     const trimmed = (askStale ? false : askTrimmed) || dropped > 0
@@ -1533,7 +1545,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
                 style: { padding: '0 12px 8px', display: 'flex', gap: 12, alignItems: 'baseline', flexWrap: 'wrap' },
                 children: [
                   jsx('div', { className: 'ub-fault', style: { flex: '1 1 240px' }, children: `ASK FAULT \\\\ ${askError}` }),
-                  button({ kind: 'ghost', disabled: askBusy, onClick: () => askSend(true), children: 'Retry' })
+                  canRetry ? button({ kind: 'ghost', disabled: askBusy, onClick: () => askSend(true), children: 'Retry' }) : null
                 ]
               })
             : null,
