@@ -3420,7 +3420,7 @@ _ASK_SECRET_PATTERNS = (
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted]"),
     (
         re.compile(
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
         ),
         "[redacted]",
     ),
@@ -3676,6 +3676,10 @@ _ASK_NUMERIC_SECRET_WORDS = frozenset(
         "private_key",
         "credential",
         "storepass",
+        "token",
+        "auth",
+        "authentication",
+        "oauth",
     }
 )
 
@@ -3691,6 +3695,8 @@ def _ask_numeric_credential(key: str, value: Any, word: str) -> bool:
         digits = bool(re.fullmatch(r"\d+", value.strip().strip("\"' ")))
     else:
         return False
+    if str(key).strip().strip("\"' ").casefold().endswith("tokens"):
+        return False  # a count of tokens (``tokens: 12``), not a token
     return digits and word in _ASK_NUMERIC_SECRET_WORDS and _ask_secret_key_is_exact(key)
 
 
@@ -4249,6 +4255,11 @@ def _ask_withhold_unscanned(rest: str) -> str:
                 out.append("[redacted: too much structured text to scan]" if risky(rest[i:]) else rest[i:])
                 break
             end = _ask_json_container_end(rest, i)
+            if end is None and risky(rest[i:]):
+                # A container that cannot be delimited (an escaped or unclosed JSON string) cannot
+                # be judged piece by piece: the remainder is withheld rather than copied.
+                out.append("[redacted: too much structured text to scan]")
+                break
             if end is not None and risky(rest[i:end]):
                 out.append("[redacted]")
                 i = end
@@ -4410,7 +4421,18 @@ def _ask_card_view(
                 done[k] = "[redacted]"
             else:
                 done[k] = _ask_card_view(v, key, _text_budget, _scrub)
-        return {k: done[k] for k in value if k in done}
+        shown: dict[Any, Any] = {}
+        for k in value:
+            if k not in done:
+                continue
+            name = k
+            if isinstance(k, str):
+                for path in _scrub:
+                    name = name.replace(path, "[workspace]")
+                while name != k and name in shown:  # two keys that scrub alike both survive
+                    name += "#"
+            shown[name] = done[k]
+        return shown
     if isinstance(value, (list, tuple)):
         if _text_budget is None:
             return [_ask_card_view(v, _key, None, _scrub) for v in value]
