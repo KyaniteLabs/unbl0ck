@@ -332,14 +332,15 @@ def _read_json(p: Path, *, errors: list[str] | None = None, source: str = "state
     return data
 
 
-def _write_json(p: Path, data: dict[str, Any]) -> None:
+def _write_json(p: Path, data: dict[str, Any], *, ordered: bool = False) -> None:
+    """Atomic JSON write. ``ordered`` keeps insertion order (stores that evict the oldest entry)."""
     tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
     fd = os.open(
         tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
     )  # waits hold prompt text
     try:
         with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps(data, indent=1, sort_keys=True))
+            fh.write(json.dumps(data, indent=1, sort_keys=not ordered))
         tmp.replace(p)
     finally:
         tmp.unlink(
@@ -400,7 +401,7 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
         hidden.pop(item_id, None)
         hidden[item_id] = version
         hidden = _trim_hidden(hidden)  # oldest first out; the store never grows unbounded
-        _write_json(_hidden_path(home), hidden)
+        _write_json(_hidden_path(home), hidden, ordered=True)
 
 
 def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:
@@ -446,7 +447,7 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
         # Hidden marker first: if the second write fails the Done token still matches on retry.
         if clear_hidden:
             del hidden[item_id]
-            _write_json(_hidden_path(home), hidden)
+            _write_json(_hidden_path(home), hidden, ordered=True)
         if clear_done:
             rec.pop("done_at")
             _write_json(f, rec)
@@ -479,7 +480,7 @@ def _set_pending_release(
             data[item_id] = version
             if len(data) > _HIDDEN_KEEP:
                 data = dict(list(data.items())[-_HIDDEN_KEEP:])
-        _write_json(_pending_path(home), data)
+        _write_json(_pending_path(home), data, ordered=True)
 
 
 # --- BLUF cache (one model summary per item version) ----------------------------------------
@@ -523,12 +524,29 @@ def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str,
 
 
 def save_bluf(
-    item_id: str, version: str, bluf: str, why: str, home: Path | None = None
+    item_id: str,
+    version: str,
+    bluf: str,
+    why: str,
+    home: Path | None = None,
+    *,
+    started_at: float | None = None,
 ) -> None:
+    """Cache one summary. ``started_at`` is when the model request began: if a summary for a
+    different version of the item was saved after that, this one is superseded and is dropped,
+    so a slow request for an old question cannot replace the newer question's summary."""
     with _state_lock(
         home
     ):  # read-modify-write: concurrent workers must not drop each other's entries
         data = load_blufs(home)
+        existing = data.get(item_id)
+        if (
+            started_at is not None
+            and isinstance(existing, dict)
+            and existing.get("version") != version
+            and _num(existing.get("at")) > started_at
+        ):
+            return
         data.pop(item_id, None)
         data[item_id] = {
             "version": version,
@@ -545,8 +563,12 @@ def prune_blufs(
     home: Path | None = None,
     *,
     preserve_prefixes: tuple[str, ...] = (),
+    observed_at: float | None = None,
 ) -> None:
-    """Keep current summaries and ids whose source the caller could not observe."""
+    """Keep current summaries and ids whose source the caller could not observe.
+
+    ``observed_at`` is when *items* was read: a summary saved after that was never in the
+    caller's view, so it is kept rather than judged against a list that predates it."""
     current = {item["id"]: item["version"] for item in items}
     with _state_lock(home):
         data = load_blufs(home)
@@ -555,7 +577,8 @@ def prune_blufs(
             for item_id, value in data.items()
             if isinstance(value, dict)
             and (
-                item_id.startswith(preserve_prefixes)
+                (observed_at is not None and _num(value.get("at")) >= observed_at)
+                or item_id.startswith(preserve_prefixes)
                 or (item_id in current and value.get("version") == current[item_id])
             )
         }
@@ -2154,6 +2177,9 @@ def file_outside(
     if action not in ("file", "resolve"):
         raise ValueError("action must be file or resolve")
     key = _outside_field(args, "dedupe_key", 120)
+    if len(str(args.get("dedupe_key") or "")) > 120:
+        # A cut key would let two different long keys collide into one record.
+        raise ValueError("dedupe_key must be at most 120 characters")
     # Hermes' tool dispatch passes task_id, session_id and user_task but not the profile, so
     # an absent kwarg falls back to the profile the process is running under, the same way
     # record_wait() resolves it. An explicit kwarg still wins.
@@ -2228,7 +2254,15 @@ def file_outside(
             if match is None or not match.is_file() or match.is_symlink():
                 raise LookupError("No filed outside item matches that id or dedupe_key")
             match.unlink()
-            return {"ok": True, "resolved": True, "id": f"outside:filed:{match.stem}"}
+            resolved_id = f"outside:filed:{match.stem}"
+            # A "Not for me" marker names a record that no longer exists: drop it here,
+            # under the same lock, so hidden.json does not keep dead ids. A damaged
+            # hidden.json is left as it is for repair rather than overwritten.
+            marks = load_hidden(home, errors=(bad := []))
+            if not bad and resolved_id in marks:
+                marks.pop(resolved_id)
+                _write_json(_hidden_path(home), marks, ordered=True)
+            return {"ok": True, "resolved": True, "id": resolved_id}
         if match is None and len(files) >= _OUTSIDE_LIMIT:
             # Done records waiting out their undo window do not count against the cap.
             active = sum(1 for f in files if not f.is_symlink() and not _is_done(_read_json(f)))
@@ -2663,6 +2697,7 @@ def build_queue(
     home: Path | None = None, *, include_hidden: bool = False
 ) -> dict[str, Any]:
     home = home or hermes_home()
+    observed_at = time.time()
     errors: list[str] = []
     items: list[dict[str, Any]] = []
     outside_source_failed = False
@@ -2704,7 +2739,7 @@ def build_queue(
         # Folder ids are shared across profiles, but their configured folders are not.
         preserve_prefixes += ("outside:folder:",)
     try:
-        prune_blufs(items, home, preserve_prefixes=preserve_prefixes)
+        prune_blufs(items, home, preserve_prefixes=preserve_prefixes, observed_at=observed_at)
     except (OSError, TimeoutError) as exc:
         log.warning(
             "unbl0ck: could not prune summary cache: %s: %s", type(exc).__name__, exc
@@ -4262,8 +4297,11 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         "expires_at": now + 3600,
         "mode": "unblock",
         "cards": cards,
+        # False when a source could not be read: an empty pack is then not "nothing needs you".
+        "complete": not queue.get("errors"),
         # What this pack leaves out, as counts only; the original surface has the rest.
         "omitted": {
+            "unread_sources": len(queue.get("errors") or []),
             "asks": max(0, len(asks) - limit),
             "stuck": sum(1 for it in queue["items"] if it.get("tier") == "stuck"),
             "answered": sum(1 for it in queue["items"] if it.get("tier") == "answered"),

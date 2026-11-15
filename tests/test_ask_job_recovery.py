@@ -630,5 +630,33 @@ class ProfileDirectory(unittest.TestCase):
             self.assertEqual(a.get(J1)["reply"], "WORK ANSWER")
 
 
+class ClassSweepJournal(RecoveryBase):
+    def test_consume_that_cannot_delete_its_record_keeps_the_job(self):
+        # Bug: consume() dropped the job from memory and ignored a failed delete, so the saved
+        # reply stayed on disk and the next lookup recovered the job it had just consumed.
+        self.keep = True
+        self.jobs.create(J1, card="c1")
+        self.jobs.mark_sent(J1)
+        self.jobs.finish(J1, "Pick A", "p", "m")
+        with patch.object(self.journal, "delete", return_value=False), \
+                patch.object(self.journal, "verified_absent", return_value=False):
+            with self.assertRaises(jobs.DiscardFailed):
+                self.jobs.consume(J1)
+        self.assertIsNotNone(self.jobs.get(J1))
+        self.assertEqual(self.files(), [f"{J1}.json"])
+
+    def test_consume_still_works_when_the_record_is_already_gone(self):
+        self.jobs.create(J1, card="c1")
+        self.jobs.fail(J1, "no")
+        (self.dir / f"{J1}.json").unlink()
+        self.assertEqual(self.jobs.consume(J1)["detail"], "no")
+
+    def test_an_oversized_record_is_corrupt_and_never_read_whole(self):
+        self.jobs.create(J1, card="c1")
+        path = self.dir / f"{J1}.json"
+        path.write_text('{"job": "%s", "started": 1, "pad": "%s"}' % (J1, "x" * (jobs.AskJournal.MAX_RECORD_BYTES + 10)))
+        self.assertEqual(self.journal.read(J1), {"corrupt": True})
+
+
 if __name__ == "__main__":
     unittest.main()
