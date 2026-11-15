@@ -805,13 +805,15 @@ BLUF_SYSTEM = (
 )
 
 
-def _bluf_path(home: Path | None) -> Path:
-    return data_dir(home) / "bluf.json"
+def _bluf_path(home: Path | None, *, create: bool = True) -> Path:
+    return data_dir(home, create=create) / "bluf.json"
 
 
-def load_blufs(home: Path | None = None, *, strict: bool = False) -> dict[str, dict[str, str]]:
+def load_blufs(
+    home: Path | None = None, *, strict: bool = False, create: bool = True
+) -> dict[str, dict[str, str]]:
     return _read_json(
-        _bluf_path(home), strict=strict, entry_ok=lambda v: isinstance(v, dict)
+        _bluf_path(home, create=create), strict=strict, entry_ok=lambda v: isinstance(v, dict)
     )
 
 
@@ -2044,21 +2046,40 @@ BACKFILL_FILE = "chat-backfill.json"
 BACKFILL_IDS_MAX = 1000
 
 
-def _backfill_state(home: Path | None) -> tuple[float | None, list[str], bool]:
-    """``(floor, ids, readable)``: the oldest time any earlier queue read reached back to, and the
-    chats first listed from before it (a widened ``chat_window_days`` found them). Nothing here is
-    chat text: a time and the ids the dismissal and summary stores already hold."""
+def _finite_time(value: Any) -> float | None:
+    """A stored time, or None when it is not a finite number (a JSON integer past the float
+    range raises OverflowError, which is damage to this record, not a reason to stop the read)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _backfill_state(
+    home: Path | None,
+) -> tuple[float | None, dict[str, float | None], float | None, bool]:
+    """``(floor, marks, before, readable)``: the oldest time any earlier queue read reached back to,
+    the chats first listed from before it (a widened ``chat_window_days`` found them) with the time
+    of the ask, and ``before``: every chat at or older than that time is backfill, because the
+    marks of the oldest ones had to be dropped to stay within ``BACKFILL_IDS_MAX``. Nothing here is
+    chat text: times and the ids the dismissal and summary stores already hold."""
     try:
         p = data_dir(home, create=False) / BACKFILL_FILE
         if not os.path.lexists(p):
-            return None, [], True
+            return None, {}, None, True
         data = json.loads(_read_plain_text(p))
-        floor = data.get("floor")
-        floor = float(floor) if isinstance(floor, (int, float)) and math.isfinite(floor) else None
-        ids = [i for i in data.get("ids", []) if isinstance(i, str)][-BACKFILL_IDS_MAX:]
-        return floor, ids, True
-    except (OSError, ValueError, AttributeError, TypeError, UnicodeError):
-        return None, [], False
+        times = data.get("id_ts")
+        times = times if isinstance(times, dict) else {}
+        marks: dict[str, float | None] = {}
+        for i in data.get("ids", []):
+            if isinstance(i, str):
+                marks[i] = _finite_time(times.get(i))
+        return _finite_time(data.get("floor")), marks, _finite_time(data.get("before")), True
+    except (OSError, ValueError, AttributeError, TypeError, UnicodeError, RecursionError):
+        return None, {}, None, False
 
 
 def _mark_backfill(
@@ -2067,42 +2088,58 @@ def _mark_backfill(
     since: float,
     *,
     record: bool,
-    complete: bool,
     errors: list[str] | None,
 ) -> None:
     """Flag chats that only a widened window reached (``backfilled``), so nothing is sent to a
     model for them automatically. A chat is backfill when it is older than the default window or
-    older than anything an earlier read looked at; the flag then stays with it, so a later
-    refresh cannot turn it back into an ordinary ask. Only ``record`` (the queue build) saves."""
+    older than anything an earlier read looked at; the flag then stays with it, so neither a later
+    refresh nor a narrower window can turn it back into an ordinary ask. Only ``record`` (the
+    queue build) saves, and it reads and rewrites the file under the shared state lock so two
+    builds cannot overwrite each other's marks. Marks beyond ``BACKFILL_IDS_MAX`` are not lost:
+    the oldest are dropped and ``before`` then flags everything as old as the newest dropped."""
     default_since = time.time() - CHAT_WINDOW_DAYS * 86400
-    floor, ids, readable = _backfill_state(home)
-    edge = floor if floor is not None else since
-    marked = dict.fromkeys(ids)
-    changed = False
-    for it in items:
-        ts = it.get("since") or 0
-        if it["id"] not in marked and (ts < edge or not readable) and ts < time.time() - 86400:
-            marked[it["id"]] = None
+
+    def apply(write: bool) -> None:
+        now = time.time()
+        floor, marks, before, readable = _backfill_state(home)
+        edge = floor if floor is not None else since
+        changed = False
+        for it in items:
+            ts = it.get("since") or 0
+            if it["id"] not in marks and (ts < edge or not readable) and ts < now - 86400:
+                marks[it["id"]] = ts
+                changed = True
+            if ts < default_since or it["id"] in marks or (before is not None and ts <= before):
+                it["backfilled"] = True
+        if len(marks) > BACKFILL_IDS_MAX:
+            oldest_first = sorted(marks, key=lambda i: (marks[i] is None, marks[i] or 0))
+            for dropped in oldest_first[: len(marks) - BACKFILL_IDS_MAX]:
+                when = marks.pop(dropped)
+                before = max(before if before is not None else 0, when if when is not None else now)
             changed = True
-        if ts < default_since or it["id"] in marked:
-            it["backfilled"] = True
-    if complete:  # a whole read: chats no longer listed need no flag
-        listed = {it["id"] for it in items}
-        kept = {i: None for i in marked if i in listed}
-        changed = changed or len(kept) != len(marked)
-        marked = kept
-    new_floor = min(edge, since)
-    if not record or not readable or (not changed and floor is not None and new_floor >= floor):
-        return
+        new_floor = min(edge, since)
+        if not write or not readable or (not changed and floor is not None and new_floor >= floor):
+            return
+        payload: dict[str, Any] = {
+            "floor": new_floor,
+            "ids": list(marks),
+            "id_ts": {i: t for i, t in marks.items() if t is not None},
+        }
+        if before is not None:
+            payload["before"] = before
+        _write_json(data_dir(home) / BACKFILL_FILE, payload, ordered=True)
+
     try:
-        _write_json(
-            data_dir(home) / BACKFILL_FILE,
-            {"floor": new_floor, "ids": list(marked)[-BACKFILL_IDS_MAX:]},
-            ordered=True,
-        )
-    except OSError as exc:
+        if record:
+            with _state_lock(home):
+                apply(True)
+        else:
+            apply(False)
+    except (OSError, TimeoutError, RuntimeError) as exc:
         if errors is not None:
             errors.append(f"chat: backfill marks could not be saved ({type(exc).__name__})")
+        if record:
+            apply(False)  # the flags still apply to what is listed now
 
 
 def chat_items(
@@ -2146,7 +2183,7 @@ def chat_items(
         """Whether a dismissal or a cached summary already exists under this profile's chat ids."""
         prefix = f"chat:{profile}:"
         try:
-            ids = list(load_hidden(home, create=False)) + list(load_blufs(home))
+            ids = list(load_hidden(home, create=False)) + list(load_blufs(home, create=False))
         except Exception:  # noqa: BLE001 - only a tie-break between aliases; the first one wins
             return False
         return any(str(i).startswith(prefix) for i in ids)
@@ -2359,7 +2396,6 @@ def chat_items(
         _mark_backfill(
             home, items, since,
             record=record_backfill,
-            complete=not cov.get("sessions_omitted") and not (errors or []) and not unread_profiles,
             errors=errors,
         )
     return items
@@ -6320,7 +6356,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         "cards": cards,
         # False when a source could not be read or a card was cut or left out: an empty pack is
         # then not "nothing needs you".
-        "complete": not unread_sources(queue.get("errors")) and not listing_cut(queue.get("errors")) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
+        "complete": not unread_sources(queue.get("errors")) and not listing_cut(queue.get("errors")) and not coverage_gaps(queue) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
         # What this pack leaves out, as counts only; the original surface has the rest.
         "omitted": {
             "unread_sources": unread_sources(queue.get("errors")),

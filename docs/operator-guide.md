@@ -217,7 +217,7 @@ that is older than 14 days, or older than any earlier read (widening 1 to 7 days
 three-day-old asks), is listed but never summarized automatically, even when summaries are
 on; the Summarize action still works on it. To keep that flag across refreshes the queue keeps a
 small `chat-backfill.json` in the plugin data folder: the oldest time any read reached and the
-ids of such chats (at most 1000), never chat text. If a chat database cannot be read, the coverage note says so instead of naming a window. The labeled
+ids of such chats (at most 1000; past that the oldest are dropped and everything as old as the newest dropped stays flagged), never chat text. Narrowing the window again keeps the flag, and the file is rewritten under the shared state lock. If a chat database cannot be read, the coverage note says so instead of naming a window. The labeled
 corpus in `tests/ask_corpus.py` lists the known misses (`KNOWN_GAPS`); run
 `python tests/test_ask_corpus.py --report` to print the false-positive and false-negative
 report.

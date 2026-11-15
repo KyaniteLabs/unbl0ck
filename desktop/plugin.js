@@ -1838,7 +1838,9 @@ function Page({ ctx, refresh, scope = '' }) {
                                 ? 'Everything that is waiting on your word.'
                                 : held
                                   ? 'No asks, but stuck or answered cards are listed.'
-                                  : 'Nothing is blocked on you.',
+                                  : omittedChats(q) > 0
+                                    ? 'No ask was found, but some older chats were not read.'
+                                    : 'Nothing is blocked on you.',
                           jsx('i', { className: 'ub-cursor' })
                         ]
                       })

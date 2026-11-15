@@ -92,7 +92,7 @@ An answer with release is one Kanban write transaction: a stale version is refus
 written, and a release that fails after the answer is written (false or an error) leaves the comment and a
 recovery marker for the retry. Duplicate detection looks only at comments made since the current block.
 
-Shared read-modify-write stores for hidden, summary, pending-release and filed state
+Shared read-modify-write stores for hidden, summary, pending-release, filed and chat-backfill state
 use thread locks and atomic replacement. macOS/Linux additionally use `fcntl`
 cross-process locking with a five-second timeout. Live prompt files and Pocket pack
 use per-file atomic replacement without those shared-store locks. Windows lacks that
