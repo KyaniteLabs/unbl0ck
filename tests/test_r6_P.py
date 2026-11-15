@@ -90,7 +90,7 @@ class CommentSignature(unittest.TestCase):
         conn.execute("CREATE TABLE task_comments(id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INT)")
         conn.executemany(
             "INSERT INTO task_comments(task_id, author, body, created_at) VALUES('t', 'w', ?, ?)",
-            [("x" * 100_000, i) for i in range(200)],
+            [("x " * 50_000, i) for i in range(200)],  # words: a cut drops only the word it splits
         )
         read = [0]
 
