@@ -25,6 +25,13 @@ records), then deleted; the agent's own `resolve` action removes a record perman
 is the only action that means the work is finished. Re-filing identical content keeps a
 Done item hidden; changed content brings it back.
 
+The filter box searches titles and previews of the cards loaded in the window only; its
+status line says so. **Search full text** runs one bounded read of the stored text behind
+those cards (at most 200 items and 20,000 characters each) and lists matches with their
+source and version, plus what it did not cover: items past the cap, text cut at the limit,
+sources that failed, and password prompts, which are never read. It does not call your
+model and does not repeat on its own.
+
 Search and source filtering use already loaded text. They preserve mounted answer
 boxes and conversations and do not change the total queue count. **Clear filters**
 restores the list. **Esc** closes TL;DR, Context, then Full text; in Search it clears
