@@ -335,16 +335,18 @@ class AskJournal:
                 os.close(fd)
 
     @contextlib.contextmanager
-    def _locked(self, fd: int):
-        """Hold the directory lock; yields False (fail closed) when it cannot be taken in time."""
+    def _locked(self, fd: int, wait: Optional[float] = None):
+        """Hold the directory lock; yields False (fail closed) when it cannot be taken in time.
+
+        ``wait`` caps how long to wait (0 tries once). Without ``fcntl`` there is no lock that
+        other processes honour, so the lock is never "taken": nothing is persisted rather than
+        letting two writers both claim the last slot."""
         lfd = None
         got = False
         try:
             lfd = os.open(".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=fd)
-            if fcntl is None:
-                got = True
-            else:
-                deadline = time.monotonic() + self.LOCK_WAIT_S
+            if fcntl is not None:
+                deadline = time.monotonic() + (self.LOCK_WAIT_S if wait is None else wait)
                 while True:
                     try:
                         fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -690,7 +692,7 @@ class AskJournal:
             return False
         return True
 
-    def delete(self, job: str, d: Optional[Path] = None, tombstone: bool = False) -> bool:
+    def delete(self, job: str, d: Optional[Path] = None, tombstone: bool = False, wait: Optional[float] = None) -> bool:
         """True when a record was removed. With ``tombstone``, a job another running worker still
         owns (queued, sent or already settled, which that worker may still serve from memory) is
         also marked deleted, so that worker's later write is refused and its next read drops the
@@ -701,7 +703,7 @@ class AskJournal:
         with self._session(False, d) as (fd, _status):
             if fd is None:
                 return False
-            with self._locked(fd) as got:
+            with self._locked(fd, wait) as got:
                 if not got:
                     return False
                 name = f"{job}.json"
@@ -738,14 +740,15 @@ class AskJournal:
                 self.failures += 1
                 return True
 
-    def prune(self, ttl: float, keep: Callable[[str], bool] = lambda job: False, d: Optional[Path] = None) -> int:
+    def prune(self, ttl: float, keep: Callable[[str], bool] = lambda job: False, d: Optional[Path] = None,
+              wait: Optional[float] = None) -> int:
         """Delete expired and unreadable files, then the oldest beyond MAX_FILES.
 
         ``keep(job)`` protects jobs that are alive in memory. Returns how many were removed."""
         with self._session(False, d) as (fd, _status):
             if fd is None:
                 return 0
-            with self._locked(fd) as got:
+            with self._locked(fd, wait) as got:
                 return self._prune_locked(fd, ttl, keep) if got else 0
 
     def _prune_locked(self, fd: int, ttl: float, keep: Callable[[str], bool]) -> int:
@@ -800,9 +803,14 @@ class AskJournal:
                 self.failures += 1
         return removed
 
-    def enforce_settled(self, limit: int, keep: Callable[[str], bool], d: Optional[Path] = None) -> int:
+    def enforce_settled(self, limit: int, keep: Callable[[str], bool], d: Optional[Path] = None,
+                        on_fail: Optional[Callable[[str, float], None]] = None, wait: Optional[float] = None) -> int:
         """Keep at most ``limit`` settled (done or error) records on disk, oldest settled first,
-        whoever wrote them: answers recovered after a restart count against the same bound."""
+        whoever wrote them: answers recovered after a restart count against the same bound.
+
+        Records ``keep`` protects are skipped and the next oldest goes instead, so a protected
+        record never stops the bound from being enforced. A record that cannot be deleted is
+        reported to ``on_fail(job, started)`` (the caller must stop serving it) and counts as gone."""
         with self._session(False, d) as (fd, _status):
             if fd is None:
                 return 0
@@ -816,15 +824,23 @@ class AskJournal:
                     rec = self._read_fd(fd, name, stem) if self._valid(stem) else None
                     if rec and not rec.get("corrupt") and rec.get("state") in ("done", "error"):
                         at = rec.get("settled_at")
-                        settled.append((at if _finite(at) else rec["started"], stem))
+                        settled.append((at if _finite(at) else rec["started"], stem, rec["started"]))
             except OSError:
                 self.failures += 1
                 return 0
         settled.sort()
-        removed = 0
-        for _, stem in settled[: max(0, len(settled) - limit)]:
-            if not keep(stem) and self.delete(stem, d=d):
+        removed, excess = 0, len(settled) - limit
+        for _, stem, started in settled:
+            if excess <= 0:
+                break
+            if keep(stem):
+                continue
+            if self.delete(stem, d=d, wait=wait):
                 removed += 1
+                excess -= 1
+            elif on_fail is not None:
+                on_fail(stem, started)
+                excess -= 1
         return removed
 
 
@@ -867,8 +883,9 @@ class AskJobs:
     TTL_S = 900
     MAX_SETTLED = 128
     PRUNE_EVERY_S = 30  # journal housekeeping cadence; polls are every 1.5 s
-    MAX_UNDELETED = 1024
+    MAX_UNDELETED = 1024  # past this, entries already beyond their retention are forgotten; live ones never are
     MAX_KNOWN_DIRS = 256
+    HOUSEKEEPING_BUDGET_S = 2.0  # total time one cleanup pass may spend waiting on journal locks
 
     def __init__(self, clock: Optional[Callable[[], float]] = None, journal: Optional[AskJournal] = None):
         self._clock = clock or (lambda: time.time())
@@ -884,6 +901,7 @@ class AskJobs:
         # their last in-memory job is gone (recovered answers and leftover temporary files).
         self._known: dict[Path, None] = {}
         self._last_prune = float("-inf")
+        self._deadline = float("inf")  # monotonic time by which the current pass stops waiting on locks
         self._bg_every: Optional[float] = None
         self._timer: Optional[threading.Timer] = None
 
@@ -1135,7 +1153,9 @@ class AskJobs:
                 self._drop_record(k[1], k[0], evicted["started"] if evicted else None)
             if self._journal and where is not None:
                 # Answers recovered from an earlier run are not in memory but still count against the bound.
-                self._journal.enforce_settled(self.MAX_SETTLED, keep=lambda j: (where, j) in self._jobs, d=where)
+                self._journal.enforce_settled(self.MAX_SETTLED, keep=lambda j: (where, j) in self._jobs, d=where,
+                                              on_fail=lambda j, started: self._drop_record(j, where, started),
+                                              wait=self._wait())
             return True
 
     def consume(self, job: str) -> dict[str, Any]:
@@ -1161,16 +1181,28 @@ class AskJobs:
         served) and the removal is retried by housekeeping, so a failed delete cannot bypass a limit."""
         if not self._journal or where is None:
             return
-        if self._journal.delete(job, d=where) or self._journal.verified_absent(job, owned=True, d=where):
+        if self._journal.delete(job, d=where, wait=self._wait()) or self._journal.verified_absent(job, owned=True, d=where):
             self._undeleted.pop((where, job), None)
             return
         self._undeleted[(where, job)] = started if started is not None else self._clock()
-        while len(self._undeleted) > self.MAX_UNDELETED:
-            self._undeleted.pop(next(iter(self._undeleted)))  # the TTL prune removes the file regardless
+        if len(self._undeleted) > self.MAX_UNDELETED:
+            self._forget_lapsed()
+
+    def _wait(self) -> float:
+        """How long the next journal lock may be waited for: what is left of this pass's budget."""
+        return max(0.0, min(self._journal.LOCK_WAIT_S if self._journal else 0.0, self._deadline - time.monotonic()))
+
+    def _forget_lapsed(self) -> None:
+        """Forget undeleted records past their retention: reading one drops it as expired anyway.
+        A record still inside its retention is never forgotten, or its evicted answer would be served again."""
+        cutoff = self._clock() - self.TTL_S
+        for k in [k for k, started in self._undeleted.items() if started < cutoff]:
+            self._undeleted.pop(k, None)
 
     def _retry_undeleted(self) -> None:
         for (where, job), started in list(self._undeleted.items()):
             self._drop_record(job, where, started)
+        self._forget_lapsed()
 
     def _journal_dirs(self) -> list[Path]:
         dirs: list[Path] = []
@@ -1181,6 +1213,7 @@ class AskJobs:
         return dirs
 
     def _expire(self) -> None:
+        self._deadline = time.monotonic() + self.HOUSEKEEPING_BUDGET_S
         cutoff = self._clock() - self.TTL_S
         for k in [k for k, v in list(self._jobs.items()) if v["started"] < cutoff]:
             gone = self._jobs.pop(k, None)
@@ -1189,7 +1222,7 @@ class AskJobs:
         if self._journal and now - self._last_prune >= self.PRUNE_EVERY_S:
             self._last_prune = now
             for d in self._journal_dirs():
-                self._journal.prune(self.TTL_S, keep=lambda j, d=d: (d, j) in self._jobs, d=d)
+                self._journal.prune(self.TTL_S, keep=lambda j, d=d: (d, j) in self._jobs, d=d, wait=self._wait())
             self._retry_undeleted()
 
     def housekeeping(self) -> None:

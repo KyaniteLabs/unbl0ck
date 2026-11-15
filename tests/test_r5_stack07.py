@@ -298,6 +298,88 @@ class DeleteStopsTheOwner(Profiles):
         self.assertIsNone(a.get(J1))
 
 
+class RetentionHolds(Profiles):
+    """R5-jobs-014, 015, 016, 017 and 018 (classes H, B and D)."""
+
+    def saved(self, table, i, reply="R"):
+        """A settled, answer-keeping record written by an earlier run."""
+        ticket = table.create(hexid(i), card="c1")
+        table.mark_sent(ticket)
+        table.finish(ticket, f"{reply}{i}", "p", "m")
+        self.clock.t += 1
+
+    def refuse_unlink(self, *stems):
+        real = os.unlink
+        names = {f"{s}.json" for s in stems}
+
+        def unlink(path, *a, **kw):
+            if str(path) in names:
+                raise PermissionError("refused")
+            return real(path, *a, **kw)
+
+        return patch("os.unlink", unlink)
+
+    def test_a_protected_oldest_record_does_not_stop_the_limit_being_enforced(self):  # 014
+        table = self.table()
+        for i in (1, 2):
+            self.saved(table, i)
+        journal = table._journal
+        removed = journal.enforce_settled(1, keep=lambda j: j == hexid(1), d=self.dirs["home"])
+        self.assertEqual(removed, 1)
+        self.assertEqual(sorted(p.name for p in self.dirs["home"].glob("*.json")), [f"{hexid(1)}.json"])
+
+    def test_a_refused_deletion_of_a_recovered_answer_is_not_served_again(self):  # 015
+        first = self.table()
+        for i in (1, 2, 3):
+            self.saved(first, i)
+        restarted = self.table()
+        with patch.object(jobs.AskJobs, "MAX_SETTLED", 3), self.refuse_unlink(hexid(1)):
+            ticket = restarted.create(hexid(4), card="c1")
+            restarted.mark_sent(ticket)
+            restarted.finish(ticket, "R4", "p", "m")
+            self.assertIsNone(restarted.get(hexid(1)), "the evicted answer must not come back")
+
+    def test_forgetting_an_undeleted_record_never_resurrects_its_answer(self):  # 016
+        first = self.table()
+        for i in (1, 2):
+            self.saved(first, i)
+        restarted = self.table()
+        with patch.object(jobs.AskJobs, "MAX_UNDELETED", 1), self.refuse_unlink(hexid(1), hexid(2)):
+            for i in (1, 2):
+                restarted._drop_record(hexid(i), self.dirs["home"], self.clock())
+            for i in (1, 2):
+                self.assertIsNone(restarted.get(hexid(i)), f"record {i} was evicted and must stay hidden before its retention ends")
+
+    def test_without_fcntl_nothing_is_persisted_instead_of_pretending_to_lock(self):  # 017
+        journal = jobs.AskJournal(lambda: self.dirs["home"], lambda: True, self.clock)
+        with patch.object(jobs, "fcntl", None):
+            wrote = journal.write(J1, {"state": "queued", "started": self.clock(), "card": "c"})
+        self.assertFalse(wrote)
+        self.assertEqual(list(self.dirs["home"].glob("*.json")), [])
+
+    def test_a_held_journal_lock_cannot_freeze_the_table_through_cleanup_retries(self):  # 018
+        import fcntl
+        import time
+
+        table = self.table()
+        home = self.dirs["home"]
+        for i in range(20):
+            self.saved(table, 100 + i)
+            table._journal.delete(hexid(100 + i), d=home)
+            table._undeleted[(home, hexid(100 + i))] = self.clock()
+        holder = os.open(home / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        try:
+            with patch.object(jobs.AskJournal, "LOCK_WAIT_S", 0.3), \
+                    patch.object(jobs.AskJobs, "HOUSEKEEPING_BUDGET_S", 0.5, create=True):
+                t0 = time.monotonic()
+                table.housekeeping()
+                elapsed = time.monotonic() - t0
+        finally:
+            os.close(holder)
+        self.assertLess(elapsed, 2.5, "one cleanup pass must stay inside its budget")
+
+
 class HugeIntegersAreImplausibleNotFatal(rec.RecoveryBase):
     """R5-jobs-013 (class G)."""
 
