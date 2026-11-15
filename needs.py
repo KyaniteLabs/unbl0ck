@@ -1687,10 +1687,16 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
             return
         home = home or hermes_home()
         pid = os.getpid()
+        kind = str(payload.get("kind") or "")[:40]
+        prompt = str(payload.get("prompt") or "")
+        # A password prompt is never expanded, so keep no more of it than before. Others are
+        # kept up to the full-text limit so Full text can show the whole question.
+        keep = 4000 if kind == "sudo" else FULL_TEXT_LIMIT
         rec = {
             "request_id": rid,
-            "kind": str(payload.get("kind") or "")[:40],
-            "prompt": str(payload.get("prompt") or "")[:4000],
+            "kind": kind,
+            "prompt": prompt[:keep],
+            "prompt_cut": len(prompt) > keep,
             "session_id": str(payload.get("session_id") or ""),
             "platform": str(payload.get("platform") or ""),
             "profile": _profile_of(home),
@@ -1801,7 +1807,11 @@ def wait_items(
                 # A password prompt is never expanded: its excerpt is all the queue ever shows.
                 "ask_truncated": kind != "sudo" and _is_excerpted(str(rec.get("prompt") or "")),
                 **(
-                    _full_fields(str(rec.get("prompt") or ""))
+                    {
+                        **_full_fields(str(rec.get("prompt") or "")),
+                        "text_cut": _full_fields(str(rec.get("prompt") or ""))["text_cut"]
+                        or bool(rec.get("prompt_cut")),
+                    }
                     if full and kind != "sudo"
                     else {}
                 ),

@@ -945,7 +945,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     setOutsideTextError('')
     const id = encodeURIComponent(item.id), version = encodeURIComponent(item.version)
     ctx.rest(isOutside ? `/outside/text?id=${id}&version=${version}` : `/source/text?id=${id}&version=${version}`)
-      .then(d => { if (alive) setOutsideText({ text: d.text, __version: item.version }) })
+      .then(d => { if (alive) setOutsideText({ text: d.text, truncated: d.truncated === true, __version: item.version }) })
       .catch(e => { if (alive) setOutsideTextError(String(e?.message || e)) })
       .finally(() => { if (alive) setOutsideTextLoading(false) })
     return () => { alive = false }
@@ -1365,6 +1365,9 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
               jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' }),
               item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null
             ]),
+        !isOutside && hasFull && open && outsideText?.__version === item.version && outsideText.truncated
+          ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This message is longer than 20,000 characters. Only the beginning is shown; the end, which may hold the question, is in the original chat.' })
+          : null,
         isOutside && item.truncated ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This export exceeds 256 KiB. Only the beginning is shown; read the complete text in the original app.' }) : null,
         jsx('div', { className: 'ub-act', children: actions }),
         detailNode || askNode ? jsxs('div', { className: 'ub-detail', children: [detailNode, askNode] }) : null
