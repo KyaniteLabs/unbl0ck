@@ -18,6 +18,7 @@ except Exception:  # noqa: BLE001
 
 sys.path.insert(0, str(Path(__file__).parent))
 from test_needs import make_home, needs  # noqa: E402
+from test_outside import OutsideFixture  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -94,6 +95,45 @@ class MatrixIsTheCode(unittest.TestCase):
                 [yes(row["summary"]), yes(row["ask"]), yes(row["search"]), yes(row["cross_profile"])],
                 row["source"],
             )
+
+
+class CrossProfileIsWhatIsCollected(OutsideFixture):
+    """The matrix column is checked against what the readers return, not against a constant."""
+
+    def file(self, profile, title):
+        args = {"kind": "draft", "title": title, "body": "B", "act_where": "Mail"}
+        return json.loads(self.tools["unbl0ck_file"][2](args, session_id="s", profile=profile))
+
+    def test_filed_items_from_every_profile_are_collected_and_the_matrix_says_so(self):
+        self.file("work", "From work")
+        self.file("personal", "From personal")
+        titles = {i["title"] for i in needs.outside_items(self.home)}
+        self.assertEqual(titles, {"From work", "From personal"})
+        row = {r["source"]: r for r in needs.disclosure_matrix({})}["outside"]
+        self.assertTrue(row["cross_profile"])
+
+    def test_chats_of_every_profile_are_collected_and_the_matrix_says_so(self):
+        import sqlite3
+
+        for profile in ("work", "personal"):
+            prof = self.home / "profiles" / profile
+            prof.mkdir(parents=True)
+            db = sqlite3.connect(prof / "state.db")
+            db.executescript("""
+              CREATE TABLE sessions(id TEXT, title TEXT, archived INT, source TEXT, chat_type TEXT,
+                                    user_id TEXT, display_name TEXT, started_at REAL, last_activity_at REAL);
+              CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,
+                                    timestamp REAL, display_kind TEXT, active INT);
+            """)
+            now = __import__("time").time()
+            db.execute("INSERT INTO sessions VALUES(?,?,0,'cli','dm','u','Pat',?,?)", (f"s-{profile}", "t", now, now))
+            db.execute("INSERT INTO messages VALUES(1,?,?,?,?,NULL,1)", (f"s-{profile}", "assistant", "Should I open the PR now?", now))
+            db.commit()
+            db.close()
+        with patch.object(needs, "_settings", lambda: {"principal_name": "Ada"}):
+            got = {i["session_id"] for i in needs.chat_items(self.home)}
+        self.assertEqual(got, {"s-work", "s-personal"})
+        self.assertTrue({r["source"]: r for r in needs.disclosure_matrix({})}["chat"]["cross_profile"])
 
 
 @unittest.skipIf(fastapi is None, "fastapi not installed")

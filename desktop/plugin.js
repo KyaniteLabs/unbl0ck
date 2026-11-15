@@ -1546,6 +1546,7 @@ function Page({ ctx, refresh }) {
     const parts = [`full text searched ${Object.entries(h.searched || {}).map(([s, n]) => `${n} ${s}`).join(', ') || 'nothing'}`]
     const miss = Object.entries(h.not_searched || {}).map(([s, n]) => `${n} ${s} not searched (limit ${h.limits.items_per_source} per source)`)
     if (miss.length) parts.push(miss.join(', '))
+    if (h.chat_sessions_unread) parts.push(`${h.chat_sessions_unread} older chat session(s) not read (scan limit)`)
     if (h.items_cut) parts.push(`${h.items_cut} long item(s) searched only to ${h.limits.chars_per_item} characters`)
     if (h.skipped_private) parts.push(`${h.skipped_private} password prompt(s) never searched`)
     for (const e of h.errors || []) parts.push(e)
@@ -1709,7 +1710,7 @@ function Page({ ctx, refresh }) {
 function coverageNote(q) {
   const c = q && q.coverage
   if (!c) return null
-  const days = c.chat && c.chat.window_days
+  const days = c.chat && !c.chat.failed && c.chat.window_days
   const notes = Array.isArray(c.not_covered) ? c.not_covered.filter(x => typeof x === 'string') : []
   if (!days && !notes.length) return null
   return jsxs('details', { className: 'ub-coverage', children: [

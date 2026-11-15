@@ -206,6 +206,85 @@ class RealReaders(unittest.TestCase):
         self.assertTrue(all("text" not in i for i in items))
 
 
+class SearchBudget(RealReaders):
+    """Round-3 review: the budget goes to cards a person could see, and coverage tells the truth."""
+
+    test_chat_text_the_reader_cut_is_counted_as_cut_not_as_a_complete_miss = None
+    test_prompt_text_the_reader_cut_is_counted_as_cut = None
+    test_only_the_searched_window_is_expanded_and_the_rest_are_still_counted = None
+    test_the_queue_itself_still_carries_every_item_without_full_text = None
+
+    def test_hidden_chats_do_not_use_up_the_search_budget(self):
+        self.chats([f"Should I merge change {i} now?" for i in range(201)])
+        listed = needs.chat_items(self.home)
+        for it in listed[:200]:
+            needs.hide(it["id"], it["version"], self.home)
+        last = listed[200]
+        r = needs.search_text("change")
+        self.assertEqual([m["id"] for m in r["matches"]], [last["id"]])
+        self.assertEqual(r["searched"]["chat"], 1)
+        self.assertNotIn("chat", r["not_searched"])
+        self.assertFalse(r["partial"])
+
+    def test_a_hidden_chat_that_changed_is_searched_again(self):
+        self.chats(["Should I merge change 0 now?"])
+        (it,) = needs.chat_items(self.home)
+        needs.hide(it["id"], "an-older-version", self.home)
+        self.assertEqual(len(needs.search_text("change")["matches"]), 1)
+        needs.hide(it["id"], it["version"], self.home)
+        self.assertEqual(needs.search_text("change")["matches"], [])
+
+    def test_password_prompts_are_skipped_not_counted_as_searched(self):
+        needs.record_wait(self.home, request_id="0123456789abcdef", kind="sudo", prompt="sudo password for ada", platform="cli")
+        r = needs.search_text("ada")
+        self.assertEqual((r["matches"], r["skipped_private"]), ([], 1))
+        self.assertEqual(r["searched"].get("prompt", 0), 0)
+
+
+class SearchFolders(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        self.a, self.b = Path(self.tmp.name) / "a", Path(self.tmp.name) / "b"
+        self.a.mkdir()
+        self.b.mkdir()
+        settings = {"principal_name": "Ada", "outside_dirs": f"{self.a},{self.b}"}
+        for name, value in (("_settings", lambda: settings), ("hermes_home", lambda: self.home),
+                            ("chat_items", lambda *a, **k: []), ("wait_items", lambda *a, **k: [])):
+            p = patch.object(needs, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_two_folders_share_one_read_budget(self):
+        for folder in (self.a, self.b):
+            for n in range(110):
+                (folder / f"{n}.txt").write_text(f"note {n} in {folder.name}")
+        reads = []
+        real = needs._folder_outside_item
+        with patch.object(needs, "_folder_outside_item", lambda *a, **k: reads.append(1) or real(*a, **k)):
+            r = needs.search_text("note")
+        self.assertLessEqual(len(reads), needs.SEARCH_MAX_ITEMS)
+        self.assertEqual(r["searched"]["outside"], 200)
+        self.assertEqual(r["not_searched"]["outside"], 20)
+        self.assertTrue(r["partial"])
+        self.assertEqual(len(r["matches"]), 200)
+
+    def test_a_file_cut_at_the_read_limit_is_counted_as_cut(self):
+        # The headers use up the whole read, so the body (and the term) is never seen, and the
+        # text left over is short: only the reader's own `truncated` flag tells search it is partial.
+        (self.a / "big.eml").write_text("Subject: hello\nX-Pad: " + "a" * 300000 + "\n\nthe needle is in the body\n")
+        r = needs.search_text("needle")
+        self.assertEqual((r["matches"], r["items_cut"], r["partial"]), ([], 1, True))
+
+    def test_a_small_file_is_found_and_complete(self):
+        (self.a / "small.txt").write_text("a needle here")
+        r = needs.search_text("needle")
+        self.assertEqual(len(r["matches"]), 1)
+        self.assertFalse(r["partial"])
+
+
 @unittest.skipIf(FastAPI is None, "fastapi missing")
 class Endpoint(Fixture):
     def setUp(self):

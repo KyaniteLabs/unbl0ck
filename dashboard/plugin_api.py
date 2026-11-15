@@ -196,6 +196,7 @@ def queue():
     if q.get("bluf_enabled"):
         for it in q["items"]:
             if (not it.get("bluf") and it.get("source") not in getattr(n, "NO_BLUF_SOURCES", ())
+                    and not it.get("backfilled")   # older than the default window: no automatic model call
                     and it.get("tier") not in ("stuck", "answered")):   # not asks: no model call each
                 if ctx is not None and hasattr(ctx, "llm"):
                     _queue_bluf(n, ctx, it)

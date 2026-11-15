@@ -50,7 +50,7 @@ from collections.abc import Iterable
 from contextlib import closing, contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Who the human is. Set in Hermes config: plugins.entries.unbl0ck.settings.principal_name
 # (comma-separated names, e.g. "Ada, Ada Lovelace"). The generic words "principal" and "human"
@@ -466,12 +466,20 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
                 return False
         if not done and not is_hidden:
             return False
-        if done:
-            rec.pop("done_at")
-            _write_json(f, rec)
-        if is_hidden:
+        clear_done, clear_hidden = done, is_hidden
+        if token is not None and done and is_hidden and hidden[item_id] != str(rec.get("version")):
+            # The two markers belong to different versions of the item (hidden at v1, Done at v2).
+            # A token for one never authorizes removing the other's newer dismissal.
+            if token == hidden[item_id]:
+                return False
+            clear_hidden = False
+        # Hidden marker first: if the second write fails the Done token still matches on retry.
+        if clear_hidden:
             del hidden[item_id]
             _write_json(_hidden_path(home), hidden)
+        if clear_done:
+            rec.pop("done_at")
+            _write_json(f, rec)
         return True
 
 
@@ -1445,6 +1453,7 @@ def chat_items(
     full: bool = False,
     coverage: dict[str, Any] | None = None,
     full_limit: int | None = None,
+    visible: Callable[[str, str], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
     last visible turn is the bot asking you something you have not answered.
@@ -1577,6 +1586,8 @@ def chat_items(
                 ).lower() in CHAT_GROUP_TYPES and not names.search(str(content)[-900:]):
                     cov["skipped_group_unnamed"] += 1
                     continue
+                if visible is not None and not visible(f"chat:{profile}:{sid}", str(mid)):
+                    continue  # dismissed at this version: it must not use up a full-text budget
                 bot_chat = title in CHAT_TITLES
                 where_ = (
                     "Bot Chat"
@@ -1603,6 +1614,9 @@ def chat_items(
                         "owner": profile,
                         "priority": 0,
                         "since": int(ts or 0),
+                        # Found only because chat_window_days reaches past the default window:
+                        # listed, but never sent to a model without a deliberate action.
+                        **({"backfilled": True} if (ts or 0) < time.time() - CHAT_WINDOW_DAYS * 86400 else {}),
                     }
                 )
     return items
@@ -1888,6 +1902,7 @@ def wait_items(
     *,
     full: bool = False,
     full_limit: int | None = None,
+    visible: Callable[[str, str], bool] | None = None,
 ) -> list[dict[str, Any]]:
     """Open live prompts. A wait whose process is gone is deleted, not shown."""
     home = home or hermes_home()
@@ -1907,6 +1922,8 @@ def wait_items(
                 errors.append(f"prompt: {f.name}: {type(exc).__name__}; could not remove stale record")
             continue
         rid = str(rec["request_id"])
+        if visible is not None and not visible(f"prompt:{rid}", rid):
+            continue
         kind = str(rec.get("kind") or "")
         profile = str(rec.get("profile") or "default")
         who = _bot_name(home, profile) if profile != "default" else "An agent"
@@ -2001,10 +2018,35 @@ def search_text(query: Any) -> dict[str, Any]:
     if len(terms) > SEARCH_MAX_TERMS:
         raise ValueError(f"use at most {SEARCH_MAX_TERMS} search terms")
     home = hermes_home()
+    hidden = load_hidden(home)
+
+    def visible(item_id: str, version: str) -> bool:
+        # The queue's own rule: dismissed at this version means not a card, so not searchable
+        # and not allowed to use up the item budget.
+        return visibility(hidden, item_id, version) is not Visibility.HIDDEN
+
+    unread = [0]
+    chat_cov: dict[str, Any] = {}
     readers = (
-        ("outside", lambda errs: outside_items(errors=errs)),
-        ("chat", lambda errs: chat_items(home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS)),
-        ("prompt", lambda errs: wait_items(home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS)),
+        (
+            "outside",
+            lambda errs: outside_items(
+                home, errors=errs, visible=visible, read_budget=SEARCH_MAX_ITEMS, unread=unread
+            ),
+        ),
+        (
+            "chat",
+            lambda errs: chat_items(
+                home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS, visible=visible,
+                coverage=chat_cov,
+            ),
+        ),
+        (
+            "prompt",
+            lambda errs: wait_items(
+                home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS, visible=visible
+            ),
+        ),
     )
     matches: list[dict[str, str]] = []
     searched: dict[str, int] = {}
@@ -2022,21 +2064,25 @@ def search_text(query: Any) -> dict[str, Any]:
         if source_errors:
             errors.append(f"{source}: some records could not be read")
         window = items[:SEARCH_MAX_ITEMS]
-        if len(items) > len(window):
-            not_searched[source] = len(items) - len(window)
-        searched[source] = len(window)
+        skipped = len(items) - len(window) + (unread[0] if source == "outside" else 0)
+        if skipped:
+            not_searched[source] = skipped
+        examined = 0
         for item in window:
             if item.get("kind") == "sudo":
                 private += 1  # password prompts are never expanded, searched or returned
                 continue
+            examined += 1
             text = str(item.get("text") or item.get("ask") or "")
-            # The readers already cut chat and prompt text at the same limit and say so.
-            if item.get("text_cut") or len(text) > SEARCH_MAX_CHARS:
+            # The readers already cut chat and prompt text at the same limit and say so; a
+            # watched-folder read stops at its own size limit and reports it as `truncated`.
+            if item.get("text_cut") or item.get("truncated") or len(text) > SEARCH_MAX_CHARS:
                 cut += 1
                 text = text[:SEARCH_MAX_CHARS]
             hay = f"{item.get('title') or ''}\n{text}".casefold()
             if all(term in hay for term in terms):
                 matches.append({"id": str(item.get("id")), "version": str(item.get("version")), "source": source})
+        searched[source] = examined
     return {
         "query": query.strip(),
         "matches": matches,
@@ -2045,7 +2091,8 @@ def search_text(query: Any) -> dict[str, Any]:
         "items_cut": cut,
         "skipped_private": private,
         "errors": errors,
-        "partial": bool(not_searched or cut or errors),
+        "chat_sessions_unread": int(chat_cov.get("sessions_omitted") or 0),
+        "partial": bool(not_searched or cut or errors or chat_cov.get("sessions_omitted")),
         "limits": {"items_per_source": SEARCH_MAX_ITEMS, "chars_per_item": SEARCH_MAX_CHARS},
     }
 
@@ -2504,6 +2551,9 @@ def _scan_outside_folder(
     unsupported: collections.Counter[str] = collections.Counter()
     while stack and not stopped:
         d, depth = stack.pop()
+        if time.monotonic() > deadline:
+            stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
+            break  # queued directories count against the budget even when they hold no entries
         try:
             # A queued directory may have been swapped for a symlink since it was listed.
             if d != root and d.resolve() != d:
@@ -2558,10 +2608,23 @@ def _scan_outside_folder(
 
 
 def outside_items(
-    home: Path | None = None, errors: list[str] | None = None, *, with_hidden: bool = False
+    home: Path | None = None,
+    errors: list[str] | None = None,
+    *,
+    with_hidden: bool = False,
+    visible: Callable[[str, str], bool] | None = None,
+    read_budget: int | None = None,
+    unread: list[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Our filed records plus bounded, non-recursive reads of explicitly watched folders."""
+    """Our filed records plus bounded, non-recursive reads of explicitly watched folders.
+
+    ``visible(id, version)`` drops filed records that are dismissed at their current version.
+    ``read_budget`` caps how many items are returned in all (filed first, then folder files
+    newest first, across every watched folder); files left unread because of it are added to
+    ``unread[0]`` so a caller can report them."""
     errors = errors if errors is not None else []
+    if unread is not None and not unread:
+        unread.append(0)
     items = []
     done_seen = False
     for f in _outside_dir(home).glob("*.json"):
@@ -2581,7 +2644,8 @@ def outside_items(
                     for key in ("version", "title", "act_where"))
             and isinstance(rec.get("text"), str)
         ):
-            items.append(rec)
+            if visible is None or visible(rec["id"], rec["version"]):
+                items.append(rec)
         elif len(errors) == before:
             errors.append(f"outside: {f.name}: invalid filed record")
     filed_waiting = len(items)
@@ -2635,6 +2699,12 @@ def outside_items(
             # Hidden files never use up the waiting window; callers that count or show them
             # (build_queue) ask for them separately, bounded by the same limit.
             window = candidates[:_OUTSIDE_LIMIT]
+            if read_budget is not None:
+                room = max(0, read_budget - len(items))
+                if len(window) > room:
+                    if unread is not None:
+                        unread[0] += len(window) - room
+                    window = window[:room]
             if with_hidden:
                 hidden_pairs.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
                 window = window + hidden_pairs[:_OUTSIDE_LIMIT]
@@ -2706,13 +2776,15 @@ NO_BLUF_SOURCES = ("prompt", "pairing")
 # Which sources can reach a model provider, by surface (issue #42). "summary" is the automatic
 # one-line summary, "ask" is the TL;DR / follow-up panel (Kanban cards only: it needs a board
 # and task), "search" is the opt-in full-text search, which reads locally and never calls a
-# model. "cross_profile" marks sources read from every profile under the Hermes home.
+# model. "cross_profile" marks sources the queue reads without filtering by profile: chats and
+# prompts from every profile under the Hermes home, and the shared filed-item folder and watched
+# folders (the queue has no reading profile; a filed item records its profile only for dedupe).
 # docs/architecture.md carries the same table and a test keeps the two equal.
 SURFACES = {
     "prompt": {"ask": False, "search": True, "cross_profile": True},
     "pairing": {"ask": False, "search": False, "cross_profile": True},
     "kanban": {"ask": True, "search": False, "cross_profile": False},
-    "outside": {"ask": False, "search": True, "cross_profile": False},
+    "outside": {"ask": False, "search": True, "cross_profile": True},
     "chat": {"ask": False, "search": True, "cross_profile": True},
 }
 
@@ -2844,6 +2916,11 @@ def build_queue(
         errors.append(f"outside: {type(exc).__name__}: {exc}")
     if _SETTINGS_ERROR:
         errors.append(_SETTINGS_ERROR)
+    if chat_coverage is not None:
+        # The reader returns normally after a corrupt database or unreadable settings and says
+        # so only in `errors`; a window that was not fully read must not look like a complete one.
+        chat_coverage["errors"] = sum(1 for e in errors if e.split(":", 1)[0].split("[", 1)[0] == "chat")
+        chat_coverage["failed"] = bool(chat_coverage["errors"])
     hidden = load_hidden(home, errors=errors)
     failed_sources = {error.split(":", 1)[0].split("[", 1)[0] for error in errors}
     preserve_prefixes = tuple(
@@ -2913,6 +2990,10 @@ def not_covered_notes(chat_coverage: dict[str, Any] | None) -> list[str]:
     ]
     if chat_coverage is None:
         notes.insert(0, "Chats could not be read this time, so no chat window applies.")
+    elif chat_coverage.get("failed"):
+        notes.insert(0, "Some chats could not be read this time, so this list may be missing asks from them.")
+        if chat_coverage.get("sessions_omitted"):
+            notes.insert(1, f"{chat_coverage['sessions_omitted']} older chat sessions were not read (scan limit {CHAT_SESSION_CAP} per profile).")
     elif chat_coverage.get("sessions_omitted"):
         notes.insert(0, f"{chat_coverage['sessions_omitted']} older chat sessions were not read (scan limit {CHAT_SESSION_CAP} per profile).")
     return notes
