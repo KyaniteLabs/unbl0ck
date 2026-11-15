@@ -1005,17 +1005,11 @@ def save_bluf(
     for an old question cannot replace the newer question's summary. Start
     order decides, not completion order: the older request finishing first must not make the
     newer one look stale. A summary saved without a start time is never treated as newer."""
-    with _state_lock(
-        home
-    ):  # read-modify-write: concurrent workers must not drop each other's entries
-        data = load_blufs(home, strict=True)  # a damaged cache is repaired, not overwritten
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any] | None:
         existing = data.get(item_id)
-        if (
-            started_at is not None
-            and isinstance(existing, dict)
-            and _num(existing.get("started_at")) > started_at
-        ):
-            return
+        if started_at is not None and isinstance(existing, dict) and _num(existing.get("started_at")) > started_at:
+            return None
         data.pop(item_id, None)
         entry = {
             "version": version,
@@ -3144,7 +3138,7 @@ def search_text(query: Any) -> dict[str, Any]:
         raise ValueError(f"use at most {SEARCH_MAX_TERMS} search terms")
     home = hermes_home()
     hidden_errors: list[str] = []
-    raw_hidden = _load_hidden_raw(home, errors=hidden_errors, create=False)
+    raw_hidden = _load_hidden_raw(home, errors=hidden_errors)
     hidden = {item_id: _split_hidden(value)[0] for item_id, value in raw_hidden.items()}
     # A dismissal that names no version (null, a number, a list, an empty string) cannot say what
     # was dismissed, so the card reads as shown: that is damage to report, like an unreadable file.
@@ -3574,16 +3568,9 @@ def file_outside(
                     "an outside record could not be read; repair or remove it before filing or resolving"
                 )
         if action == "resolve":
-            if match is None or not match.is_file() or match.is_symlink():
-                raise LookupError("No filed outside item matches that id or dedupe_key")
-            try:
-                found = _read_json(match, strict=True)
-            except RuntimeError as exc:
-                raise SourceUnavailable(str(exc)) from exc
+            found = _load_filed(d, match.stem) if match is not None else {}
             if not found:
                 raise LookupError("No filed outside item matches that id or dedupe_key")
-            if not _is_filed_record(found, match.stem):
-                raise SourceUnavailable("filed outside record is invalid; repair it")
             if version is not None:
                 current = found.get("version")
                 if current != version:
