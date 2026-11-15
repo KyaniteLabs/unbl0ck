@@ -330,7 +330,7 @@ read properly (whole property names, comments and `!important` understood; `min-
 height with clipped overflow remove the whole element; `visibility:hidden` and `font-size:0`
 apply to what is inside unless an inner element sets them back (`visible`, `initial` or a real
 size). An inline `display` value overrides `hidden` only when it is a real one (`block`, `flex`,
-`initial` and so on); scripts, styles and the other inert elements stay out even inside a hidden
+`inline flow-root`, `initial` and so on; a repeated or conflicting pair such as `block block` is not); scripts, styles and the other inert elements stay out even inside a hidden
 element whose hiding is uncertain. The message's `<style>` rules are never matched to elements: when a stylesheet could hide
 text, or could show again text an inline style or `hidden` hides, that text is kept and the card
 says "styles or markup ... were not evaluated". The same note covers markup the converter does

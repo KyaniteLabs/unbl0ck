@@ -36,23 +36,29 @@ class InvalidDisplayCombination(unittest.TestCase):
 
 
 class LostDismissalCounter(s11.QueueCase):
-    def test_a_missing_or_damaged_counter_refuses_the_dismissal(self):
-        """R7-011: a lost or malformed counter refuses the dismissal instead of reissuing orders."""
+    def test_a_lost_counter_restarts_above_stored_orders_and_refuses_an_incomplete_scan(self):
+        """R7-011: a missing counter restarts above every stored order; a scan it cannot finish,
+        or a malformed counter, refuses the dismissal."""
         path = needs.data_dir(self.home) / needs.ORDER_FILE
         with patch.object(needs.time, "time", lambda: 1000.0):
             needs.hide_ordered("kanban:b:t", "1", self.home)
-            needs.hide_ordered("kanban:b:t", "1", self.home)
-            for damage in (None, {"last": "damaged"}, {}):
-                if damage is None:
-                    path.unlink()
-                else:
-                    path.write_text(json.dumps(damage))
-                with self.assertRaisesRegex(RuntimeError, needs.ORDER_FILE, msg=damage):
-                    needs.hide_ordered("kanban:b:t", "1", self.home)
-        # A pre-order install (bare versions, no counter) still dismisses.
-        path.unlink(missing_ok=True)
-        hidden = needs._hidden_path(self.home)
-        hidden.write_text(json.dumps({"kanban:b:old": "1"}))  # a bare version, as 0.5.1 wrote
+            _, last = needs.hide_ordered("kanban:b:t", "1", self.home)
+            for damage in (None, {}):
+                path.unlink(missing_ok=True) if damage is None else path.write_text(json.dumps(damage))
+                _, order = needs.hide_ordered("kanban:b:t", "1", self.home)
+                self.assertGreater(order, last, damage)
+                last = order
+            path.write_text(json.dumps({"last": "damaged"}))
+            with self.assertRaisesRegex(RuntimeError, needs.ORDER_FILE):
+                needs.hide_ordered("kanban:b:t", "1", self.home)
+            path.unlink()
+            outside = needs._outside_dir(self.home)
+            (outside / "broken.json").write_text("{not json")
+            with self.assertRaisesRegex(RuntimeError, needs.ORDER_FILE):
+                needs.hide_ordered("kanban:b:t", "1", self.home)
+            (outside / "broken.json").unlink()
+        # A pre-order install (bare versions, no counter) still dismisses at the clock.
+        needs._hidden_path(self.home).write_text(json.dumps({"kanban:b:old": "1"}))
         _, order = needs.hide_ordered("kanban:b:t", "1", self.home)
         self.assertGreaterEqual(order, int(time.time() * 1000) - 60_000)
 

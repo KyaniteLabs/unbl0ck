@@ -783,28 +783,28 @@ def _dismissal_order(home: Path | None) -> int:
     """A number that grows with each dismissal any process commits (milliseconds, never repeated
     or lowered by a clock that stands still or steps back). The last one is kept in ORDER_FILE
     and taken under the state lock, so it follows the order dismissals were committed in, which
-    the client cannot see from the order of its clicks or of the responses. A malformed counter,
-    or a missing one while stored dismissals already carry orders, refuses the dismissal."""
+    the client cannot see from the order of its clicks or of the responses. A missing counter
+    restarts above every stored order; a malformed one refuses the dismissal."""
     out: dict[str, int] = {}
 
     def bump(data: dict[str, Any]) -> dict[str, Any]:
-        if "last" not in data and _orders_issued(home):
-            raise RuntimeError(f"{ORDER_FILE} is missing; restore it before dismissing")
-        out["order"] = max(int(time.time() * 1000), data.get("last", 0) + 1)
+        out["order"] = max(int(time.time() * 1000), (data["last"] if "last" in data else _orders_issued(home)) + 1)
         return {"last": out["order"]}
 
     _update_state(home, data_dir(home) / ORDER_FILE, bump, entry_ok=lambda v: type(v) is int and v >= 0)
     return out["order"]
 
 
-def _orders_issued(home: Path | None) -> bool:
-    """Whether a stored dismissal carries an order (a token, or a Done); a record that cannot be
-    read, or a filed folder too large to check, counts as one."""
-    if any(_split_hidden(v)[1] for v in _load_hidden_raw(home, strict=True).values()):
-        return True
+def _orders_issued(home: Path | None) -> int:
+    """The highest order a stored dismissal carries (a hidden token's 13-hex prefix, a Done's
+    done_order). Raises when a record cannot be read or the filed listing is cut."""
+    tokens = (_split_hidden(v)[1] for v in _load_hidden_raw(home, strict=True).values())
     d, errors = _outside_dir(home, create=False), []
     files, cut = _filed_files(d) if d.is_dir() else ([], False)
-    return cut or any("done_order" in _read_json(f, errors=errors) for f in files) or bool(errors)
+    recs = [_read_json(f, errors=errors) for f in files]
+    if cut or errors:
+        raise RuntimeError(f"{ORDER_FILE} is missing and the stored orders could not all be read; restore it")
+    return max([int(t[:13], 16) for t in tokens if t] + [_done_order(r) for r in recs if "done_order" in r], default=0)
 
 
 class StaleHide(RuntimeError):
@@ -851,9 +851,9 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
                 out["existing"] = existing
                 return None
             hidden.pop(item_id, None)
-            out["token"] = uuid.uuid4().hex
+            out["order"] = _dismissal_order(home)  # the token starts with it, so a lost counter can restart above it
+            out["token"] = f"{out['order']:013x}{uuid.uuid4().hex[:19]}"
             hidden[item_id] = f"{version}\x1f{out['token']}"
-            out["order"] = _dismissal_order(home)
             return _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
 
         _update_state(home, _hidden_path(home), mutate, entry_ok=_hidden_entry_ok)
