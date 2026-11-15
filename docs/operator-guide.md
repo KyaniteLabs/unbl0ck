@@ -188,10 +188,50 @@ report.
 | Old-question draft notice /409 | The item changed after the draft or request was created | Read the new question, clear the old draft, then answer again. |
 | Answer posted but release failed | The comment succeeded; the transition did not | Use Release. Check the card before attempting another answer. |
 | Busy/retry state write | Another process owns the lock | Wait briefly and retry. Never delete a lock to bypass the writer. |
-| Corrupt hidden or release state | The stored record cannot be interpreted safely | Preserve the file, repair or restore it through the owning installation, then retry. Mutations refuse to overwrite corrupt state. |
+| Corrupt hidden, release or summary state | The stored record cannot be interpreted safely | Follow [Repair corrupt state](#repair-corrupt-state). Mutations refuse to overwrite corrupt state. |
 | Summary unavailable | The original text remains available | Read Full text. Automatic retry follows the bounded summary retry schedule. |
 | Ask fault | The model, its capacity, or transport failed | Retry. A transport retry resumes the same job; after a restart the card says `unknown` or `not sent` and Retry is your decision to ask again. |
 | Security reconciliation pending | A signed request has no authenticated current verdict | Follow the [Security recovery procedure](security-review-link.md). An acknowledgement is not an approval. |
+
+## Repair corrupt state
+
+Run these on the machine that owns the Hermes home. Output is counts, sizes and fixed
+sentences only; no record, id or text is printed. `recovery.py` sits next to `needs.py`.
+
+```
+python3 recovery.py diagnose
+python3 recovery.py preserve hidden
+python3 recovery.py restore hidden hidden-<label>.bak
+python3 recovery.py restore hidden hidden-<label>.bak --apply
+```
+
+Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Hermes home.
+
+1. **Diagnose.** Each store is `healthy`, `absent`, `corrupt` (truncated or not JSON),
+   `unsupported_schema` (valid JSON this version does not read) or `unsafe` (not a regular
+   file, such as a symlink). `writer_active` is reported separately: another process holds
+   the state lock. Records written by older releases with a null or empty version are valid
+   and count as healthy.
+2. **Preserve.** `preserve` copies the exact current bytes, readable or not, into
+   `plugin-data/unbl0ck/recovery/` and checks the copy. Nothing else changes. These backups
+   hold the same private content as the store and are never deleted by the plugin or this
+   tool; remove them yourself when you no longer need them.
+3. **Restore.** Put a backup you trust in that directory as `<store>-<label>.bak` with mode
+   600 (a copy from your own backup system is fine). `restore` without `--apply` is a dry
+   run: it checks the backup, then lists what the restore would replace. State files carry
+   no version number, so "compatible" means the backup parses and has the shape this
+   version reads for that store; a backup for another store, a symlink, or one readable by
+   others is refused. With `--apply` the tool takes the same state lock the plugin uses,
+   copies the current bytes aside first, writes the backup beside the store, verifies it and
+   swaps it in atomically. If anything fails, the store is left as it was.
+
+Consequences to expect: everything changed after the backup was made is lost (dismissals,
+pending releases, summaries). The tool never creates defaults for a record it cannot read,
+and it never clears a lock. If it reports `writer_active`, wait for the other process or
+stop it in its owning installation, then run it again. On Windows there is no
+cross-process lock to check, so `--apply` is refused; dry runs and `preserve` still work.
+Per-record files (`outside/`, `waits/`, `ask/`) are not covered: a corrupt record there is
+skipped on its own and does not block the others.
 
 ## Outside-source limits
 

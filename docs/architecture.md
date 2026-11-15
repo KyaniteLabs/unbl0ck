@@ -13,6 +13,7 @@ and performs explicit human-selected actions; it does not run a separate service
 | `dashboard/plugin_api.py` | Validated HTTP inputs, background execution, capacity admission and explicit HTTP failure contracts |
 | `desktop/src/plugin.src.js` | Desktop queue, local drafts, actions, recovery controls and host SDK integration |
 | `desktop/build.py` | Reproducible font/token inlining into `desktop/plugin.js` and `design/unbl0ck.css` |
+| `recovery.py` | Operator CLI: diagnose the shared state files, preserve their bytes, restore a verified backup; counts only, never clears a lock |
 | `scripts/security_review.py` | Trusted CI relay and authenticated GitHub verdict reconciliation |
 | `scripts/install_security_review_route.py` | Owner-run installation of one native Hermes subscription |
 
@@ -108,6 +109,7 @@ as private. Settings and source files remain owned by their original application
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; visible to every profile, with `dedupe_key` private to the filing profile unless `dedupe_scope` is `global` |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
 | `bluf.json` | Summary cache capped at 2,000, version-bound; failed-source entries retained subject to cap |
+| `recovery/*.bak` | Byte-for-byte copies of a shared state file, written only when an operator runs `recovery.py preserve` or `restore --apply` (directory 0700, files 0600). They hold the same private content as the file they copy and are never deleted by the plugin; remove them yourself when no longer needed |
 | `pocket-pack.json` | Written only on explicit pack request |
 | Summary jobs | Process memory; restart loses pending work and results |
 | `ask/*.json` | Owner-only (0600/0700) Ask restart markers, capped at 256, 15-minute retention; no card or question text; answer text only with `ask_persist_replies` (default off) |
