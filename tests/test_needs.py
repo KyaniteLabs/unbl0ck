@@ -577,6 +577,19 @@ class FakeKanban(unittest.TestCase):
         self.assertIn("comment 7", str(ctx.exception))
         self.assertEqual([c[0] for c in self.calls], ["comment", "unblock"])
 
+    def test_a_failed_pending_marker_clear_does_not_turn_a_released_card_into_a_failure(self):
+        # Class sweep (G): the card was released; clearing the retry marker afterwards failed.
+        with mock.patch.object(needs, "_set_pending_release", side_effect=OSError("disk")):
+            r = needs.answer_card("factory", "t_1", "Go", release=True, version="11")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["released"])
+
+    def test_a_failed_pending_marker_write_does_not_mask_the_unblock_failure(self):
+        self.release_behavior = lambda *args: False
+        with mock.patch.object(needs, "_set_pending_release", side_effect=OSError("disk")):
+            with self.assertRaises(needs.UnblockFailed):
+                needs.answer_card("factory", "t_1", "Go", release=True, version="11")
+
     def test_answer_to_an_old_block_is_refused(self):
         # The card was blocked again (event 12) after the human read the block-11 question.
         self.events = [
