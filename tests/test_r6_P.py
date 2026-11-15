@@ -125,5 +125,26 @@ class DismissalReads(OutsideFixture):
         self.assertNotIn(f, opened)
 
 
+@unittest.skipIf(HERMES_ERROR, f"Hermes unavailable: {HERMES_ERROR}")
+class CommentPlacement(KanbanAnswerCase):
+    def test_a_logged_answer_counts_beside_an_unlogged_comment(self):
+        """R6-010: an unlogged comment does not take the place of the logged answer after the block."""
+        task = self.card()
+        with self.conn() as c:
+            block = needs._latest_block(c, kanban_db, task)
+            kanban_db.add_comment(c, task, "operator", "Approved")
+            c.execute("UPDATE task_comments SET created_at = ? WHERE task_id = ?", (int(block.created_at) - 10, task))
+            c.execute(
+                "INSERT INTO task_comments(task_id, author, body, created_at) VALUES(?,?,?,?)",
+                (task, "someone", "imported note", int(block.created_at) - 20),
+            )
+            c.commit()
+            self.assertTrue(needs._answered_since(c, kanban_db, task, "operator", block.created_at, block.id))
+            self.assertEqual(
+                needs._comments_since_block(c, kanban_db, task, block.created_at, block.id),
+                [("operator", "Approved")],
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

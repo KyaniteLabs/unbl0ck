@@ -5080,69 +5080,93 @@ def _unblock_task_at_version(
         return True
 
 
+def _event_logs(payload: Any, author: Any, body: Any) -> bool:
+    """Whether a ``commented`` event's payload can record this comment: same author, and a
+    length the stored (stripped) body fits in. A payload without them matches any comment."""
+    payload = payload if isinstance(payload, dict) else {}
+    who, size = payload.get("author"), payload.get("len")
+    return (not isinstance(who, str) or _same_author(who.strip(), author)) and (
+        not isinstance(size, int) or len(str(body or "")) <= size
+    )
+
+
+def _after_block(
+    comments: Iterable[tuple[Any, Any, Any, Any]], events: Iterable[tuple[int, Any]], cut: int, block_id: int
+) -> list[tuple[str, str]]:
+    """Walk ``(id, author, body, created_at)`` comments and ``(id, payload)`` commented events,
+    both newest first, pairing each event with the next comment it can record. A paired comment
+    counts when its event is later than the block, and the walk ends at the first that is not;
+    a comment no event records counts when its time is at or after *cut*."""
+    out: list[tuple[str, str]] = []
+    pending = iter(events)
+    event = next(pending, None)
+    for _, author, body, created_at in comments:
+        if event is not None and _event_logs(event[1], author, body):
+            if event[0] <= block_id:
+                break
+            out.append((author, body))
+            event = next(pending, None)
+        elif (_num(created_at) or 0) >= cut:
+            out.append((author, body))
+    return out[::-1]
+
+
 def _comments_since_block(
     conn: Any, kanban_db: Any, task_id: str, since: int, block_id: int | None
 ) -> list[tuple[str, str]]:
     """``(author, body)`` of the comments made since the current block began, oldest first.
 
-    With the block's event id a comment is placed by its ``commented`` event when every comment
-    has one (event ids are ordered, clocks are not); when some comment has none, its time
-    decides as well, a comment counting when strictly later than the block. Without the id, a
-    comment counts when it is at or after the block's second. Older blocks' comments never count."""
-    strict = block_id is not None
-    cut = (since or 0) + 1 if strict else (since or 0)
-    try:
-        by_event_only = False
-        if strict:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
-            ).fetchone()[0]
-            logged = conn.execute(
-                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
-                (task_id,),
-            ).fetchone()[0]
-            by_event_only = logged >= total
-        rows = {
-            r[0]: (r[1], r[2])
-            for r in (
-                []
-                if by_event_only
-                else conn.execute(
-                    "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-                    (task_id, cut),
-                ).fetchall()
-            )
-        }
-        if strict:
-            n = conn.execute(
-                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
-                (task_id, block_id),
-            ).fetchone()[0]
-            if n:
+    With the block's event id a comment is placed by the ``commented`` event that records it
+    (event ids are ordered, clocks are not; see :func:`_after_block`); a comment no event records
+    counts when strictly later than the block. Without the id, a comment counts when it is at or
+    after the block's second. Older blocks' comments never count."""
+    if block_id is None:
+        try:
+            return [
+                (r[0], r[1])
                 for r in conn.execute(
-                    "SELECT id, author, body FROM task_comments WHERE task_id = ? "
-                    "ORDER BY id DESC LIMIT ?",
-                    (task_id, n),
-                ).fetchall():
-                    rows[r[0]] = (r[1], r[2])
-    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments = list(kanban_db.list_comments(conn, task_id))
-        keyed = [(getattr(c, "id", None) or i, c) for i, c in enumerate(comments, 1)]
-        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
-        by_event_only = strict and (
-            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
+                    "SELECT author, body FROM task_comments WHERE task_id = ? AND created_at >= ? ORDER BY id",
+                    (task_id, since or 0),
+                ).fetchall()
+            ]
+        except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+            return [(c.author, c.body) for c in kanban_db.list_comments(conn, task_id) if c.created_at >= (since or 0)]
+    cut = (since or 0) + 1
+    try:
+        comments = conn.execute(
+            "SELECT id, author, body, created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+            (task_id,),
         )
-        rows = {} if by_event_only else {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
-        if strict:
-            n = sum(
-                1
-                for e in all_events
-                if getattr(e, "kind", None) == "commented"
-                and int(getattr(e, "id", 0) or 0) > block_id
+        events = (
+            (r[0], _json_payload(r[1]))
+            for r in conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'commented' ORDER BY id DESC",
+                (task_id,),
             )
-            for k, c in keyed[len(keyed) - n :] if n else []:
-                rows[k] = (c.author, c.body)
-    return [rows[k] for k in sorted(rows)]
+        )
+        return _after_block(comments, events, cut, block_id)
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        listed = list(kanban_db.list_comments(conn, task_id))
+        keyed = sorted(
+            ((getattr(c, "id", None) or i, c) for i, c in enumerate(listed, 1)), key=lambda kc: kc[0], reverse=True
+        )
+        logged = sorted(
+            (
+                (int(getattr(e, "id", 0) or 0), getattr(e, "payload", None))
+                for e in kanban_db.list_events(conn, task_id)
+                if getattr(e, "kind", None) == "commented"
+            ),
+            key=lambda e: e[0],
+            reverse=True,
+        )
+        return _after_block(((k, c.author, c.body, c.created_at) for k, c in keyed), logged, cut, block_id)
+
+
+def _json_payload(raw: Any) -> Any:
+    try:
+        return _json_loads_safe(raw) if isinstance(raw, (str, bytes)) else raw
+    except ValueError:
+        return None
 
 
 def answer_card(
