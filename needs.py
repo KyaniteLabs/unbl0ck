@@ -2410,8 +2410,11 @@ def file_outside(
         old = _read_json(match, strict=True) if match else {}
         record_id = match.stem if match else uuid.uuid4().hex
         item_id = f"outside:filed:{record_id}"
+        # The version names the content. The session that filed it is provenance: it is stored,
+        # but identical content refiled from another session must not look like a new item.
+        content = {k: v for k, v in fields.items() if k != "session_id"}
         version = hashlib.sha256(
-            json.dumps(fields, sort_keys=True, ensure_ascii=False).encode()
+            json.dumps(content, sort_keys=True, ensure_ascii=False).encode()
         ).hexdigest()
         rec = {
             **fields,
