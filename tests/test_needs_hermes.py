@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 HERMES_SOURCE = os.environ.get("UNBL0CK_HERMES_SOURCE")
@@ -32,6 +33,15 @@ else:
     _HERMES_IMPORT_ERROR, f"Hermes dependency unavailable: {_HERMES_IMPORT_ERROR}"
 )
 class RealHermesRelease(unittest.TestCase):
+    def setUp(self):
+        # Native board resolution follows HERMES_KANBAN_HOME before HERMES_HOME: isolate it so a
+        # card created here never lands in an existing installation's database.
+        self._kanban_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self._kanban_home.cleanup)
+        patcher = patch.dict(os.environ, {"HERMES_KANBAN_HOME": self._kanban_home.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_answer_release_uses_native_transaction_boundary_and_posts_once(self):
         previous_home = os.environ.get("HERMES_HOME")
         with tempfile.TemporaryDirectory() as directory:
@@ -138,7 +148,7 @@ class RealHermesRelease(unittest.TestCase):
                         top_level_txns += 1
                     with original_write_txn(conn, allow_nested=allow_nested):
                         yield conn
-                    if top_level and top_level_txns == 2 and not interleaved:
+                    if top_level and top_level_txns == 1 and not interleaved:  # the answer and release are one transaction
                         interleaved = True
                         with kanban_db_connect.connect(board="default") as other:
                             self.assertTrue(

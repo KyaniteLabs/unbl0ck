@@ -110,8 +110,10 @@ unmount remains a separate possible enhancement; transport retry within a mounte
 is implemented and verified.
 
 Bounded folder selection discloses older omissions instead of silently scanning an
-unbounded directory. Folder pagination and automatic export archiving were not adopted;
-the latter would change the read-only source contract. Filed dedupe keys remain shared
+unbounded directory. Folders are paged by completion rather than by a cursor: each poll
+shows the newest 200 waiting files, and Done or Not for me on a file brings an older one
+into view. Automatic export archiving was not adopted; it would change the read-only
+source contract. Filed dedupe keys remain shared
 across profiles; callers can namespace them without migrating existing records.
 
 The review link reuses native signed ingress and verifies GitHub review identity rather

@@ -104,7 +104,13 @@ class VisibilityMachine(unittest.TestCase):
     def test_format_is_unchanged(self):
         needs.hide("kanban:b:t", "7", self.home)
         p = needs.data_dir(self.home) / "hidden.json"
-        self.assertEqual(json.loads(p.read_text()), {"kanban:b:t": "7"})
+        # id -> "<version>\x1f<dismissal token>"; a plain version (older files) still loads.
+        raw = json.loads(p.read_text())
+        self.assertEqual(list(raw), ["kanban:b:t"])
+        self.assertTrue(raw["kanban:b:t"].startswith("7\x1f"))
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "7"})
+        p.write_text(json.dumps({"kanban:b:t": "7"}))
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "7"})
 
     def test_random_walk_matches_model(self):
         rng = random.Random(7)
@@ -437,7 +443,8 @@ class BlufJobsMachine(unittest.TestCase):
         self.clock.t += jobs.BlufJobs.RETRY_S + 1
         self.assertTrue(self.j.start(("new", "1")))
         self.assertIs(self.j.state(K), jobs.BlufState.PENDING)
-        self.assertLess(len(self.j), 10)
+        # cooled failures keep their attempt count (round 4: pruning them reset the cap)
+        self.assertEqual(self.j.attempts(("x0", "1")), 1)
 
     def test_random_walk_invariants(self):
         rng = random.Random(11)

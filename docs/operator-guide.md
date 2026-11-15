@@ -21,7 +21,7 @@ restoration is pending, and renews its window after a failed restoration request
 "could not restore, try again". When an entry expires the page announces
 "Undo window ended". If the item changed or its record is already gone, Undo says nothing
 was restored. A filed record is kept on disk for 15 minutes after Done (at most 25 such
-records), then deleted; the agent's own `resolve` action removes a record permanently and
+records), then deleted on the next poll, filing or action while UNBL0CK runs (there is no background timer, so records can remain on disk while UNBL0CK is not running); the agent's own `resolve` action removes a record permanently and
 is the only action that means the work is finished. Re-filing identical content keeps a
 Done item hidden; changed content brings it back.
 
@@ -47,7 +47,10 @@ Queue polling carries only the last 480 characters of a chat message or live pro
 marked with a note. **Full text** then reads the whole record (up to 20,000 characters)
 from its source for that item version, and never sends it to a model. A changed or
 vanished record, or an unreadable source, reports an error with Retry and leaves the
-excerpt labelled as an excerpt. Password prompts are never expanded.
+excerpt labelled as an excerpt. Password prompts are never expanded. A live prompt over
+20,000 characters is stored cut, with its last 2,000 characters kept beside it in the same
+wait record, so the excerpt is the true end of the prompt; a chat message is read from its
+last 100,000 characters.
 
 **TL;DR** starts a read-only model job. **Use as answer** copies a suggestion into the
 answer box; the human still submits it. **Discuss in chat** asks the host composer to
@@ -59,7 +62,11 @@ after a transport failure. A terminal model failure permits a new attempt. Compl
 results can be read repeatedly: polling does not consume them. At most 128 settled
 results are retained in completion order, and every job expires 15 minutes after creation.
 A restart loses in-memory jobs; the UI reports an unknown/expired job and offers a fresh
-attempt. The client polls for up to 150 seconds per attempt.
+attempt. The client polls for up to 150 seconds per attempt, counted from the first request
+and checked after every response, including a finished answer. Each Ask carries a random
+request ID that Retry reuses, so a lost response cannot start a second model call, and it
+carries the card version, so a changed card is refused instead of answered from old context.
+A follow-up over 20,000 characters, or one the server refuses, is not kept in the conversation.
 
 The displayed Ask conversation remains intact while that card is mounted. Requests
 send its latest 50 messages; the server then applies `ask_history_turns`. Conversation
