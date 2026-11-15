@@ -11,6 +11,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -278,6 +279,7 @@ class Ordering(unittest.TestCase):
 
 
 class Hidden(unittest.TestCase):
+    @patch.object(needs, "_current_version", lambda *a, **kw: None)  # this test is about the store, not staleness
     def test_hide_rejects_oversized_and_caps_the_store(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)

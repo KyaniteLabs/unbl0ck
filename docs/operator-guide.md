@@ -121,7 +121,7 @@ the result expired) and offers a fresh attempt. The client polls for up to 150 s
 and checked after every response, including a finished answer. Each Ask carries a random
 request ID that Retry reuses, so a lost response cannot start a second model call, and it
 carries the card version, so a changed card is refused instead of answered from old context.
-A follow-up over 20,000 characters, or one the server refuses, is not kept in the conversation.
+A follow-up over 20,000 characters, or one the server refuses outright (a client error other than busy or timeout), is not kept in the conversation. After a busy (429) or timeout answer it stays, so Retry can send it again.
 
 
 After a gateway restart the plugin never sends a request again by itself. Each Ask job
@@ -154,15 +154,16 @@ returning to the page restores the conversation without asking the model again; 
 request still running when you left is followed to its result. A reload or app restart
 clears this memory, and nothing is written to disk, so there is nothing to delete. Conversations
 are kept for each backend connection separately: the same card id on another backend or
-profile never shows or resends them, and closing a connection removes its conversations.
+profile never shows or resends them, and closing a connection removes its conversations, its queue and its Undo list. A card and the page itself are remounted per connection, so an answer being typed or advice for the same card id never carries over to another backend.
 One conversation keeps at most 100 messages and 200,000 characters; older messages are
 dropped, and the card says so. A conversation that expires while its card stays open
 leaves the screen too. If a request's conversation is evicted or expires while the model
 is still answering, the card reports that it was dropped from session memory and offers
 Retry; the late answer is not shown. The recovered conversation stays bound to the card it
-was asked about: if the block version or the title, question, owner or comments changed,
-it is marked as out of date and its suggestion cannot be used as an answer until you ask
-again. A late response from an older request
+was asked about: if the block version or the title, question, owner, description or comments
+(including a comment rewritten in place) changed, it is marked as out of date and its suggestion
+cannot be used as an answer until you ask again. A Retry after leaving and returning to the
+page reuses the request's id, so a response lost in transit never starts a second model call. A late response from an older request
 never replaces a newer one.
 
 ## Recover from a fault
