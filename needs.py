@@ -492,12 +492,29 @@ def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str,
 
 
 def save_bluf(
-    item_id: str, version: str, bluf: str, why: str, home: Path | None = None
+    item_id: str,
+    version: str,
+    bluf: str,
+    why: str,
+    home: Path | None = None,
+    *,
+    started_at: float | None = None,
 ) -> None:
+    """Cache one summary. ``started_at`` is when the model request began: if a summary for a
+    different version of the item was saved after that, this one is superseded and is dropped,
+    so a slow request for an old question cannot replace the newer question's summary."""
     with _state_lock(
         home
     ):  # read-modify-write: concurrent workers must not drop each other's entries
         data = load_blufs(home)
+        existing = data.get(item_id)
+        if (
+            started_at is not None
+            and isinstance(existing, dict)
+            and existing.get("version") != version
+            and _num(existing.get("at")) > started_at
+        ):
+            return
         data.pop(item_id, None)
         data[item_id] = {
             "version": version,
@@ -514,8 +531,12 @@ def prune_blufs(
     home: Path | None = None,
     *,
     preserve_prefixes: tuple[str, ...] = (),
+    observed_at: float | None = None,
 ) -> None:
-    """Keep current summaries and ids whose source the caller could not observe."""
+    """Keep current summaries and ids whose source the caller could not observe.
+
+    ``observed_at`` is when *items* was read: a summary saved after that was never in the
+    caller's view, so it is kept rather than judged against a list that predates it."""
     current = {item["id"]: item["version"] for item in items}
     with _state_lock(home):
         data = load_blufs(home)
@@ -524,7 +545,8 @@ def prune_blufs(
             for item_id, value in data.items()
             if isinstance(value, dict)
             and (
-                item_id.startswith(preserve_prefixes)
+                (observed_at is not None and _num(value.get("at")) >= observed_at)
+                or item_id.startswith(preserve_prefixes)
                 or (item_id in current and value.get("version") == current[item_id])
             )
         }
@@ -2258,6 +2280,7 @@ def build_queue(
     home: Path | None = None, *, include_hidden: bool = False
 ) -> dict[str, Any]:
     home = home or hermes_home()
+    observed_at = time.time()
     errors: list[str] = []
     items: list[dict[str, Any]] = []
     outside_source_failed = False
@@ -2299,7 +2322,7 @@ def build_queue(
         # Folder ids are shared across profiles, but their configured folders are not.
         preserve_prefixes += ("outside:folder:",)
     try:
-        prune_blufs(items, home, preserve_prefixes=preserve_prefixes)
+        prune_blufs(items, home, preserve_prefixes=preserve_prefixes, observed_at=observed_at)
     except (OSError, TimeoutError) as exc:
         log.warning(
             "unbl0ck: could not prune summary cache: %s: %s", type(exc).__name__, exc
