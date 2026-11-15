@@ -157,5 +157,19 @@ class DismissalOrder(s11.QueueCase):
         self.assertGreater(second, first)
 
 
+class DoneOrder(OutsideFixture):
+    def test_refiling_identical_content_keeps_the_rank_of_the_done(self):
+        """R6-021: an identical refile keeps done_order with the Done and its token."""
+        filed = self.file(dedupe_key="reply-1")
+        done = needs.done_outside(filed["id"], filed["version"], self.home)
+        path = self.record(filed)
+        rec = json.loads(path.read_text())
+        rec["done_order"] = 4242
+        path.write_text(json.dumps(rec))
+        self.assertEqual(self.file(dedupe_key="reply-1")["id"], filed["id"])
+        again = needs.done_outside(filed["id"], filed["version"], self.home)
+        self.assertEqual((again["token"], again["order"]), (done["token"], 4242))
+
+
 if __name__ == "__main__":
     unittest.main()

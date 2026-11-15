@@ -909,8 +909,8 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
                     f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before undoing Done"
                 )
         def undo_done() -> None:
-            rec.pop("done_at", None)
-            rec.pop("done_token", None)
+            for key in _DONE_FIELDS:
+                rec.pop(key, None)
             _write_json(f, rec)
 
         def undo_hidden() -> None:
@@ -3311,6 +3311,23 @@ def _done_token(rec: dict[str, Any]) -> str:
     return token if isinstance(token, str) and token else repr(rec.get("done_at"))
 
 
+def _done_order(rec: dict[str, Any]) -> int:
+    """The commit order of one Done; a Done written before orders existed falls back to its time."""
+    order = rec.get("done_order")
+    if isinstance(order, bool) or not isinstance(order, int):
+        return int((_done_at(rec) or 0) * 1000)
+    return order
+
+
+_DONE_FIELDS = ("done_at", "done_token", "done_order")
+
+
+def _done_marks(rec: dict[str, Any]) -> dict[str, Any]:
+    """Everything that names one Done (time, token, order), pinned so that rewriting the record
+    or its ``done_at`` keeps the same dismissal with the same token and rank."""
+    return {"done_at": rec.get("done_at"), "done_token": _done_token(rec), "done_order": _done_order(rec)}
+
+
 def _done_at(rec: dict[str, Any]) -> float | None:
     """The Done time, or None when there is none or it is not a real finite time (a boolean is
     an int to Python, and NaN or infinity never compare as expired)."""
@@ -3410,7 +3427,7 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
         if done_at > now:
             # The clock stepped back since this Done: keep the record and restart its window.
             try:
-                rec["done_token"] = _done_token(rec)
+                rec.update(_done_marks(rec))
                 rec["done_at"] = now
                 _write_json(f, rec)
             except OSError:
@@ -3653,9 +3670,7 @@ def file_outside(
                     f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before filing another"
                 )
         if stays_done:
-            rec["done_at"] = old["done_at"]
-            if "done_token" in old:
-                rec["done_token"] = old["done_token"]
+            rec.update(_done_marks(old))
         _write_json(d / f"{record_id}.json", rec)
         return {
             "ok": True,
@@ -4591,9 +4606,7 @@ def done_outside(
                 # is reported in the reply, never as a failed Done the client could not undo.
                 cleanup_failed += _purge_logged(d)
             token = _done_token(rec)
-        order = rec.get("done_order")
-        if isinstance(order, bool) or not isinstance(order, int):
-            order = int((_done_at(rec) or 0) * 1000)  # a Done written before orders existed
+        order = _done_order(rec)
         reply = {
             "ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS,
             "token": token, "order": order,
