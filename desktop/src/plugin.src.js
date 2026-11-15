@@ -1311,7 +1311,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false 
         ] }),
         jsx('div', { className: 'ub-hint', role: 'note', children: item.origin === 'folder'
           ? 'Done only hides this card until the file changes. The file is not changed, moved or deleted. You can Undo.'
-          : 'Done only clears this card here. It does not send, file or finish anything in the original app, and you can Undo for a few minutes.' })
+          : 'Done only clears this card here. It does not send, file or finish anything in the original app. Undo stays on the banner for 12 seconds.' })
       ].filter(Boolean)
     : [
         opensHere ? null : jsx('div', { className: 'ub-hint', role: 'note', children: `Reply in ${platformName || 'the chat'}. It leaves this list once you answer.` }),
