@@ -48,9 +48,25 @@ class SingleQuoteBackslashIsLiteral(unittest.TestCase):
             "curl -u 'alice:pre\\'password=\"PART SECRET\" x",
             "curl -u 'alice:pre\\';\"curl\" -u bob:PARTSECRET",  # Sol r9e: ; ends the shell word
             "curl -u 'alice:pre\\'|curl -u bob:PARTSECRET x",
+            "curl -u 'alice:pre\\'\"curl\" -u bob:PARTSECRET",  # Sol r9f: a later pass needs the rest of the word
+            "curl -u 'alice:pre\\'password= PARTSECRET",
         ):
             self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
 
+
+
+class EveryFlagIsRedacted(unittest.TestCase):
+    def test_each_secret_flag_of_a_command_is_redacted_not_only_the_first(self):
+        """A command line with two secret flags shows neither value, even when the first one is odd."""
+        for text in (
+            "curl -b a=1 -b sid=PARTSECRET https://example.test",
+            "curl -u alice:x -u bob:PARTSECRET https://example.test",
+            "keytool -storepass a -storepass PARTSECRET",
+            "mysql -p'\\'\n-p PARTSECRET",
+            "curl -b 'pre\\'-balicepasswordtoken -b PARTSECRETpassword",  # sweep: one quote no longer shields the next
+            "curl -u 'pre\\'passwd:\\&'Bearer PARTSECRET",
+        ):
+            self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
 
 class QuotedExplicitKeys(unittest.TestCase):
     def test_a_quoted_explicit_key_continued_across_lines_still_redacts(self):

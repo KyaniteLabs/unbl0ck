@@ -5512,27 +5512,36 @@ _ASK_CREDENTIAL_NAME = rf"(?:{_ASK_SECRET_KEY}|{_ASK_CODE_KEY})"
 
 
 # Last resort for a single-quoted value no other reading closes: the shell reads a backslash inside single
-# quotes literally and joins the quote to the rest of its word, which ends at a space or ;|&<>().
-_SQ = r"""'[^']*'(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s'";|&<>()])*+"""
+# quotes literally. The rest of its shell word stays for the later passes, and _ASK_GLUED takes what is left.
+_SQ = r"'[^']*'"
+_ASK_GLUED = re.compile(r"""\[redacted\][^\s'"@;|&<>()]+""")
+
+
+def _ask_every_flag(span: str, flag: str, bare: str, single: str = r"'(?:\\.|[^'\\])*'") -> Callable[[str], str]:
+    """Each *flag* in a *span* (a command to the end of its line, and the whitespace that ends it) has its
+    value redacted, not only the first. A quoted value may run on past the span, as the shell reads it."""
+    command = re.compile(rf"(?i){span}")
+    value = re.compile(rf"""(?i)({flag})(?:"(?:\\.|[^"\\])*"|{single}|{bare}|{_SQ})""")
+
+    def redact(text: str) -> str:
+        at = 0
+        while found := command.search(text, at):
+            at, end = found.start(), found.end()
+            while (hit := value.search(text, at)) and hit.start() <= end:
+                text = text[: hit.end(1)] + "[redacted]" + text[hit.end() :]
+                at = hit.end(1) + len("[redacted]")
+                end = max(at, end - (hit.end() - at))
+            at = max(at, end)
+        return text
+
+    return redact
 
 
 _ASK_SECRET_PATTERNS = (
     # URL userinfo: scheme://user:pass@host
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1[redacted]@"),
-    (
-        re.compile(
-            r"(?i)((?:proxy-)?authorization\s*:\s*digest\b[^\r\n]*?\bnonce\s*[=:]\s*)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+|""" + _SQ + r""")"""
-        ),
-        r"\1[redacted]",
-    ),
-    (
-        re.compile(
-            r"(?i)((?:proxy-)?authorization\s*:\s*digest\b[^\r\n]*?\bresponse\s*[=:]\s*)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+|""" + _SQ + r""")"""
-        ),
-        r"\1[redacted]",
-    ),
+    _ask_every_flag(r"(?:proxy-)?authorization\s*:\s*digest\b[^\r\n]*", r"\bnonce\s*[=:]\s*", r"[^\s,;]+"),
+    _ask_every_flag(r"(?:proxy-)?authorization\s*:\s*digest\b[^\r\n]*", r"\bresponse\s*[=:]\s*", r"[^\s,;]+"),
     (
         re.compile(
             r"(?i)((?:proxy-)?authorization\s*:\s*)"
@@ -5540,35 +5549,12 @@ _ASK_SECRET_PATTERNS = (
         ),
         r"\1[redacted]",
     ),
-    (
-        re.compile(
-            r"(?i)(\bcurl\b[^\r\n]*?\s(?:--user|-u)(?:=|\s+)?)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^:\s'\"]+:[^\s'\"]+|""" + _SQ + r""")"""
-        ),
-        r"\1[redacted]",
+    _ask_every_flag(r"\bcurl\b[^\r\n]*", r"\s(?:--user|-u)(?:=|\s+)?", r"""[^:\s'"]+:[^\s'"]+""", _SQ),
+    _ask_every_flag(r"\bcurl\b[^\r\n]*", r"\s(?:--cookie|-b)(?:=|\s+)?", r"""[^\s'"]+"""),
+    _ask_every_flag(
+        r"\b(?:mysql|mysqldump|mariadb|sshpass|docker\s+login)\b[^;\r\n]*", r"\s-(?-i:p)(?:=|\s+)?", r"""[^\s'"]+"""
     ),
-    (
-        re.compile(
-            r"(?i)(\bcurl\b[^\r\n]*?\s(?:--cookie|-b)(?:=|\s+)?)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s'\"]+|""" + _SQ + r""")"""
-        ),
-        r"\1[redacted]",
-    ),
-    (
-        re.compile(
-            r"(?i)(\b(?:mysql|mysqldump|mariadb|sshpass|docker\s+login)\b"
-            r"[^;\r\n]*?\s-(?-i:p)(?:=|\s+)?)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s'\"]+|""" + _SQ + r""")"""
-        ),
-        r"\1[redacted]",
-    ),
-    (
-        re.compile(
-            r"(?i)(?P<prefix>\bkeytool\b[^\r\n]*?\s-storepass(?:=|[ \t]+))"
-            r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s;]+|" + _SQ + r")"
-        ),
-        r"\g<prefix>[redacted]",
-    ),
+    _ask_every_flag(r"\bkeytool\b[^\r\n]*", r"\s-storepass(?:=|[ \t]+)", r"[^\s;]+"),
     (
         re.compile(
             r"(?i)(?P<prefix>\bIDENTIFIED\s+BY\s+)"
@@ -6457,8 +6443,8 @@ def _ask_redact(text: str) -> str:
     home = os.path.expanduser("~")
     if home and home not in ("/", "~"):
         text = text.replace(home, "~")
-    for pattern, repl in _ASK_SECRET_PATTERNS:
-        text = pattern.sub(repl, text)
+    for rule in _ASK_SECRET_PATTERNS:
+        text = rule(text) if callable(rule) else rule[0].sub(rule[1], text)
     text = _ask_redact_http_basic_auth(text)
     text = _ask_redact_short_password_flags(text)
     text = _ask_redact_cookie_headers(text)
@@ -6467,7 +6453,7 @@ def _ask_redact(text: str) -> str:
     text = _ask_redact_yaml(text)
     text = _ask_redact_embedded_json(text)
     text = _ask_redact_assignments(text)
-    return _ask_redact_numeric_codes(text)
+    return _ask_redact_numeric_codes(_ASK_GLUED.sub("[redacted]", text))
 
 
 ASK_CARD_CONTEXT_LIMIT = 24000
