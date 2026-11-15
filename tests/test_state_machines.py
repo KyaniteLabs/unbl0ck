@@ -104,7 +104,13 @@ class VisibilityMachine(unittest.TestCase):
     def test_format_is_unchanged(self):
         needs.hide("kanban:b:t", "7", self.home)
         p = needs.data_dir(self.home) / "hidden.json"
-        self.assertEqual(json.loads(p.read_text()), {"kanban:b:t": "7"})
+        # id -> "<version>\x1f<dismissal token>"; a plain version (older files) still loads.
+        raw = json.loads(p.read_text())
+        self.assertEqual(list(raw), ["kanban:b:t"])
+        self.assertTrue(raw["kanban:b:t"].startswith("7\x1f"))
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "7"})
+        p.write_text(json.dumps({"kanban:b:t": "7"}))
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "7"})
 
     def test_random_walk_matches_model(self):
         rng = random.Random(7)
@@ -423,7 +429,7 @@ class BlufJobsMachine(unittest.TestCase):
     def test_failed_entries_past_their_retries_do_not_grow_the_table_forever(self):
         # Bug: a version that failed MAX_ATTEMPTS times could never start again, so the
         # prune (which only drops entries that can start) never removed it.
-        with mock.patch.object(jobs.BlufJobs, "MAX_ENTRIES", 20), mock.patch.object(jobs.BlufJobs, "PRUNE_OVER", 10):
+        with mock.patch.object(jobs.BlufJobs, "HARD_CAP", 20), mock.patch.object(jobs.BlufJobs, "PRUNE_OVER", 10):
             for i in range(60):
                 key = (f"item{i}", "v")
                 for _ in range(jobs.BlufJobs.MAX_ATTEMPTS):
@@ -436,7 +442,7 @@ class BlufJobsMachine(unittest.TestCase):
         self.assertIsNotNone(self.j.state(("item59", "v")))
 
     def test_the_cap_never_drops_a_pending_job(self):
-        with mock.patch.object(jobs.BlufJobs, "MAX_ENTRIES", 5), mock.patch.object(jobs.BlufJobs, "PRUNE_OVER", 2):
+        with mock.patch.object(jobs.BlufJobs, "HARD_CAP", 5), mock.patch.object(jobs.BlufJobs, "PRUNE_OVER", 2):
             for i in range(8):
                 self.assertTrue(self.j.start((f"p{i}", "v")))
             self.assertTrue(all(self.j.is_pending((f"p{i}", "v")) for i in range(8)))
@@ -458,7 +464,8 @@ class BlufJobsMachine(unittest.TestCase):
         self.clock.t += jobs.BlufJobs.RETRY_S + 1
         self.assertTrue(self.j.start(("new", "1")))
         self.assertIs(self.j.state(K), jobs.BlufState.PENDING)
-        self.assertLess(len(self.j), 10)
+        # cooled failures keep their attempt count (round 4: pruning them reset the cap)
+        self.assertEqual(self.j.attempts(("x0", "1")), 1)
 
     def test_random_walk_invariants(self):
         rng = random.Random(11)

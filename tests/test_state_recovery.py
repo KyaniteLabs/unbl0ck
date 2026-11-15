@@ -23,6 +23,9 @@ rec = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rec)
 
 SECRET = "SECRET-card-title-9f3a"
+# Applying needs the cross-process state lock; where the platform has none the tool refuses (by
+# design), so a test of the applied path states that expectation instead of requiring "restored".
+APPLIES = rec.fcntl is not None
 
 
 class Base(unittest.TestCase):
@@ -148,6 +151,12 @@ class Restore(Base):
         self.cur = self.put("hidden.json", self.bad)
         self.name = self.backup("hidden-good.bak", self.good)
 
+    def refused_without_a_lock(self, r):
+        """Where there is no lock the apply is refused and nothing is touched: the whole expectation."""
+        self.assertEqual(r["status"], "refused")
+        self.assertEqual(self.cur.read_bytes(), self.bad)
+        self.assertEqual([p.name for p in (self.d / "recovery").iterdir()], [self.name])
+
     def test_dry_run_changes_nothing_and_states_the_consequences(self):
         r = rec.restore("hidden", self.name, self.home)
         self.assertEqual(r["status"], "dry_run")
@@ -159,6 +168,8 @@ class Restore(Base):
 
     def test_apply_preserves_original_bytes_then_replaces_atomically(self):
         r = rec.restore("hidden", self.name, self.home, apply=True)
+        if not APPLIES:
+            return self.refused_without_a_lock(r)
         self.assertEqual(r["status"], "restored")
         self.assertEqual(json.loads(self.cur.read_text()), {"item-1": "v1"})
         self.assertEqual(stat.S_IMODE(self.cur.stat().st_mode), 0o600)
@@ -174,11 +185,17 @@ class Restore(Base):
     def test_restore_into_a_missing_store_works_and_preserves_nothing(self):
         self.cur.unlink()
         r = rec.restore("hidden", self.name, self.home, apply=True)
+        if not APPLIES:
+            self.assertEqual(r["status"], "refused")
+            self.assertFalse(self.cur.exists())
+            return
         self.assertEqual((r["status"], r["preserved_current"]), ("restored", None))
 
     def test_interruption_before_the_swap_leaves_the_original_and_a_copy(self):
         with patch.object(rec.os, "replace", side_effect=OSError("disk full")):
             r = rec.restore("hidden", self.name, self.home, apply=True)
+        if not APPLIES:
+            return self.refused_without_a_lock(r)
         self.assertEqual(r["status"], "failed")
         self.assertTrue(r["store_unchanged"])
         self.assertEqual(self.cur.read_bytes(), self.bad)
@@ -188,20 +205,23 @@ class Restore(Base):
     def test_failure_while_copying_the_original_aside_changes_nothing(self):
         with patch.object(rec, "_preserve_raw", side_effect=OSError("read-only")):
             r = rec.restore("hidden", self.name, self.home, apply=True)
+        if not APPLIES:
+            return self.refused_without_a_lock(r)
         self.assertEqual((r["status"], r["store_unchanged"]), ("failed", True))
         self.assertEqual(self.cur.read_bytes(), self.bad)
 
     def test_a_backup_that_does_not_match_what_was_written_is_never_installed(self):
-        real = rec._write_new
-
-        def torn(path, raw):
-            real(path, raw[:5])  # a short write
-            raise OSError("short write")
-
-        with patch.object(rec, "_write_new", torn):
+        # A real readback mismatch: the bytes on disk differ from the buffer (same length, one byte
+        # changed) with nothing raising on its own. Without the comparison this would install.
+        real = rec._read_back
+        with patch.object(rec, "_read_back", lambda fd, n: real(fd, n)[:-1] + b"X"):
             r = rec.restore("hidden", self.name, self.home, apply=True)
+        if not APPLIES:
+            return self.refused_without_a_lock(r)
         self.assertEqual(r["status"], "failed")
+        self.assertTrue(r["store_unchanged"])
         self.assertEqual(self.cur.read_bytes(), self.bad)
+        self.assertEqual([p.name for p in self.d.glob(".restore.*")], [])
 
     def test_refuses_unverifiable_backups_before_any_mutation(self):
         cases = {
@@ -237,7 +257,11 @@ class Restore(Base):
     def test_legacy_null_records_survive_a_restore_round_trip(self):
         legacy = json.dumps({"a": None, "b": ""})
         name = self.backup("hidden-legacy.bak", legacy)
-        self.assertEqual(rec.restore("hidden", name, self.home, apply=True)["status"], "restored")
+        r = rec.restore("hidden", name, self.home, apply=True)
+        if not APPLIES:
+            self.assertEqual(r["status"], "refused")
+            return
+        self.assertEqual(r["status"], "restored")
         self.assertEqual(self.cur.read_text(), legacy)
 
     def test_healthy_sources_continue_while_one_store_is_restored(self):
@@ -271,6 +295,7 @@ class Restore(Base):
             self.assertEqual(rec.restore("hidden", self.name, self.home, apply=True)["status"], "refused")
             self.assertEqual(rec.restore("hidden", self.name, self.home)["status"], "dry_run")
         self.assertEqual(self.cur.read_bytes(), self.bad)
+        self.assertEqual([p.name for p in (self.d / "recovery").iterdir()], [self.name])  # nothing preserved either
 
 
 def _fast_needs():
@@ -306,6 +331,9 @@ class Cli(Base):
         self.assertEqual((r.returncode, json.loads(r.stdout)["status"]), (0, "dry_run"))
         self.assertEqual(cur.read_bytes(), b"{")
         r = self.run_cli("restore", "hidden", name, "--apply")
+        if not APPLIES:
+            self.assertEqual((r.returncode, json.loads(r.stdout)["status"]), (1, "refused"))
+            return
         self.assertEqual((r.returncode, json.loads(r.stdout)["status"]), (0, "restored"))
 
 

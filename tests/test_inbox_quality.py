@@ -88,7 +88,7 @@ class ExportedMail(OutsideFixture):
 class CommandOutput(unittest.TestCase):
     def test_empty_incomplete_queue_never_claims_all_clear(self):
         q = {"count": 0, "items": [], "errors": ["outside: unreadable folder"]}
-        with patch.object(plugin, "_needs", return_value=types.SimpleNamespace(build_queue=lambda: q)):
+        with patch.object(plugin, "_needs", return_value=types.SimpleNamespace(build_queue=lambda: q, _clean=needs._clean)):
             local = plugin.slash_unbl0ck(platform="cli")
             remote = plugin.slash_unbl0ck(platform="telegram")
         self.assertIn("incomplete", local.lower())

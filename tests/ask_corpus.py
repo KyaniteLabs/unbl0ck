@@ -11,6 +11,10 @@ KNOWN_GAPS lists the ids the heuristic is known to get wrong today. They are rea
 (not regressions): the test pins the exact set, so fixing one forces its removal and a new
 failure forces a decision. Cases already fixed in earlier releases are not in KNOWN_GAPS."""
 
+# The principal name the corpus is judged with: "named" cases contain it literally, so a detector
+# that stopped matching the configured name could not pass on "your" alone.
+PRINCIPAL = "Ada"
+
 CASES = [
     # --- direct asks, English, several platforms -------------------------------------------
     ("en-direct-should-i", "chat", "Should I open the PR now?", None, True, ("cli", "en", "none", "direct")),
@@ -56,6 +60,16 @@ CASES = [
     ("kb-stuck-technical", "kanban", "Tests fail on the arm64 runner", None, False, ("kanban", "en", "none", "stuck")),
     ("kb-order-not-ask", "kanban", "Operator 14:02 stop all deploys", None, False, ("kanban", "en", "role", "relayed")),
     ("kb-es", "kanban", "Necesita tu decisión sobre el proveedor", "needs_input", True, ("kanban", "es", "none", "direct")),
+    # --- the principal named literally (the configured principal_name) ------------------------
+    ("kb-named-gate", "kanban", "Ada must approve the migration", None, True, ("kanban", "en", "named", "direct")),
+    ("kb-named-waiting", "kanban", "Waiting on Ada for the budget", None, True, ("kanban", "en", "named", "direct")),
+    ("kb-named-possessive", "kanban", "Ada's approval is required before launch", None, True, ("kanban", "en", "named", "direct")),
+    ("kb-named-input", "kanban", "Ada has the vendor choice", "needs_input", True, ("kanban", "en", "named", "direct")),
+    ("kb-named-lowercase", "kanban", "needs ada to pick the region", "needs_input", True, ("kanban", "en", "named", "direct")),
+    ("kb-named-order", "kanban", "Ada 14:02 stop all deploys", None, False, ("kanban", "en", "named", "relayed")),
+    ("kb-named-report", "kanban", "Tests fail on the arm64 runner; Ada was told", None, False, ("kanban", "en", "named", "stuck")),
+    ("kb-other-name", "kanban", "Bob must approve the migration", None, False, ("kanban", "en", "named", "relayed")),
+    ("kb-named-substring", "kanban", "Adage cache expired", "needs_input", False, ("kanban", "en", "named", "stuck")),
 ]
 
 # Cases the current heuristic gets wrong. Not regressions; see the module docstring.

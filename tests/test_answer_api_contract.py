@@ -34,7 +34,7 @@ class AnswerContract(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
-        p = patch.dict(os.environ, {"HERMES_HOME": self.tmp.name})
+        p = patch.dict(os.environ, {"HERMES_HOME": self.tmp.name, "HERMES_KANBAN_HOME": self.tmp.name})
         p.start()
         self.addCleanup(p.stop)
         self.settings = {"principal_name": "CEO", "comment_author": "operator"}
@@ -110,8 +110,33 @@ class AnswerContract(unittest.TestCase):
         self.assertEqual(self.post(tid, version=version).status_code, 200)
 
     def test_required_version_applies_to_release_without_changing_its_400(self):
-        tid, _ = self.block()
-        self.assertEqual(self.post(tid, release=True).status_code, 400)
+        self.settings["require_answer_version"] = True
+        tid, version = self.block()
+        r = self.post(tid, release=True)
+        self.assertEqual(r.status_code, 400, r.text)  # not 428: release already required a version
+        self.assertIn("version", r.json()["detail"])
+        self.assertEqual(self.comments(tid), [])
+        self.assertEqual(self.post(tid, release=True, version=version).status_code, 200)
+        self.assertEqual(self.comments(tid), ["Use option A é ✓"])
+
+    def test_version_requirement_is_enforced_on_the_snapshot_the_write_uses(self):
+        """The decision is made by answer_card from its own settings capture, never from a
+        separate earlier read that the setting could change under."""
+        self.settings["require_answer_version"] = True
+        tid, version = self.block()
+        with self.assertRaises(needs.VersionRequired):
+            needs.answer_card("default", tid, "text", release=False, version=None)
+        self.assertEqual(self.comments(tid), [])
+        seen = []
+        real = needs.answer_version_required
+
+        def spy(settings=None):
+            seen.append(settings)
+            return real(settings)
+
+        with patch.object(needs, "answer_version_required", spy):
+            self.assertEqual(self.post(tid).status_code, 428)
+        self.assertTrue(seen and all(s is not None for s in seen), "decided on a fresh read")
         self.assertEqual(self.comments(tid), [])
 
     def test_stale_version_is_409_and_never_posts_or_releases(self):
@@ -167,6 +192,31 @@ class AnswerContract(unittest.TestCase):
         ):
             self.assertEqual(self.client.get("/card", params=params).status_code, 400, params)
 
+    def test_c1_controls_are_rejected_not_stripped_into_another_card(self):
+        tid, _ = self.block()
+        for ch in ("\x80", "\x85", "\x9f", "\u2028", "\u2029", "\x1c"):
+            for params in (
+                {"id": f"kanban:default:{tid}{ch}"},
+                {"board": "default", "task_id": tid + ch},
+                {"board": "default" + ch, "task_id": tid},
+            ):
+                self.assertEqual(self.client.get("/card", params=params).status_code, 400, repr(params))
+            self.assertEqual(self.post(tid + ch).status_code, 400, repr(ch))
+            self.assertEqual(self.post(tid, version="1" + ch).status_code, 400, repr(ch))
+            self.assertEqual(self.client.post("/hide", json={"id": "chat:p:s" + ch, "version": "1"}).status_code, 400)
+        self.assertEqual(self.comments(tid), [])
+
+    def test_equivalent_board_spellings_are_not_a_conflict(self):
+        tid, _ = self.block()
+        for params in (
+            {"id": f"kanban:default:{tid}", "board": "DEFAULT"},
+            {"id": f"kanban:DEFAULT:{tid}", "board": "default"},
+            {"id": f"kanban:default:{tid}", "board": " Default ", "task_id": tid},
+        ):
+            r = self.client.get("/card", params=params)
+            self.assertEqual(r.status_code, 200, (params, r.text))
+        self.assertEqual(self.client.get("/card", params={"id": f"kanban:default:{tid}", "board": "other"}).status_code, 400)
+
     def test_same_bounds_on_hide_unhide_and_outside_done(self):
         long = "x" * 301
         self.assertEqual(self.client.post("/hide", json={"id": long, "version": "1"}).status_code, 400)
@@ -178,12 +228,46 @@ class AnswerContract(unittest.TestCase):
         self.assertEqual(self.client.post("/hide", json={"id": exact, "version": exact}).status_code, 200)
 
     def test_ask_job_identifier_is_bounded(self):
-        self.assertEqual(self.client.get("/card/ask/" + "j" * 301).status_code, 404)
+        self.assertEqual(self.client.get("/card/ask/" + "j" * 301 + "?card=kanban:factory:t_1").status_code, 404)
 
     def test_oversize_answer_fields_stay_422(self):
         tid, _ = self.block()
         self.assertEqual(self.post(tid, version="v" * 301).status_code, 422)
         self.assertEqual(self.post("t" * 301).status_code, 422)
+
+
+class FixtureScope(unittest.TestCase):
+    def test_kanban_tests_never_resolve_the_boards_of_a_real_install(self):
+        """Native board resolution follows HERMES_KANBAN_HOME before HERMES_HOME, so a test
+        that creates cards must isolate both or it writes into an existing installation."""
+        tests = Path(__file__).resolve().parent
+        bad = []
+        for path in sorted(tests.glob("test_*.py")):
+            text = path.read_text()
+            if path.name == Path(__file__).name:
+                continue
+            creates = "kanban_db.create_task" in text or "kanban_db_connect.connect(" in text
+            if creates and "HERMES_HOME" in text and "HERMES_KANBAN_HOME" not in text:
+                bad.append(path.name)
+        self.assertEqual(bad, [])
+
+    def test_docs_state_the_release_400_snapshot_and_c1_rules(self):
+        arch = (ROOT / "docs/architecture.md").read_text()
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("a release without a version stays 400", arch)
+        self.assertIn("C1 range", arch)
+        self.assertIn("a release without a version is still refused with 400", readme)
+
+    def test_this_fixture_isolates_an_outer_kanban_home(self):
+        outer = tempfile.TemporaryDirectory()
+        self.addCleanup(outer.cleanup)
+        with patch.dict(os.environ, {"HERMES_KANBAN_HOME": outer.name}):
+            case = AnswerContract("test_versioned_answer_reports_the_version_it_applied_to")
+            case.setUp()
+            try:
+                self.assertEqual(Path(kanban_db.kanban_home()), case.home)
+            finally:
+                case.doCleanups()
 
 
 if __name__ == "__main__":
