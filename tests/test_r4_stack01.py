@@ -521,5 +521,66 @@ function render(item) { cursor = 0; effects = []; return Item({ctx, item, n: 1, 
 """)
 
 
+class JobTables(unittest.TestCase):
+    def load(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("ub_jobs_r4", ROOT / "jobs.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_pruning_never_resets_the_attempt_count_of_a_failing_summary(self):
+        """01-023: a cooled-down failure carries its attempt count; pruning the table must not drop it."""
+        jobs = self.load()
+        clock = types.SimpleNamespace(t=1000.0)
+        table = jobs.BlufJobs(clock=lambda: clock.t)
+        for i in range(jobs.BlufJobs.PRUNE_OVER + 1):
+            key = (f"x{i}", "1")
+            self.assertTrue(table.start(key))
+            table.fail(key, "e")
+        clock.t += jobs.BlufJobs.RETRY_S + 1
+        self.assertTrue(table.start(("new", "1")))
+        self.assertEqual(table.attempts(("x0", "1")), 1)
+        self.assertEqual(table.attempts(("x500", "1")), 1)
+
+    def test_a_stuck_pending_job_is_still_pruned_and_the_table_has_a_hard_cap(self):
+        jobs = self.load()
+        clock = types.SimpleNamespace(t=1000.0)
+        table = jobs.BlufJobs(clock=lambda: clock.t)
+        self.assertTrue(table.start(("stuck", "1")))
+        clock.t += jobs.BlufJobs.STUCK_S + 1
+        for i in range(jobs.BlufJobs.PRUNE_OVER + 1):
+            key = (f"x{i}", "1")
+            table.start(key)
+            table.fail(key, "e")
+            clock.t += 1
+        table.start(("new", "1"))
+        self.assertIsNone(table.state(("stuck", "1")))
+        for i in range(jobs.BlufJobs.HARD_CAP + 50):
+            key = (f"y{i}", "1")
+            table.start(key)
+            table.fail(key, "e")
+            clock.t += 1
+        self.assertLessEqual(len(table), jobs.BlufJobs.HARD_CAP + 1)
+
+    def test_ask_jobs_have_no_journal_or_profile_scope_on_this_branch(self):
+        """01-009, 01-024, 01-025 DISPUTED here: this branch keeps Ask jobs only in memory under a
+        random id, with no journal directory and no profile-dependent resolver, so there is no
+        recovery path to leak across profiles or to bypass the settled limit."""
+        source = (ROOT / "jobs.py").read_text()
+        self.assertNotIn("journal", source.lower())
+        jobs = self.load()
+        jobs.AskJobs.MAX_SETTLED = 1
+        table = jobs.AskJobs()
+        table.create("a")
+        table.create("b")
+        table.finish("a", "A")
+        table.finish("b", "B")
+        self.assertIsNone(table.get("a"), "an evicted answer is gone, not recoverable")
+        self.assertEqual(table.get("b")["reply"], "B")
+        api = (ROOT / "dashboard/plugin_api.py").read_text()
+        self.assertNotIn("journal", api.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
