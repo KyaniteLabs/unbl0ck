@@ -24,7 +24,7 @@ class DesktopContract(unittest.TestCase):
         self.assertIn("askEnabled: q.ask_enabled !== false", src)
         self.assertIn("item.id))", src)
         self.assertNotIn("${item.id}:${item.version}", src)
-        self.assertIn("!(q.errors || []).length", src)
+        self.assertIn("if ((q.errors || []).length) return 'errors'", src)
         self.assertIn("r && r.released", src)
         self.assertIn("kept blocked", src)
         self.assertIn("Use as answer", src)
@@ -50,7 +50,8 @@ const helper = src.match(/function askCount\(q\) \{[^\n]*\}/)?.[0] || 'function 
 const chip = src.match(/function Chip\(\) \{[\s\S]*?\n\}/)?.[0];
 if (!helper || !chip) throw new Error('count renderer or helper missing');
 const jsx = (_type, props) => props;
-const render = new Function('jsx', 'useValue', '$queue', `${helper}; return (${chip});`)(
+const verdict = src.slice(src.indexOf('function omittedChats('), src.indexOf('function coverageNote('));
+const render = new Function('jsx', 'useValue', '$queue', `${helper}; ${verdict}; return (${chip});`)(
   jsx, () => ({count: 10, counts: {asks: 1}}), Symbol('queue'));
 const result = render();
 if (result.children !== '◆ 1 NEEDS YOU') throw new Error(`unexpected chip: ${result.children}`);

@@ -1721,8 +1721,7 @@ function Page({ ctx, refresh, scope = '' }) {
   const kanbanAsks = kanban.filter(i => i.tier !== 'stuck' && i.tier !== 'answered')
   const kanbanStuck = kanban.filter(i => i.tier === 'stuck')
   const kanbanAnswered = kanban.filter(i => i.tier === 'answered')
-  // Stuck and answered cards are listed but are not asks; they still mean the queue is not empty.
-  const held = q.items.filter(i => i.tier === 'stuck' || i.tier === 'answered').length
+  const verdict = queueVerdict(q)
   const chats = q.items.filter(i => i.source === 'chat')
   const outside = q.items.filter(i => i.source === 'outside')
   const prompts = q.items.filter(i => i.source === 'prompt')
@@ -1828,17 +1827,7 @@ function Page({ ctx, refresh, scope = '' }) {
                       jsxs('div', {
                         className: 'ub-sub',
                         children: [
-                          q.loading
-                            ? 'Scanning boards, outside items, chats, live prompts and pairing requests'
-                            : q.fault
-                              ? 'Cannot reach the queue; showing the last known list.'
-                              : (q.errors || []).length
-                                ? 'See the notices below; the list may be incomplete.'
-                                : askCount(q)
-                                ? 'Everything that is waiting on your word.'
-                                : held
-                                  ? 'No asks, but stuck or answered cards are listed.'
-                                  : 'Nothing is blocked on you.',
+                          VERDICT_LINE[verdict],
                           jsx('i', { className: 'ub-cursor' })
                         ]
                       })
@@ -1909,10 +1898,10 @@ function Page({ ctx, refresh, scope = '' }) {
           ...group('KANBAN.ANSWERED', kanbanAnswered, true),
           ...group('OUTSIDE.HERMES', outside),
           ...group('CHATS', chats),
-          !q.loading && !askCount(q) && !held && !q.fault && !(q.errors || []).length && omittedChats(q) > 0
-            ? jsxs('div', { className: 'ub-clear', role: 'status', children: [jsx('b', { children: '● NOT ALL CLEAR' }), jsx('span', { children: `No ask was found, but ${omittedChats(q)} older chat session(s) were not read (scan limit reached).` })] })
+          verdict === 'incomplete'
+            ? jsxs('div', { className: 'ub-clear', role: 'status', children: [jsx('b', { children: '● NOT ALL CLEAR' }), jsx('span', { children: `${askCount(q) ? 'The cards above may not be all' : 'No ask was found'}: ${omittedChats(q)} older chat session(s) were not read (scan limit reached).` })] })
             : null,
-          !q.loading && !askCount(q) && !held && !q.fault && !(q.errors || []).length && !omittedChats(q)
+          verdict === 'clear'
             ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, outside item, chat, prompt or pairing request is waiting on you.' })] })
             : null,
           !q.loading ? coverageNote(q) : null
@@ -1928,6 +1917,29 @@ function Page({ ctx, refresh, scope = '' }) {
 function omittedChats(q) {
   const n = Number(q && q.coverage && q.coverage.chat && q.coverage.chat.sessions_omitted)
   return Number.isFinite(n) && n > 0 ? n : 0
+}
+// The one judgement of what the queue proves. The subtitle, the ALL CLEAR / NOT ALL CLEAR banners
+// and the status chip all read it, so no widget can call a list complete that another calls
+// incomplete. Anything that stops the list being whole outranks the asks on it.
+const INCOMPLETE = new Set(['fault', 'errors', 'incomplete'])
+function queueVerdict(q) {
+  if (q.loading) return 'loading'
+  if (q.fault) return 'fault'
+  if ((q.errors || []).length) return 'errors'
+  if (omittedChats(q)) return 'incomplete'
+  if (askCount(q)) return 'asks'
+  // Stuck and answered cards are listed but are not asks; they still mean the queue is not empty.
+  if ((q.items || []).some(i => i.tier === 'stuck' || i.tier === 'answered')) return 'held'
+  return 'clear'
+}
+const VERDICT_LINE = {
+  loading: 'Scanning boards, outside items, chats, live prompts and pairing requests',
+  fault: 'Cannot reach the queue; showing the last known list.',
+  errors: 'See the notices below; the list may be incomplete.',
+  incomplete: 'Older chat sessions were not read; the list may be incomplete.',
+  asks: 'Everything that is waiting on your word.',
+  held: 'No asks, but stuck or answered cards are listed.',
+  clear: 'Nothing is blocked on you.'
 }
 
 function coverageNote(q) {
@@ -1945,7 +1957,7 @@ function coverageNote(q) {
 function Chip() {
   const q = useValue($queue)
   const count = askCount(q)
-  const incomplete = !!q.fault || !!q.errors?.length || Number(q.coverage?.chat?.sessions_omitted) > 0
+  const incomplete = INCOMPLETE.has(queueVerdict(q))
   if (!count && !incomplete) return null
   return jsx('button', {
     type: 'button',

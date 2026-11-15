@@ -67,8 +67,9 @@ plugin.register({rest:()=>new Promise(r=>{resolvers.push(r)}),registerMany:list=
 const fs = require('fs'), assert = require('node:assert/strict');
 const src = fs.readFileSync(process.argv[1], 'utf8');
 const chip = src.match(/function Chip\(\) \{[\s\S]*?\n\}/)[0];
+const verdict = src.slice(src.indexOf('function omittedChats('), src.indexOf('function coverageNote('));
 for (const q of [{count:0,errors:['unavailable']},{count:0,fault:'offline'}]) {
- const render = new Function('jsx','useValue','$queue','askCount',`${chip};return Chip;`)((type,props)=>props,()=>q,{},q=>q.count);
+ const render = new Function('jsx','useValue','$queue','askCount',`${verdict};${chip};return Chip;`)((type,props)=>props,()=>q,{},q=>q.count);
  assert.equal(render().children,'◆ QUEUE INCOMPLETE');
 }
 """)
