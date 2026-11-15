@@ -35,6 +35,17 @@ class NodeCase(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class AcceptanceDates(unittest.TestCase):
+    def test_an_impossible_recorded_time_or_release_date_is_refused(self):
+        """R6-024: a date-shaped but impossible time or release date does not pass as acceptance evidence."""
+        good = ["r", "h", "source abcdef0 / Hermes 0.23.1 released 2026.2.9", "2026-02-09T10:00:00Z", "pass"]
+        self.assertEqual(host_compat.matrix_row_problems(good), [])
+        bad = ["r", "h", "source abcdef0 / Hermes 0.23.1 released 2026.99.99", "2026-99-99T99:99:99Z", "pass"]
+        self.assertEqual(host_compat.matrix_row_problems(bad), ["recorded at is not a UTC time", "no Hermes release date"])
+        late = ["r", "h", "source abcdef0 / Hermes 0.23.1 released 2026-02-30", "2026-02-09T24:00:00Z", "pass"]
+        self.assertEqual(host_compat.matrix_row_problems(late), ["recorded at is not a UTC time", "no Hermes release date"])
+
+
 class Tombstones(unittest.TestCase):
     def test_deleted_and_left_view_at_the_same_seq_and_revision_collide(self):
         """R6-026: an untracked deletion and an untracked left_view are different provider states at one seq."""

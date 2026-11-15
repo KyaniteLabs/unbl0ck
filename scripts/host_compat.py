@@ -71,6 +71,15 @@ def _hermes_identity() -> dict:
     return {"hermes_version": version or "unknown", "hermes_release_date": date or "unknown"}
 
 
+def _real_time(text: str, fmt: str) -> bool:
+    """True when text is a real calendar date or time in fmt: month 99 or hour 25 is not one."""
+    try:
+        datetime.strptime(text, fmt)
+    except ValueError:
+        return False
+    return True
+
+
 def matrix_row_problems(row: list[str]) -> list[str]:
     """Why a run row of the docs/verification.md acceptance matrix (five cells) does not identify
     its run, per the format stated above that table; a "not run" row has none."""
@@ -78,14 +87,16 @@ def matrix_row_problems(row: list[str]) -> list[str]:
     if result.strip().lower().startswith("not run"):
         return []
     problems = []
-    if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", when.strip()):
+    if not (re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", when.strip())
+            and _real_time(when.strip(), "%Y-%m-%dT%H:%M:%SZ")):
         problems.append("recorded at is not a UTC time")
     if not re.search(r"\bsource [0-9a-f]{7,40}\b", revision):
         problems.append("no source commit")
     hermes = re.search(r"\bHermes (\S+)(.*)", revision)
     if not hermes or hermes.group(1).lower() in _PLACEHOLDERS:
         problems.append("no Hermes version")
-    if not hermes or not re.search(r"\b\d{4}([.-])\d{1,2}\1\d{1,2}\b", hermes.group(2)):
+    dates = re.finditer(r"\b(\d{4})([.-])(\d{1,2})\2(\d{1,2})\b", hermes.group(2)) if hermes else ()
+    if not any(_real_time("-".join(m.group(1, 3, 4)), "%Y-%m-%d") for m in dates):
         problems.append("no Hermes release date")
     return problems
 
