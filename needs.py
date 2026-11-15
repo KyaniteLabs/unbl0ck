@@ -386,14 +386,13 @@ def unhide(item_id: str, home: Path | None = None) -> bool:
             d = _outside_dir(home)
             _purge_done(d)
             f = d / (filed.group(1) + ".json")
-            if f.is_symlink() or not f.is_file():
-                return False
-            rec = _read_json(f)
-            if not _is_done(rec):
-                return False
-            rec.pop("done_at")
-            _write_json(f, rec)
-            return True
+            if not f.is_symlink() and f.is_file():
+                rec = _read_json(f)
+                if _is_done(rec):
+                    rec.pop("done_at")
+                    _write_json(f, rec)
+                    return True
+        # Not locally done: it may have been hidden with "Not for me"; restore that below.
     with _state_lock(home):
         hidden = load_hidden(home, strict=True)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
@@ -1993,7 +1992,10 @@ def file_outside(
     if action not in ("file", "resolve"):
         raise ValueError("action must be file or resolve")
     key = _outside_field(args, "dedupe_key", 120)
-    caller = str(kwargs.get("profile") or "")
+    # Hermes' tool dispatch passes task_id, session_id and user_task but not the profile, so
+    # an absent kwarg falls back to the profile the process is running under, the same way
+    # record_wait() resolves it. An explicit kwarg still wins.
+    caller = str(kwargs.get("profile") or "") or _profile_of(home or hermes_home())
     scope = _dedupe_scope(args, caller) if (key or action == "file") else "global"
     if action == "resolve" and not caller and args.get("dedupe_scope") in (None, ""):
         scope = None  # unknown caller: resolve only an unambiguous key
@@ -2095,8 +2097,13 @@ def _folder_outside_item(
     if f.is_symlink():
         return None
     real = f.resolve()
-    if real.name != f.name or (real.parent != root and root not in real.parents):
-        return None  # escaped the watched folder (a swapped directory or symlink)
+    # *root* is already resolved, so a path with any symlinked ancestor resolves to somewhere
+    # else. Reject that outright: the same file name under a swapped directory (for example a
+    # hidden folder inside the root) must not pass as a visible nested file.
+    if real != f or (real.parent != root and root not in real.parents):
+        return None
+    if any(part.startswith(".") for part in f.relative_to(root).parts):
+        return None
     fd = os.open(
         f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     )
@@ -2171,41 +2178,55 @@ def _scan_outside_folder(
     examined = 0
     deadline = time.monotonic() + OUTSIDE_SCAN_SECONDS
     stopped = ""
+    too_deep = False
     while stack and not stopped:
         d, depth = stack.pop()
         try:
-            entries = list(os.scandir(d))
+            # A queued directory may have been swapped for a symlink since it was listed.
+            if d != root and d.resolve() != d:
+                errors.append(f"outside: {d.name}: changed while scanning; skipped")
+                continue
+            scan = os.scandir(d)
         except OSError as exc:
             errors.append(f"outside: {d.name}: {type(exc).__name__}: {exc}")
             continue
-        for entry in sorted(entries, key=lambda e: e.name):
-            examined += 1
-            if examined > OUTSIDE_SCAN_ENTRIES:
-                stopped = f"examined {OUTSIDE_SCAN_ENTRIES} entries"
-                break
-            if time.monotonic() > deadline:
-                stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
-                break
-            if entry.name.startswith("."):
-                continue
-            f = d / entry.name
-            try:
-                st = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(st.st_mode):
-                    if recursive and depth < OUTSIDE_MAX_DEPTH:
-                        stack.append((f, depth + 1))
+        # Entries are consumed one at a time so the entry and time budgets apply before a
+        # huge directory is read into memory.
+        with scan as entries:
+            for entry in entries:
+                examined += 1
+                if examined > OUTSIDE_SCAN_ENTRIES:
+                    stopped = f"examined {OUTSIDE_SCAN_ENTRIES} entries"
+                    break
+                if time.monotonic() > deadline:
+                    stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
+                    break
+                if entry.name.startswith("."):
                     continue
-                if f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
-                    out.append((f, st))
-            except OSError as exc:
-                errors.append(f"outside: {entry.name}: {type(exc).__name__}: {exc}")
+                f = d / entry.name
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(st.st_mode):
+                        if recursive and depth < OUTSIDE_MAX_DEPTH:
+                            stack.append((f, depth + 1))
+                        elif recursive:
+                            too_deep = True
+                        continue
+                    if f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
+                        out.append((f, st))
+                except OSError as exc:
+                    errors.append(f"outside: {entry.name}: {type(exc).__name__}: {exc}")
     if stopped:
         errors.append(f"outside: {root.name}: scan {stopped}; some files may not be listed")
+    if too_deep:
+        errors.append(
+            f"outside: {root.name}: folders deeper than {OUTSIDE_MAX_DEPTH} levels were not scanned"
+        )
     return out
 
 
 def outside_items(
-    home: Path | None = None, errors: list[str] | None = None
+    home: Path | None = None, errors: list[str] | None = None, *, with_hidden: bool = False
 ) -> list[dict[str, Any]]:
     """Our filed records plus bounded, non-recursive reads of explicitly watched folders."""
     errors = errors if errors is not None else []
@@ -2247,6 +2268,7 @@ def outside_items(
     recursive = outside_recursive()
     hidden = load_hidden(home, errors=errors) if str(raw).strip() else {}
     seen: set[Path] = set()
+    collected: set[Path] = set()  # a file under two overlapping roots is listed once
     for name in str(raw).split(","):
         if not name.strip():
             continue
@@ -2258,16 +2280,18 @@ def outside_items(
             if root in seen:
                 continue
             seen.add(root)
-            candidates = [
-                pair
-                for pair in _scan_outside_folder(root, recursive, errors)
-                if visibility(
+            candidates = []
+            hidden_pairs = []
+            for pair in _scan_outside_folder(root, recursive, errors):
+                if pair[0] in collected:
+                    continue
+                collected.add(pair[0])
+                state = visibility(
                     hidden,
                     "outside:folder:" + hashlib.sha256(str(pair[0]).encode()).hexdigest(),
                     f"{pair[1].st_mtime_ns}:{pair[1].st_size}",
                 )
-                is not Visibility.HIDDEN
-            ]
+                (hidden_pairs if state is Visibility.HIDDEN else candidates).append(pair)
             # Files already marked Done at their current version do not use up the window, so
             # finishing a page always exposes the next one. Ties break on path, so order is stable.
             candidates.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
@@ -2277,7 +2301,13 @@ def outside_items(
                     f"{len(candidates) - _OUTSIDE_LIMIT} older files are waiting. "
                     "Finish or hide items to bring them into view"
                 )
-            for f, st in candidates[:_OUTSIDE_LIMIT]:
+            # Hidden files never use up the waiting window; callers that count or show them
+            # (build_queue) ask for them separately, bounded by the same limit.
+            window = candidates[:_OUTSIDE_LIMIT]
+            if with_hidden:
+                hidden_pairs.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
+                window = window + hidden_pairs[:_OUTSIDE_LIMIT]
+            for f, st in window:
                 try:
                     item = _folder_outside_item(f, root, st)
                     if item is not None:
@@ -2367,7 +2397,7 @@ def build_queue(
     except Exception as exc:  # noqa: BLE001
         errors.append(f"pairing: {type(exc).__name__}: {exc}")
     try:
-        items.extend(outside_items(home, errors=errors))
+        items.extend(outside_items(home, errors=errors, with_hidden=True))
     except Exception as exc:  # noqa: BLE001
         outside_source_failed = True
         errors.append(f"outside: {type(exc).__name__}: {exc}")

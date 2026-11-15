@@ -1460,7 +1460,9 @@ function Page({ ctx, refresh }) {
   const undoHide = async (u) => {
     if (!u || undoBusy) return
     setUndoBusy(true)
-    const drop = () => $undo.set(($undo.get() || []).filter(x => x.id !== u.id))
+    // A late response may only touch its own dismissal: the same item can resurface and be dismissed again meanwhile.
+    const same = x => x.id === u.id && x.at === u.at
+    const drop = () => $undo.set(($undo.get() || []).filter(x => !same(x)))
     try {
       const r = await ctx.rest('/unhide', { method: 'POST', body: { id: u.id } })
       drop()
@@ -1472,7 +1474,7 @@ function Page({ ctx, refresh }) {
       await refresh()
     } catch (e) {
       // Keep a failed restoration for another full retry window, marked so it reads as retryable.
-      $undo.set(($undo.get() || []).map(x => (x.id === u.id ? { ...u, at: Date.now(), failed: true } : x)))
+      $undo.set(($undo.get() || []).map(x => (same(x) ? { ...u, at: Date.now(), failed: true } : x)))
       host.notifyError(e, 'UNBL0CK: could not undo')
     } finally {
       setUndoBusy(false)
