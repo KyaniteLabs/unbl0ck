@@ -12,6 +12,7 @@ import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+from conftest import ask_gen
 
 import jobs
 import needs
@@ -283,7 +284,7 @@ def test_ask_expiry_does_not_require_another_request_or_allow_late_completion():
     table.create("late")
     now[0] = table.TTL_S + 1
     assert table.get("poll") is None
-    assert not table.finish("late", "too late")
+    assert not table.finish("late", "too late", gen=ask_gen(table, "late"))
 
 
 def api_module():
@@ -354,7 +355,8 @@ def test_worker_completion_or_failure_returns_model_capacity(fail):
 def test_ask_overload_and_failed_submission_are_explicit_and_recoverable():
     from fastapi import HTTPException
     api = api_module()
-    api._needs = lambda: types.SimpleNamespace(ask_enabled=lambda: True, card_context=lambda *a: {}, build_ask_messages=lambda *a: [])
+    api._needs = lambda: types.SimpleNamespace(ask_enabled=lambda: True, card_context=lambda *a: {}, build_ask_messages=lambda *a: [],
+                                               ask_journal_dir=lambda: None)
     api._checked_card_ref = lambda *a: ("default", "t")
     api._loaded_ctx = lambda: types.SimpleNamespace(llm=object())
     submitted = []
@@ -367,7 +369,8 @@ def test_ask_overload_and_failed_submission_are_explicit_and_recoverable():
     assert exc.value.status_code == 429
     assert len(submitted) == 4
     api = api_module()
-    api._needs = lambda: types.SimpleNamespace(ask_enabled=lambda: True, card_context=lambda *a: {}, build_ask_messages=lambda *a: [])
+    api._needs = lambda: types.SimpleNamespace(ask_enabled=lambda: True, card_context=lambda *a: {}, build_ask_messages=lambda *a: [],
+                                               ask_journal_dir=lambda: None)
     api._checked_card_ref = lambda *a: ("default", "t")
     api._loaded_ctx = lambda: types.SimpleNamespace(llm=object())
     api._ASK_POOL = types.SimpleNamespace(submit=lambda *args: (_ for _ in ()).throw(RuntimeError("closed")))

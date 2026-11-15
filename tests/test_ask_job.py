@@ -6,6 +6,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from conftest import ask_gen
 
 CARD = "kanban:factory:t_1"  # what the mocked board/task pair canonicalises to
 
@@ -102,7 +103,7 @@ class AskJobTest(unittest.TestCase):
 
     def test_poll_envelope_distinguishes_model_failure_from_transport_failure(self):
         self.api._ASK_JOBS.create("failed", card=CARD)
-        self.api._ASK_JOBS.fail("failed", "model call failed: ValueError")
+        self.api._ASK_JOBS.fail("failed", "model call failed: ValueError", gen=ask_gen(self.api._ASK_JOBS, "failed"))
         self.assertEqual(self.c.get(f"/card/ask/failed?card={CARD}").status_code, 502)
         first = self.c.get(f"/card/ask/failed?poll=true&card={CARD}")
         self.assertEqual(first.status_code, 200)
@@ -114,7 +115,7 @@ class AskJobTest(unittest.TestCase):
         table.create("pending")
         for i in range(table.MAX_SETTLED + 5):
             table.create(str(i))
-            table.finish(str(i), "A")
+            table.finish(str(i), "A", gen=ask_gen(table, str(i)))
         self.assertEqual(len(table), table.MAX_SETTLED + 1)
         self.assertIsNotNone(table.get("pending"))
         self.assertIsNone(table.get("0"))
@@ -125,8 +126,8 @@ class AskJobTest(unittest.TestCase):
         table.create("slow")
         for i in range(table.MAX_SETTLED):
             table.create(str(i))
-            table.finish(str(i), "fast")
-        self.assertTrue(table.finish("slow", "finally"))
+            table.finish(str(i), "fast", gen=ask_gen(table, str(i)))
+        self.assertTrue(table.finish("slow", "finally", gen=ask_gen(table, "slow")))
         self.assertEqual(table.get("slow")["reply"], "finally")
         self.assertIsNone(table.get("0"))
         self.assertEqual(len(table), table.MAX_SETTLED)

@@ -404,16 +404,11 @@ def card_ask(body: CardAsk):
             status_code=503,
             detail="Ask is unavailable: the plugin host LLM is not reachable",
         )
+    card = f"kanban:{board}:{task_id}"  # the canonical identity from the validated pair, never the raw id
     # A retry of the same request returns the same job; no second model call.
-    if body.request_id:
-        existing = _ASK_JOBS.get(body.request_id)
-        if existing is not None:
-            if existing.get("unavailable"):
-                raise HTTPException(status_code=503, detail="the saved state for this request cannot be read right now. Retry in a moment.")
-            if existing.get("card") != f"kanban:{board}:{task_id}":
-                # A request id answers only for the card it was created for.
-                raise HTTPException(status_code=409, detail="this request id belongs to a different card")
-            return {"ok": True, "pending": True, "job": body.request_id}
+    bound = _bind_existing(body.request_id, card) if body.request_id else None
+    if bound is not None:
+        return bound
     # Admission comes before any card read or prompt build, so a busy server does no work.
     if not _ASK_SLOTS.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Ask is busy. Retry when an active answer finishes.", headers={"Retry-After": "15"})
@@ -433,15 +428,20 @@ def card_ask(body: CardAsk):
         # background and let the client poll GET /card/ask/{job}.
         job = body.request_id or uuid.uuid4().hex
         try:
-            # The canonical card identity from the validated board/task pair, never the optional raw id.
-            _ASK_JOBS.create(job, card=f"kanban:{board}:{task_id}")
+            gen = _ASK_JOBS.create(job, card=card)
+        except jobs.ScopeUnavailable:
+            raise HTTPException(status_code=503, detail=_UNREADABLE)
         except jobs.IllegalTransition:
-            return {"ok": True, "pending": True, "job": job}   # a concurrent twin got there first
+            # A concurrent twin got there first: the same card checks apply to it.
+            bound = _bind_existing(job, card)
+            if bound is None:
+                raise HTTPException(status_code=409, detail="this request id is already in use")
+            return bound
         try:
-            _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, job, ctx, messages)
+            _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, job, gen, ctx, messages)
             submitted = True
         except Exception as exc:
-            _ASK_JOBS.fail(job, "could not start Ask")
+            _ASK_JOBS.fail(job, "could not start Ask", gen=gen)
             try:
                 _ASK_JOBS.consume(job)
             except jobs.DiscardFailed:
@@ -452,6 +452,23 @@ def card_ask(body: CardAsk):
         if not submitted:
             _ASK_SLOTS.release()
     return {"ok": True, "pending": True, "job": job}
+
+
+_UNREADABLE = "the saved state for this request cannot be read right now. Retry in a moment."
+
+
+def _bind_existing(request_id: str, card: str) -> Optional[dict[str, Any]]:
+    """The pending reply for a request id that already names a job the caller can see, None when
+    it names none. A job answers only for the card it was created for (409 otherwise), and storage
+    that cannot be read is 503, never a fresh start."""
+    st = _ASK_JOBS.get(request_id)
+    if st is None:
+        return None
+    if st.get("unavailable"):
+        raise HTTPException(status_code=503, detail=_UNREADABLE)
+    if st.get("card") != card:
+        raise HTTPException(status_code=409, detail="this request id belongs to a different card")
+    return {"ok": True, "pending": True, "job": request_id}
 
 
 # Lifecycle and bounded retention of repeatably readable results are jobs.AskJobs.
@@ -476,16 +493,17 @@ _ASK_JOBS.start_background()
 _ASK_SLOTS = threading.BoundedSemaphore(4)
 
 
-def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
+def _run_ask(job: str, gen: str, ctx: Any, messages: list[dict[str, str]]) -> None:
+    """The worker for one Ask job, named by its id and the generation ``create`` returned."""
     # Durable marker first: after a crash from here on the outcome is unknown, never "resend".
-    if not _ASK_JOBS.mark_sent(job):
-        _ASK_JOBS.fail(job, "could not record the request, so it was not sent")
+    if not _ASK_JOBS.mark_sent(job, gen=gen):
+        _ASK_JOBS.fail(job, "could not record the request, so it was not sent", gen=gen)
         return
     try:
         # Settings may have changed while this waited for a worker: disclosure follows the
         # setting at the moment of the model call, not at admission.
         if not _needs().ask_enabled():
-            _ASK_JOBS.fail(job, "Ask was turned off before the model was called")
+            _ASK_JOBS.fail(job, "Ask was turned off before the model was called", gen=gen)
             return
         result = ctx.llm.complete(
             messages,
@@ -498,14 +516,14 @@ def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - surface the host error honestly
         log.warning("unbl0ck: ask model call failed: %s: %s", type(exc).__name__, exc)   # detail stays in the log
-        _ASK_JOBS.fail(job, f"model call failed: {type(exc).__name__}")
+        _ASK_JOBS.fail(job, f"model call failed: {type(exc).__name__}", gen=gen)
         return
     reply = ask_reply_text(getattr(result, "text", ""))
     if not reply:
         model = getattr(result, "model", None) or "the model"
-        _ASK_JOBS.fail(job, f"{model} returned no answer text (it may have used its whole budget thinking). Retry, or pick a non-reasoning model for plugins.")
+        _ASK_JOBS.fail(job, f"{model} returned no answer text (it may have used its whole budget thinking). Retry, or pick a non-reasoning model for plugins.", gen=gen)
         return
-    _ASK_JOBS.finish(job, reply, getattr(result, "provider", None), getattr(result, "model", None))
+    _ASK_JOBS.finish(job, reply, getattr(result, "provider", None), getattr(result, "model", None), gen=gen)
 
 
 ASK_MAX_TOKENS = 4000
