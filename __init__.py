@@ -14,6 +14,9 @@ def _needs():
     return needs
 
 
+APPROVE_COMMAND_SHOWN = 400
+
+
 def _summary(limit: int = 12) -> str:
     n = _needs()
     q = n.build_queue()
@@ -35,7 +38,14 @@ def _summary(limit: int = 12) -> str:
         lead = c(it.get("bluf") or it.get("ask"), 140)
         lines.append(f"- [{where}] {c(it.get('title'), 160)}: {lead}")
         if it.get("approve_command"):
-            lines.append(f"  approve: {c(it['approve_command'], 300)}")
+            # A command cut short is a different command: show it whole or not at all. The
+            # longest valid one (a 250-character profile name) is under 330 characters.
+            cmd = c(it["approve_command"], APPROVE_COMMAND_SHOWN + 1)
+            lines.append(
+                f"  approve: {cmd}"
+                if len(cmd) <= APPROVE_COMMAND_SHOWN
+                else "  approve: (command too long to show here; use the Desktop card)"
+            )
     if q["count"] > limit:
         lines.append(f"…and {q['count'] - limit} more. Open /unblock in Desktop.")
     if held:
