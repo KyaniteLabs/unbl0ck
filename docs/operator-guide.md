@@ -166,6 +166,19 @@ it was asked about: if the card changed, it is marked as out of date and its sug
 cannot be used as an answer until you ask again. A late response from an older request
 never replaces a newer one.
 
+## What an empty queue does not prove
+
+The queue reports its own reach under **What this list does not cover**: the chat window it
+read (14 days unless `chat_window_days` is set, at most 90), how many chat sessions it left
+unread past the 500-per-profile scan limit, and fixed notes on what detection cannot see.
+Group-chat requests that never name you, requests written in languages other than English
+and anything in Kanban comments rather than the block reason can be missed. Raising
+`chat_window_days` is a read-only backfill of the same local chat database: it sends nothing
+to a model, adds no duplicates, and keeps cards you hid or answered hidden. The labeled
+corpus in `tests/ask_corpus.py` lists the known misses (`KNOWN_GAPS`); run
+`python tests/test_ask_corpus.py --report` to print the false-positive and false-negative
+report.
+
 ## Recover from a fault
 
 | Visible fault | Meaning | Next action |

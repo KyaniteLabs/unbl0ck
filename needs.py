@@ -140,6 +140,19 @@ def bluf_enabled(settings: dict[str, Any] | None = None) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def chat_window_days(settings: dict[str, Any] | None = None) -> int:
+    """How many days back chats are read (setting ``chat_window_days``): 14 by default, 1 to 90.
+
+    Anything else (zero, negative, fractional, boolean, text) falls back to the default so a bad
+    value can neither disable the source nor widen it past the cap."""
+    raw = (settings if settings is not None else _settings()).get("chat_window_days")
+    if isinstance(raw, str) and raw.strip().isdigit():
+        raw = int(raw.strip())
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        return CHAT_WINDOW_DAYS
+    return min(raw, CHAT_WINDOW_MAX_DAYS)
+
+
 def outside_recursive(settings: dict[str, Any] | None = None) -> bool:
     """Whether watched folders also read nested folders (``outside_recursive``, off by default)."""
     raw = (settings if settings is not None else _settings()).get("outside_recursive", False)
@@ -178,6 +191,8 @@ def ask_journal_dir(home: Path | None = None) -> Path:
 
 
 CHAT_WINDOW_DAYS = 14
+CHAT_WINDOW_MAX_DAYS = 90  # the most a configured backfill may reach
+CHAT_SESSION_CAP = 500  # sessions read per profile in one queue build; the rest are counted, not read
 CHAT_TITLES = ("Bot Chat",)
 
 _PATTERN_CACHE: dict[str, dict[str, re.Pattern[str]]] = {}
@@ -1382,17 +1397,26 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def chat_items(
     home: Path | None = None,
-    days: int = CHAT_WINDOW_DAYS,
+    days: int | None = None,
     errors: list[str] | None = None,
     *,
     full: bool = False,
+    coverage: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
-    last visible turn is the bot asking you something you have not answered."""
+    last visible turn is the bot asking you something you have not answered.
+
+    ``coverage`` (when given) is filled with counts only: the window actually read, sessions
+    checked and left unread past ``CHAT_SESSION_CAP``, and chats skipped by the group-name and
+    owner rules, so an empty result is never mistaken for an exhaustive one."""
     home = home or hermes_home()
-    since = time.time() - days * 86400
     items: list[dict[str, Any]] = []
     settings, settings_error = _settings_state()
+    days = days if days is not None else chat_window_days(settings)
+    since = time.time() - days * 86400
+    cov = coverage if coverage is not None else {}
+    cov.update(window_days=days, since=int(since), sessions_checked=0, sessions_omitted=0,
+               skipped_group_unnamed=0, skipped_other_owner=0, profiles=0)
     if settings_error:
         if errors is not None:
             errors.append("chat: unavailable until plugin settings can be read")
@@ -1447,10 +1471,21 @@ def chat_items(
                     for c in ("source", "chat_type", "user_id", "display_name")
                 )
                 mcols = _columns(conn, "messages")
+                where_sql = " AND ".join(where) or "1"
+                order = (
+                    "COALESCE(s.last_activity_at, s.started_at, 0) DESC"
+                    if "last_activity_at" in cols and "started_at" in cols
+                    else "s.rowid DESC"
+                )
                 sessions = conn.execute(
-                    f"SELECT s.id, s.title, {pick} FROM sessions s WHERE {' AND '.join(where) or '1'}",
+                    f"SELECT s.id, s.title, {pick} FROM sessions s WHERE {where_sql} "
+                    f"ORDER BY {order} LIMIT {int(CHAT_SESSION_CAP)}",
                     args,
                 ).fetchall()
+                total = conn.execute(f"SELECT COUNT(*) FROM sessions s WHERE {where_sql}", args).fetchone()[0]
+                cov["sessions_checked"] += len(sessions)
+                cov["sessions_omitted"] += max(0, int(total) - len(sessions))
+                cov["profiles"] += 1
             except sqlite3.Error as exc:
                 if errors is not None:
                     errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
@@ -1477,6 +1512,7 @@ def chat_items(
                 ):
                     # A gateway chat with someone other than you, or with nobody known: when you
                     # set owner_user_ids, only chats proven to be yours are shown (and summarised).
+                    cov["skipped_other_owner"] += 1
                     continue
                 try:
                     row = conn.execute(last_sql, (sid,)).fetchone()
@@ -1496,6 +1532,7 @@ def chat_items(
                 if str(
                     chat_type or ""
                 ).lower() in CHAT_GROUP_TYPES and not names.search(str(content)[-900:]):
+                    cov["skipped_group_unnamed"] += 1
                     continue
                 bot_chat = title in CHAT_TITLES
                 where_ = (
@@ -2542,9 +2579,11 @@ def build_queue(
         items.extend(kanban_items(errors=errors))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"kanban: {type(exc).__name__}: {exc}")
+    chat_coverage: dict[str, Any] | None = {}
     try:
-        items.extend(chat_items(home, errors=errors))
+        items.extend(chat_items(home, errors=errors, coverage=chat_coverage))
     except Exception as exc:  # noqa: BLE001
+        chat_coverage = None  # a failed source is not "covered"
         errors.append(f"chat: {type(exc).__name__}: {exc}")
     try:
         items.extend(wait_items(home, errors=errors))
@@ -2614,7 +2653,24 @@ def build_queue(
         "ask_enabled": ask_enabled(),
         "bluf_enabled": bluf_enabled(),
         "capabilities": CAPABILITIES,
+        "coverage": {"chat": chat_coverage, "not_covered": not_covered_notes(chat_coverage)},
     }
+
+
+def not_covered_notes(chat_coverage: dict[str, Any] | None) -> list[str]:
+    """Fixed sentences (no card text) on what an empty queue does not prove."""
+    days = (chat_coverage or {}).get("window_days") or chat_window_days()
+    notes = [
+        f"Chats older than {days} days are not read (setting chat_window_days, up to {CHAT_WINDOW_MAX_DAYS}).",
+        "Requests in group chats are found only when the message names you; indirect or unnamed requests are not detected.",
+        "Detection phrases are English; requests written in other languages may be missed.",
+        "Kanban cards are judged by their block reason, not by their comments.",
+    ]
+    if chat_coverage is None:
+        notes.insert(0, "Chats could not be read this time, so no chat window applies.")
+    elif chat_coverage.get("sessions_omitted"):
+        notes.insert(0, f"{chat_coverage['sessions_omitted']} older chat sessions were not read (scan limit {CHAT_SESSION_CAP} per profile).")
+    return notes
 
 
 class UnblockFailed(RuntimeError):

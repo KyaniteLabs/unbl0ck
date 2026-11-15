@@ -1689,12 +1689,27 @@ function Page({ ctx, refresh }) {
           ...group('CHATS', chats),
           !q.loading && !askCount(q) && !q.fault && !(q.errors || []).length
             ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, outside item, chat, prompt or pairing request is waiting on you.' })] })
-            : null
+            : null,
+          !q.loading ? coverageNote(q) : null
         ]
       })
       ] })
     ]
   })
+}
+
+// What an empty or short list does not prove: the chat window actually read and the fixed
+// coverage sentences from the server. Text only; counts and sentences, never card content.
+function coverageNote(q) {
+  const c = q && q.coverage
+  if (!c) return null
+  const days = c.chat && c.chat.window_days
+  const notes = Array.isArray(c.not_covered) ? c.not_covered.filter(x => typeof x === 'string') : []
+  if (!days && !notes.length) return null
+  return jsxs('details', { className: 'ub-coverage', children: [
+    jsx('summary', { children: (days ? `Chats checked: last ${days} days. ` : '') + 'What this list does not cover' }),
+    ...notes.map(line => jsx('p', { key: line, children: line }))
+  ] })
 }
 
 function Chip() {
