@@ -286,18 +286,17 @@ class PlanAndInstall(Base):
 
     @unittest.skipIf(rec.fcntl is None, "needs flock")
     def test_the_reported_plan_is_the_one_that_was_installed(self):
-        n = rec._needs()
-        real_lock = n._state_lock
+        real_lock = rec._state_lock
         two = json.dumps({"k1": "v", "k2": "v"})
 
         @contextmanager
-        def lock(home):
-            with real_lock(home):
+        def lock(dfd):
+            with real_lock(dfd):
                 (self.d / "recovery" / self.name).write_text(two)  # replaced while we waited
                 self.cur.write_text(json.dumps({"healthy": "now"}))
                 yield
 
-        with mock.patch.object(n, "_state_lock", lock):
+        with mock.patch.object(rec, "_state_lock", lock):
             r = rec.restore("hidden", self.name, self.home, apply=True)
         self.assertEqual(r["status"], "restored")
         self.assertEqual(r["backup_entries"], 2)

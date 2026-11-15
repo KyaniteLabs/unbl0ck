@@ -649,10 +649,11 @@ class AskJournal:
             if fd is None:
                 return False
             name = f"{job}.json"
-            if tombstone and self._exists(fd, name) and not self._touch(fd, f"{job}.gone"):
-                return False
             with self._locked(fd, until or self.deadline()) as got:
                 if not got:
+                    return False
+                # Fenced under the lock, so a record published while this waited is fenced too.
+                if tombstone and self._exists(fd, name) and not self._touch(fd, f"{job}.gone"):
                     return False
                 try:
                     os.unlink(name, dir_fd=fd)
