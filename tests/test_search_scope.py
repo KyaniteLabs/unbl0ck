@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import re
 import sqlite3
 import sys
 import tempfile
@@ -283,6 +284,76 @@ class SearchFolders(unittest.TestCase):
         r = needs.search_text("needle")
         self.assertEqual(len(r["matches"]), 1)
         self.assertFalse(r["partial"])
+
+
+class SearchProfileBoundary(unittest.TestCase):
+    """Search reads exactly what the queue reads: every profile under the Hermes home, nothing outside it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "home"
+        self.outside_home = Path(self.tmp.name) / "elsewhere"
+        for profile_home, profile, text in (
+            (self.root / "profiles" / "work", "work", "Should I ship the zebra release?"),
+            (self.root / "profiles" / "personal", "personal", "Should I book the zebra trip?"),
+            (self.outside_home, "stranger", "Should I wipe the zebra archive?"),
+        ):
+            profile_home.mkdir(parents=True)
+            db = sqlite3.connect(profile_home / "state.db")
+            db.execute("CREATE TABLE sessions(id TEXT, title TEXT, source TEXT, chat_type TEXT, started_at REAL,"
+                       " last_activity_at REAL, user_id TEXT, display_name TEXT)")
+            db.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,"
+                       " timestamp REAL, display_kind TEXT, active INT)")
+            now = time.time()
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)", (f"s-{profile}", "", "cli", "dm", now - 60, now - 30, "u", "n"))
+            db.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES(?, 'assistant', ?, ?)",
+                       (f"s-{profile}", text, now - 30))
+            db.commit()
+            db.close()
+        for name, value in (("_settings", lambda: {"principal_name": "Ada"}), ("hermes_home", lambda: self.root),
+                            ("outside_items", lambda *a, **k: []), ("wait_items", lambda *a, **k: [])):
+            p = patch.object(needs, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_every_profile_under_the_home_is_searched_and_no_other_home_is(self):
+        r = needs.search_text("zebra")
+        sessions = {m["id"] for m in r["matches"]}
+        self.assertEqual(len(sessions), 2)
+        queue_ids = {i["id"] for i in needs.chat_items(self.root)}
+        self.assertEqual(sessions, queue_ids)  # search finds exactly the cards the queue shows
+        self.assertEqual(r["searched"]["chat"], 2)
+
+    def test_results_carry_ids_and_versions_only_and_no_message_text(self):
+        r = needs.search_text("zebra")
+        self.assertTrue(all(set(m) == {"id", "version", "source"} for m in r["matches"]))
+        blob = repr(r)
+        for leak in ("stranger", "ship the", "book the", "wipe the"):
+            self.assertNotIn(leak, blob)
+
+
+class DesktopSearchPreservesState(unittest.TestCase):
+    """Using the full-text button must not touch typed answers, drafts or open conversations."""
+
+    def test_the_click_handler_changes_only_the_search_state(self):
+        s = (ROOT / "desktop/src/plugin.src.js").read_text()
+        start = s.index("const runFullSearch = async () => {")
+        end = s.index("const fullSummary", start)
+        body = s[start:end]
+        setters = set(re.findall(r"\b(set[A-Z]\w*)\(", body))
+        self.assertEqual(setters, {"setFullBusy", "setFullError", "setFullHits"})
+        for forbidden in ("refresh(", "reload(", "load(", "setItems", "setQuery", "setSource", "localStorage", "composer", "notify("):
+            self.assertNotIn(forbidden, body)
+        self.assertEqual(body.count("ctx.rest("), 1)
+
+    def test_cards_stay_mounted_by_id_so_their_state_survives_a_search(self):
+        s = (ROOT / "desktop/src/plugin.src.js").read_text()
+        # Every list renders Item with the item id as its key, and the full-text result never
+        # replaces the list: it only adds a summary line and marks matches.
+        self.assertGreaterEqual(s.count("}, item.id))"), 2)
+        self.assertNotIn("setItems(fullHits", s)
+        self.assertNotIn("items={fullHits", s)
 
 
 @unittest.skipIf(FastAPI is None, "fastapi missing")
