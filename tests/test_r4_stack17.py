@@ -270,8 +270,12 @@ class RuntimeIdentity(unittest.TestCase):
         )
         rec = json.loads(out.stdout)
         hermes_cli = importlib.import_module("hermes_cli")
-        self.assertEqual(rec["hermes_version"], hermes_cli.__version__)
-        self.assertEqual(rec["hermes_release_date"], hermes_cli.__release_date__)
+        # A runtime whose own version is the 0.0.0 placeholder (the pinned CI checkout is one)
+        # is recorded as unknown, never as 0.0.0; any other version is recorded as it is.
+        version = str(hermes_cli.__version__)
+        expected = "unknown" if version in {"", "0.0.0", "0", "unknown", "none"} else version
+        self.assertEqual(rec["hermes_version"], expected)
+        self.assertEqual(rec["hermes_release_date"], str(hermes_cli.__release_date__ or "unknown"))
         self.assertNotEqual(rec["hermes_version"], "0.0.0")
 
 
