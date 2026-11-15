@@ -294,7 +294,8 @@ class LeftView(unittest.TestCase):  # 15-020, class G
         self.assertFalse(local[k()].held)
 
     def test_leaving_the_view_never_creates_a_card(self):
-        self.assertEqual(ops(ac.reconcile({}, batch(it(state=ac.LEFT_VIEW)))), [])
+        # Round 5: it keeps its watermark as a tombstone (R5-api-009); it still never creates a card.
+        self.assertEqual(ops(ac.reconcile({}, batch(it(state=ac.LEFT_VIEW)))), ["tombstone"])
 
 
 class Imap(unittest.TestCase):  # 15-019

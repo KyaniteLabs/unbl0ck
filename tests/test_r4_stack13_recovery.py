@@ -63,6 +63,8 @@ class Base(unittest.TestCase):
         def opener(path, flags, *a, **k):
             if str(path).endswith(name_suffix) and not done and not (flags & os.O_CREAT):
                 done.append(1)
+                if k.get("dir_fd") is not None:  # the tool opens the bare name inside its checked directory
+                    path = next(c for c in (self.d / str(path), self.d / "recovery" / str(path)) if c.exists())
                 os.unlink(path)
                 os.symlink(foreign, path)
             return real(path, flags, *a, **k)
@@ -254,7 +256,7 @@ class PlainReads(Base):
             return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid, 2, 0, 0, 0))
 
         real_read = rec._read_file
-        with mock.patch.object(rec, "_read_file", lambda p, limit=100: real_read(p, limit)), \
+        with mock.patch.object(rec, "_read_file", lambda p, limit=100: real_read(p, min(limit, 100))), \
                 mock.patch.object(os, "fstat", small):
             self.assertEqual(rec._check_backup(self.d, "hidden", name)[1]["status"], "refused")
             self.assertEqual(rec._read_store(self.d, "hidden"), (None, "too_large"))
@@ -332,11 +334,12 @@ class PlanAndInstall(Base):
         os.chmod(planted, 0o600)
         real = os.replace
 
-        def replace(src, dst):
+        def replace(src, dst, **kw):  # the tool replaces by name inside the checked directory
             if ".restore." in str(src) and str(src).endswith(".tmp"):
-                os.unlink(src)
-                os.symlink(planted, src)
-            return real(src, dst)
+                tmp = self.d / Path(src).name
+                os.unlink(tmp)
+                os.symlink(planted, tmp)
+            return real(src, dst, **kw)
 
         with mock.patch.object(os, "replace", replace):
             r = rec.restore("hidden", self.name, self.home, apply=True)
