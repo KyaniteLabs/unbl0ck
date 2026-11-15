@@ -35,7 +35,7 @@ const mk=(n,origin)=>({source:'outside',origin,kind:'draft',id:'outside:filed:'+
  await find(Item({ctx,item:mk(7,'filed'),n:1,refresh,askEnabled:false}),'Done').onClick();
  assert.equal(undo.length,5);
  // each entry is separately undoable and a restore removes only that entry
- const page=()=>{cursor=0;return Page({ctx,refresh})};
+ const page=()=>{cursor=0;state=[];return Page({ctx,refresh})};
  const buttons=all(page()).filter(n=>n?.type==='button'&&n.props.children==='Undo');
  assert.equal(buttons.length,5);
  await buttons[2].props.onClick();

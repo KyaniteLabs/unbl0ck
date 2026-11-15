@@ -66,7 +66,7 @@ the result expired) and offers a fresh attempt. The client polls for up to 150 s
 and checked after every response, including a finished answer. Each Ask carries a random
 request ID that Retry reuses, so a lost response cannot start a second model call, and it
 carries the card version, so a changed card is refused instead of answered from old context.
-A follow-up over 20,000 characters, or one the server refuses, is not kept in the conversation.
+A follow-up over 20,000 characters, or one the server refuses outright (a client error other than busy or timeout), is not kept in the conversation. After a busy (429) or timeout answer it stays, so Retry can send it again.
 
 Requests send the conversation's latest 50 messages; the server then applies
 `ask_history_turns`. The conversation, any running request and its outstanding job are

@@ -74,10 +74,11 @@ as private. Settings and source files remain owned by their original application
 | State | Lifetime and ownership |
 | --- | --- |
 | `hidden.json` | Version-specific hides, capped at 1,000 (the oldest dismissal goes first), plus Not for me and Done on watched-folder files, capped separately at 5,000 per watched folder (the per-folder scan bound; up to 8 folders) so paging progress is not evicted, and always kept under the 16 MiB state limit by dropping the oldest; a hide for a version older than the card's current one is refused; shared by local operator surfaces |
-| `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is always recoverable |
+| `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is recoverable; when the store is full the answer is still posted without a marker and the result says the release could not be remembered |
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; visible to every profile, with `dedupe_key` private to the filing profile unless `dedupe_scope` is `global` |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
-| `bluf.json` | Summary cache capped at 2,000, bound to the item version and to a hash of its title, text, owner and comment count (an edit or a new comment is summarized again); failed-source entries retained subject to cap |
+| `wait-faults.json` | Only while an agent process could not record or clear a live prompt: request ids, what failed and that process's identity (never prompt text), removed when the fault settles or the process is gone; it lets the dashboard report the missing prompt |
+| `bluf.json` | Summary cache capped at 2,000, bound to the item version and to a hash of its title, text, owner and comment count (an edit or a new comment is summarized again; an entry saved before that hash existed is bound to the item version alone until it is next summarized); failed-source entries retained subject to cap |
 | `pocket-pack.json` | Written only on explicit pack request |
 | Summary/Ask jobs | Process memory; restart loses pending work and results |
 | Answer drafts | Desktop session memory, 100 entries, 30 minutes after last edit; original question version retained |
@@ -95,7 +96,7 @@ use per-file atomic replacement without those shared-store locks. Windows lacks 
 cross-process guarantee. Never repair corruption by silently replacing it with defaults.
 
 State reads and writes never follow a link: a symbolic link in place of `plugin-data/unbl0ck`,
-its subfolders, the lock file, a state file or a temporary file is refused, and a state file
+its subfolders, the lock file or a state file is refused; a link planted where a temporary file would go is removed, never followed, and the write continues with a fresh private file; a state file
 that is not a regular file or is over 16 MiB is treated as unreadable. A state file whose
 entries are not in the shape this version writes is likewise left untouched until repaired.
 
