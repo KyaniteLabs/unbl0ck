@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import math
 import json
 import logging
 import os
@@ -1111,29 +1112,35 @@ _CLOSER = re.compile(
 _ANSWERED = re.compile(r"(?:because|answer:|a:|it was|the answer)\b", re.IGNORECASE)
 
 
-def chat_asks_you(text: str) -> bool:
-    """Does a bot's final turn ask the human for something?
+def chat_ask_span(text: str) -> int:
+    """How many trailing characters of a bot's final turn hold its ask (0 when it asks nothing).
 
     Anchored to the tail of the turn: a gate idiom inside an earlier status report
     ("…Platform's, on your word.") is not an ask. Packet/option-list shapes are
-    exempt from the question mark; other cues need a ``?`` after the cue."""
+    exempt from the question mark and may be long; other cues need a ``?`` after the cue.
+    A name that must address you has to lie inside the same span."""
     # URLs carry "?" query strings; a polite sign-off ("Anything else you need?") asks nothing.
     text = _URL.sub(" ", text or "")
     text = _CLOSER.sub("", text.strip()).strip()
     tail = text[-900:]
     if not tail:
-        return False
+        return 0
     pats = _patterns()
     if pats["_ASK_PACKET"].search(text[-4000:]):
-        return True
+        return 4000
     for match in pats["_ASK_STRONG"].finditer(tail):
         if "?" in tail[match.end() : match.end() + 300]:
-            return True
+            return 900
     if "?" not in tail[-400:] or not pats["_YOU"].search(tail[-400:]):
-        return False
+        return 0
     # A question the turn goes on to answer ("Why did it fail? Because ...") is not an ask.
     rest = tail[tail.rfind("?") + 1 :].strip()
-    return len(rest) <= 120 and not _ANSWERED.match(rest)
+    return 900 if len(rest) <= 120 and not _ANSWERED.match(rest) else 0
+
+
+def chat_asks_you(text: str) -> bool:
+    """Does a bot's final turn ask the human for something?"""
+    return chat_ask_span(text) > 0
 
 
 def _excerpt(text: str, n: int = 480) -> str:
@@ -1436,7 +1443,9 @@ def kanban_items(
 # --- Chat source ---------------------------------------------------------------------------
 
 
-def _state_dbs(home: Path, errors: list[str] | None = None) -> list[tuple[str, Path]]:
+def _state_dbs(
+    home: Path, errors: list[str] | None = None, only: str | None = None
+) -> list[tuple[str, Path]]:
     """Every profile's chat database that lies inside *home*. A link (to a profile folder or to the
     database itself) could aim the search at another Hermes home, so a linked one is reported and
     skipped, and a profiles folder that cannot be listed is a failed source, not an empty one."""
@@ -1447,13 +1456,15 @@ def _state_dbs(home: Path, errors: list[str] | None = None) -> list[tuple[str, P
             errors.append(f"chat[{profile}]: {why}; not searched")
 
     root = home / "state.db"
-    if os.path.lexists(root):
+    if only in (None, "default") and os.path.lexists(root):
         if root.is_symlink():
             refuse("default", "state.db is a symbolic link")
         else:
             out.append(("default", root))
+    if only == "default":
+        return out
     try:
-        entries = _list_files(home / "profiles")
+        entries = [home / "profiles" / only] if only else _list_files(home / "profiles")
     except FileNotFoundError:
         return out
     except OSError as exc:
@@ -1600,15 +1611,33 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
+# Most characters of one chat message that are read from the database and processed. The ask
+# sits at the end of a turn, so a longer message is read from its end.
+CHAT_READ_CHARS = 100_000
+
+
+def _text_digest(length: Any, text: str) -> str:
+    return hashlib.sha256(f"{length}\0{text}".encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
+    if not over:
+        return _full_fields(shown)
+    full, _ = _full_text(shown[-FULL_TEXT_LIMIT:])  # the end holds the ask
+    return {"text": full, "text_cut": True}
+
+
 def chat_items(
     home: Path | None = None,
     days: int = CHAT_WINDOW_DAYS,
     errors: list[str] | None = None,
     *,
     full: bool = False,
+    only: tuple[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
-    last visible turn is the bot asking you something you have not answered."""
+    last visible turn is the bot asking you something you have not answered. ``only`` =
+    (profile, session id) looks at that one chat and opens no other database."""
     home = home or hermes_home()
     since = time.time() - days * 86400
     items: list[dict[str, Any]] = []
@@ -1620,7 +1649,7 @@ def chat_items(
     names = _patterns(principal_names(settings), role_words(settings))["_NAMES"]
     owners = chat_owner_ids(settings)
     me = {n.lower() for n in principal_names(settings)}
-    for profile, db in _state_dbs(home, errors):
+    for profile, db in _state_dbs(home, errors, only[0] if only else None):
         try:
             conn = sqlite3.connect(
                 db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2
@@ -1662,6 +1691,9 @@ def chat_items(
                 if "last_activity_at" in cols and "started_at" in cols:
                     where.append("COALESCE(s.last_activity_at, s.started_at, 0) >= ?")
                     args.append(since)
+                if only:
+                    where.append("s.id = ?")
+                    args.append(only[1])
                 pick = ", ".join(
                     f"s.{c}" if c in cols else "NULL"
                     for c in ("source", "chat_type", "user_id", "display_name")
@@ -1677,7 +1709,8 @@ def chat_items(
                 continue
             # Only the columns this profile's schema has: an old schema must not fail per session.
             last_sql = (
-                "SELECT id, role, content, timestamp FROM messages WHERE session_id=? "
+                "SELECT id, role, SUBSTR(content, ?), LENGTH(content), timestamp FROM messages "
+                "WHERE session_id=? "
                 "AND role IN ('user','assistant') AND content IS NOT NULL AND TRIM(content) != '' "
                 + (
                     "AND COALESCE(display_kind,'') != 'hidden' "
@@ -1691,36 +1724,37 @@ def chat_items(
                 platform = str(platform or "")
                 if (
                     owners
-                    and platform
                     and platform.lower() not in LOCAL_PLATFORMS
+                    and (platform or user_id)
                     and str(user_id or "") not in owners
                 ):
                     # A gateway chat with someone other than you, or with nobody known: when you
                     # set owner_user_ids, only chats proven to be yours are shown (and summarised).
+                    # An unknown source with a user id is a gateway chat too; only a session with
+                    # neither (an older local one) carries no remote identity to check.
                     continue
                 try:
-                    row = conn.execute(last_sql, (sid,)).fetchone()
+                    row = conn.execute(last_sql, (-CHAT_READ_CHARS, sid)).fetchone()
                 except sqlite3.Error as exc:
                     if errors is not None:
                         errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
                     break  # same schema for every session: say it once
                 if not row:
                     continue
-                mid, role, content, ts = row
-                if (
-                    role != "assistant"
-                    or (ts or 0) < since
-                    or not chat_asks_you(content)
+                mid, role, content, length, ts = row
+                content = str(content)
+                span = chat_ask_span(content) if role == "assistant" and (ts or 0) >= since else 0
+                if not span:
+                    continue
+                if str(chat_type or "").lower() in CHAT_GROUP_TYPES and not names.search(
+                    content[-span:]
                 ):
                     continue
-                if str(
-                    chat_type or ""
-                ).lower() in CHAT_GROUP_TYPES and not names.search(str(content)[-900:]):
-                    continue
+                over = (length or 0) > len(content)  # only the end of a very long message was read
                 bot_chat = title in CHAT_TITLES
                 # Redact the whole turn before it is cut to an excerpt: the cut keeps the tail,
                 # so a long secret would otherwise leave a readable fragment.
-                shown = _ask_redact(str(content))
+                shown = _ask_redact(content)
                 where_ = (
                     "Bot Chat"
                     if bot_chat
@@ -1729,7 +1763,9 @@ def chat_items(
                 items.append(
                     {
                         "id": f"chat:{profile}:{sid}",
-                        "version": str(mid),
+                        # The message row id and a digest of the text: Hermes can rewrite a
+                        # message in place, and the row id alone would not change.
+                        "version": f"{mid}:{_text_digest(length, content)}",
                         "source": "chat",
                         "profile": profile,
                         "session_id": sid,
@@ -1739,8 +1775,8 @@ def chat_items(
                         "chat_with": _chat_with(platform, display_name, me),
                         "title": f"{_bot_name(home, profile)} is asking you",
                         "ask": _excerpt(shown),
-                        "ask_truncated": _is_excerpted(shown),
-                        **(_full_fields(shown) if full else {}),
+                        "ask_truncated": over or _is_excerpted(shown),
+                        **(_chat_full_fields(shown, over) if full else {}),
                         "why": f"Last turn in this {where_} is a question for you",
                         "owner": profile,
                         "priority": 0,
@@ -1922,9 +1958,10 @@ WAIT_MAX_AGE = (
 
 def _num(value: Any) -> float:
     try:
-        return float(value or 0)
+        number = float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+    return number if math.isfinite(number) else 0.0  # NaN/inf are not times
 
 
 def _waits_dir(home: Path | None = None) -> Path:
@@ -2075,9 +2112,14 @@ def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitSt
 
 
 def wait_items(
-    home: Path | None = None, errors: list[str] | None = None, *, full: bool = False
+    home: Path | None = None,
+    errors: list[str] | None = None,
+    *,
+    full: bool = False,
+    only_rid: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Open live prompts. A wait whose process is gone is deleted, not shown."""
+    """Open live prompts. A wait whose process is gone is deleted, not shown. ``only_rid``
+    reads that one record and touches no other."""
     home = home or hermes_home()
     errors = errors if errors is not None else []
     items: list[dict[str, Any]] = []
@@ -2088,6 +2130,8 @@ def wait_items(
         # An unreadable folder is not an empty one: the prompts in it are unknown.
         errors.append(f"prompt: waits: {type(exc).__name__}; could not list live prompts")
         return items
+    if only_rid is not None:
+        records = [f for f in records if f.name == f"{only_rid}.json"]
     for f in records:
         before = len(errors)
         rec = _read_json(f, errors=errors, source="prompt")
@@ -2139,6 +2183,9 @@ def wait_items(
     return items
 
 
+_REF_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
 class SourceUnavailable(RuntimeError):
     """The source could not be read, so the record's absence is unknown."""
 
@@ -2154,9 +2201,20 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
     if source not in ("chat", "prompt") or ":" not in item_id:
         raise ValueError("full text is available for chat and live-prompt items only")
     errors: list[str] = []
+    # Check the reference's shape first: a malformed one opens nothing, and a well-formed one
+    # looks at that single chat or prompt, so an unrelated broken profile cannot fail it.
+    parts = item_id.split(":", 2)
+    if source == "chat":
+        if len(parts) != 3 or not _REF_PART.fullmatch(parts[1]) or not parts[2]:
+            raise LookupError("chat item is no longer available")
+        look: dict[str, Any] = {"only": (parts[1], parts[2])}
+    else:
+        if len(parts) != 2 or not _REF_PART.fullmatch(parts[1]):
+            raise LookupError("prompt item is no longer available")
+        look = {"only_rid": parts[1]}
     try:
         items = (chat_items if source == "chat" else wait_items)(
-            hermes_home(), errors=errors, full=True
+            hermes_home(), errors=errors, full=True, **look
         )
     except Exception as exc:  # noqa: BLE001
         raise SourceUnavailable(f"{source} source unreadable: {type(exc).__name__}") from exc

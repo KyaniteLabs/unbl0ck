@@ -367,7 +367,8 @@ class Chats(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             items = needs.chat_items(make_home(Path(d)))
             self.assertEqual([i["session_id"] for i in items], ["s1"])
-            self.assertEqual(items[0]["version"], "2")
+            # The message row id plus a digest of its text (round 4, 01-067).
+            self.assertRegex(items[0]["version"], r"\A2:[0-9a-f]{12}\Z")
 
     def test_user_replied_last(self):
         with tempfile.TemporaryDirectory() as d:
