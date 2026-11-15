@@ -350,8 +350,9 @@ def _hidden_path(home: Path | None, *, create: bool = True) -> Path:
 
 STATE_LOCK_TIMEOUT = 5.0  # seconds to wait for the state lock before giving up
 _STATE_LOCK = (
-    threading.Lock()
+    threading.RLock()
 )  # shared state, including filed outside items, is read-modify-write
+_STATE_HELD = threading.local()  # the data folder this thread already holds the file lock for
 
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # absent on Windows
@@ -373,24 +374,23 @@ def _msvcrt_contention(exc: OSError) -> bool:
 @contextmanager
 def _state_lock(home: Path | None):
     """Serialise a read-modify-write of UNBL0CK's state files across threads AND processes
-    (the dashboard backend, the agent plugin and a plugin host can all write them)."""
+    (the dashboard backend, the agent plugin and a plugin host can all write them). A thread
+    that already holds it for the same folder re-enters, so one transaction can update several
+    files through :func:`_update_state`."""
     deadline = time.monotonic() + STATE_LOCK_TIMEOUT
     if not _STATE_LOCK.acquire(timeout=STATE_LOCK_TIMEOUT):
         raise TimeoutError("unbl0ck: state lock busy (another thread holds it)")
     try:
         d = data_dir(home)
-        # O_NOFOLLOW: a dangling or redirected link is never created through or locked.
-        lock_path = d / ".state.lock"
-        # Where O_NOFOLLOW is absent (Windows) the open below would follow a link.
-        if lock_path.is_symlink():
-            raise OSError("the state lock is not a regular file")
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
+        held = getattr(_STATE_HELD, "dir", None)
+        if held is not None:
+            if held != d:
+                raise RuntimeError("unbl0ck: the state lock is already held for another folder")
+            yield
+            return
+        fd, _ = _pinned_open(d / ".state.lock", os.O_RDWR, create=True)
         locked_with_msvcrt = False
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError("the state lock is not a regular file")
-            if not _names_open_file(fd, d / ".state.lock"):
-                raise OSError("the state lock is a link; refusing to lock through it")
             if fcntl is not None:
                 while True:
                     try:
@@ -420,7 +420,11 @@ def _state_lock(home: Path | None):
                                 "unbl0ck: state lock busy (another process holds it)"
                             )
                         time.sleep(0.02)
-            yield
+            _STATE_HELD.dir = d
+            try:
+                yield
+            finally:
+                _STATE_HELD.dir = None
         finally:
             if locked_with_msvcrt:
                 try:
@@ -620,6 +624,38 @@ def _write_json(p: Path, data: dict[str, Any], *, ordered: bool = False) -> None
         )  # gone after a successful replace; removed after a failed write
 
 
+def _update_state(
+    home: Path | None,
+    path: Path,
+    mutate: Callable[[dict[str, Any]], dict[str, Any] | None],
+    *,
+    entry_ok: Any = None,
+) -> dict[str, Any]:
+    """One read-modify-write of a state file: under the state lock, read it strictly (a damaged
+    file or an entry *entry_ok* refuses is never rewritten), pass it to *mutate*, and write what
+    *mutate* returns (None writes nothing). Every check that guards the write belongs inside
+    *mutate*, where nothing can change between the check and the write."""
+    with _state_lock(home):
+        data = _read_json(path, strict=True, entry_ok=entry_ok)
+        new = mutate(data)
+        if new is None:
+            return data
+        _write_json(path, new, ordered=True)
+        return new
+
+
+def _dropper(key: str) -> Callable[[dict[str, Any]], dict[str, Any] | None]:
+    """An :func:`_update_state` mutation that removes *key* (and writes nothing when it is absent)."""
+
+    def drop(data: dict[str, Any]) -> dict[str, Any] | None:
+        if key not in data:
+            return None
+        del data[key]
+        return data
+
+    return drop
+
+
 def _hidden_entry_ok(value: Any) -> bool:
     # A string version; null and "" are older writes that unhide still removes.
     return value is None or isinstance(value, str)
@@ -781,18 +817,23 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
         current = _current_version(item_id, home)
         if current is not None and current != version:
             raise StaleHide("the card changed since this view; refresh before hiding it")
-        with _state_lock(home):
-            hidden = _load_hidden_raw(home, strict=True)
+        out: dict[str, Any] = {}
+
+        def mutate(hidden: dict[str, Any]) -> dict[str, Any] | None:
             existing = _split_hidden(hidden.get(item_id))[0] if item_id in hidden else None
-            if not existing or existing == version or existing == judged:
-                hidden.pop(item_id, None)
-                token = uuid.uuid4().hex
-                hidden[item_id] = f"{version}\x1f{token}"
-                hidden = _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
-                order = _dismissal_order()
-                _write_json(_hidden_path(home), hidden, ordered=True)
-                return token, order
-            judged = existing
+            if existing and existing not in (version, judged):
+                out["existing"] = existing
+                return None
+            hidden.pop(item_id, None)
+            out["token"] = uuid.uuid4().hex
+            hidden[item_id] = f"{version}\x1f{out['token']}"
+            out["order"] = _dismissal_order()
+            return _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
+
+        _update_state(home, _hidden_path(home), mutate, entry_ok=_hidden_entry_ok)
+        if "token" in out:
+            return out["token"], out["order"]
+        judged = out["existing"]
 
 
 def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:
@@ -852,41 +893,43 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
                 raise RuntimeError(
                     f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before undoing Done"
                 )
-        # Hidden marker first. If the Done write then fails, the marker is put back so the
-        # same token still names a dismissal on retry (the undo is all or nothing).
-        before = dict(hidden)
-        if clear_hidden:
-            del hidden[item_id]
-            _write_json(_hidden_path(home), hidden, ordered=True)
-        if clear_done:
+        def undo_done() -> None:
             rec.pop("done_at", None)
             rec.pop("done_token", None)
-            try:
-                _write_json(f, rec)
-            except BaseException:
-                if clear_hidden:
-                    try:
-                        _write_json(_hidden_path(home), before, ordered=True)
-                    except Exception:  # noqa: BLE001 - the original failure is the one to report
-                        log.warning("unbl0ck: could not restore the dismissal after a failed undo", exc_info=True)
-                raise
+            _write_json(f, rec)
+
+        def undo_hidden() -> None:
+            _update_state(home, _hidden_path(home), _dropper(item_id), entry_ok=_hidden_entry_ok)
+
+        # The store the token names is written last: if the first write fails, a retry with
+        # the same token still finds its dismissal and finishes the undo.
+        steps = [(clear_hidden, undo_hidden), (clear_done, undo_done)]
+        if token is not None and h_match and not d_match:
+            steps.reverse()
+        for wanted, step in steps:
+            if wanted:
+                step()
         return True
 
 
 # --- Releases that failed after the answer was posted ---------------------------------------
-# {item_id: block version}. The answer is on the card but the card is still blocked, so the queue
+# {item_id: block version \x1f owner token}. The answer is on the card but the card is still blocked, so the queue
 # keeps showing it (tier "release_failed") and answer_card may retry the release without
 # posting the answer twice.
 
 
-def _pending_path(home: Path | None) -> Path:
-    return data_dir(home) / "pending-release.json"
+def _pending_path(home: Path | None, *, create: bool = True) -> Path:
+    return data_dir(home, create=create) / "pending-release.json"
+
+
+def _pending_entry_ok(value: Any) -> bool:
+    return isinstance(value, str)
 
 
 def load_pending_releases(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, str]:
-    return _read_json(
-        _pending_path(home), errors=errors, strict=strict, entry_ok=lambda v: isinstance(v, str)
-    )
+    """``{item_id: block version}``; the owner tokens are not part of this view."""
+    raw = _read_json(_pending_path(home, create=False), errors=errors, strict=strict, entry_ok=_pending_entry_ok)
+    return {item_id: _split_hidden(value)[0] for item_id, value in raw.items()}
 
 
 class PendingReleaseFull(RuntimeError):
@@ -906,29 +949,37 @@ def _set_pending_release(
     home: Path | None = None,
     *,
     expected: str | None = None,
-) -> None:
+) -> tuple[str, bool] | None:
     """Record (version) or clear (None) the unfinished release for one card.
 
-    A clear with *expected* removes only the marker recorded for that version, and a record
-    never replaces a marker for a newer block: a slow worker for an older version cannot undo
-    the newer one's recovery."""
-    with _state_lock(home):
-        data = load_pending_releases(home, strict=True)
+    A record stamps the marker with a fresh owner token and returns ``(token, created)``:
+    *created* is False when a marker for this version already existed, which the caller then
+    shares and must never remove. A clear with *expected* removes the marker only while it
+    still holds that version or that owner token: a caller cleaning up its own reservation
+    cannot remove a marker another caller has stamped since. A record never replaces a
+    marker for a newer block (it returns None), so a slow worker for an older version cannot
+    undo the newer one's recovery."""
+    out: dict[str, Any] = {}
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any] | None:
+        stored, owner = _split_hidden(data.get(item_id))
         if version is None:
-            if item_id not in data or (expected is not None and data[item_id] != expected):
-                return
+            if item_id not in data or (expected is not None and expected not in (stored, owner)):
+                return None
             del data[item_id]
-        else:
-            old, new = _version_number(data.get(item_id)), _version_number(version)
-            if old is not None and new is not None and new < old:
-                return
-            if item_id not in data and len(data) >= _HIDDEN_KEEP:
-                raise PendingReleaseFull(
-                    "too many unfinished releases are waiting to be retried"
-                )
-            data.pop(item_id, None)  # an updated marker is the newest
-            data[item_id] = version
-        _write_json(_pending_path(home), data, ordered=True)
+            return data
+        old, new = _version_number(stored), _version_number(version)
+        if old is not None and new is not None and new < old:
+            return None
+        if item_id not in data and len(data) >= _HIDDEN_KEEP:
+            raise PendingReleaseFull("too many unfinished releases are waiting to be retried")
+        out["reserved"] = (uuid.uuid4().hex, stored != version)
+        data.pop(item_id, None)  # an updated marker is the newest
+        data[item_id] = f"{version}\x1f{out['reserved'][0]}"
+        return data
+
+    _update_state(home, _pending_path(home), mutate, entry_ok=_pending_entry_ok)
+    return out.get("reserved")
 
 
 # --- BLUF cache (one model summary per item version) ----------------------------------------
@@ -947,14 +998,16 @@ BLUF_SYSTEM = (
 )
 
 
-def _bluf_path(home: Path | None) -> Path:
-    return data_dir(home) / "bluf.json"
+def _bluf_path(home: Path | None, *, create: bool = True) -> Path:
+    return data_dir(home, create=create) / "bluf.json"
 
 
-def load_blufs(home: Path | None = None, *, strict: bool = False) -> dict[str, dict[str, str]]:
-    return _read_json(
-        _bluf_path(home), strict=strict, entry_ok=lambda v: isinstance(v, dict)
-    )
+def _bluf_entry_ok(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
+def load_blufs(home: Path | None = None) -> dict[str, dict[str, str]]:
+    return _read_json(_bluf_path(home, create=False), entry_ok=_bluf_entry_ok)
 
 
 def summary_fingerprint(item: dict[str, Any]) -> str:
@@ -976,14 +1029,9 @@ def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str,
     if len(data) <= _BLUF_KEEP:
         return data
 
-    def saved_at(entry: Any) -> int:
-        try:
-            return int(entry.get("at") or 0) if isinstance(entry, dict) else 0
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
     ranked = sorted(
-        data.items(), key=lambda pair: (saved_at(pair[1]), pair[0] == newest_id)
+        data.items(),
+        key=lambda pair: (_num(pair[1].get("at")) if isinstance(pair[1], dict) else 0.0, pair[0] == newest_id),
     )
     return dict(ranked[-_BLUF_KEEP:])
 
@@ -1021,8 +1069,10 @@ def save_bluf(
         if fp is not None:
             entry["fp"] = fp
         data[item_id] = entry
-        data = _trim_blufs(data, item_id)
-        _write_json(_bluf_path(home), data, ordered=True)
+        return _trim_blufs(data, item_id)
+
+    # A damaged cache is refused for repair, never overwritten.
+    _update_state(home, _bluf_path(home), mutate, entry_ok=_bluf_entry_ok)
 
 
 def prune_blufs(
@@ -1037,21 +1087,18 @@ def prune_blufs(
     ``observed_at`` is when *items* was read: a summary saved after that was never in the
     caller's view, so it is kept rather than judged against a list that predates it."""
     current = {item["id"]: item["version"] for item in items}
-    with _state_lock(home):
-        data = load_blufs(home, strict=True)
-        kept = {
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any] | None:
+        kept = _trim_blufs({
             item_id: value
             for item_id, value in data.items()
-            if isinstance(value, dict)
-            and (
-                (observed_at is not None and _num(value.get("at")) >= observed_at)
-                or item_id.startswith(preserve_prefixes)
-                or (item_id in current and value.get("version") == current[item_id])
-            )
-        }
-        kept = _trim_blufs(kept)
-        if kept != data:
-            _write_json(_bluf_path(home), kept, ordered=True)
+            if (observed_at is not None and _num(value.get("at")) >= observed_at)
+            or item_id.startswith(preserve_prefixes)
+            or (item_id in current and value.get("version") == current[item_id])
+        })
+        return kept if kept != data else None
+
+    _update_state(home, _bluf_path(home), mutate, entry_ok=_bluf_entry_ok)
 
 
 def attach_blufs(
@@ -2177,24 +2224,26 @@ def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
 
 
 BACKFILL_FILE = "chat-backfill.json"
-BACKFILL_IDS_MAX = 1000
 
 
-def _backfill_state(home: Path | None) -> tuple[float | None, list[str], bool]:
-    """``(floor, ids, readable)``: the oldest time any earlier queue read reached back to, and the
-    chats first listed from before it (a widened ``chat_window_days`` found them). Nothing here is
-    chat text: a time and the ids the dismissal and summary stores already hold."""
+def _backfill_floor(home: Path | None, since: float, *, record: bool, errors: list[str] | None) -> float:
+    """The start of the first window any queue build read (``{"floor": time}``, written once
+    under the state lock), or *since* before one exists. Nothing here is chat text. A floor
+    that cannot be read or saved counts as a day ago, so a widened window never passes for
+    an ordinary one."""
     try:
-        p = data_dir(home, create=False) / BACKFILL_FILE
-        if not os.path.lexists(p):
-            return None, [], True
-        data = json.loads(_read_plain_text(p))
-        floor = data.get("floor")
-        floor = float(floor) if isinstance(floor, (int, float)) and math.isfinite(floor) else None
-        ids = [i for i in data.get("ids", []) if isinstance(i, str)][-BACKFILL_IDS_MAX:]
-        return floor, ids, True
-    except (OSError, ValueError, AttributeError, TypeError, UnicodeError):
-        return None, [], False
+        if record:
+            data = _update_state(
+                home, data_dir(home) / BACKFILL_FILE, lambda d: None if "floor" in d else {"floor": since}
+            )
+        else:
+            data = _read_json(data_dir(home, create=False) / BACKFILL_FILE, strict=True)
+    except (OSError, RuntimeError) as exc:
+        if errors is not None:
+            errors.append(f"chat: the backfill floor could not be read or saved ({type(exc).__name__})")
+        return time.time() - 86400
+    floor = _finite(data.get("floor", since))
+    return floor if floor is not None else time.time() - 86400
 
 
 def _mark_backfill(
@@ -4551,7 +4600,7 @@ def outside_items(
     settings = _settings()  # one snapshot: the folders and the recursion flag cannot disagree
     raw = settings.get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
     recursive = outside_recursive(settings)
-    hidden = load_hidden(home, errors=errors, create=not readonly) if str(raw).strip() else {}
+    hidden = load_hidden(home, errors=errors) if str(raw).strip() else {}
     seen: set[Path] = set()
     # A file under two overlapping roots is listed once, where it is tried first.
     claimed: set[Path] = set()
@@ -5329,11 +5378,10 @@ def answer_card(
         raise ValueError("answer text is required")
     if release and version is None:
         raise ValueError("queue version is required to release a card")
-    pending: dict[str, str] = {}
     if release:
         # Check recovery state before posting or releasing, so a damaged record cannot
         # turn a successful action into a late, misleading failure or be overwritten.
-        pending = load_pending_releases(home, strict=True)
+        load_pending_releases(home, strict=True)
     settings, settings_error = _settings_state()
     if settings_error:
         raise RuntimeError("could not read plugin settings; repair them before answering")
@@ -5347,26 +5395,19 @@ def answer_card(
     version_s = str(version) if version is not None else None
     comment_id: int | None = None
     post_answer = False
-    marker_reserved = False  # the recovery marker for this block is recorded
+    reserved: tuple[str, bool] | None = None  # (owner token, created) of the recovery marker
     marker_full = False
-    marker_key = (str(data_dir(home)), item_id, version_s)
-    marker_entry = _marker_join(marker_key) if release else None
     if release:
         # Reserve the failed-release marker BEFORE anything is written: a marker that cannot
         # be stored after the answer was posted would leave an answered card with no recovery
         # state. A full store is not a reason to refuse the answer; it is reported afterwards.
-        if pending.get(item_id) == version_s:
-            marker_reserved = True
-        else:
-            try:
-                _set_pending_release(item_id, version_s, home)
-                marker_reserved = True
-                marker_entry["ours"] = True
-            except PendingReleaseFull:
-                marker_full = True
-            except BaseException:
-                _marker_leave(marker_key, marker_entry, keep=False)
-                raise
+        # Reserving stamps the marker with this call's token, so another caller that created
+        # it for the same block can no longer remove it while this one relies on it.
+        try:
+            reserved = _set_pending_release(item_id, version_s, home)
+        except PendingReleaseFull:
+            marker_full = True
+    marker_reserved = reserved is not None
     released = False
     release_failed = False
     release_error: BaseException | None = None
@@ -5449,17 +5490,11 @@ def answer_card(
                         )
             committed = True
     finally:
-        # The marker is dropped only by the last caller out, and only when none of them wrote an
-        # answer whose release failed: another caller may rely on the marker this one reserved.
-        last_out = (
-            _marker_leave(marker_key, marker_entry, keep=release_failed)
-            if marker_entry is not None
-            else False
-        )
-        if not committed and last_out:
-            # Nothing was written (stale, refused, unreadable): drop the marker reserved for it.
+        if not committed and reserved is not None and reserved[1]:
+            # Nothing was written (stale, refused, unreadable): drop the marker this call
+            # created, unless another caller has stamped it since and relies on it now.
             try:
-                _set_pending_release(item_id, None, home, expected=version_s)
+                _set_pending_release(item_id, None, home, expected=reserved[0])
             except Exception:  # noqa: BLE001 - an inert marker (no answer exists) is harmless
                 log.warning("unbl0ck: could not remove an unused recovery marker for %s", item_id)
     if release_failed:
