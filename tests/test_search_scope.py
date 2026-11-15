@@ -663,7 +663,7 @@ const shown=tree=>all(tree).filter(n=>n?.type===Item&&!n.props.hidden).length;
 """
 
     def run_views(self, script):
-        from tests.test_operator_recovery import HARNESS
+        from test_operator_recovery import HARNESS
         for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
             with self.subTest(path=path.name):
                 r = subprocess.run(["node", "-e", HARNESS + self.PRELUDE + script, str(path)], capture_output=True, text=True)
