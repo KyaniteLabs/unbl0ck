@@ -141,6 +141,40 @@ const render=it=>{cursor=0;return store.Item({ctx,item:it,n:1,refresh,askEnabled
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)
 
+    def test_superseded_polling_stops_and_never_records_its_job_over_a_newer_one(self):
+        self.run_views(r"""
+let posts=0;const polls={j1:0,j2:0},hold={};
+const ctx={rest:(url)=>{
+  if(url==='/card/ask'){posts++;return Promise.resolve({pending:true,job:'j'+posts})}
+  const job=url.includes('j1')?'j1':'j2';polls[job]++;
+  return new Promise(r=>{hold[job]=r})}};
+const it={...item,id:'kanban:default:ask7',version:'1'};
+const render=()=>{cursor=0;return store.Item({ctx,item:it,n:1,refresh,askEnabled:true})};
+const realSet=global.setTimeout;global.setTimeout=(fn)=>realSet(fn,0);
+(async()=>{
+ render();
+ const old=find(render(),'TL;DR').onClick();
+ await new Promise(r=>realSet(r,20));
+ assert.equal(polls.j1,1);
+ // the running session is evicted while the card is mounted; a second request starts
+ store.clearAskSession(it.id);
+ state=[];
+ render();
+ const fresh=find(render(),'TL;DR').onClick();
+ await new Promise(r=>realSet(r,20));
+ assert.equal(store.readAskSession(it.id).job.id,'j2');
+ // the older request's pending poll answers: it must stop, not follow j1 any further
+ hold.j1({pending:true,job:'j1'});
+ await new Promise(r=>realSet(r,60));
+ assert.equal(polls.j1,1,'a superseded request stops polling');
+ assert.equal(store.readAskSession(it.id).job.id,'j2','Retry would follow the newer job, never the old one');
+ hold.j2({ok:true,reply:'NEW'});
+ await Promise.all([old,fresh]);
+ assert.ok(store.readAskSession(it.id).msgs.some(m=>m.content==='NEW'));
+ global.setTimeout=realSet;
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
     def test_failed_request_is_remembered_with_its_error_and_retryable(self):
         self.run_views(r"""
 const ctx={rest:async()=>{throw new Error('model down')}};
