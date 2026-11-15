@@ -146,7 +146,9 @@ class CardAsk(BaseModel):
         return msgs
 
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+# C0 and C1 controls plus the line/paragraph separators: str.strip() would otherwise fold some
+# of them away and silently address a different card.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 _OTHER_SOURCES = ("chat:", "prompt:", "pairing:", "outside:")
 
 
@@ -157,6 +159,15 @@ def _bounded(**fields: str) -> None:
             raise HTTPException(status_code=400, detail=f"{name} is over {MAX_ID} characters")
         if _CONTROL.search(value):
             raise HTTPException(status_code=400, detail=f"{name} contains control characters")
+
+
+def _same_board(a: str, b: str) -> bool:
+    """Two spellings of one board (case, surrounding space) are the same board."""
+    try:
+        n = _needs()
+        return n.normalize_board_slug(a) == n.normalize_board_slug(b)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 def _card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
@@ -172,7 +183,7 @@ def _card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
             parts = id_.split(":", 2)
             if len(parts) != 3 or not parts[1] or not parts[2]:
                 raise HTTPException(status_code=400, detail="malformed Kanban card id")
-            if (board and board != parts[1]) or (task_id and task_id != parts[2]):
+            if (board and not _same_board(board, parts[1])) or (task_id and task_id != parts[2]):
                 raise HTTPException(status_code=400, detail="id conflicts with board/task_id")
             return parts[1], parts[2]
         if task_id and task_id != id_:
@@ -476,11 +487,6 @@ def answer(body: Answer, response: Response):
         _bounded(version=body.version)
         if not body.version.strip():
             raise HTTPException(status_code=400, detail="version must not be empty; omit it or send the queue version")
-    elif getattr(_needs(), "answer_version_required", lambda: False)():
-        raise HTTPException(
-            status_code=428,
-            detail="this installation requires the queue item version with every answer",
-        )
     try:
         board = _needs().normalize_board_slug(body.board)
     except ValueError as exc:
@@ -497,6 +503,8 @@ def answer(body: Answer, response: Response):
         raise HTTPException(status_code=400, detail=str(exc))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except _needs().VersionRequired as exc:   # before RuntimeError: it is a subclass
+        raise HTTPException(status_code=428, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     if body.version is None:

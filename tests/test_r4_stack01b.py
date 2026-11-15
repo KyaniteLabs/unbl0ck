@@ -388,7 +388,9 @@ class KanbanVersions(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        p = patch.dict(os.environ, {"HERMES_HOME": self.tmp.name})
+        p = patch.dict(
+            os.environ, {"HERMES_HOME": self.tmp.name, "HERMES_KANBAN_HOME": self.tmp.name}
+        )
         p.start()
         self.addCleanup(p.stop)
         p = patch.object(needs, "_settings", lambda: {"principal_name": "CEO", "comment_author": "operator"})

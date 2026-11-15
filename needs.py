@@ -2850,6 +2850,10 @@ class StaleAnswer(RuntimeError):
     """The card was blocked again after the human read it."""
 
 
+class VersionRequired(RuntimeError):
+    """This installation requires the queue item version with every answer."""
+
+
 def _unblock_task_at_version(
     conn: Any, kanban_db: Any, task_id: str, version: str
 ) -> bool:
@@ -3002,6 +3006,11 @@ def answer_card(
     settings, settings_error = _settings_state()
     if settings_error:
         raise RuntimeError("could not read plugin settings; repair them before answering")
+    if version is None and answer_version_required(settings):
+        # Decided on the snapshot this write uses, before anything is reserved or written.
+        raise VersionRequired(
+            "this installation requires the queue item version with every answer"
+        )
     author = principal_author(settings)
     item_id = f"kanban:{board}:{task_id}"
     version_s = str(version) if version is not None else None
