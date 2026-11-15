@@ -677,18 +677,19 @@ def _split_hidden(value: Any) -> tuple[Any, str | None]:
 
 
 def _load_hidden_raw(
-    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False, create: bool = True
+    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False
 ) -> dict[str, Any]:
+    # A reader never makes the state folder: only a write does (see _update_state).
     return _read_json(
-        _hidden_path(home, create=create), errors=errors, strict=strict, entry_ok=_hidden_entry_ok
+        _hidden_path(home, create=False), errors=errors, strict=strict, entry_ok=_hidden_entry_ok
     )
 
 
 def load_hidden(
-    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False, create: bool = True
+    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False
 ) -> dict[str, str]:
     """``{item_id: version}``; the dismissal tokens are not part of this view."""
-    raw = _load_hidden_raw(home, errors=errors, strict=strict, create=create)
+    raw = _load_hidden_raw(home, errors=errors, strict=strict)
     return {item_id: _split_hidden(value)[0] for item_id, value in raw.items()}
 
 
@@ -788,7 +789,7 @@ class StaleHide(RuntimeError):
 def _current_version(item_id: str, home: Path | None) -> str | None:
     """The queue's current version of one item, or None when it is gone or cannot be looked up."""
     try:
-        for it in build_queue(home, include_hidden=True).get("items", []):
+        for it in build_queue(home, include_hidden=True, record=False).get("items", []):
             if it.get("id") == item_id:
                 return str(it.get("version") or "")
     except Exception:  # noqa: BLE001 - a lookup failure must not block a dismissal
@@ -2541,12 +2542,7 @@ def chat_items(
     # Found only because chat_window_days reaches further back than an earlier read did (or past
     # the default window): listed, but never sent to a model without a deliberate action.
     if only is None:
-        _mark_backfill(
-            home, items, since,
-            record=record_backfill,
-            complete=not cov.get("sessions_omitted") and not (errors or []) and not unread_profiles,
-            errors=errors,
-        )
+        _mark_backfill(home, items, since, record=record_backfill, errors=errors)
     return items
 
 
@@ -3297,6 +3293,19 @@ def _is_filed_record(rec: Any, stem: str) -> bool:
         )
         and isinstance(rec.get("text"), str)
     )
+
+
+def _load_filed(d: Path, stem: str) -> dict[str, Any]:
+    """The record filed as ``<stem>.json`` in *d*, or ``{}`` when there is none. A link, a
+    damaged file or a record this plugin did not file raises ``SourceUnavailable``: it is never
+    read, rewritten or deleted as ours, and it is never mistaken for "gone"."""
+    try:
+        rec = _read_json(d / f"{stem}.json", strict=True)
+    except RuntimeError as exc:
+        raise SourceUnavailable(str(exc)) from exc
+    if rec and not _is_filed_record(rec, stem):
+        raise SourceUnavailable("filed outside record is invalid; repair it")
+    return rec
 _OUTSIDE_LIMIT = 200
 _OUTSIDE_READ_LIMIT = 256 * 1024
 # Recursive intake (outside_recursive) is bounded three ways: nesting depth, directory
@@ -4678,17 +4687,9 @@ def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
     (an unreadable folder, a corrupt record, a file that changed mid-read)."""
     match = _FILED_ID.fullmatch(item_id or "")
     if match:
-        f = _outside_dir(home) / (match.group(1) + ".json")
-        if f.is_symlink():
-            raise SourceUnavailable("filed outside record is not a regular file")
-        try:
-            rec = _read_json(f, strict=True)
-        except RuntimeError as exc:
-            raise SourceUnavailable(str(exc)) from exc
+        rec = _load_filed(_outside_dir(home), match.group(1))
         if not rec:
             raise LookupError("outside item is no longer available")
-        if not _is_filed_record(rec, match.group(1)):
-            raise SourceUnavailable("filed outside record is invalid; repair it")
         return rec
     if not _FOLDER_ID.fullmatch(item_id or ""):
         raise ValueError("id must identify an outside item")
@@ -5015,14 +5016,14 @@ def build_queue(
         items.extend(
             chat_items(
                 home, errors=errors, coverage=chat_coverage, unread_profiles=unread_profiles,
-                record_backfill=True,
+                record_backfill=record,
             )
         )
     except Exception as exc:  # noqa: BLE001
         chat_coverage = None  # a failed source is not "covered"
         errors.append(f"chat: {type(exc).__name__}: {exc}")
     try:
-        items.extend(wait_items(home, errors=errors))
+        items.extend(wait_items(home, errors=errors, readonly=not record))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"prompt: {type(exc).__name__}: {exc}")
     try:
@@ -5032,7 +5033,8 @@ def build_queue(
     try:
         items.extend(
             outside_items(
-                home, errors=errors, retained=outside_retained, with_hidden=True, stats=outside_stats
+                home, errors=errors, retained=outside_retained, with_hidden=True, stats=outside_stats,
+                readonly=not record,
             )
         )
     except Exception as exc:  # noqa: BLE001
@@ -5063,12 +5065,13 @@ def build_queue(
         # Folder ids are shared across profiles, but their configured folders are not.
         preserve_prefixes += ("outside:folder:",)
     try:
-        prune_blufs(
-            items + [{"id": i, "version": v} for i, v in outside_retained.items()],
-            home,
-            preserve_prefixes=preserve_prefixes,
-            observed_at=observed_at,
-        )
+        if record:
+            prune_blufs(
+                items + [{"id": i, "version": v} for i, v in outside_retained.items()],
+                home,
+                preserve_prefixes=preserve_prefixes,
+                observed_at=observed_at,
+            )
     except (OSError, TimeoutError, RuntimeError) as exc:
         # RuntimeError: a damaged cache is left for repair, not rewritten.
         log.warning(
@@ -5318,32 +5321,6 @@ def _comments_since_block(
             for k, c in keyed[len(keyed) - n :] if n else []:
                 rows[k] = (c.author, c.body)
     return [rows[k] for k in sorted(rows)]
-
-
-# Callers in this process that rely on one recovery marker (data folder, card, block version):
-# {"users": callers still inside answer_card, "ours": one of them recorded it, "keep": one of
-# them posted an answer whose release failed, so the marker is that answer's only recovery}.
-_MARKER_USERS: dict[tuple[str, str, str | None], dict[str, Any]] = {}
-_MARKER_LOCK = threading.Lock()
-
-
-def _marker_join(key: tuple[str, str, str | None]) -> dict[str, Any]:
-    with _MARKER_LOCK:
-        entry = _MARKER_USERS.setdefault(key, {"users": 0, "ours": False, "keep": False})
-        entry["users"] += 1
-        return entry
-
-
-def _marker_leave(key: tuple[str, str, str | None], entry: dict[str, Any], *, keep: bool) -> bool:
-    """Leave the marker's user list. True only for the last user out when the marker was
-    recorded for this block and nobody needs it for a failed release: it is then safe to drop."""
-    with _MARKER_LOCK:
-        entry["keep"] = entry["keep"] or keep
-        entry["users"] -= 1
-        if entry["users"] > 0:
-            return False
-        _MARKER_USERS.pop(key, None)
-        return bool(entry["ours"] and not entry["keep"])
 
 
 def answer_card(

@@ -132,9 +132,6 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import needs
 home, tag, count = Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])
-# hide looks the card up with a queue build, which prunes summaries of cards it does not list;
-# these synthetic ids are on no queue, and this test is about the lock, not that lookup.
-needs._current_version = lambda *a: None
 for i in range(count):
     needs.hide(f"hid-{tag}-{i}", "1", home)
     needs.save_bluf(f"blf-{tag}-{i}", "1", "b", "w", home)
