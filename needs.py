@@ -4019,7 +4019,8 @@ def _html_convert(markup: str, limit: int) -> tuple[str, list[str]]:
             uncertain = uncertain or bool(causes and piece.strip())
         elif piece.strip() and any(r.cause != "drop" for r in hiding):
             swallowed = True
-    text = "".join(ch for ch in "".join(kept) if unicodedata.category(ch) != "Cf")
+    # Format characters can hide text and are dropped, except the joiners words and emoji need.
+    text = "".join(ch for ch in "".join(kept) if ch in "‌‍" or unicodedata.category(ch) != "Cf")
     lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in text.split("\n")]
     cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     if swallowed:
