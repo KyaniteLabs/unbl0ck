@@ -223,6 +223,7 @@ CHAT_SESSION_CAP = 500  # sessions read per profile in one queue build; the rest
 # session cap bounds rows returned, this bounds the work behind them, so a table without the
 # indexes Hermes creates fails the source visibly instead of stalling the refresh.
 CHAT_QUERY_OPS = 30_000_000
+CHAT_HASH_BYTES = 64 << 20  # bytes of cut messages one queue build hashes in full (outside SQLite's steps)
 CHAT_TITLES = ("Bot Chat",)
 
 _PATTERN_CACHE: dict[str, dict[str, re.Pattern[str]]] = {}
@@ -2169,11 +2170,14 @@ def _drop_cut_prefix(text: str) -> str:
     return rest.lstrip()
 
 
-def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, over: bool) -> str:
-    """Names the whole message: the retained text alone cannot, when only its end was read, so
-    a cut message is hashed from the database in full, streamed in 1 MiB blocks."""
+def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, over: bool, budget: list[int]) -> str:
+    """Names the whole message: a cut one is hashed in full while the poll's *budget* of bytes
+    lasts; past it the version is new on every poll, so it is never taken as unchanged."""
     if not over:
         return f"{mid}:{_text_digest(length, text)}"
+    if length > budget[0]:
+        return f"{mid}:unhashed-{uuid.uuid4().hex[:12]}"
+    budget[0] -= length
     digest = hashlib.sha256(f"{length}\0".encode())
     rowid = conn.execute("SELECT rowid FROM messages WHERE id=?", (mid,)).fetchone()[0]
     with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
@@ -2183,32 +2187,22 @@ def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, ov
     return f"{mid}:{digest.hexdigest()[:12]}"
 
 
-def _other_fd_on(fd: int, st: os.stat_result) -> bool | None:
-    """Whether a descriptor other than *fd* is open on the file *st* describes, or None where
-    descriptors cannot be listed (Windows, whose open descriptor already keeps the path from
-    being replaced)."""
-    try:
-        names = os.listdir("/dev/fd")
-    except OSError:
-        return None
-    for name in names:
-        try:
-            if int(name) != fd and os.path.samestat(os.fstat(int(name)), st):
-                return True
-        except (OSError, ValueError):
-            continue
-    return False
-
-
 def _open_chat_db(db: Path) -> sqlite3.Connection:
-    """Open *db* read-only, only if it is the regular file it was when the search began. SQLite
-    opens the path again, so the open is accepted only when the path still names the pinned
-    file and a descriptor besides the pin (SQLite's) is open on that same file."""
-    fd, st = _pinned_open(db, os.O_RDONLY)
+    """Open *db* read-only by the pinned descriptor's own name (Linux's descriptor link, macOS's
+    ``F_GETPATH``; Windows cannot rename an open file), while that name still names the pin."""
+    fd, _ = _pinned_open(db, os.O_RDONLY)
     try:
-        conn = sqlite3.connect(Path(os.path.abspath(db)).as_uri() + "?mode=ro", uri=True, timeout=2)
+        if os.path.isdir("/proc/self/fd"):
+            name = f"/proc/self/fd/{fd}"  # SQLite resolves it to the file's name as it opens it
+        elif hasattr(fcntl, "F_GETPATH"):
+            name = os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+        elif msvcrt is not None:
+            name = os.path.abspath(db)
+        else:
+            raise UnsafeStateFile("state.db cannot be opened by descriptor on this platform", "changed")
+        conn = sqlite3.connect(Path(name).as_uri() + "?mode=ro", uri=True, timeout=2)
         try:
-            if not _names_open_file(fd, db) or _other_fd_on(fd, st) is False:
+            if not _names_open_file(fd, Path(conn.execute("PRAGMA database_list").fetchone()[2])):
                 raise UnsafeStateFile("state.db changed while it was opened", "changed")
         except BaseException:
             conn.close()
@@ -2319,6 +2313,7 @@ def chat_items(
             return False
         return any(str(i).startswith(prefix) for i in ids)
 
+    hash_budget = [CHAT_HASH_BYTES]
     for profile, db in _state_dbs(home, errors, only[0] if only else None, known):
         try:
             conn = _open_chat_db(db)
@@ -2471,7 +2466,7 @@ def chat_items(
                         content = content.lstrip("\ufffd")  # a character cut in two
                     content = _drop_cut_prefix(content)
                 ts = _num(ts)  # an infinite or NaN stored time is not a time (int() would raise)
-                version = _chat_version(conn, mid, length, content, over)
+                retained = content
                 content = content.replace("\x00", " ")
                 span = chat_ask_span(content) if role == "assistant" and (ts or 0) >= since else 0
                 if not span:
@@ -2481,6 +2476,7 @@ def chat_items(
                 ):
                     cov["skipped_group_unnamed"] += 1
                     continue
+                version = _chat_version(conn, mid, length, retained, over, hash_budget)
                 if visible is not None and not visible(f"chat:{profile}:{sid}", version):
                     continue  # dismissed at this version: it must not use up a full-text budget
                 bot_chat = title in CHAT_TITLES
