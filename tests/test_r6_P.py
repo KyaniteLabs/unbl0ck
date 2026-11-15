@@ -146,5 +146,16 @@ class CommentPlacement(KanbanAnswerCase):
             )
 
 
+class DismissalOrder(s11.QueueCase):
+    def test_a_later_dismissal_in_another_process_gets_a_higher_order(self):
+        """R6-019: orders grow across processes, even within one millisecond."""
+        frozen = time.time()
+        with patch.object(needs.time, "time", lambda: frozen):
+            _, first = needs.hide_ordered("kanban:b:t", "1", self.home)
+            with patch.object(needs, "_last_order", 0, create=True):  # a fresh process
+                _, second = needs.hide_ordered("kanban:b:t", "1", self.home)
+        self.assertGreater(second, first)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -776,19 +776,24 @@ def _fit_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
         hidden = dict(list(hidden.items())[-keep:])
     return hidden
 
-_ORDER_LOCK = threading.Lock()
-_last_order = 0
+ORDER_FILE = "dismissal-order.json"
 
 
-def _dismissal_order() -> int:
-    """A number that grows with each dismissal this process commits (milliseconds, never repeated
-    or lowered by a clock that stands still or steps back). Taken while the state lock is held,
-    so it follows the order the server committed dismissals in, which the client cannot see from
-    the order of its clicks or of the responses."""
-    global _last_order
-    with _ORDER_LOCK:
-        _last_order = max(int(time.time() * 1000), _last_order + 1)
-        return _last_order
+def _dismissal_order(home: Path | None) -> int:
+    """A number that grows with each dismissal any process commits (milliseconds, never repeated
+    or lowered by a clock that stands still or steps back). The last one is kept in ORDER_FILE
+    and taken under the state lock, so it follows the order dismissals were committed in, which
+    the client cannot see from the order of its clicks or of the responses."""
+    out: dict[str, int] = {}
+
+    def bump(data: dict[str, Any]) -> dict[str, Any]:
+        last = data.get("last")
+        last = last if isinstance(last, int) and not isinstance(last, bool) else 0
+        out["order"] = max(int(time.time() * 1000), last + 1)
+        return {"last": out["order"]}
+
+    _update_state(home, data_dir(home) / ORDER_FILE, bump)
+    return out["order"]
 
 
 class StaleHide(RuntimeError):
@@ -837,7 +842,7 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
             hidden.pop(item_id, None)
             out["token"] = uuid.uuid4().hex
             hidden[item_id] = f"{version}\x1f{out['token']}"
-            out["order"] = _dismissal_order()
+            out["order"] = _dismissal_order(home)
             return _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
 
         _update_state(home, _hidden_path(home), mutate, entry_ok=_hidden_entry_ok)
@@ -4580,7 +4585,7 @@ def done_outside(
             if not _is_done(rec):
                 rec["done_at"] = time.time()
                 rec["done_token"] = uuid.uuid4().hex
-                rec["done_order"] = _dismissal_order()
+                rec["done_order"] = _dismissal_order(home)
                 _write_json(f, rec)
                 # The Done is committed. Enforcing the keep limit is best effort: a failure there
                 # is reported in the reply, never as a failed Done the client could not undo.
