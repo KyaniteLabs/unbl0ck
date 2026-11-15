@@ -6629,7 +6629,7 @@ def _ask_card_view(
             if isinstance(k, str):
                 for path in _scrub:
                     name = name.replace(path, "[workspace]")
-                while name != k and name in shown:  # two keys that scrub alike both survive
+                while name in shown:  # a key that scrubs like another key, either order, keeps both
                     name += "#"
             shown[name] = done[k]
         return shown

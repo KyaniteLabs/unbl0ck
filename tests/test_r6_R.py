@@ -57,5 +57,15 @@ class HtmlHiding(unittest.TestCase):
         self.assertEqual((text, notes), ("SHOWN", []))
 
 
+class ScrubbedKeys(unittest.TestCase):
+    def test_a_later_unchanged_key_does_not_overwrite_a_scrubbed_one(self):
+        """R6-013: ``[workspace]/a`` after ``/p/a`` replaced its value."""
+        for m in ({"/p/a": 1, "[workspace]/a": 2}, {"[workspace]/a": 2, "/p/a": 1}):
+            with self.subTest(m=m):
+                view = needs._ask_card_view({"workspace": {"path": "/p"}, "m": m})
+                self.assertEqual(sorted(view["m"].values()), [1, 2])
+                self.assertNotIn("/p/", repr(view))
+
+
 if __name__ == "__main__":
     unittest.main()

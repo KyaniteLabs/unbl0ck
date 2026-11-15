@@ -76,7 +76,7 @@ class WorkspacePathIsScrubbedFromKeys(unittest.TestCase):
         view = needs._ask_card_view(
             {
                 "workspace": {"path": "/srv/private/repo"},
-                "m": {"/srv/private/repo/a": 1, "/srv/private/repo/b": 2},
+                "m": {"/srv/private/repo/a": 1, "[workspace]/a": 2},
             }
         )
         self.assertEqual(sorted(view["m"].values()), [1, 2])
