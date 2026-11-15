@@ -4153,17 +4153,24 @@ def _folder_outside_item(
     }
 
 
-def _stat_hidden(hidden: dict[str, Any], f: Path, st: os.stat_result) -> bool:
+def _stat_hidden(
+    hidden: dict[str, Any], f: Path, st: os.stat_result, attempts: list[int] | None = None
+) -> bool:
     """Whether a folder file is still dismissed at its current mtime, size and content.
 
     Time and size alone repeat after an in-place edit with a restored timestamp, so they only
     pick the candidates: a dismissal holds only when the stored content digest matches the same
     bounded read that makes the file's version. A version stored without a digest, a file that
-    cannot be read or one that differs is not dismissed."""
+    cannot be read or one that differs is not dismissed. The read uses one of *attempts* (the
+    caller's read budget); with none left the file is not dismissed."""
     stored = hidden.get("outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest())
     key = f"{st.st_mtime_ns}:{st.st_size}:"
     if not isinstance(stored, str) or not stored.startswith(key):
         return False
+    if attempts is not None:
+        if attempts[0] <= 0:
+            return False
+        attempts[0] -= 1
     try:
         fd, now = _pinned_open(f, os.O_RDONLY)
         with os.fdopen(fd, "rb") as fh:
@@ -4180,13 +4187,15 @@ def _scan_outside_folder(
     recursive: bool,
     errors: list[str],
     hidden: dict[str, Any] | None = None,
+    attempts: list[int] | None = None,
 ) -> tuple[list[tuple[Path, os.stat_result]], list[tuple[Path, os.stat_result]]]:
     """``(waiting, dismissed)`` eligible regular files under *root*, never following symlinks.
 
     The entry budget is spent on files that still wait (and on everything that is not a
     file): files already dismissed at their current version are the progress made through a
     large folder, so they cost time but not budget, and finishing a page always reaches the
-    next one. The time budget covers every step, including the last directory opened."""
+    next one. The time budget covers every step, including the last directory opened. Each
+    file read to confirm a dismissal uses one of *attempts*."""
     waiting: list[tuple[Path, os.stat_result]] = []
     dismissed: list[tuple[Path, os.stat_result]] = []
     stack: list[tuple[Path, int]] = [(root, 0)]
@@ -4242,7 +4251,7 @@ def _scan_outside_folder(
                             elif recursive:
                                 too_deep = True
                         elif f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
-                            if _stat_hidden(hidden, f, st):
+                            if _stat_hidden(hidden, f, st, attempts):
                                 dismissed.append((f, st))
                             elif charge():
                                 waiting.append((f, st))
@@ -4438,7 +4447,7 @@ def outside_items(
             if root in seen:
                 continue
             seen.add(root)
-            waiting, dismissed = _scan_outside_folder(root, recursive, errors, hidden)
+            waiting, dismissed = _scan_outside_folder(root, recursive, errors, hidden, attempts)
             # A file under two overlapping roots is listed once, where it is shown first.
             waiting = [pair for pair in waiting if pair[0] not in claimed]
             dismissed = [pair for pair in dismissed if pair[0] not in claimed]
@@ -4467,7 +4476,7 @@ def outside_items(
                 if with_hidden:
                     dismissed.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
                     read_hidden, hidden_rest = _read_folder_window(
-                        dismissed, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors
+                        dismissed, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors, attempts
                     )
                 hidden_omitted.update(f for f, _ in hidden_rest)
             for item in shown + read_hidden:

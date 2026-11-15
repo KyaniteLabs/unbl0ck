@@ -105,5 +105,25 @@ class CommentSignature(unittest.TestCase):
         self.assertNotEqual(needs._comments_sig(conn, None, "t"), before)
 
 
+class DismissalReads(OutsideFixture):
+    def test_confirming_a_dismissal_uses_the_read_budget(self):
+        """R6-009: with no read budget, no dismissed folder file is opened to confirm it."""
+        self.watch()
+        f = self.folder / "note.txt"
+        f.write_text("Call the supplier back")
+        (item,) = needs.outside_items(self.home)
+        needs.hide(item["id"], item["version"], self.home)
+        opened = []
+        real = needs._pinned_open
+
+        def spy(p, *a, **kw):
+            opened.append(Path(p))
+            return real(p, *a, **kw)
+
+        with patch.object(needs, "_pinned_open", spy):
+            needs.outside_items(self.home, read_budget=0, unread=[0])
+        self.assertNotIn(f, opened)
+
+
 if __name__ == "__main__":
     unittest.main()
