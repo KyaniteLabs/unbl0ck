@@ -117,6 +117,8 @@ a Kanban board then fails to read, the queue adds a single
 `host: this Hermes lacks N of the M interfaces UNBL0CK uses (...)` line to its errors instead
 of failing deep in a card read.
 
+A row that was run fills the revision cell as `source <commit> / Hermes <version> released <YYYY.M.D>` and the time as `YYYY-MM-DDTHH:MM:SSZ`; `scripts/host_compat.py` (`matrix_row_problems`) rejects any other run row.
+
 | Receipt | Host and OS | Plugin / Hermes revision | Recorded at (UTC) | Result |
 | --- | --- | --- | --- | --- |
 | Source tests and interface check (`pytest`, `scripts/host_compat.py`) | not run | not recorded | not recorded | not run |

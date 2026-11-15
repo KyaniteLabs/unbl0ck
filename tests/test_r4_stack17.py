@@ -289,14 +289,6 @@ class MatrixRowsAreIdentifiable(unittest.TestCase):
                 out.append([c.strip() for c in line.strip().strip("|").split("|")])
         return out
 
-    def test_a_passing_row_names_its_source_revision_hermes_revision_and_utc_time(self):
-        for receipt, host, revision, when, result in self.rows():
-            if result.lower().startswith("not run"):
-                continue
-            self.assertRegex(when, r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", receipt)
-            self.assertRegex(revision, r"source [0-9a-f]{7,40}", receipt)
-            self.assertRegex(revision, r"Hermes \S+", receipt)
-
     def test_the_source_row_is_not_claimed_without_a_run_record(self):
         rows = {r[0]: r for r in self.rows()}
         source = next(r for k, r in rows.items() if k.startswith("Source tests"))
