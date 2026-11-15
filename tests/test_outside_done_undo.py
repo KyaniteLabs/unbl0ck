@@ -43,6 +43,18 @@ class DoneUndo(OutsideFixture):
         self.assertFalse(needs.unhide("outside:filed:" + "0" * 32))
         self.assertTrue(self.record(result).exists())
 
+    def test_undo_clears_done_and_not_for_me_together(self):
+        result = self.file(dedupe_key="a")
+        (it,) = self.queue()
+        self.done(it)
+        needs.hide(it["id"], it["version"])
+        self.assertEqual(self.queue(), [])
+        self.assertTrue(needs.unhide(it["id"]))
+        self.assertEqual([i["id"] for i in self.queue()], [it["id"]])
+        self.assertNotIn(it["id"], needs.load_hidden())
+        self.assertNotIn("done_at", json.loads(self.record(result).read_text()))
+        self.assertFalse(needs.unhide(it["id"]))
+
     def test_not_for_me_on_a_filed_item_is_undoable_through_unhide(self):
         result = self.file(dedupe_key="a")
         (it,) = self.queue()
@@ -231,6 +243,70 @@ class DoneUndoApi(OutsideFixture):
         self.assertEqual(self.client.get("/queue").json()["count"], 1)
         r = self.client.post("/unhide", json={"id": it["id"]})
         self.assertEqual((r.status_code, r.json()["restored"]), (200, False))
+
+
+class UndoTokens(OutsideFixture):
+    """Round-2 review: an Undo names the dismissal it undoes and clears every marker of it."""
+
+    def queue(self):
+        return needs.build_queue()["items"]
+
+    def test_old_undo_cannot_remove_a_newer_done(self):
+        result = self.file(dedupe_key="a")
+        (it,) = self.queue()
+        first = needs.done_outside(it["id"], it["version"])["token"]
+        self.assertTrue(needs.unhide(it["id"], token=first))
+        self.file(dedupe_key="a", body="Changed content, needs you again.")
+        (again,) = self.queue()
+        self.assertNotEqual(again["version"], it["version"])
+        second = needs.done_outside(again["id"], again["version"])["token"]
+        self.assertNotEqual(first, second)
+        self.assertFalse(needs.unhide(it["id"], token=first))  # the stale Undo is refused
+        self.assertEqual(self.queue(), [])
+        self.assertIn("done_at", json.loads(self.record(result).read_text()))
+        self.assertTrue(needs.unhide(it["id"], token=second))
+        self.assertEqual(len(self.queue()), 1)
+
+    def test_old_not_for_me_undo_cannot_remove_a_newer_hide(self):
+        self.file(dedupe_key="a")
+        (it,) = self.queue()
+        needs.hide(it["id"], "v-old")
+        needs.hide(it["id"], it["version"])  # dismissed again at the current version
+        self.assertFalse(needs.unhide(it["id"], token="v-old"))
+        self.assertEqual(self.queue(), [])
+        self.assertTrue(needs.unhide(it["id"], token=it["version"]))
+
+    def test_done_and_not_for_me_on_one_version_are_cleared_together(self):
+        for name in ("done", "hidden"):
+            with self.subTest(undo=name):
+                result = self.file(dedupe_key=name)
+                item = next(i for i in self.queue() if i["id"].endswith(self.record(result).stem))
+                needs.hide(item["id"], item["version"])  # tab A: Not for me
+                done_token = needs.done_outside(item["id"], item["version"])["token"]  # tab B: Done
+                self.assertTrue(all(i["id"] != item["id"] for i in self.queue()))
+                token = done_token if name == "done" else item["version"]
+                self.assertTrue(needs.unhide(item["id"], token=token))
+                self.assertIn(item["id"], [i["id"] for i in self.queue()])  # not left hidden by the other marker
+                self.assertNotIn("done_at", json.loads(self.record(result).read_text()))
+                self.assertNotIn(item["id"], needs.load_hidden())
+                self.assertFalse(needs.unhide(item["id"], token=token))
+                needs.done_outside(item["id"], item["version"])
+                needs.unhide(item["id"])  # cleanup: next subtest starts clean
+
+    def test_desktop_sends_the_token_of_the_dismissal_it_undoes(self):
+        from pathlib import Path
+
+        for name in ("desktop/src/plugin.src.js", "desktop/plugin.js"):
+            src = (Path(__file__).resolve().parents[1] / name).read_text()
+            with self.subTest(name):
+                self.assertIn("token: r.done ? r.token : item.version", src)
+                self.assertIn("{ id: u.id, token: u.token }", src)
+
+    def test_tokenless_callers_keep_the_old_behavior(self):
+        self.file(dedupe_key="a")
+        (it,) = self.queue()
+        needs.done_outside(it["id"], it["version"])
+        self.assertTrue(needs.unhide(it["id"]))
 
 
 if __name__ == "__main__":

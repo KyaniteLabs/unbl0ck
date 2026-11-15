@@ -2,6 +2,7 @@
 
 import json
 import os
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -125,6 +126,54 @@ class NestedFolders(FolderPaging):
         self.make("top.txt")
         self.make("sub/deep.txt")
         self.assertEqual([i["path"] for i in self.items()["items"]], ["top.txt"])
+
+    def test_overlapping_roots_do_not_lose_files_the_parent_window_left_out(self):
+        child = self.folder / "child"
+        child.mkdir()
+        self.settings["outside_dirs"] = f"{self.folder},{child}"
+        self.settings["outside_recursive"] = True
+        with patch.object(needs, "_OUTSIDE_LIMIT", 3):
+            for n in range(4):
+                self.make(f"top{n}.txt", age=n)  # newer than everything in the child
+            for n in range(2):
+                self.make(f"old{n}.txt", age=100 + n, folder=child)
+            paths = {i["path"] for i in self.items()["items"]}
+        # The parent's window holds its newest three; the child's own window still shows both
+        # of its files, so nothing is silently dropped.
+        self.assertTrue({"old0.txt", "old1.txt"} <= {p.split("/")[-1] for p in paths} or
+                        {"child/old0.txt", "child/old1.txt"} <= paths, paths)
+
+    def test_paging_survives_a_backlog_larger_than_the_dismissal_store(self):
+        self.watch()
+        total = needs._HIDDEN_KEEP + needs._OUTSIDE_LIMIT + 100  # 1,300 with production limits
+        for n in range(total):
+            self.make(f"f{n:04d}.txt", age=n)  # f0000 is the newest
+        done = 0
+        order = []
+        for _ in range(total // needs._OUTSIDE_LIMIT + 2):
+            page = self.items()["items"]
+            if not page:
+                break
+            for it in page:
+                order.append(it["path"])
+                needs.done_outside(it["id"], it["version"])
+            done += len(page)
+        self.assertEqual(done, total)
+        self.assertEqual(order, sorted(order), "paging never revisits or skips ahead")
+        self.assertEqual(len(set(order)), total)
+        self.assertEqual(self.items()["items"], [])
+
+    def test_other_dismissals_do_not_evict_folder_progress(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            for n in range(needs._HIDDEN_FOLDER_KEEP):
+                needs.hide(f"outside:folder:{n}", "v", home) if n % 500 == 0 else None
+            needs.hide("outside:folder:keep", "v", home)
+            for n in range(needs._HIDDEN_KEEP + 5):
+                needs.hide(f"chat:p:{n}", "v", home)
+            hidden = needs.load_hidden(home)
+            self.assertIn("outside:folder:keep", hidden)
+            self.assertEqual(sum(1 for k in hidden if k.startswith("chat:")), needs._HIDDEN_KEEP)
 
     def test_recursive_intake_reads_nested_files_read_only(self):
         self.watch()

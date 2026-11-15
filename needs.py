@@ -391,6 +391,19 @@ def visibility(hidden: dict[str, Any], item_id: str, version: str) -> Visibility
 
 
 _HIDDEN_KEEP = 1000
+# Folder Done records are the paging progress through a watched-folder backlog. A scan reads at
+# most OUTSIDE_SCAN_ENTRIES files per folder, so finishing that many must not evict the earliest
+# completions (they would outrank the files still waiting). They keep their own, larger bound.
+_HIDDEN_FOLDER_KEEP = 5000
+
+
+def _trim_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
+    """Oldest-first eviction, separately for folder Done records and every other dismissal."""
+    folder = [k for k in hidden if k.startswith("outside:folder:")]
+    other = [k for k in hidden if not k.startswith("outside:folder:")]
+    drop = set(folder[:-_HIDDEN_FOLDER_KEEP] if len(folder) > _HIDDEN_FOLDER_KEEP else [])
+    drop |= set(other[:-_HIDDEN_KEEP] if len(other) > _HIDDEN_KEEP else [])
+    return {k: v for k, v in hidden.items() if k not in drop} if drop else hidden
 
 
 def hide(item_id: str, version: str, home: Path | None = None) -> None:
@@ -401,35 +414,49 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
         hidden = load_hidden(home, strict=True)
         hidden.pop(item_id, None)
         hidden[item_id] = version
-        if (
-            len(hidden) > _HIDDEN_KEEP
-        ):  # oldest hides first out; the store never grows unbounded
-            hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
+        hidden = _trim_hidden(hidden)  # oldest first out; the store never grows unbounded
         _write_json(_hidden_path(home), hidden)
 
 
-def unhide(item_id: str, home: Path | None = None) -> bool:
-    """Undo "Not for me" or a local Done. Returns whether anything was restored."""
-    filed = _FILED_ID.fullmatch(str(item_id))
-    if filed:
-        with _state_lock(home):
+def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:
+    """Undo "Not for me" or a local Done. Returns whether anything was restored.
+
+    ``token`` names the dismissal being undone: the version that was hidden, or the ``token``
+    a Done returned. A caller holding one may only restore that dismissal: a newer one (the
+    item resurfaced with changed content and was dismissed again) is left alone and the
+    answer is False. Without a token every dismissal of the id is restored (older callers).
+    A filed record dismissed twice (Done in one tab, "Not for me" in another) carries both
+    markers; one matching token clears both, under one lock, so the card cannot stay hidden
+    behind the marker the undo did not name."""
+    item_id = str(item_id)
+    token = None if token is None else str(token)
+    filed = _FILED_ID.fullmatch(item_id)
+    with _state_lock(home):
+        hidden = load_hidden(home, strict=True)
+        rec = f = None
+        if filed:
             d = _outside_dir(home)
             _purge_done(d)
             f = d / (filed.group(1) + ".json")
             if not f.is_symlink() and f.is_file():
                 rec = _read_json(f)
-                if _is_done(rec):
-                    rec.pop("done_at")
-                    _write_json(f, rec)
-                    return True
-        # Not locally done: it may have been hidden with "Not for me"; restore that below.
-    with _state_lock(home):
-        hidden = load_hidden(home, strict=True)
+        done = bool(rec) and _is_done(rec)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
-        if item_id not in hidden:
+        is_hidden = item_id in hidden
+        if token is not None:
+            matches = (done and token in (_done_token(rec), str(rec.get("version")))) or (
+                is_hidden and hidden[item_id] == token
+            )
+            if not matches:
+                return False
+        if not done and not is_hidden:
             return False
-        del hidden[item_id]
-        _write_json(_hidden_path(home), hidden)
+        if done:
+            rec.pop("done_at")
+            _write_json(f, rec)
+        if is_hidden:
+            del hidden[item_id]
+            _write_json(_hidden_path(home), hidden)
         return True
 
 
@@ -1402,6 +1429,7 @@ def chat_items(
     *,
     full: bool = False,
     coverage: dict[str, Any] | None = None,
+    full_limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
     last visible turn is the bot asking you something you have not answered.
@@ -1554,7 +1582,8 @@ def chat_items(
                         "title": f"{_bot_name(home, profile)} is asking you",
                         "ask": _excerpt(content),
                         "ask_truncated": _is_excerpted(content),
-                        **(_full_fields(content) if full else {}),
+                        # Only the first `full_limit` items pay for a full-text copy.
+                        **(_full_fields(content) if full and (full_limit is None or len(items) < full_limit) else {}),
                         "why": f"Last turn in this {where_} is a question for you",
                         "owner": profile,
                         "priority": 0,
@@ -1839,7 +1868,11 @@ def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitSt
 
 
 def wait_items(
-    home: Path | None = None, errors: list[str] | None = None, *, full: bool = False
+    home: Path | None = None,
+    errors: list[str] | None = None,
+    *,
+    full: bool = False,
+    full_limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Open live prompts. A wait whose process is gone is deleted, not shown."""
     home = home or hermes_home()
@@ -1863,6 +1896,8 @@ def wait_items(
         profile = str(rec.get("profile") or "default")
         who = _bot_name(home, profile) if profile != "default" else "An agent"
         platform = str(rec.get("platform") or "")
+        expand = full and kind != "sudo" and (full_limit is None or len(items) < full_limit)
+        fields = _full_fields(str(rec.get("prompt") or "")) if expand else {}
         items.append(
             {
                 "id": f"prompt:{rid}",
@@ -1878,12 +1913,8 @@ def wait_items(
                 # A password prompt is never expanded: its excerpt is all the queue ever shows.
                 "ask_truncated": kind != "sudo" and _is_excerpted(str(rec.get("prompt") or "")),
                 **(
-                    {
-                        **_full_fields(str(rec.get("prompt") or "")),
-                        "text_cut": _full_fields(str(rec.get("prompt") or ""))["text_cut"]
-                        or bool(rec.get("prompt_cut")),
-                    }
-                    if full and kind != "sudo"
+                    {**fields, "text_cut": fields["text_cut"] or bool(rec.get("prompt_cut"))}
+                    if expand
                     else {}
                 ),
                 "why": "Its run is paused until you answer"
@@ -1957,8 +1988,8 @@ def search_text(query: Any) -> dict[str, Any]:
     home = hermes_home()
     readers = (
         ("outside", lambda errs: outside_items(errors=errs)),
-        ("chat", lambda errs: chat_items(home, errors=errs, full=True)),
-        ("prompt", lambda errs: wait_items(home, errors=errs, full=True)),
+        ("chat", lambda errs: chat_items(home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS)),
+        ("prompt", lambda errs: wait_items(home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS)),
     )
     matches: list[dict[str, str]] = []
     searched: dict[str, int] = {}
@@ -1984,7 +2015,8 @@ def search_text(query: Any) -> dict[str, Any]:
                 private += 1  # password prompts are never expanded, searched or returned
                 continue
             text = str(item.get("text") or item.get("ask") or "")
-            if len(text) > SEARCH_MAX_CHARS:
+            # The readers already cut chat and prompt text at the same limit and say so.
+            if item.get("text_cut") or len(text) > SEARCH_MAX_CHARS:
                 cut += 1
                 text = text[:SEARCH_MAX_CHARS]
             hay = f"{item.get('title') or ''}\n{text}".casefold()
@@ -2041,6 +2073,11 @@ def _outside_field(
         marker = "\n[truncated]"
         return value[: limit - len(marker)] + marker
     return value[:limit]
+
+
+def _done_token(rec: dict[str, Any]) -> str:
+    """Names one Done: a later Done of the same record gets a new token."""
+    return repr(rec.get("done_at"))
 
 
 def _is_done(rec: dict[str, Any]) -> bool:
@@ -2157,6 +2194,26 @@ def file_outside(
                 for f in files
                 if not f.is_symlink() and _dedupe_matches(_read_json(f), key, scope, caller)
             ]
+            if scope == "profile" and caller and not found:
+                # Before profile resolution, a tool call stored no profile. That record is
+                # the only copy of the key. Adopt one of those; never guess among several.
+                legacy = []
+                for f in files:
+                    if f.is_symlink():
+                        continue
+                    rec = _read_json(f)
+                    if (
+                        rec.get("dedupe_key") == key
+                        and "dedupe_scope" not in rec
+                        and not str(rec.get("profile") or "")
+                    ):
+                        legacy.append(f)
+                if len(legacy) > 1:
+                    raise ValueError(
+                        f"dedupe_key matches {len(legacy)} legacy items with no profile; "
+                        "resolve by id or pass dedupe_scope"
+                    )
+                found = legacy
             if scope is None and len(found) > 1:
                 raise ValueError(
                     f"dedupe_key matches {len(found)} items in different profiles; "
@@ -2181,9 +2238,17 @@ def file_outside(
         old = _read_json(match) if match else {}
         record_id = match.stem if match else uuid.uuid4().hex
         item_id = f"outside:filed:{record_id}"
-        version = hashlib.sha256(
-            json.dumps(fields, sort_keys=True, ensure_ascii=False).encode()
-        ).hexdigest()
+        def digest(values: dict[str, Any]) -> str:
+            return hashlib.sha256(
+                json.dumps(values, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
+
+        version = digest(fields)
+        # A record filed before the profile was known has a version computed with an empty
+        # profile. Adopting it into a profile is not a change to the claim: keep that version so
+        # the human's Done or Not for me still applies.
+        if old and fields["profile"] and old.get("version") == digest({**fields, "profile": ""}):
+            version = old["version"]
         rec = {
             **fields,
             "id": item_id,
@@ -2389,7 +2454,7 @@ def outside_items(
     recursive = outside_recursive()
     hidden = load_hidden(home, errors=errors) if str(raw).strip() else {}
     seen: set[Path] = set()
-    collected: set[Path] = set()  # a file under two overlapping roots is listed once
+    claimed: set[Path] = set()  # a file under two overlapping roots is listed once, where it is shown
     for name in str(raw).split(","):
         if not name.strip():
             continue
@@ -2404,9 +2469,8 @@ def outside_items(
             candidates = []
             hidden_pairs = []
             for pair in _scan_outside_folder(root, recursive, errors):
-                if pair[0] in collected:
+                if pair[0] in claimed:
                     continue
-                collected.add(pair[0])
                 state = visibility(
                     hidden,
                     "outside:folder:" + hashlib.sha256(str(pair[0]).encode()).hexdigest(),
@@ -2433,6 +2497,7 @@ def outside_items(
                     item = _folder_outside_item(f, root, st)
                     if item is not None:
                         items.append(item)
+                        claimed.add(f)
                 except (OSError, ValueError) as exc:
                     errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
         except (OSError, ValueError, RuntimeError) as exc:
@@ -2475,7 +2540,8 @@ def done_outside(
                 rec["done_at"] = time.time()
                 _write_json(f, rec)
                 _purge_done(d)  # enforce the keep limit now that this one counts
-        return {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS}
+            token = _done_token(rec)
+        return {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS, "token": token}
     if not _FOLDER_ID.fullmatch(item_id):
         raise ValueError("id must identify an outside item")
     hide(item_id, version, home)

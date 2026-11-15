@@ -142,6 +142,15 @@ class EmptyAndIncomplete(unittest.TestCase):
         self.assertNotIn("Card ", pkg.slash_unbl0ck(platform="telegram"))
         self.assertEqual(q["count"], 0)
 
+    def test_incomplete_empty_ask_list_still_discloses_stuck_and_answered(self):
+        with_queue({"count": 0, "counts": {"asks": 0, "answered": 1, "stuck": 1}, "errors": ["kanban: boom"],
+                    "items": [kanban(1, "stuck"), kanban(2, "answered")]})
+        out = pkg._summary()
+        self.assertIn("Not listed here: 1 stuck, 1 answered", out)
+        self.assertIn("(source error: kanban: boom)", out)
+        self.assertNotIn("Nothing is blocked on you.", out)
+        self.assertNotIn("Card ", out.split("Not listed here:")[0])
+
     def test_all_clear_stays_all_clear_without_other_cards(self):
         with_queue({"count": 0, "counts": {"asks": 0, "answered": 0, "stuck": 0}, "errors": [], "items": []})
         self.assertEqual(pkg._summary(), "Nothing is blocked on you.")
