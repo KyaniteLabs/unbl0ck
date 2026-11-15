@@ -3723,7 +3723,11 @@ class _HtmlStop(Exception):
 
 
 _CSS_COMMENT = re.compile(r"/\*.*?(?:\*/|\Z)", re.S)
-_CSS_DECL = re.compile(r"([-\w]+)\s*:\s*([^;{}]*)")
+# CSS whitespace is only space, tab, LF, CR and FF, and CSS lowercases ASCII only: any other
+# character is part of a token, so Unicode spaces or case folds cannot turn a value into a keyword.
+_CSS_WS = " \t\n\r\f"
+_CSS_LOWER = {c: c + 32 for c in range(65, 91)}
+_CSS_DECL = re.compile(r"([-\w]+)[ \t\n\r\f]*:[ \t\n\r\f]*([^;{}]*)")
 _CSS_ZERO = re.compile(r"^[+-]?(?:0+(?:\.0*)?|\.0+)(?:[a-z]+|%)?$")
 _CSS_ABS_LENGTH = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:px|pt|pc|cm|mm|in|q|rem|vw|vh|vmin|vmax)$")
 _CSS_REL_LENGTH = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:em|ex|ch|cap|ic|lh|rlh|%)$")
@@ -3731,7 +3735,7 @@ _CSS_FONT_KEYWORDS = frozenset(
     "xx-small x-small small medium large x-large xx-large xxx-large math".split()
 )
 _CSS_INHERIT = frozenset(("inherit", "unset", "revert", "revert-layer"))
-_CSS_IMPORTANT = re.compile(r"\s*!\s*important\s*$")
+_CSS_IMPORTANT = re.compile(r"[ \t\n\r\f]*![ \t\n\r\f]*important[ \t\n\r\f]*\Z")
 _CSS_SIZES = ("width", "height", "max-width", "max-height")
 _CSS_OVERFLOW = ("overflow", "overflow-x", "overflow-y")
 # The properties that can hide an element, per way it was hidden; a stylesheet setting one of them
@@ -3755,11 +3759,15 @@ def _css_declarations(block: str) -> dict[str, list[str]]:
     found: dict[str, list[tuple[str, bool]]] = {}
     for piece in _CSS_COMMENT.sub("", block).split(";"):
         name, sep, value = piece.partition(":")
-        name = name.strip().lower()
+        name = _css_text(name)
         if sep and name in _CSS_HIDING:
-            value = value.strip().lower()
-            found.setdefault(name, []).append((_CSS_IMPORTANT.sub("", value).strip(), bool(_CSS_IMPORTANT.search(value))))
+            value = _css_text(value)
+            found.setdefault(name, []).append((_CSS_IMPORTANT.sub("", value), bool(_CSS_IMPORTANT.search(value))))
     return {n: [v for v, imp in vs if imp] or [v for v, _ in vs] for n, vs in found.items()}
+
+
+def _css_text(raw: str) -> str:
+    return raw.strip(_CSS_WS).translate(_CSS_LOWER)
 
 
 def _css_zero(value: str) -> bool:
@@ -3796,7 +3804,7 @@ _CSS_DISPLAY_WORDS = frozenset(
 
 def _css_display_shows(value: str) -> bool:
     """Whether an inline ``display`` value is a real one that overrides the ``hidden`` attribute."""
-    words = value.split()
+    words = re.split(r"[ \t\n\r\f]+", value)
     picks = [g.intersection(words) for g in _CSS_DISPLAY_GROUPS]
     if len(words) == 1:
         return words[0] in _CSS_DISPLAY_WORDS
@@ -3972,11 +3980,11 @@ class _InertText(html.parser.HTMLParser):
         top = self.stack[-1] if self.stack else None
         if top and top.tag == "style" and not self.open_count["template"]:
             for name, value in _CSS_DECL.findall(_CSS_COMMENT.sub("", data)):
-                name, value = name.lower(), value.strip().lower()
+                name, value = _css_text(name), _css_text(value)
                 if name in _CSS_HIDING:
                     important = bool(_CSS_IMPORTANT.search(value))
                     self.sheet[name] = self.sheet.get(name, False) or important
-                    self.sheet_hides |= _css_could_hide(name, _CSS_IMPORTANT.sub("", value).strip())
+                    self.sheet_hides |= _css_could_hide(name, _CSS_IMPORTANT.sub("", value))
         if top and top.tag in _HTML_NO_TEXT and data.strip() and self.open_count["table"]:
             i = self._nearest("table")
             self._emit(data, self._causes(self.stack[i - 1] if i else None))  # shown before the table
