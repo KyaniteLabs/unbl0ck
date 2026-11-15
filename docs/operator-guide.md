@@ -53,7 +53,11 @@ after a transport failure. A terminal model failure permits a new attempt. Compl
 results can be read repeatedly: polling does not consume them. At most 128 settled
 results are retained in completion order, and every job expires 15 minutes after creation.
 A restart loses in-memory jobs; the UI reports an unknown/expired job and offers a fresh
-attempt. The client polls for up to 150 seconds per attempt.
+attempt. The client polls for up to 150 seconds per attempt, counted from the first request
+and checked after every response, including a finished answer. Each Ask carries a random
+request ID that Retry reuses, so a lost response cannot start a second model call, and it
+carries the card version, so a changed card is refused instead of answered from old context.
+A follow-up over 20,000 characters, or one the server refuses, is not kept in the conversation.
 
 The displayed Ask conversation remains intact while that card is mounted. Requests
 send its latest 50 messages; the server then applies `ask_history_turns`. Conversation

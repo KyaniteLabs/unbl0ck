@@ -464,7 +464,8 @@ class ShortMultilineText(OutsideFixture):
 ITEM_PRELUDE = r"""
 const fs = require('fs'), assert = require('node:assert/strict');
 const src = fs.readFileSync(process.argv[1], 'utf8');
-const views = src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
+const tldr = src.match(/const TLDR_ASK = .*\n/)[0];
+const views = tldr + src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
 const noop = () => {};
 const node = (type, props) => ({type, props});
 let state = [], cursor = 0, effects = [], deps = [], undoSet = [];
@@ -477,7 +478,7 @@ const env = {
   sfx: {play: noop}, petEmit: noop, host: {notify: noop, notifyError: e => {throw e}},
   $undo: {set: v => { undoSet.push(v) }}, $queue: 'queue', $fxOn: 'fx', UNDO_MS: 12000, askCount: q => q.count,
   Field: noop, Watermark: noop, Banner: noop, Pet: noop, Ticker: noop, FxToggle: noop, SfxToggle: noop,
-  grainUrl: () => '', oldestAskSince: () => 0,
+  grainUrl: () => '', oldestAskSince: () => 0, replyPlain: x => x, replyParts: x => x,
 };
 const {Item} = new Function('env', `with(env) { ${views}; return {Item}; }`)(env);
 function all(n) { if (n == null) return []; if (Array.isArray(n)) return n.flatMap(all); if (typeof n !== 'object') return [n]; return [n, ...all(n.props?.children)]; }
@@ -580,6 +581,139 @@ class JobTables(unittest.TestCase):
         self.assertEqual(table.get("b")["reply"], "B")
         api = (ROOT / "dashboard/plugin_api.py").read_text()
         self.assertNotIn("journal", api.lower())
+
+
+ASK_HELPERS = r"""
+const btn = (tree, label) => all(tree).find(x => x?.type === 'button' && x.props.children === label);
+const box = tree => all(tree).find(x => x?.type === 'textarea' && x.props['aria-label'] === 'Ask a follow-up');
+const tick = () => new Promise(r => setImmediate(r));
+const chat = {source: 'kanban', id: 'kanban:default:task', board: 'default', task_id: 'task', version: '1', title: 'Launch', ask: 'Which day?', tier: 'ask', since: 1};
+function mount(ctx, item = chat, extra = {}) {
+  state = []; deps = []; effects = [];
+  const render = () => { cursor = 0; effects = []; return Item({ctx, item, n: 1, refresh: extra.refresh || (async () => {}), askEnabled: true}); };
+  return render;
+}
+"""
+
+
+class DesktopRound4(unittest.TestCase):
+    def check(self, body):
+        for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
+            with self.subTest(path=path.name):
+                result = subprocess.run(
+                    ["node", "-e", ITEM_PRELUDE + ASK_HELPERS + body, str(path)],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_undo_is_offered_before_the_queue_refresh_finishes(self):
+        """01-014: a hung refresh must not hold back Undo for a dismissal that already succeeded."""
+        self.check(r"""
+const ctx = {rest: async url => url === '/outside/done' ? {hidden: true} : {}};
+const item = {id: 'outside:x', version: '1', source: 'outside', origin: 'filed', title: 't', ask: 'a', act_where: 'somewhere', since: 1};
+const render = mount(ctx, item, {refresh: () => new Promise(() => {})});
+(async () => {
+  btn(render(), 'Done').props.onClick();
+  await tick(); await tick();
+  assert.equal(undoSet.length, 1, 'Undo must be registered while the refresh is still pending');
+  assert.equal(undoSet[0].id, 'outside:x');
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
+    def test_a_refused_oversize_follow_up_never_enters_the_history(self):
+        """01-015: 20,001 characters is refused on the client; a later short question is sent alone."""
+        self.check(r"""
+const sent = [];
+const ctx = {rest: async (url, o) => { sent.push(o?.body); return {reply: 'ok'}; }};
+const render = mount(ctx);
+(async () => {
+  btn(render(), 'TL;DR').props.onClick(); await tick();
+  const first = sent.length;
+  box(render()).props.onChange({target: {value: 'x'.repeat(20001)}});
+  await btn(render(), 'Send').props.onClick();
+  assert.equal(sent.length, first, 'an oversize message is not sent');
+  assert.ok(text(render()).includes('20000'), 'the limit is explained');
+  assert.equal(box(render()).props.value.length, 20001, 'the text stays in the box');
+  box(render()).props.onChange({target: {value: 'short'}});
+  await btn(render(), 'Send').props.onClick();
+  const last = sent[sent.length - 1];
+  assert.ok(last.messages.every(m => m.content.length <= 20000), 'the oversize text never reaches the server');
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
+    def test_an_admission_refusal_rolls_the_message_back_and_restores_the_input(self):
+        """01-015: a 4xx refusal removes the refused message from history, so it is never resent."""
+        self.check(r"""
+const sent = [];
+let refuse = true;
+const ctx = {rest: async (url, o) => {
+  sent.push(o?.body);
+  if (url === '/card/ask' && refuse && o.body.messages.length > 1) { const e = new Error('HTTP 422: too long'); e.status = 422; throw e; }
+  return {reply: 'fine'};
+}};
+const render = mount(ctx);
+(async () => {
+  btn(render(), 'TL;DR').props.onClick(); await tick();
+  box(render()).props.onChange({target: {value: 'bad follow-up'}});
+  await btn(render(), 'Send').props.onClick();
+  assert.equal(box(render()).props.value, 'bad follow-up', 'the refused text comes back for editing');
+  refuse = false;
+  box(render()).props.onChange({target: {value: 'good follow-up'}});
+  await btn(render(), 'Send').props.onClick();
+  const last = sent[sent.length - 1].messages.map(m => m.content);
+  assert.ok(!last.includes('bad follow-up'), 'the refused message is not resent');
+  assert.ok(last.includes('good follow-up'));
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
+    def test_the_request_carries_the_card_version_and_a_stable_request_id(self):
+        """01-016 and 01-017: the version binds the request; Retry after a lost POST reuses the id."""
+        self.check(r"""
+const posts = [];
+let lose = true;
+const ctx = {rest: async (url, o) => {
+  if (url === '/card/ask') {
+    posts.push(o.body);
+    if (lose) { lose = false; throw new Error('network down'); }
+    return {reply: 'answer'};
+  }
+  return {};
+}};
+const render = mount(ctx);
+(async () => {
+  btn(render(), 'TL;DR').props.onClick(); await tick();
+  assert.equal(posts[0].version, '1');
+  assert.match(posts[0].request_id, /^[0-9a-f]{32}$/);
+  await btn(render(), 'Retry').props.onClick();
+  assert.equal(posts.length, 2);
+  assert.equal(posts[1].request_id, posts[0].request_id, 'Retry reuses the id of the lost request');
+  box(render()).props.onChange({target: {value: 'next'}});
+  await btn(render(), 'Send').props.onClick();
+  assert.notEqual(posts[2].request_id, posts[0].request_id, 'a new question gets a new id');
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
+    def test_the_150_second_limit_covers_posts_sleeps_and_terminal_replies(self):
+        """01-018: polls that each take 30 s must fail at the limit, even when the last one answers."""
+        self.check(r"""
+let now = 0;
+env.Date = {now: () => now};
+env.setTimeout = (fn, ms) => { now += ms; fn(); return 1; };
+let polls = 0;
+const ctx = {rest: async url => {
+  if (url === '/card/ask') { now += 30000; return {pending: true, job: 'j'}; }
+  if (!url.startsWith('/card/ask/')) return {};
+  polls++; now += 30000;
+  return polls < 6 ? {pending: true, job: 'j'} : {ok: true, reply: 'late answer'};
+}};
+const render = mount(ctx);
+(async () => {
+  btn(render(), 'TL;DR').props.onClick(); await tick(); await tick();
+  assert.ok(!text(render()).includes('late answer'), 'an answer after 150 s is not accepted');
+  assert.ok(text(render()).includes('over 150 s'));
+  assert.ok(now <= 150000 + 30000 + 1500, 'no sleep runs past the limit: ' + now);
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
 
 
 if __name__ == "__main__":
