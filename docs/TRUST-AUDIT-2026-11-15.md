@@ -7,12 +7,14 @@ An outside audit found 15 gaps in how UNBL0CK checks its own guarantees (#71). T
 | Check | Before | After |
 |---|---|---|
 | CI lint job (`ruff check .`) | none | runs; clean |
+| CI type-check job (mypy) | none | runs; fails on any error outside the 69-error baseline |
 | CI job timeout | none | 20 min tests, 10 min lint |
 | CI dependency cache | none | uv cache on |
 | Production `# noqa: BLE001` with no reason | 15 | 0 |
 | Property-based (Hypothesis) test files | 0 | 1 |
 | Feature list tied to tests | none | `docs/FEATURES.md`, 36 behaviours, checked by `tests/test_features_doc.py` |
 | Test that `subprocess` is started in one place | none | `tests/test_subprocess_sites.py` |
+| CI check that a fix's new tests fail without the fix | none | `.github/scripts/new_tests_bite.py`, on pull requests |
 | Dead image links in `design/CANON.md` | 2 | 0 |
 | `.claude/` in `.gitignore` | no | yes |
 | Skip directives in tests | 50 | 51 (one new Windows-only skip; CI still fails on any skipped test) |
@@ -22,8 +24,8 @@ An outside audit found 15 gaps in how UNBL0CK checks its own guarantees (#71). T
 | # | Finding | Status |
 |---|---|---|
 | 1 | Allowlist card view (the queue's trust boundary) is spread across `needs.py` | Fixed: Ask builds its payload from a fixed list of named fields in `_ask_card_payload`, pinned by `tests/test_r5_stack01_ask.py` |
-| 2 | Process-start test is a characterization labelled as a contract; redaction tests assert on substrings | Fixed: the ps test is relabelled and a syntax-tree scan pins the one process start; `assert_redacted` fails on any surviving 4-character piece of a secret |
-| 3 | CI runs no linter or type checker | Fixed for lint (ruff). No type-check job: mypy is not set up and could not be shown passing |
+| 2 | Process-start test is a characterization labelled as a contract; redaction tests assert on substrings | Fixed: the ps test is relabelled and a syntax-tree scan pins the one process start; `assert_redacted` fails on any surviving 4-character piece of a secret. On pull requests, CI runs each `fix` commit's new tests against the parent's code and fails if any pass |
+| 3 | CI runs no linter or type checker | Fixed. Lint: ruff. Types: mypy, against a baseline of the 69 errors present when it was added; each was read and is a value checked elsewhere that mypy cannot see, not a defect |
 | 4 | CI has no job timeout or dependency cache | Fixed. Making the checks required on `main` is a repository setting for the owner |
 | 5 | No feature list or driver | Fixed: `docs/FEATURES.md` |
 | 6 | No property-based tests for the state machines | Fixed: Hypothesis state machines for Ask jobs and for outside Done, Not for me and Undo |
