@@ -250,6 +250,7 @@ def _queue_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
 
 def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
     key = (item["id"], item["version"])
+    started = time.time()
     try:
         try:
             comments = n.recent_comments(item)
@@ -260,7 +261,7 @@ def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
             n.bluf_messages(item, comments), purpose="unbl0ck.bluf", temperature=0.1, max_tokens=BLUF_MAX_TOKENS, timeout=90
         )
         bluf, why = n.parse_bluf(result.text)
-        n.save_bluf(item["id"], item["version"], bluf, why)
+        n.save_bluf(item["id"], item["version"], bluf, why, started_at=started)
         _BLUF_JOBS.succeed(key)
     except Exception as exc:  # noqa: BLE001 - logged; the card keeps its raw text and retries later
         log.warning("unbl0ck: summary for %s failed: %s: %s", item["id"], type(exc).__name__, exc)
@@ -346,7 +347,10 @@ def card_ask(body: CardAsk):
     except Exception as exc:
         _ASK_SLOTS.release()
         _ASK_JOBS.fail(job, "could not start Ask")
-        _ASK_JOBS.consume(job)
+        try:
+            _ASK_JOBS.consume(job)
+        except jobs.DiscardFailed:
+            pass  # the settled record expires on its own; the caller still gets the 503 below
         log.warning("unbl0ck: could not submit Ask: %s", type(exc).__name__)
         raise HTTPException(status_code=503, detail="Ask could not start. Retry in a moment.") from exc
     return {"ok": True, "pending": True, "job": job}
