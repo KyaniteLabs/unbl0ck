@@ -2679,6 +2679,11 @@ def _proc_start(pid: int) -> str | None:
     return out or None
 
 
+def _valid_pid(v: Any) -> int | None:
+    """A process id ``os.kill`` accepts (1 to 2**31-1), or None."""
+    return v if isinstance(v, int) and not isinstance(v, bool) and 0 < v < 2**31 else None
+
+
 def _alive(pid: int, start: str | None) -> bool:
     try:
         os.kill(pid, 0)
@@ -2784,11 +2789,8 @@ def _other_process_faults(home: Path, errors: list[str]) -> None:
     for rid, entry in data.items():
         if not isinstance(entry, dict):
             continue
-        try:
-            pid = int(entry.get("pid") or 0)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if pid <= 0 or pid == os.getpid():
+        pid = _valid_pid(entry.get("pid"))
+        if pid is None or pid == os.getpid():
             continue
         if not _alive(pid, entry.get("proc_start")):
             _journal_fault(home, rid, None)  # its prompts died with it
@@ -2916,14 +2918,11 @@ class WaitState(str, Enum):
 def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitState:
     """Classify one wait record read from *f* (an empty dict means unreadable)."""
     now = time.time() if now is None else now
-    try:
-        pid = int(rec.get("pid") or 0)
-    except (TypeError, ValueError, OverflowError):
-        pid = 0
+    pid = _valid_pid(rec.get("pid"))
     rid = str(rec.get("request_id") or "")
     if (
         not rec
-        or pid <= 0
+        or pid is None
         or not _SAFE_ID.match(rid)
         or f.stem != rid
         or now - _num(rec.get("since")) > WAIT_MAX_AGE
