@@ -1,6 +1,7 @@
 """Every lifecycle UNBL0CK keeps, named and checked: the derived state tables, each legal
 transition, each illegal one refused, legacy values still read, and a seeded random walk per
-machine that checks the invariants after every step (stdlib only here; the property tests use Hypothesis)."""
+machine that checks the invariants after every step. These walks use the stdlib only; the
+Hypothesis state machines for Ask jobs and outside dismissals are in test_state_properties.py."""
 
 import importlib.util
 import json
