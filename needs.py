@@ -3741,6 +3741,20 @@ def _css_font_kind(value: str) -> str | None:
     return None
 
 
+_CSS_DISPLAY_WORDS = frozenset(
+    "block inline run-in flow flow-root table flex grid ruby list-item contents math inline-block "
+    "inline-table inline-flex inline-grid table-row-group table-header-group table-footer-group "
+    "table-row table-cell table-column-group table-column table-caption ruby-base ruby-text "
+    "ruby-base-container ruby-text-container".split()
+)
+
+
+def _css_display_shows(value: str) -> bool:
+    """Whether an inline ``display`` value is a real one that overrides the ``hidden`` attribute."""
+    words = value.split()
+    return value in ("initial", "unset", "inherit") or 0 < len(words) <= 3 and all(w in _CSS_DISPLAY_WORDS for w in words)
+
+
 def _css_could_hide(name: str, value: str) -> bool:
     return (
         (name == "display" and value == "none")
@@ -3855,20 +3869,25 @@ class _InertText(html.parser.HTMLParser):
             raise _HtmlStop
         gone, vis, font = (parent.gone, parent.vis, parent.font) if parent else (None, None, None)
         own: tuple[_Region, ...] = ()
-        if gone is None:
+        if tag in _HTML_DROP:  # inert whatever its ancestors' visibility, never borrowing their doubt
+            gone = _Region("drop")
+            own = (gone,)
+        elif gone is None:
             a = {k: (v or "") for k, v in attrs}
             d = _css_declarations(a.get("style", ""))
+            disp = d.get("display", [])
             clip = any(v in ("hidden", "clip", "scroll", "auto") for p in _CSS_OVERFLOW for v in d.get(p, ()))
             cause = (
-                "drop" if tag in _HTML_DROP
-                else "display" if "none" in d.get("display", ())
-                else "hidden" if "hidden" in a and "display" not in d
+                "display" if "none" in disp
+                else "hidden" if "hidden" in a and not (disp and all(map(_css_display_shows, disp)))
                 else "opacity" if any(_css_zero(v) for v in d.get("opacity", ()))
                 else "clip" if clip and any(_css_zero(v) for p in _CSS_SIZES for v in d.get(p, ()))
                 else None
             )
             if cause:
-                gone = _Region(cause, any(len(set(d.get(p, ()))) > 1 for p in _CSS_CAUSES[cause]))
+                # ``hidden`` beside a display value the converter does not know is a doubt, not a show.
+                doubt = cause == "hidden" and bool(disp)
+                gone = _Region(cause, doubt or any(len(set(d.get(p, ()))) > 1 for p in _CSS_CAUSES[cause]))
                 own = (gone,)
             else:
                 vis, v_own = _css_inherited(d.get("visibility", []), vis, "visibility", _css_vis_kind)
@@ -5494,6 +5513,9 @@ _ASK_SECRET_KEY = (
     r"authentication|authorization|cookie|oauth|auth|storepass)"
     r"[a-z0-9_.-]{0,32}"
 )
+# A key whose value is a short numeric code (``otp``, ``login_pin``); secret only with digits as its value.
+_ASK_CODE_KEY = r"(?:[a-z0-9]+[_.-]){0,3}(?:bearer|t?otp|pin|passcode|session[_-]?id|signing[_-]?key)"
+_ASK_CREDENTIAL_NAME = rf"(?:{_ASK_SECRET_KEY}|{_ASK_CODE_KEY})"
 
 
 _ASK_SECRET_PATTERNS = (
@@ -5594,7 +5616,7 @@ _ASK_SECRET_PATTERNS = (
 )
 
 _ASK_SECRET_KEY_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])" + _ASK_SECRET_KEY + r"(?![A-Za-z0-9_.-])",
+    r"(?<![A-Za-z0-9_.-])" + _ASK_CREDENTIAL_NAME + r"(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
 _ASK_NON_SECRET_AUTH_KEYS = frozenset(
@@ -5679,15 +5701,13 @@ _ASK_SECRET_KEY_TERMINALS = frozenset(
         "storepass",
     }
 )
-# Keys whose value is a short numeric code: secret only as digits in key position (``otp=123456``).
 _ASK_CODE_KEY_TERMINALS = frozenset({"bearer", "otp", "totp", "pin", "passcode", "sessionid"})
 _ASK_CODE_ASSIGNMENT = re.compile(
-    r"""(?i)(?<![A-Za-z0-9_.-])(?P<key>["']?(?:[a-z0-9]+[_.-]){0,3}"""
-    r"""(?:bearer|t?otp|pin|passcode|session[_-]?id|signing[_-]?key)["']?)"""
+    rf"""(?i)(?<![A-Za-z0-9_.-])(?P<key>["']?{_ASK_CODE_KEY}["']?)"""
     r"""(?P<sep>[ \t]*[=:][ \t]*)(?P<value>"\d+"|'\d+'|\d+)(?![A-Za-z0-9_.-])"""
 )
 _ASK_SECRET_ASSIGNMENT = re.compile(
-    rf"""(?ix)(?<![A-Za-z0-9.-])(?P<flag>--)?(?P<key_open>\\*["']?)(?P<key>{_ASK_SECRET_KEY})(?P<key_close>\\*["']?)(?![A-Za-z0-9_.-])"""
+    rf"""(?ix)(?<![A-Za-z0-9.-])(?P<flag>--)?(?P<key_open>\\*["']?)(?P<key>{_ASK_CREDENTIAL_NAME})(?P<key_close>\\*["']?)(?![A-Za-z0-9_.-])"""
     r"""(?P<sep>[ \t]*(?:=>|[=:])[ \t]*(?:\r?\n[ \t]*)?|[ \t]+)"""
 )
 
@@ -5819,6 +5839,11 @@ def _ask_secret_key_is_exact(key: str) -> bool:
         and len(parts) > 1
         and parts[-2] in {"api", "access", "private", "secret", "signing"}
     )
+
+
+def _ask_names_credential(name: str) -> bool:
+    """Whether *name* could hold a credential, so its value goes to ``_ask_is_secret_key``."""
+    return _ask_secret_word(name) is not None or _ask_secret_key_is_exact(name)
 
 
 def _ask_harmless_secret_value(value: Any) -> bool:
@@ -5997,7 +6022,7 @@ _ASK_YAML_FIELD = re.compile(
     r"(?P<key>[A-Za-z0-9_.-]+)(?P=quote)\s*:\s*(?P<value>[^\r\n]*)"
 )
 _ASK_YAML_EXPLICIT_FIELD = re.compile(
-    rf"(?im)^(?P<indent>[ \t]*)\?[ \t]*(?P<key>{_ASK_SECRET_KEY})[ \t]*"
+    rf"(?im)^(?P<indent>[ \t]*)\?[ \t]*(?P<key>{_ASK_CREDENTIAL_NAME})[ \t]*"
     r"\r?\n(?P=indent):[ \t]*(?P<value>[^\r\n]*)"
 )
 _ASK_YAML_BLOCK = re.compile(
@@ -6054,12 +6079,12 @@ def _ask_yaml_scalar_end(
 def _ask_flow_secret_values(text: str) -> str:
     quoted_value = r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,}]+"""
     name_first = re.compile(
-        rf"""(?ix)(?P<before>["']?(?:name|key)["']?\s*:\s*["']?)(?P<name>{_ASK_SECRET_KEY})"""
+        rf"""(?ix)(?P<before>["']?(?:name|key)["']?\s*:\s*["']?)(?P<name>{_ASK_CREDENTIAL_NAME})"""
         rf"""(?P<after>["']?\s*,\s*["']?(?:value|val|default)["']?\s*:\s*)(?P<value>{quoted_value})"""
     )
     value_first = re.compile(
         rf"""(?ix)(?P<before>["']?(?:value|val|default)["']?\s*:\s*)(?P<value>{quoted_value})"""
-        rf"""(?P<between>\s*,\s*["']?(?:name|key)["']?\s*:\s*["']?)(?P<name>{_ASK_SECRET_KEY})(?P<endquote>["']?)"""
+        rf"""(?P<between>\s*,\s*["']?(?:name|key)["']?\s*:\s*["']?)(?P<name>{_ASK_CREDENTIAL_NAME})(?P<endquote>["']?)"""
     )
 
     def replacement(raw: str) -> str:
@@ -6097,7 +6122,7 @@ def _ask_redact_yaml(text: str) -> str:
         if field is None or field.group("key").casefold() not in {"name", "key"}:
             continue
         name = field.group("value").strip().strip("\"'")
-        if _ask_secret_word(name) is None:
+        if not _ask_names_credential(name):
             continue
         base_indent = _ask_yaml_indent(field)
         paired = False
@@ -6133,7 +6158,7 @@ def _ask_redact_yaml(text: str) -> str:
         key = field.group("key")
         raw_value = field.group("value")
         paired_name = paired_values.get(index)
-        direct_secret = _ask_secret_word(key) is not None
+        direct_secret = _ask_names_credential(key)
         if direct_secret and raw_value.lstrip().startswith(('"', "'")):
             out.append(lines[index])
             index += 1
@@ -6572,12 +6597,13 @@ def _ask_card_view(
     if _scrub is None:
         _scrub = _ask_workspace_paths(value)
     if isinstance(value, dict):
-        named_secret = any(
-            str(field).casefold() in {"name", "key"}
-            and isinstance(field_value, str)
-            and _ask_secret_word(field_value) is not None
+        named = [
+            field_value
             for field, field_value in value.items()
-        )
+            if str(field).casefold() in {"name", "key"}
+            and isinstance(field_value, str)
+            and _ask_names_credential(field_value)
+        ]
         keys = list(value)
         if _text_budget is not None:
             keys.sort(key=lambda k: _ASK_VIEW_PRIORITY.get(str(k), 8))
@@ -6587,7 +6613,9 @@ def _ask_card_view(
             if _key == "workspace" and k == "path":
                 continue
             key = str(k)
-            if named_secret and key.casefold() in {"value", "val", "default"}:
+            if key.casefold() in {"value", "val", "default"} and any(
+                _ask_secret_word(n) is not None or _ask_is_secret_key(n, v) for n in named
+            ):
                 done[k] = "[redacted]"
             elif _ask_is_secret_key(key, v):
                 done[k] = "[redacted]"
@@ -6601,7 +6629,7 @@ def _ask_card_view(
             if isinstance(k, str):
                 for path in _scrub:
                     name = name.replace(path, "[workspace]")
-                while name != k and name in shown:  # two keys that scrub alike both survive
+                while name in shown:  # a key that scrubs like another key, either order, keeps both
                     name += "#"
             shown[name] = done[k]
         return shown
