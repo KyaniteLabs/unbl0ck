@@ -420,6 +420,27 @@ class BlufJobsMachine(unittest.TestCase):
         self.clock.t += jobs.BlufJobs.STUCK_S
         self.assertTrue(self.j.start(K))  # really stuck: one retry
 
+    def test_failed_entries_past_their_retries_do_not_grow_the_table_forever(self):
+        # Bug: a version that failed MAX_ATTEMPTS times could never start again, so the
+        # prune (which only drops entries that can start) never removed it.
+        with mock.patch.object(jobs.BlufJobs, "MAX_ENTRIES", 20), mock.patch.object(jobs.BlufJobs, "PRUNE_OVER", 10):
+            for i in range(60):
+                key = (f"item{i}", "v")
+                for _ in range(jobs.BlufJobs.MAX_ATTEMPTS):
+                    self.j.start(key)
+                    self.j.fail(key, "boom")
+                    self.clock.t += jobs.BlufJobs.RETRY_S * 8
+                self.clock.t += 1
+            self.assertLessEqual(len(self.j), 20)
+        self.assertIsNone(self.j.state(("item0", "v")))  # the oldest went first
+        self.assertIsNotNone(self.j.state(("item59", "v")))
+
+    def test_the_cap_never_drops_a_pending_job(self):
+        with mock.patch.object(jobs.BlufJobs, "MAX_ENTRIES", 5), mock.patch.object(jobs.BlufJobs, "PRUNE_OVER", 2):
+            for i in range(8):
+                self.assertTrue(self.j.start((f"p{i}", "v")))
+            self.assertTrue(all(self.j.is_pending((f"p{i}", "v")) for i in range(8)))
+
     def test_illegal_transitions_are_refused(self):
         self.j.start(K)
         self.j.fail(K, "x")

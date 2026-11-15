@@ -347,7 +347,10 @@ def card_ask(body: CardAsk):
     except Exception as exc:
         _ASK_SLOTS.release()
         _ASK_JOBS.fail(job, "could not start Ask")
-        _ASK_JOBS.consume(job)
+        try:
+            _ASK_JOBS.consume(job)
+        except jobs.DiscardFailed:
+            pass  # the settled record expires on its own; the caller still gets the 503 below
         log.warning("unbl0ck: could not submit Ask: %s", type(exc).__name__)
         raise HTTPException(status_code=503, detail="Ask could not start. Retry in a moment.") from exc
     return {"ok": True, "pending": True, "job": job}
