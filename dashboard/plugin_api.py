@@ -478,13 +478,14 @@ def outside_done(body: Hide):
 
 class Unhide(BaseModel):
     id: str
+    token: str | None = None
 
 
 @router.post("/unhide")
 def unhide(body: Unhide):
-    _bounded(id=body.id)
+    _bounded(id=body.id, token=body.token or "")
     try:
-        return {"ok": True, "restored": _needs().unhide(body.id)}
+        return {"ok": True, "restored": _needs().unhide(body.id, token=body.token)}
     except TimeoutError:
         raise HTTPException(status_code=409, detail="busy, retry")
     except RuntimeError as exc:
