@@ -1526,8 +1526,13 @@ def chat_asks_you(text: str) -> bool:
     return chat_ask_span(text) > 0
 
 
+def _norm_text(text: str) -> str:
+    """The one-line form every excerpt shows: each run of whitespace is one space, ends trimmed."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
 def _excerpt(text: str, n: int = 480) -> str:
-    text = re.sub(r"\s+", " ", (text or "")).strip()
+    text = _norm_text(text)
     return text if len(text) <= n else "…" + text[-(n - 1) :]
 
 
@@ -1539,15 +1544,13 @@ def _is_excerpted(text: str, n: int = EXCERPT_CHARS) -> bool:
     """True when ``_excerpt`` would change *text*: cut it, or flatten its line breaks and spacing."""
     # Compared with what Full text shows: the first line's indentation is content there, and the
     # excerpt removes it.
-    original, _ = _full_text(text)
-    collapsed = re.sub(r"\s+", " ", original).strip()
-    return len(collapsed) > n or collapsed != original
+    shown = _norm_text(text)
+    return len(shown) > n or shown != _full_text(text)[0]
 
 
 def _is_cut(text: str, n: int = EXCERPT_CHARS) -> bool:
     """True when ``_excerpt`` drops the start of *text* (a literal leading ellipsis is not a cut)."""
-    original, _ = _full_text(text)
-    return len(re.sub(r"\s+", " ", original).strip()) > n
+    return len(_norm_text(text)) > n
 
 
 def _full_text(text: str) -> tuple[str, bool]:
@@ -1564,7 +1567,7 @@ def _full_fields(text: str) -> dict[str, Any]:
 
 
 def _excerpt_head(text: str, n: int = 480) -> str:
-    text = re.sub(r"\s+", " ", (text or "")).strip()
+    text = _norm_text(text)
     return text if len(text) <= n else text[: n - 1] + "…"
 
 

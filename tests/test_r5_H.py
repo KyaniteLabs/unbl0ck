@@ -1,10 +1,14 @@
-"""Round 5, lane H: HTML mail text is never deleted by a guess about hiding, every left-out or cut part
-is noted."""
+"""Round 5, lane H: HTML mail text is never deleted by a guess about hiding, every left-out or cut
+part is noted, and the excerpt and its labels agree with the text they summarise."""
 
+import subprocess
 import unittest
+from pathlib import Path
 
 from test_outside import needs
+from test_r4_stack01 import ITEM_PRELUDE
 
+ROOT = Path(__file__).resolve().parents[1]
 UNSURE = "not evaluated"
 NOT_SHOWN = "Part of this HTML body is not shown"
 
@@ -80,6 +84,29 @@ class LeftOutTextIsNoted(unittest.TestCase):
         self.assertIn(NOT_SHOWN, notes)
         text, notes = convert("<div>" * 30 + "<p>hello</p>", 20)
         self.assertEqual(text, "hello")
+
+
+class ExcerptAgreesWithFullText(unittest.TestCase):
+    def test_indentation_the_excerpt_drops_counts_as_a_change(self):
+        """R5-needs-042: the excerpt drops leading indentation that Full text keeps."""
+        self.assertNotEqual(needs._excerpt("    print(1)"), "    print(1)")
+        self.assertTrue(needs._is_excerpted("    print(1)"))
+
+    def test_a_leading_ellipsis_in_a_short_message_is_not_called_a_cut(self):
+        """R5-desk-024: the label follows the server's cut flag, not a leading "…" in the text."""
+        body = r"""
+const ctx = {rest: async () => ({text: '…Can you\napprove?', truncated: false})};
+cursor = 0; effects = []; effectCursor = 0;
+const item = {id: 'chat:p:s3', version: '1', source: 'chat', title: 't', ask: '…Can you approve?',
+              ask_truncated: true, ask_cut: false, since: 1};
+const tree = Item({ctx, item, n: 1, refresh: async () => {}, askEnabled: false});
+assert.ok(text(tree).includes('one-line version'), text(tree));
+assert.ok(!text(tree).includes('last 480 characters'));
+"""
+        for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
+            with self.subTest(path=path.name):
+                run = subprocess.run(["node", "-e", ITEM_PRELUDE + body, str(path)], capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, run.stderr)
 
 
 if __name__ == "__main__":
