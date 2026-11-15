@@ -1786,21 +1786,30 @@ def _digest(*texts: Any) -> str:
 
 
 def _comments_sig(conn: Any, kanban_db: Any, task_id: str) -> str:
-    """"count:newest id:digest of the comment bodies": it changes when a comment is added and when an
-    existing one is rewritten, so advice or a summary written from the old text is not shown for the
-    card as it is now."""
+    """"count:newest id:digest" of a card's comments: it changes when a comment is added and when
+    one that a model call can see (the newest CARD_CONTEXT_COMMENTS, each up to
+    ASK_CARD_CONTEXT_LIMIT characters) is rewritten, so advice or a summary written from the old
+    text is not shown for the card as it is now. The bounds are applied by the query."""
     try:
+        count, newest = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,)
+        ).fetchone()
         rows = conn.execute(
-            "SELECT id, author, body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)
+            "SELECT id, author, LENGTH(body), SUBSTR(body, 1, ?) FROM task_comments WHERE task_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (ASK_CARD_CONTEXT_LIMIT, task_id, CARD_CONTEXT_COMMENTS),
         ).fetchall()
-        comments = [(r[0], r[1], r[2]) for r in rows]
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments = [
-            (getattr(c, "id", 0) or 0, getattr(c, "author", ""), getattr(c, "body", ""))
-            for c in kanban_db.list_comments(conn, task_id)
+        comments, count = _newest_rows(
+            conn, kanban_db, "task_comments", "Comment", "list_comments", task_id, CARD_CONTEXT_COMMENTS
+        )
+        newest = max((getattr(c, "id", 0) or 0 for c in comments), default=0)
+        rows = [
+            (getattr(c, "id", 0) or 0, getattr(c, "author", ""), len(body), body[:ASK_CARD_CONTEXT_LIMIT])
+            for c in reversed(comments)
+            for body in (str(getattr(c, "body", "") or ""),)
         ]
-    newest = max((c[0] or 0 for c in comments), default=0)
-    return f"{len(comments)}:{newest}:{_digest(*(part for c in comments for part in c))}"
+    return f"{count}:{newest}:{_digest(*(part for r in rows for part in r))}"
 
 
 def kanban_items(

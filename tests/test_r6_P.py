@@ -83,5 +83,27 @@ class ChatVersion(unittest.TestCase):
         self.assertNotEqual(versions[0], versions[1])
 
 
+class CommentSignature(unittest.TestCase):
+    def test_the_signature_reads_a_bounded_number_of_comment_bytes(self):
+        """R6-008: a long comment history is not read in full on every poll."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE task_comments(id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INT)")
+        conn.executemany(
+            "INSERT INTO task_comments(task_id, author, body, created_at) VALUES('t', 'w', ?, ?)",
+            [("x" * 100_000, i) for i in range(200)],
+        )
+        read = [0]
+
+        def measure(cursor, row):
+            read[0] += sum(len(v) for v in row if isinstance(v, (str, bytes)))
+            return row
+
+        conn.row_factory = measure
+        before = needs._comments_sig(conn, None, "t")
+        self.assertLess(read[0], 2_000_000)
+        conn.execute("UPDATE task_comments SET body = 'y' || SUBSTR(body, 2) WHERE id = 200")
+        self.assertNotEqual(needs._comments_sig(conn, None, "t"), before)
+
+
 if __name__ == "__main__":
     unittest.main()
