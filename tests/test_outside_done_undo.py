@@ -293,6 +293,41 @@ class UndoTokens(OutsideFixture):
                 needs.done_outside(item["id"], item["version"])
                 needs.unhide(item["id"])  # cleanup: next subtest starts clean
 
+    def test_a_stale_hide_token_cannot_remove_a_newer_done(self):
+        result = self.file(dedupe_key="a")
+        (old,) = self.queue()
+        needs.hide(old["id"], old["version"])  # tab 1: Not for me at v1
+        self.file(dedupe_key="a", body="Changed content, needs you again.")
+        (new,) = self.queue()
+        self.assertNotEqual(new["version"], old["version"])
+        needs.done_outside(new["id"], new["version"])  # tab 2: Done at v2
+        self.assertFalse(needs.unhide(old["id"], token=old["version"]))
+        self.assertIn("done_at", json.loads(self.record(result).read_text()))
+        self.assertEqual(self.queue(), [])
+
+    def test_a_failed_second_write_leaves_the_done_undo_retryable(self):
+        from unittest import mock
+
+        result = self.file(dedupe_key="a")
+        (it,) = self.queue()
+        needs.hide(it["id"], it["version"])
+        token = needs.done_outside(it["id"], it["version"])["token"]
+        real = needs._write_json
+        calls = []
+
+        def flaky(path, data, *a, **k):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            return real(path, data, *a, **k)
+
+        with mock.patch.object(needs, "_write_json", flaky):
+            with self.assertRaises(OSError):
+                needs.unhide(it["id"], token=token)
+        self.assertTrue(needs.unhide(it["id"], token=token))  # the retry still finds its token
+        self.assertEqual([i["id"] for i in self.queue()], [it["id"]])
+        self.assertNotIn("done_at", json.loads(self.record(result).read_text()))
+
     def test_desktop_sends_the_token_of_the_dismissal_it_undoes(self):
         from pathlib import Path
 
