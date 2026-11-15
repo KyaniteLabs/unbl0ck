@@ -257,8 +257,11 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
    `recovery_dir` is `absent`, `ok` or `unsafe` (a file or link where the directory
    belongs; the command exits 1). A diagnosis lists at most 100 backups, newest label
    first, and reads at most 64 MiB of them; the rest are counted in `backups_omitted` or
-   marked `not_checked`. A link at `plugin-data`, `unbl0ck`, `recovery` or a store or
-   backup file makes every command refuse; other entries in the tree are not read.
+   marked `not_checked`. A link at `plugin-data` or `unbl0ck` makes every command refuse.
+   A link at `recovery` is reported as `unsafe` by `diagnose` and refused by `preserve`
+   and `restore`. A store or backup file that is a link matters only to the command that
+   reads it: `diagnose` reports it as `unsafe`, `preserve` and `restore` refuse to copy or
+   replace it. Other entries in the tree are not read.
 2. **Preserve.** `preserve` copies the exact current bytes, readable or not, into
    `plugin-data/unbl0ck/recovery/` (it creates the recovery directory, mode 700, on first
    use), checks the copy and syncs it and its directory to disk; a sync that fails is
