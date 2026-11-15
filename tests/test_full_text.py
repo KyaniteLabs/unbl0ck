@@ -231,6 +231,8 @@ class SourceTextRoute(unittest.TestCase):
     def test_identifier_bounds(self):
         self.assertEqual(self.get("chat:" + "x" * 301).status_code, 400)
         self.assertEqual(self.get(v="v" * 301).status_code, 400)
+        self.assertEqual(self.get(i="chat:p:s\n").status_code, 400)
+        self.assertEqual(self.get(v="1\x00").status_code, 400)
         self.assertEqual(self.calls, [])
 
 
