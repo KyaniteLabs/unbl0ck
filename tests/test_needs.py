@@ -385,9 +385,8 @@ class Chats(unittest.TestCase):
             self.assertEqual(q["count"], 1)
             needs.hide(q["items"][0]["id"], q["items"][0]["version"], home)
             self.assertEqual(needs.build_queue(home)["count"], 0)
-            needs.hide(
-                q["items"][0]["id"], "older", home
-            )  # source changed → shows again
+            # The source changed after it was hidden: the stored version no longer matches.
+            needs._write_json(needs._hidden_path(home), {q["items"][0]["id"]: "older"})
             self.assertEqual(needs.build_queue(home)["count"], 1)
 
     def test_queue_count_and_pocket_pack_include_only_unanswered_asks(self):

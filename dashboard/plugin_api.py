@@ -214,8 +214,19 @@ def _run_with_slot(slots, worker, *args):
         slots.release()
 
 
+def _fingerprint(n: Any, item: dict[str, Any]) -> str | None:
+    fn = getattr(n, "summary_fingerprint", None)
+    return fn(item) if callable(fn) else None
+
+
+def _bluf_key(n: Any, item: dict[str, Any]) -> tuple[str, str]:
+    """One job per item version AND card text: a changed title or a new comment is a new job."""
+    fp = _fingerprint(n, item)
+    return (item["id"], item["version"] if fp is None else f"{item['version']}|{fp}")
+
+
 def _queue_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
-    key = (item["id"], item["version"])
+    key = _bluf_key(n, item)
     if _BLUF_JOBS.is_pending(key) and not _BLUF_JOBS.can_start(key):
         item["bluf_pending"] = True   # still running: keep saying so on every poll
         return
@@ -239,7 +250,7 @@ def _queue_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
 
 
 def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
-    key = (item["id"], item["version"])
+    key = _bluf_key(n, item)
     try:
         try:
             comments = n.recent_comments(item)
@@ -256,7 +267,11 @@ def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
         if not n.bluf_enabled():   # turned off during the call: do not cache the reply
             _BLUF_JOBS.fail(key, "summaries were turned off during the model call")
             return
-        n.save_bluf(item["id"], item["version"], bluf, why)
+        fp = _fingerprint(n, item)
+        if fp is None:
+            n.save_bluf(item["id"], item["version"], bluf, why)
+        else:
+            n.save_bluf(item["id"], item["version"], bluf, why, fp=fp)
         _BLUF_JOBS.succeed(key)
     except Exception as exc:  # noqa: BLE001 - logged; the card keeps its raw text and retries later
         log.warning("unbl0ck: summary for %s failed: %s: %s", item["id"], type(exc).__name__, exc)
