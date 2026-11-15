@@ -2678,9 +2678,7 @@ _WAIT_KINDS = {
     "sudo": "needs your admin password",
 }
 _SAFE_ID = re.compile(r"^[0-9a-f]{8,64}$")
-WAIT_MAX_AGE = (
-    86400  # no human prompt legitimately stays open a day; a missed resolve hook does
-)
+WAIT_MAX_AGE = 86400  # no human prompt legitimately stays open a day; a missed resolve hook does
 
 
 def _num(value: Any) -> float:
@@ -2758,8 +2756,7 @@ WAIT_LOST_LIMIT = 1000
 # (home, request id) -> (what failed, the record to write). The hooks run in the agent; when a
 # write or removal fails there, polling in the same process retries it and says so until it works.
 _WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
-# Faults pushed out of the full list: (home, id) -> what failed. Clears are still retried. Past
-# WAIT_LOST_LIMIT the oldest are only counted, for WAIT_MAX_AGE, when any record of theirs is stale.
+# Faults pushed out of the full list: (home, id) -> what failed; clears are still retried.
 _WAIT_FAULTS_LOST: dict[tuple[str, str], str] = {}
 _WAIT_FAULTS_DROPPED: dict[str, tuple[int, float]] = {}
 # Hooks and polls in one process settle a prompt one at a time: a retry in flight must not
@@ -2772,9 +2769,8 @@ def _fault_path(home: Path) -> Path:
 
 
 def _journal_fault(home: Path, rid: str, what: str | None) -> None:
-    """Best effort: tell other processes that this one holds a prompt it could not record or
-    clear. It holds only the request id, what failed and this process's identity, never the
-    prompt, and it is removed when the fault is settled. ``what=None`` removes *rid*."""
+    """Best effort: tell other processes this one holds a prompt it could not record or clear
+    (id, what failed and this process, never the prompt). ``what=None`` removes *rid*."""
     try:
         with _state_lock(home):
             data = _read_json(_fault_path(home))
@@ -2807,12 +2803,19 @@ def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) ->
             while len(_WAIT_FAULTS_LOST) > WAIT_LOST_LIMIT:
                 h, r = next(iter(_WAIT_FAULTS_LOST))
                 del _WAIT_FAULTS_LOST[(h, r)]
-                _WAIT_FAULTS_DROPPED[h] = (_WAIT_FAULTS_DROPPED.get(h, (0, 0.0))[0] + 1, time.time())
+                _WAIT_FAULTS_DROPPED[h] = (_dropped(h) + 1, time.time())
                 _journal_fault(Path(h), r, None)
             _journal_fault(home, rid, what)
             raise
         if had_fault:
             _journal_fault(home, rid, None)
+
+
+def _dropped(home: str) -> int:
+    """Faults *home* dropped past WAIT_LOST_LIMIT; a home whose latest drop is past WAIT_MAX_AGE is forgotten."""
+    for h in [h for h, (_, t) in _WAIT_FAULTS_DROPPED.items() if time.time() - t >= WAIT_MAX_AGE]:
+        del _WAIT_FAULTS_DROPPED[h]
+    return _WAIT_FAULTS_DROPPED.get(home, (0, 0.0))[0]
 
 
 def _apply_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
@@ -2865,8 +2868,7 @@ def _reconcile_waits(home: Path, errors: list[str]) -> None:
                 if (h, rid) not in _WAIT_FAULTS_LOST:  # those are counted below, not listed
                     verb = "record" if what == "record" else "clear"
                     errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
-        dropped, last = _WAIT_FAULTS_DROPPED.get(str(home), (0, 0.0))
-        lost = sum(k[0] == str(home) for k in _WAIT_FAULTS_LOST) + (dropped if time.time() - last < WAIT_MAX_AGE else 0)
+        lost = sum(k[0] == str(home) for k in _WAIT_FAULTS_LOST) + _dropped(str(home))
         if lost:
             errors.append(f"prompt: {lost} live prompts could not be recorded or cleared; past the newest {WAIT_FAULT_LIMIT} faults a record is no longer retried")
 
