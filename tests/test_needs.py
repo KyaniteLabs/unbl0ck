@@ -511,7 +511,11 @@ class FakeKanban(unittest.TestCase):
         self.release_behavior = lambda conn, db, task_id, version: True
         kdb = fake_db(
             get_task=lambda c, t: self.task if t == "t_1" else None,
-            list_events=lambda c, t: self.events,
+            # Hermes logs every comment with a "commented" event; these fixture comments follow the block.
+            list_events=lambda c, t: self.events + [
+                types.SimpleNamespace(id=100 + i, kind="commented", payload={"author": x.author}, created_at=x.created_at)
+                for i, x in enumerate(self.comments)
+            ],
             list_comments=lambda c, t: self.comments,
             add_comment=lambda c, t, author, body: (
                 self.calls.append(("comment", t, author, body)) or 7

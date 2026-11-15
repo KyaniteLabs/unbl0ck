@@ -139,11 +139,8 @@ class CommentPlacement(KanbanAnswerCase):
                 (task, "someone", "imported note", int(block.created_at) - 20),
             )
             c.commit()
-            self.assertTrue(needs._answered_since(c, kanban_db, task, "operator", block.created_at, block.id))
-            self.assertEqual(
-                needs._comments_since_block(c, kanban_db, task, block.created_at, block.id),
-                [("operator", "Approved")],
-            )
+            self.assertTrue(needs._answered_since(c, kanban_db, task, "operator", block.id))
+            self.assertTrue(needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved"))
 
 
 class DismissalOrder(s11.QueueCase):

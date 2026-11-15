@@ -177,21 +177,13 @@ class CardStatusMachine(unittest.TestCase):
         # Bug: the queue's SQL path used LOWER(), which folds ASCII only, while answer_card
         # used str.lower(): "ZOË" counted as answered for one and not the other.
         conn = sqlite3.connect(":memory:")
-        conn.execute(
-            "CREATE TABLE task_comments(id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INT)"
-        )
-        conn.execute(
-            "INSERT INTO task_comments(task_id, author, body, created_at) VALUES('t','ZOË','ok',10)"
-        )
+        conn.execute("CREATE TABLE task_events(id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)")
+        conn.execute("""INSERT INTO task_events VALUES(10, 't', 'commented', '{"author": "ZOË"}')""")
         fallback = types.SimpleNamespace(
-            list_comments=lambda c, t: [
-                types.SimpleNamespace(author="ZOË", body="", created_at=10)
-            ]
+            list_events=lambda c, t: [types.SimpleNamespace(id=10, kind="commented", payload={"author": "ZOË"})]
         )
         self.assertTrue(needs._answered_since(conn, fallback, "t", "zoë", 5))
-        self.assertTrue(
-            needs._answered_since(object(), fallback, "t", "zoë", 5)
-        )  # fallback path agrees
+        self.assertTrue(needs._answered_since(object(), fallback, "t", "zoë", 5))  # fallback path agrees
         self.assertFalse(needs._answered_since(conn, fallback, "t", "zoë", 11))
 
 

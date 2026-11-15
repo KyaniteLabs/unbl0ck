@@ -433,7 +433,7 @@ class KanbanVersions(unittest.TestCase):
             conn.execute("UPDATE task_comments SET created_at=? WHERE task_id=?", (block.created_at, task))
             conn.commit()
             self.assertFalse(
-                needs._answered_since(conn, kanban_db, task, "operator", block.created_at, block_id=block.id)
+                needs._answered_since(conn, kanban_db, task, "operator", block.id)
             )
             (item,) = needs.kanban_items(boards=["default"])
             self.assertEqual(item["tier"], "ask")
@@ -441,7 +441,7 @@ class KanbanVersions(unittest.TestCase):
             conn.execute("UPDATE task_comments SET created_at=? WHERE task_id=?", (block.created_at, task))
             conn.commit()
             self.assertTrue(
-                needs._answered_since(conn, kanban_db, task, "operator", block.created_at, block_id=block.id)
+                needs._answered_since(conn, kanban_db, task, "operator", block.id)
             )
 
     def test_a_kanban_item_carries_a_comment_signature(self):
