@@ -3148,13 +3148,30 @@ def _folder_outside_item(
 
 
 def _stat_hidden(hidden: dict[str, Any], f: Path, st: os.stat_result) -> bool:
-    """Whether a folder file is already dismissed at its current mtime and size.
+    """Whether a folder file is still dismissed at its current mtime, size and content.
 
-    The stored version also names the content, which only reading the file can tell; a
-    stat-identical match counts as dismissed here and is verified when the file is read."""
+    A stored version names the content digest too. Time and size alone repeat after an in-place
+    edit with a restored timestamp, so a stat match is confirmed by reading the file (the same
+    bounded read that makes its version); a file that cannot be read or differs is not
+    dismissed. A version stored without a digest can only be matched on time and size."""
     stored = hidden.get("outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest())
+    if not isinstance(stored, str):
+        return False
     key = f"{st.st_mtime_ns}:{st.st_size}"
-    return isinstance(stored, str) and (stored == key or stored.startswith(key + ":"))
+    if stored == key:
+        return True
+    if not stored.startswith(key + ":"):
+        return False
+    try:
+        fd = os.open(f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            now = os.fstat(fh.fileno())
+            if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                return False
+            raw = fh.read(_OUTSIDE_READ_LIMIT)
+    except OSError:
+        return False
+    return stored == f"{key}:{hashlib.sha256(raw).hexdigest()[:16]}"
 
 
 def _scan_outside_folder(

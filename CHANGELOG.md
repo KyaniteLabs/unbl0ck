@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **A watched file edited in place with its time restored is no longer treated as dismissed (#37 round 5).** The folder scan confirms a stat-identical dismissal against the file's content digest, so the edit shows up in search and in the queue even beyond the hidden-file read window.
 - **A hide for an older version of a card is refused even when nothing was hidden before (#37 round 5).** Every Not for me is now checked against the card's current version; the documented refusal no longer depends on an earlier dismissal existing.
 - **Undo of a Done plus Not for me can be retried after a failed write (#37 round 5).** When the second write of an undo fails, the dismissal marker removed by the first write is restored, so the same undo token still works on retry.
 - **Folder scans and dismissal stores stay bounded and honest (#37 round 4).** Files already marked Done or Not for me no longer use up the 5,000-entry scan budget, so each finished page reaches the next one. The scan reports a time overrun or a listing that failed midway without losing the files it had found. Reads backfill past unreadable files, stop at the 2-second read budget with a notice, and summarise repeated read errors. The folder dismissal cap scales with the number of watched folders (up to 8), the store is written as compact UTF-8 and trimmed to stay under its 16 MiB read limit, and the hidden count and the omission of hidden files from the listing are reported. Folders and the recursion flag are read from one settings snapshot.
