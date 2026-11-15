@@ -972,18 +972,34 @@ function cardStamp(item) {
 // keep the newest messages within a message and character budget and say when older ones were dropped.
 const ASK_KEEP_MESSAGES = 100
 const ASK_KEEP_CHARS = 200000
-function boundAsk(msgs) {
-  let out = msgs.slice(-ASK_KEEP_MESSAGES)
-  let chars = out.reduce((n, m) => n + String(m.content || '').length, 0)
+// Every message that is stored or sent passes here, replies included: each is cut to the server's
+// per-message limit (a longer one would be refused with every later request), and the history
+// starts with a user turn. `keep` is the stored cap, or the API's 50-message transport cap.
+function boundAsk(msgs, keep = ASK_KEEP_MESSAGES) {
+  let out = msgs.slice(-keep).map(m => ({ ...m, content: Array.from(String(m.content || '')).slice(0, ASK_MAX_CHARS).join('') }))
+  let chars = out.reduce((n, m) => n + m.content.length, 0)
   while (out.length > 1 && (chars > ASK_KEEP_CHARS || out[0].role !== 'user')) {
-    chars -= String(out[0].content || '').length
+    chars -= out[0].content.length
     out = out.slice(1)
   }
-  // One message can be the whole history: the budget still holds, so keep its newest characters.
-  if (out.length === 1 && chars > ASK_KEEP_CHARS) {
-    out = [{ ...out[0], content: String(out[0].content).slice(-ASK_KEEP_CHARS) }]
-  }
   return { msgs: out, dropped: msgs.length - out.length }
+}
+// Every awaited step of one Ask (the request, each sleep, each poll) runs against what is left of
+// its 150 s budget: it fails when the budget runs out while it waits, and a step that settles after
+// the limit is refused, terminal replies included. The timer re-reads the clock when it fires.
+function withinDeadline(t0, step) {
+  const late = () => Date.now() - t0 >= ASK_DEADLINE_MS
+  const tooSlow = () => new Error('The model took too long (over 150 s)')
+  if (late()) return Promise.reject(tooSlow())
+  let timer
+  const limit = new Promise((_, reject) => {
+    timer = setInterval(() => { if (late()) reject(tooSlow()) }, Math.max(1, ASK_DEADLINE_MS - (Date.now() - t0)))
+    timer?.unref?.()
+  })
+  return Promise.race([step(), limit]).then(
+    r => { clearInterval(timer); if (late()) throw tooSlow(); return r },
+    e => { clearInterval(timer); throw e }
+  )
 }
 
 function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false, scope = '' }) {
@@ -1127,7 +1143,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     setAskOpen(next)
     if (next && !detailOpen) loadDetail()
     // One click is the ask: opening TL;DR asks for the bottom line straight away (like /bro).
-    if (next && !askMsgs.length && !askBusy) askSend(false, TLDR_ASK)
+    if (next && !askMsgs.length && !askBusy) return askSend(false, TLDR_ASK)
   }
 
   // onOk runs the moment the request succeeded, before the queue refresh: a slow or hung
@@ -1288,20 +1304,17 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     updateAskSession(askId, { msgs: next, stamp: ctxNow, trimmed, running: true, error: '', gen, req: reqId, job: follow ? askJob : null })
     let admitted = false
     try {
-      // The model can outlast the desktop's 30 s request limit: poll the background job. The
-      // 150 s limit covers the initial request, every sleep and every poll, and is checked after
-      // each response, terminal ones included.
+      // The model can outlast the desktop's 30 s request limit: poll the background job. A step
+      // cut off by the 150 s limit keeps the job and the request id, so Retry follows the same work.
       const t0 = Date.now()
-      const over = () => Date.now() - t0 > ASK_DEADLINE_MS
-      const tooSlow = () => new Error('The model took too long (over 150 s)')
       // Keep displayed history intact while respecting the API's 50-message transport
       // limit. The server applies the configured model history window within that bound.
       let r = follow && askJob
         ? { pending: true, job: askJob }
-        : await ctx.rest('/card/ask', {
+        : await withinDeadline(t0, () => ctx.rest('/card/ask', {
             method: 'POST',
-            body: { id: item.id, messages: next.slice(-50), version: item.version, request_id: reqId }
-          })
+            body: { id: item.id, messages: boundAsk(next, 50).msgs, version: item.version, request_id: reqId }
+          }))
       admitted = true
       while (r && r.pending && r.job) {
         // A superseded request (evicted session, newer question) stops polling at once and
@@ -1309,17 +1322,12 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
         if (abandon()) return
         updateAskSession(askId, { job: r.job })
         setAskJob(r.job)
-        const left = ASK_DEADLINE_MS - (Date.now() - t0)
-        if (left <= 0) throw tooSlow()
-        await new Promise(res => setTimeout(res, Math.min(1500, left)))
+        await withinDeadline(t0, () => new Promise(res => setTimeout(res, 1500)))
         if (abandon()) return
-        // The sleep can use up the last of the budget: no poll starts at or after the limit.
-        if (Date.now() - t0 >= ASK_DEADLINE_MS) throw tooSlow()
-        r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true&card=' + encodeURIComponent(item.id))
-        if (over() && !(r && r.pending && r.job)) { setAskJob(null); dropReq(); throw tooSlow() }
+        const job = r.job
+        r = await withinDeadline(t0, () => ctx.rest('/card/ask/' + encodeURIComponent(job) + '?poll=true&card=' + encodeURIComponent(item.id)))
       }
       if (abandon()) return
-      if (over()) { setAskJob(null); dropReq(); throw tooSlow() }
       updateAskSession(askId, { job: null })
       setAskJob(null)
       dropReq()
@@ -1328,12 +1336,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       if (r?.ok === false && r.state === 'unknown') throw new Error(`Outcome unknown. ${r.detail || ''} Retry sends a new request.`.replace(/\s+/g, ' '))
       if (r?.ok === false && r.state === 'not_submitted') throw new Error(`Not sent. ${r.detail || ''} Retry sends it now.`.replace(/\s+/g, ' '))
       if (r?.ok === false) throw new Error(String(r.detail || 'The model could not answer'))
-      const full = String(r?.reply || '').trim()
-      if (!full) throw new Error('The model returned an empty answer')
-      // The server refuses any message over its limit, and a stored reply is sent back with every
-      // later request: keep at most the limit so one long answer cannot make the conversation unusable.
-      const parts = Array.from(full)
-      const reply = parts.length > ASK_MAX_CHARS ? parts.slice(0, ASK_MAX_CHARS).join('') : full
+      const reply = String(r?.reply || '').trim()
+      if (!reply) throw new Error('The model returned an empty answer')
       // A newer request owns the conversation now: drop this late response entirely.
       if (abandon()) return
       const kept = boundAsk([...next, { role: 'assistant', content: reply }])

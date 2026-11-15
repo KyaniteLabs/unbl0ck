@@ -71,6 +71,56 @@ const it={...item,id:'kanban:default:a4',version:'1',title:'Ship the launch',ask
 """)
 
 
+class AskBudget(NodeCase):
+    def test_every_message_sent_is_within_the_limits_and_starts_with_a_user_turn(self):
+        """R5-desk-009: stored replies are cut to the per-message limit and the 50-message window opens on a user turn."""
+        self.run_views(r"""
+const posts=[];
+const ctx={rest:async(url,o)=>{if(url!=='/card/ask')return{};posts.push(o.body.messages);
+  return{ok:true,reply:posts.length===1?'z'.repeat(30000):'Reply '+posts.length+'.'}}};
+const it={...item,id:'kanban:default:bd1',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ await find(mount(ctx,it),'TL;DR').onClick();
+ for(let i=0;i<25;i++){
+  area(mount(ctx,it)).onChange({target:{value:'question '+i}});
+  await find(mount(ctx,it),'Send').onClick();
+ }
+ assert.equal(posts.length,26,'every follow-up was sent');
+ for(const sent of posts){
+  assert.ok(sent.length<=50,'transport cap: '+sent.length);
+  assert.equal(sent[0].role,'user','a request must open on a user turn, not '+sent[0].role);
+  for(const m of sent)assert.ok(Array.from(m.content).length<=20000,'over the per-message limit: '+m.role+' '+m.content.length);
+ }
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_a_poll_that_hangs_past_the_limit_fails_at_the_limit(self):
+        """R5-desk-010: each poll is raced against what is left of the 150 s budget, not checked only after it returns."""
+        self.run_views(r"""
+let now=1e12;const t0=now;Date.now=()=>now;
+const realSet=global.setTimeout;global.setTimeout=fn=>realSet(fn,0);
+let polls=0;
+const ctx={rest:url=>{
+ if(url==='/card/ask')return Promise.resolve({ok:true,pending:true,job:'j1'});
+ if(url.startsWith('/card/ask/')){polls++;return new Promise(()=>{})}
+ return Promise.resolve({})}};
+const it={...item,id:'kanban:default:dl1',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ const asked=find(mount(ctx,it),'TL;DR').onClick();
+ await new Promise(r=>realSet(r,20));
+ assert.equal(polls,1,'the poll is in flight');
+ now=t0+150001;tick();
+ await Promise.race([asked,new Promise(r=>realSet(r,200))]);
+ const s=store.readAskSession(it.id);
+ assert.equal(s.running,false,'the ask is still waiting on a poll past the limit');
+ assert.match(s.error,/over 150 s/);
+ assert.equal(s.job,'j1','the job is kept, so Retry follows it instead of asking again');
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
 class FullTextOffer(NodeCase):
     def test_password_prompts_and_pairing_requests_offer_no_full_text(self):
         """R5-desk-026: the guide says password prompts never offer Full text and pairing requests show neither."""
