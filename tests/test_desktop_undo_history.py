@@ -44,6 +44,30 @@ const mk=(n,origin)=>({source:'outside',origin,kind:'draft',id:'outside:filed:'+
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)
 
+    def test_late_undo_response_leaves_a_newer_dismissal_of_the_same_item_alone(self):
+        for outcome in ("ok", "fail"):
+            with self.subTest(outcome=outcome):
+                self.run_views(r"""
+const outcome=%r;
+const old={id:'outside:filed:1',version:'v1',title:'Old',kind:'done',at:Date.now()};
+undo=[old];
+let release;
+const ctx={rest:()=>new Promise((res,rej)=>{release=()=>outcome==='ok'?res({restored:true}):rej(new Error('net'))})};
+(async()=>{
+ cursor=0;state=[];
+ const pending=all(Page({ctx,refresh})).find(n=>n?.type==='button'&&n.props.children==='Undo').props.onClick();
+ // the item resurfaces and is dismissed again while the first request is still pending
+ const newer={...old,version:'v2',title:'New',at:old.at+5000};
+ undo=[newer];
+ release();
+ await pending;
+ assert.equal(undo.length,1,'newer dismissal survives');
+ assert.equal(undo[0].title,'New');
+ assert.equal(undo[0].version,'v2');
+ assert.ok(!undo[0].failed,'not marked failed by the older request');
+})().catch(e=>{console.error(e);process.exitCode=1});
+""" % outcome)
+
     def test_local_done_says_it_changes_nothing_in_the_original_app(self):
         self.run_views(r"""
 const ctx={rest:async()=>({ok:true})};

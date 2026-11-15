@@ -162,7 +162,7 @@ class Outside(OutsideFixture):
                 "action": "resolve",
                 **({"id": result["id"]} if key == "one" else {"dedupe_key": key}),
             }
-            reply = json.loads(self.tools["unbl0ck_file"][2](args))
+            reply = json.loads(self.tools["unbl0ck_file"][2](args, profile="work"))
             self.assertTrue(reply["ok"])
             self.assertFalse(self.record(result).exists())
         self.assertEqual(needs.build_queue()["count"], 0)
