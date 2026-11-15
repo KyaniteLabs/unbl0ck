@@ -3454,9 +3454,6 @@ def file_outside(
     if action not in ("file", "resolve"):
         raise ValueError("action must be file or resolve")
     key = _outside_field(args, "dedupe_key", 120)
-    if len(str(args.get("dedupe_key") or "")) > 120:
-        # A cut key would let two different long keys collide into one record.
-        raise ValueError("dedupe_key must be at most 120 characters")
     # Hermes' tool dispatch passes task_id, session_id and user_task but not the profile, so
     # an absent kwarg falls back to the profile the process is running under, the same way
     # record_wait() resolves it. An explicit kwarg still wins.
