@@ -2127,9 +2127,17 @@ def file_outside(
         old = _read_json(match) if match else {}
         record_id = match.stem if match else uuid.uuid4().hex
         item_id = f"outside:filed:{record_id}"
-        version = hashlib.sha256(
-            json.dumps(fields, sort_keys=True, ensure_ascii=False).encode()
-        ).hexdigest()
+        def digest(values: dict[str, Any]) -> str:
+            return hashlib.sha256(
+                json.dumps(values, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()
+
+        version = digest(fields)
+        # A record filed before the profile was known has a version computed with an empty
+        # profile. Adopting it into a profile is not a change to the claim: keep that version so
+        # the human's Done or Not for me still applies.
+        if old and fields["profile"] and old.get("version") == digest({**fields, "profile": ""}):
+            version = old["version"]
         rec = {
             **fields,
             "id": item_id,
