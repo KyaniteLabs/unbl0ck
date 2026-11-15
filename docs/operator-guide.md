@@ -62,16 +62,18 @@ and status) and each difference below.
 <!-- surface-matrix:start -->
 | Surface | Visibility | Context | Action routing | Completion | Recovery | Intentional limits |
 |---|---|---|---|---|---|---|
-| Desktop | Every source and tier: asks, stuck, answered | Context panel, Full text, TL;DR on Kanban | Answer, release, open the session or board, Done, Not for me | The card leaves on the next poll; Undo banner lasts 12 seconds | Drafts and Ask jobs survive remounts; per-source errors with retry | Only inside Hermes Desktop |
-| CLI and local slash | Asks only, 12 listed; says how many more and how many stuck or answered cards are not listed | One line per ask: where, title, summary or first 140 characters | Prints the native `hermes pairing approve` command; no inline action | Run it again | Source errors are printed; run it again | Local surfaces only (`cli`, `tui`, `desktop`, `local`) |
-| CLI --json | The raw queue, every tier | Full item fields | None | Run it again | Pairs with `--pack` | Machine owner only; contains private text |
+| Desktop | Every source and tier: asks, stuck, answered | Context panel, Full text, TL;DR on Kanban | Answer, release, open the session or board, Done, Not for me | After Answer + unblock, release or a filed item's Done the card leaves on the next poll (Undo banner lasts 12 seconds for Done and Not for me); after Answer, keep blocked it stays listed as answered until its state changes | Drafts and Ask jobs survive remounts; per-source errors with retry | Only inside Hermes Desktop |
+| CLI and local slash | Asks only, 12 listed; says how many more and how many stuck or answered cards are not listed | One line per ask: where, title, summary or first 140 characters (a password prompt gets a fixed notice instead) | Prints the native `hermes pairing approve` command; no inline action | Run it again | Source errors are printed; run it again | Local surfaces only (`cli`, `tui`, `desktop`, `local`) |
+| CLI --json | The raw queue, every tier | Full item fields | None | Run it again | Pairs with `--pack` | Machine owner only; contains private text, including Hermes's already redacted excerpt of a live password prompt |
 | Remote slash | Counts only: asks, plus counts of stuck and answered cards and whether the queue is incomplete | None: never a title, text, id, name or approval command | Says to open Desktop or run `hermes unbl0ck` on the machine | Ask again after acting there | "Incomplete" is stated as a count-level fact | Anyone admitted to a gateway can type it, so an unknown or missing platform counts as remote |
-| Pocket pack | Up to six asks in queue order; no stuck or answered cards; `omitted` gives counts of what is left out, and `complete` is false (with `omitted.unread_sources` counting them) when a source could not be read, so an empty pack is not "nothing needs you" | Title, short summary and ask text | One fixed pointer per card ("Answer in Telegram", "Open pairing requests"); never an approval or inline action | Pack is regenerated, expires in one hour | Written only when you ask for it | Counts in `omitted` are the only disclosure of omitted work |
+| Pocket pack | Up to six asks in queue order; no stuck or answered cards; `omitted` gives counts of what is left out, and `complete` is false (with `omitted.unread_sources` counting each unreadable source once) when a source could not be read or a list was cut at its limit, so an empty pack is not "nothing needs you" | Title, short summary and ask text; a password prompt's text is replaced by a fixed notice | One fixed pointer per card ("Answer in Telegram", "Open pairing requests"); never an approval or inline action | Pack is regenerated, expires in one hour | Written only when you ask for it | Counts in `omitted` are the only disclosure of omitted work |
 <!-- surface-matrix:end -->
 
 Actions are not flattened into every surface: a surface gets a new action only after its
-authorization model is defined, and password prompts and pairing codes never leave the
-original surface or Desktop's own redacted view.
+authorization model is defined. The local list and the Pocket pack withhold a password
+prompt's text; the Pocket pack and remote output carry no pairing code or approval command
+(the local list prints the native approve command for the machine's owner). Desktop and
+`--json` show only Hermes's already redacted excerpt of a password prompt, to the owner.
 
 ## What you can do per source
 

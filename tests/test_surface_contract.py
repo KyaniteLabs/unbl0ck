@@ -49,7 +49,7 @@ def make_queue():
 
 
 def with_queue(q):
-    pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q, pocket_pack=needs.pocket_pack, _clean=needs._clean)
+    pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q, pocket_pack=needs.pocket_pack, _clean=needs._clean, _SUDO_WITHHELD=needs._SUDO_WITHHELD)
     return q
 
 

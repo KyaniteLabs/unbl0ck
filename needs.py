@@ -5289,8 +5289,43 @@ def build_ask_messages(
 # --- Pocket pack (TV / X55 card format) ----------------------------------------------------
 
 
+_SUDO_WITHHELD = "A password prompt is waiting. Its text is not shown here; answer it where it was asked."
 POCKET_PROMPT_CHARS = 4000  # one card's prompt
 POCKET_TOTAL_PROMPT_CHARS = 20000  # all prompts in one pack
+
+
+# Queue errors are plain strings that start with the source they came from. Not every one means a
+# source could not be read: some say a listing was cut at its limit, and some are about cleanup or
+# stored state. Only a read failure is an "unread source".
+_READ_SOURCES = ("kanban", "chat", "prompt", "pairing", "outside")
+_CAPACITY_NOTICES = ("agent-filed items are waiting (limit",)  # every record was read
+_LISTING_CUT_NOTICES = (  # records exist that the list does not show
+    "folder limit, showing the newest",
+    "filed entries; only the first",
+    "hidden files are not listed",
+)
+_STATE_NOTICES = ("could not remove", "retention cleanup", "invalid done_at")
+
+
+def unread_sources(errors: list[str] | None) -> int:
+    """How many sources (a Kanban board, a profile's chats, pairing, prompts, outside) could not be
+    read, counted once per source however many messages it produced. A capacity warning, a
+    cleanup problem or a cut listing is not an unread source."""
+    sources = set()
+    for error in errors or ():
+        text = str(error)
+        head = text.split(":", 1)[0]
+        if head.split("[", 1)[0] not in _READ_SOURCES:
+            continue
+        if any(m in text for m in _CAPACITY_NOTICES + _LISTING_CUT_NOTICES + _STATE_NOTICES):
+            continue
+        sources.add(head)
+    return len(sources)
+
+
+def listing_cut(errors: list[str] | None) -> bool:
+    """True when a source says some of its records are not in the list."""
+    return any(m in str(e) for e in errors or () for m in _LISTING_CUT_NOTICES)
 
 
 def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
@@ -5300,6 +5335,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     Prompt text is bounded per card and in total; a cut prompt, a source that was already cut
     and cards left out are each reported, so ``complete`` is true only when nothing was lost."""
     now = int(time.time())
+    limit = max(0, int(limit))  # a negative slice would select all but the last ask
     cards = []
     asks = [it for it in queue["items"] if it.get("tier") not in ("stuck", "answered")]
     spent = 0
@@ -5392,6 +5428,8 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
                 }
             ]
         prompt = str(it["ask"] or "")
+        if it.get("kind") == "sudo":
+            prompt = _SUDO_WITHHELD  # a password prompt stays where it was asked and in Desktop
         cut = bool(it.get("ask_truncated") or it.get("truncated"))
         room = min(POCKET_PROMPT_CHARS, max(0, POCKET_TOTAL_PROMPT_CHARS - spent))
         if len(prompt) > room:
@@ -5403,7 +5441,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
                 "id": it["id"],
                 "kind": "decide",
                 "title": it["title"][:90],
-                "short": (it.get("bluf") or it["ask"])[:160],
+                "short": (_SUDO_WITHHELD if it.get("kind") == "sudo" else (it.get("bluf") or it["ask"]))[:160],
                 "choices": [o["label"] for o in options],
                 "task_id": it.get("task_id", ""),
                 "options": options,
@@ -5427,10 +5465,10 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         "cards": cards,
         # False when a source could not be read or a card was cut or left out: an empty pack is
         # then not "nothing needs you".
-        "complete": not queue.get("errors") and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
+        "complete": not unread_sources(queue.get("errors")) and not listing_cut(queue.get("errors")) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
         # What this pack leaves out, as counts only; the original surface has the rest.
         "omitted": {
-            "unread_sources": len(queue.get("errors") or []),
+            "unread_sources": unread_sources(queue.get("errors")),
             "asks": max(0, len(asks) - len(cards)),
             "stuck": sum(1 for it in queue["items"] if it.get("tier") == "stuck"),
             "answered": sum(1 for it in queue["items"] if it.get("tier") == "answered"),

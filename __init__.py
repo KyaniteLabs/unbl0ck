@@ -37,6 +37,7 @@ def _summary(limit: int = 12) -> str:
     lines = [f"{q['count']} thing(s) waiting on you:" if q["count"]
              else "No asks detected; the queue is incomplete." if q["errors"]
              else "No asks, but listed cards are stuck or answered:"]
+    limit = max(0, int(limit))
     for it in asks[:limit]:
         where = (f"{c(it['board'], 80)}:{c(it['task_id'], 80)}" if it["source"] == "kanban"
                  else f"{c(it.get('kind') or 'prompt', 40)} {c(it.get('profile'), 80)}" if it["source"] == "prompt"
@@ -44,7 +45,7 @@ def _summary(limit: int = 12) -> str:
                  else f"outside {c(it.get('kind'), 40)} · {c(it.get('act_where'), 120)}" if it["source"] == "outside"
                  else f"chat {c(it.get('platform') or it.get('profile'), 80)}"
                  + (f" with {c(it['chat_with'], 120)}" if it.get("chat_with") else ""))
-        lead = c(it.get("bluf") or it.get("ask"), 140)
+        lead = (n._SUDO_WITHHELD if it.get("kind") == "sudo" else c(it.get("bluf") or it.get("ask"), 140))
         lines.append(f"- [{where}] {c(it.get('title'), 160)}: {lead}")
         if it.get("approve_command"):
             lines.append(f"  approve: {c(it['approve_command'], 300)}")

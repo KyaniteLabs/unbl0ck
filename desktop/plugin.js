@@ -1733,7 +1733,7 @@ function Page({ ctx, refresh, scope = '' }) {
                             : q.fault
                               ? 'Cannot reach the queue; showing the last known list.'
                               : (q.errors || []).length
-                                ? 'A source failed to load; the list may be incomplete.'
+                                ? 'See the notices below; the list may be incomplete.'
                                 : askCount(q)
                                 ? 'Everything that is waiting on your word.'
                                 : held
