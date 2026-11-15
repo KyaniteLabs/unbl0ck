@@ -555,7 +555,8 @@ assert.ok(det0 && !det0.props.open, 'details stay collapsed when nothing is omit
         script = r"""
 const fs = require('fs'), assert = require('node:assert/strict');
 const src = fs.readFileSync(process.argv[1], 'utf8');
-const body = src.slice(src.indexOf('function Chip('), src.indexOf('export default'));
+const body = src.slice(src.indexOf('function omittedChats('), src.indexOf('function coverageNote(')) +
+  src.slice(src.indexOf('function Chip('), src.indexOf('export default'));
 let q = null;
 const env = {jsx: (t, p) => ({type: t, props: p}), useValue: () => q, askCount: x => x.count || 0,
   host: {navigate() {}}, PATH: '/x', $queue: 'queue'};

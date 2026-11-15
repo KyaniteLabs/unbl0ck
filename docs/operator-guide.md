@@ -78,7 +78,7 @@ and status) and each difference below.
 | CLI and local slash | Asks only, 12 listed; says how many more and how many stuck or answered cards are not listed | One line per ask: where, title, summary or first 140 characters (a password prompt gets a fixed notice instead) | Prints the native `hermes pairing approve` command; no inline action | Run it again | Source errors are printed; run it again | Local surfaces only (`cli`, `tui`, `desktop`, `local`) |
 | CLI --json | The raw queue, every tier | Full item fields | None | Run it again | Pairs with `--pack` | Machine owner only; contains private text, including Hermes's already redacted excerpt of a live password prompt |
 | Remote slash | Counts only: asks, plus counts of stuck and answered cards and whether the queue is incomplete | None: never a title, text, id, name or approval command | Says to open Desktop or run `hermes unbl0ck` on the machine | Ask again after acting there | "Incomplete" is stated as a count-level fact | Anyone admitted to a gateway can type it, so an unknown or missing platform counts as remote |
-| Pocket pack | Up to six asks in queue order; no stuck or answered cards; `omitted` gives counts of what is left out, and `complete` is false (with `omitted.unread_sources` counting each unreadable source once) when a source could not be read or a list was cut at its limit, so an empty pack is not "nothing needs you" | Title, short summary and ask text; a password prompt's text is replaced by a fixed notice | One fixed pointer per card ("Answer in Telegram", "Open pairing requests"); never an approval or inline action | Pack is regenerated, expires in one hour | Written only when you ask for it | Counts in `omitted` are the only disclosure of omitted work |
+| Pocket pack | Up to six asks in queue order; no stuck or answered cards; `omitted` gives counts of what is left out, and `complete` is false (with `omitted.unread_sources` counting each unreadable source once) when a source could not be read or a list was cut at its limit, so an empty pack is not "nothing needs you" | Title, short summary and ask text; a password prompt's text is replaced by a fixed notice | One fixed pointer per card ("Answer in Telegram", "Open pairing requests"); a Kanban card gets two fixed choices instead ("Answer and unblock <task>", or "Answer <task>; keep it blocked" in triage, and "Keep <task> blocked"); never an approval or answer text | Pack is regenerated, expires in one hour | Written only when you ask for it | Counts in `omitted` are the only disclosure of omitted work |
 <!-- surface-matrix:end -->
 
 Actions are not flattened into every surface: a surface gets a new action only after its
@@ -106,9 +106,10 @@ authorization: it is not a gap and will not be added. **Not yet** is a real gap.
 <!-- capability-matrix:end -->
 
 - **Context** is the Context panel for Kanban and the Full text view for chats, live prompts
-  and outside items. Chats and live prompts show Full text only when the card holds a
-  shortened tail; password prompts never offer Full text, and pairing requests show neither
-  (the code and the person's platform id are never shown).
+  and outside items. Chats and live prompts read the whole record from the source only when
+  the card holds a shortened tail; otherwise **+ Full text** unfolds the text already on the
+  card; password prompts never offer Full text, and pairing requests show neither (the code
+  and the person's platform id are never shown).
 - **Model help** is the interactive TL;DR: it sends card text to your configured provider
   only on an explicit click, and only for Kanban. It is separate from the one-line summary,
   which is on by default and is sent automatically in the background when the queue is
@@ -135,8 +136,8 @@ authorization: it is not a gap and will not be added. **Not yet** is a real gap.
   Done with Undo. Neither completes anything in the original app.
 - Pocket packs name the original surface for chats, prompts, pairing requests and outside
   items ("Answer in Telegram", "Open pairing requests"). Kanban cards carry two fixed
-  choices that name the task and block ("Answer and unblock <task>", "Keep <task>
-  blocked"). No pack carries a pairing code, a person's platform id or an answer text.
+  choices that name the task and block ("Answer and unblock <task>", or "Answer <task>;
+  keep it blocked" for a card in triage, and "Keep <task> blocked"). No pack carries a pairing code, a person's platform id or an answer text.
 - With Ask turned off, Ask returns 403, and 503 when the host's model interface is not
   reachable at all; the other sources are unaffected. When the interface is present but the
   provider call fails (for example a connection error), the request is accepted, polling
