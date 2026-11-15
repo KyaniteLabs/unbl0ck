@@ -391,6 +391,16 @@ class Docs(unittest.TestCase):  # 15-017, 15-018, 15-019, 15-020, class I
         row = self.rows["Generic IMAP (Drafts folder)"]
         self.assertIn("vanished UID is `left_view`", row)
 
+    def test_caldav_removed_and_notion_archived_are_not_deletions(self):
+        caldav = self.rows["CalDAV tasks (Apple Reminders, Nextcloud)"]
+        notion = self.rows["Notion"]
+        self.assertIn("is `left_view`", caldav)
+        self.assertIn("moved to another list", caldav)
+        self.assertNotIn("| Removed in sync report |", caldav)
+        self.assertIn("is `left_view`", notion)
+        self.assertIn("restorable", notion)
+        self.assertNotIn("| Archived or trashed |", notion)
+
     def test_the_rules_for_coverage_scope_and_sequences_are_documented(self):
         for phrase in ("complete", "stop_reason", "account scope", "non-negative", "tombstone", "heuristic", "seq_collision"):
             self.assertIn(phrase, self.doc, phrase)
