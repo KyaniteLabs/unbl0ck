@@ -50,17 +50,17 @@ class UnreadSourceCount(unittest.TestCase):
 
     def test_state_and_limit_notices_are_not_sources(self):
         notices = [
-            "outside: could not remove 2 expired done record(s); their text stays until a later cleanup succeeds",
-            "outside: retention cleanup did not run: OSError; it retries on the next poll",
-            "outside: x.json: invalid done_at; kept for repair",
-            "outside: 200 agent-filed items are waiting (limit 200); agents cannot file more until you finish some",
+            needs.Notice("outside: could not remove 2 expired done record(s); their text stays until a later cleanup succeeds", "state"),
+            needs.Notice("outside: retention cleanup did not run: OSError; it retries on the next poll", "state"),
+            needs.Notice("outside: x.json: invalid done_at; kept for repair", "state"),
+            needs.Notice("outside: 200 agent-filed items are waiting (limit 200); agents cannot file more until you finish some", "capacity"),
         ]
         pack = needs.pocket_pack({"items": [], "errors": notices})
         self.assertEqual(pack["omitted"]["unread_sources"], 0)
         self.assertTrue(pack["complete"])
 
     def test_a_listing_cut_makes_the_pack_incomplete_without_an_unread_source(self):
-        pack = needs.pocket_pack({"items": [], "errors": ["outside: exports: folder limit, showing the newest 200; 3 older files are waiting. Finish or hide items to bring them into view"]})
+        pack = needs.pocket_pack({"items": [], "errors": [needs.Notice("outside: exports: folder limit, showing the newest 200; 3 older files are waiting. Finish or hide items to bring them into view", "listing_cut")]})
         self.assertEqual(pack["omitted"]["unread_sources"], 0)
         self.assertFalse(pack["complete"])
 

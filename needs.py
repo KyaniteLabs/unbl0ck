@@ -330,8 +330,17 @@ def _refuse_link(d: Path) -> None:
 
 
 class Notice(str):
-    """A message in a reader's ``errors`` list that reports a state, not a failure: the queue
-    shows it like any other, but a caller that counts failures (full-text search) does not."""
+    """A message in a reader's ``errors`` list that reports a state, not a read failure. The
+    queue shows it like any other; consumers classify it by *kind*, never by its wording:
+    ``capacity`` (every record was read, more cannot be filed), ``listing_cut`` (records exist
+    that the list does not show) or ``state`` (cleanup or stored state needs attention)."""
+
+    kind: str
+
+    def __new__(cls, text: str, kind: str) -> "Notice":
+        notice = super().__new__(cls, text)
+        notice.kind = kind
+        return notice
 
 
 def _list_files(d: Path, suffix: str = "") -> list[Path]:
@@ -350,8 +359,9 @@ def _hidden_path(home: Path | None, *, create: bool = True) -> Path:
 
 STATE_LOCK_TIMEOUT = 5.0  # seconds to wait for the state lock before giving up
 _STATE_LOCK = (
-    threading.Lock()
+    threading.RLock()
 )  # shared state, including filed outside items, is read-modify-write
+_STATE_HELD = threading.local()  # the data folder this thread already holds the file lock for
 
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # absent on Windows
@@ -373,24 +383,23 @@ def _msvcrt_contention(exc: OSError) -> bool:
 @contextmanager
 def _state_lock(home: Path | None):
     """Serialise a read-modify-write of UNBL0CK's state files across threads AND processes
-    (the dashboard backend, the agent plugin and a plugin host can all write them)."""
+    (the dashboard backend, the agent plugin and a plugin host can all write them). A thread
+    that already holds it for the same folder re-enters, so one transaction can update several
+    files through :func:`_update_state`."""
     deadline = time.monotonic() + STATE_LOCK_TIMEOUT
     if not _STATE_LOCK.acquire(timeout=STATE_LOCK_TIMEOUT):
         raise TimeoutError("unbl0ck: state lock busy (another thread holds it)")
     try:
         d = data_dir(home)
-        # O_NOFOLLOW: a dangling or redirected link is never created through or locked.
-        lock_path = d / ".state.lock"
-        # Where O_NOFOLLOW is absent (Windows) the open below would follow a link.
-        if lock_path.is_symlink():
-            raise OSError("the state lock is not a regular file")
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
+        held = getattr(_STATE_HELD, "dir", None)
+        if held is not None:
+            if held != d:
+                raise RuntimeError("unbl0ck: the state lock is already held for another folder")
+            yield
+            return
+        fd, _ = _pinned_open(d / ".state.lock", os.O_RDWR, create=True)
         locked_with_msvcrt = False
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise OSError("the state lock is not a regular file")
-            if not _names_open_file(fd, d / ".state.lock"):
-                raise OSError("the state lock is a link; refusing to lock through it")
             if fcntl is not None:
                 while True:
                     try:
@@ -420,7 +429,11 @@ def _state_lock(home: Path | None):
                                 "unbl0ck: state lock busy (another process holds it)"
                             )
                         time.sleep(0.02)
-            yield
+            _STATE_HELD.dir = d
+            try:
+                yield
+            finally:
+                _STATE_HELD.dir = None
         finally:
             if locked_with_msvcrt:
                 try:
@@ -468,20 +481,60 @@ def _names_open_file(fd: int, p: Path) -> bool:
         return False
 
 
-def _read_plain_bytes_st(p: Path, limit: int | None = None) -> tuple[bytes, os.stat_result]:
-    """Read a regular file's exact bytes without following a link or blocking on a FIFO or
-    device, refusing one larger than *limit* (before reading when ``fstat`` already says so, and
-    by the bytes actually read when it grew). Returns the bytes with the ``fstat`` of the very
-    descriptor they were read from, so a caller that caches by file signature caches the
-    signature of what it read, not of whatever a later path lookup finds."""
-    limit = MAX_STATE_BYTES if limit is None else limit
-    fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
+def _pinned_open(p: Path, flags: int, *, create: bool = False) -> tuple[int, os.stat_result]:
+    """Open the regular file *p* names itself: never through a link, never blocking on a FIFO
+    or device, and only while the path still names the descriptor's file afterwards. Returns
+    the descriptor with its ``fstat``. ``create`` makes a missing file with ``O_EXCL``, which
+    refuses any link at the name, so nothing is ever created through a link even where
+    ``O_NOFOLLOW`` does not exist."""
+    flags |= _NOFOLLOW | _NONBLOCK
+    if create:
+        try:
+            fd = os.open(p, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            fd = os.open(p, flags)
+    else:
+        fd = os.open(p, flags)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise UnsafeStateFile("not a regular file", "not_regular")
+            raise UnsafeStateFile(f"{p.name} is not a regular file", "not_regular")
         if not _names_open_file(fd, p):
-            raise UnsafeStateFile("not the file that was opened (a link or a swapped path)", "changed")
+            raise UnsafeStateFile(f"{p.name} is not the file that was opened (a link or a swapped path)", "changed")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st
+
+
+def _finite(value: Any) -> float | None:
+    """*value* as a finite number, or None for anything else: a non-number, NaN, infinity or a
+    JSON integer past the float range (which raises ``OverflowError``, not ``ValueError``)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _json_loads_safe(raw: str | bytes) -> Any:
+    """``json.loads`` whose too-deeply-nested input fails as a ``ValueError`` like any other
+    damaged record, not as a ``RecursionError`` that escapes per-record handling."""
+    try:
+        return json.loads(raw)
+    except RecursionError as exc:
+        raise ValueError("too deeply nested") from exc
+
+
+def _read_plain_bytes_st(p: Path, limit: int | None = None) -> tuple[bytes, os.stat_result]:
+    """Read a regular file's exact bytes through :func:`_pinned_open`, refusing one larger than
+    *limit* (before reading when ``fstat`` already says so, and by the bytes actually read when
+    it grew). Returns the bytes with the ``fstat`` of the very descriptor they were read from,
+    so a caller that caches by file signature caches the signature of what it read, not of
+    whatever a later path lookup finds."""
+    limit = MAX_STATE_BYTES if limit is None else limit
+    fd, st = _pinned_open(p, os.O_RDONLY)
+    try:
         if st.st_size > limit:
             raise UnsafeStateFile("too large to be a state file", "too_large")
         with os.fdopen(fd, "rb", closefd=False) as fh:
@@ -516,7 +569,7 @@ def _read_json(
     """Read one JSON object. A strict read also checks every entry with *entry_ok*, so a record
     in a shape this version does not write is refused rather than rewritten."""
     try:
-        data = json.loads(_read_plain_text(p))
+        data = _json_loads_safe(_read_plain_text(p))
         if not isinstance(data, dict):
             raise ValueError("expected a JSON object")
         if strict and entry_ok is not None and not all(entry_ok(v) for v in data.values()):
@@ -580,6 +633,38 @@ def _write_json(p: Path, data: dict[str, Any], *, ordered: bool = False) -> None
         )  # gone after a successful replace; removed after a failed write
 
 
+def _update_state(
+    home: Path | None,
+    path: Path,
+    mutate: Callable[[dict[str, Any]], dict[str, Any] | None],
+    *,
+    entry_ok: Any = None,
+) -> dict[str, Any]:
+    """One read-modify-write of a state file: under the state lock, read it strictly (a damaged
+    file or an entry *entry_ok* refuses is never rewritten), pass it to *mutate*, and write what
+    *mutate* returns (None writes nothing). Every check that guards the write belongs inside
+    *mutate*, where nothing can change between the check and the write."""
+    with _state_lock(home):
+        data = _read_json(path, strict=True, entry_ok=entry_ok)
+        new = mutate(data)
+        if new is None:
+            return data
+        _write_json(path, new, ordered=True)
+        return new
+
+
+def _dropper(key: str) -> Callable[[dict[str, Any]], dict[str, Any] | None]:
+    """An :func:`_update_state` mutation that removes *key* (and writes nothing when it is absent)."""
+
+    def drop(data: dict[str, Any]) -> dict[str, Any] | None:
+        if key not in data:
+            return None
+        del data[key]
+        return data
+
+    return drop
+
+
 def _hidden_entry_ok(value: Any) -> bool:
     # A string version; null and "" are older writes that unhide still removes.
     return value is None or isinstance(value, str)
@@ -601,18 +686,19 @@ def _split_hidden(value: Any) -> tuple[Any, str | None]:
 
 
 def _load_hidden_raw(
-    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False, create: bool = True
+    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False
 ) -> dict[str, Any]:
+    # A reader never makes the state folder: only a write does (see _update_state).
     return _read_json(
-        _hidden_path(home, create=create), errors=errors, strict=strict, entry_ok=_hidden_entry_ok
+        _hidden_path(home, create=False), errors=errors, strict=strict, entry_ok=_hidden_entry_ok
     )
 
 
 def load_hidden(
-    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False, create: bool = True
+    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False
 ) -> dict[str, str]:
     """``{item_id: version}``; the dismissal tokens are not part of this view."""
-    raw = _load_hidden_raw(home, errors=errors, strict=strict, create=create)
+    raw = _load_hidden_raw(home, errors=errors, strict=strict)
     return {item_id: _split_hidden(value)[0] for item_id, value in raw.items()}
 
 
@@ -712,7 +798,7 @@ class StaleHide(RuntimeError):
 def _current_version(item_id: str, home: Path | None) -> str | None:
     """The queue's current version of one item, or None when it is gone or cannot be looked up."""
     try:
-        for it in build_queue(home, include_hidden=True).get("items", []):
+        for it in build_queue(home, include_hidden=True, record=False).get("items", []):
             if it.get("id") == item_id:
                 return str(it.get("version") or "")
     except Exception:  # noqa: BLE001 - a lookup failure must not block a dismissal
@@ -741,18 +827,23 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
         current = _current_version(item_id, home)
         if current is not None and current != version:
             raise StaleHide("the card changed since this view; refresh before hiding it")
-        with _state_lock(home):
-            hidden = _load_hidden_raw(home, strict=True)
+        out: dict[str, Any] = {}
+
+        def mutate(hidden: dict[str, Any]) -> dict[str, Any] | None:
             existing = _split_hidden(hidden.get(item_id))[0] if item_id in hidden else None
-            if not existing or existing == version or existing == judged:
-                hidden.pop(item_id, None)
-                token = uuid.uuid4().hex
-                hidden[item_id] = f"{version}\x1f{token}"
-                hidden = _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
-                order = _dismissal_order()
-                _write_json(_hidden_path(home), hidden, ordered=True)
-                return token, order
-            judged = existing
+            if existing and existing not in (version, judged):
+                out["existing"] = existing
+                return None
+            hidden.pop(item_id, None)
+            out["token"] = uuid.uuid4().hex
+            hidden[item_id] = f"{version}\x1f{out['token']}"
+            out["order"] = _dismissal_order()
+            return _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
+
+        _update_state(home, _hidden_path(home), mutate, entry_ok=_hidden_entry_ok)
+        if "token" in out:
+            return out["token"], out["order"]
+        judged = out["existing"]
 
 
 def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:
@@ -783,8 +874,7 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
             d = _outside_dir(home)
             _purge_logged(d)
             f = d / (filed.group(1) + ".json")
-            if not f.is_symlink() and f.is_file():
-                rec = _read_json(f)
+            rec = _load_filed(d, filed.group(1))
             current = str(rec.get("version")) if rec else None
         done = bool(rec) and _is_done(rec)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
@@ -813,41 +903,43 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
                 raise RuntimeError(
                     f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before undoing Done"
                 )
-        # Hidden marker first. If the Done write then fails, the marker is put back so the
-        # same token still names a dismissal on retry (the undo is all or nothing).
-        before = dict(hidden)
-        if clear_hidden:
-            del hidden[item_id]
-            _write_json(_hidden_path(home), hidden, ordered=True)
-        if clear_done:
+        def undo_done() -> None:
             rec.pop("done_at", None)
             rec.pop("done_token", None)
-            try:
-                _write_json(f, rec)
-            except BaseException:
-                if clear_hidden:
-                    try:
-                        _write_json(_hidden_path(home), before, ordered=True)
-                    except Exception:  # noqa: BLE001 - the original failure is the one to report
-                        log.warning("unbl0ck: could not restore the dismissal after a failed undo", exc_info=True)
-                raise
+            _write_json(f, rec)
+
+        def undo_hidden() -> None:
+            _update_state(home, _hidden_path(home), _dropper(item_id), entry_ok=_hidden_entry_ok)
+
+        # The store the token names is written last: if the first write fails, a retry with
+        # the same token still finds its dismissal and finishes the undo.
+        steps = [(clear_hidden, undo_hidden), (clear_done, undo_done)]
+        if token is not None and h_match and not d_match:
+            steps.reverse()
+        for wanted, step in steps:
+            if wanted:
+                step()
         return True
 
 
 # --- Releases that failed after the answer was posted ---------------------------------------
-# {item_id: block version}. The answer is on the card but the card is still blocked, so the queue
+# {item_id: block version \x1f owner token}. The answer is on the card but the card is still blocked, so the queue
 # keeps showing it (tier "release_failed") and answer_card may retry the release without
 # posting the answer twice.
 
 
-def _pending_path(home: Path | None) -> Path:
-    return data_dir(home) / "pending-release.json"
+def _pending_path(home: Path | None, *, create: bool = True) -> Path:
+    return data_dir(home, create=create) / "pending-release.json"
+
+
+def _pending_entry_ok(value: Any) -> bool:
+    return isinstance(value, str)
 
 
 def load_pending_releases(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, str]:
-    return _read_json(
-        _pending_path(home), errors=errors, strict=strict, entry_ok=lambda v: isinstance(v, str)
-    )
+    """``{item_id: block version}``; the owner tokens are not part of this view."""
+    raw = _read_json(_pending_path(home, create=False), errors=errors, strict=strict, entry_ok=_pending_entry_ok)
+    return {item_id: _split_hidden(value)[0] for item_id, value in raw.items()}
 
 
 class PendingReleaseFull(RuntimeError):
@@ -867,29 +959,37 @@ def _set_pending_release(
     home: Path | None = None,
     *,
     expected: str | None = None,
-) -> None:
+) -> tuple[str, bool] | None:
     """Record (version) or clear (None) the unfinished release for one card.
 
-    A clear with *expected* removes only the marker recorded for that version, and a record
-    never replaces a marker for a newer block: a slow worker for an older version cannot undo
-    the newer one's recovery."""
-    with _state_lock(home):
-        data = load_pending_releases(home, strict=True)
+    A record stamps the marker with a fresh owner token and returns ``(token, created)``:
+    *created* is False when a marker for this version already existed, which the caller then
+    shares and must never remove. A clear with *expected* removes the marker only while it
+    still holds that version or that owner token: a caller cleaning up its own reservation
+    cannot remove a marker another caller has stamped since. A record never replaces a
+    marker for a newer block (it returns None), so a slow worker for an older version cannot
+    undo the newer one's recovery."""
+    out: dict[str, Any] = {}
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any] | None:
+        stored, owner = _split_hidden(data.get(item_id))
         if version is None:
-            if item_id not in data or (expected is not None and data[item_id] != expected):
-                return
+            if item_id not in data or (expected is not None and expected not in (stored, owner)):
+                return None
             del data[item_id]
-        else:
-            old, new = _version_number(data.get(item_id)), _version_number(version)
-            if old is not None and new is not None and new < old:
-                return
-            if item_id not in data and len(data) >= _HIDDEN_KEEP:
-                raise PendingReleaseFull(
-                    "too many unfinished releases are waiting to be retried"
-                )
-            data.pop(item_id, None)  # an updated marker is the newest
-            data[item_id] = version
-        _write_json(_pending_path(home), data, ordered=True)
+            return data
+        old, new = _version_number(stored), _version_number(version)
+        if old is not None and new is not None and new < old:
+            return None
+        if item_id not in data and len(data) >= _HIDDEN_KEEP:
+            raise PendingReleaseFull("too many unfinished releases are waiting to be retried")
+        out["reserved"] = (uuid.uuid4().hex, stored != version)
+        data.pop(item_id, None)  # an updated marker is the newest
+        data[item_id] = f"{version}\x1f{out['reserved'][0]}"
+        return data
+
+    _update_state(home, _pending_path(home), mutate, entry_ok=_pending_entry_ok)
+    return out.get("reserved")
 
 
 # --- BLUF cache (one model summary per item version) ----------------------------------------
@@ -908,14 +1008,16 @@ BLUF_SYSTEM = (
 )
 
 
-def _bluf_path(home: Path | None) -> Path:
-    return data_dir(home) / "bluf.json"
+def _bluf_path(home: Path | None, *, create: bool = True) -> Path:
+    return data_dir(home, create=create) / "bluf.json"
 
 
-def load_blufs(home: Path | None = None, *, strict: bool = False) -> dict[str, dict[str, str]]:
-    return _read_json(
-        _bluf_path(home), strict=strict, entry_ok=lambda v: isinstance(v, dict)
-    )
+def _bluf_entry_ok(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
+def load_blufs(home: Path | None = None) -> dict[str, dict[str, str]]:
+    return _read_json(_bluf_path(home, create=False), entry_ok=_bluf_entry_ok)
 
 
 def summary_fingerprint(item: dict[str, Any]) -> str:
@@ -937,14 +1039,9 @@ def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str,
     if len(data) <= _BLUF_KEEP:
         return data
 
-    def saved_at(entry: Any) -> int:
-        try:
-            return int(entry.get("at") or 0) if isinstance(entry, dict) else 0
-        except (TypeError, ValueError, OverflowError):
-            return 0
-
     ranked = sorted(
-        data.items(), key=lambda pair: (saved_at(pair[1]), pair[0] == newest_id)
+        data.items(),
+        key=lambda pair: (_num(pair[1].get("at")) if isinstance(pair[1], dict) else 0.0, pair[0] == newest_id),
     )
     return dict(ranked[-_BLUF_KEEP:])
 
@@ -965,17 +1062,11 @@ def save_bluf(
     for an old question cannot replace the newer question's summary. Start
     order decides, not completion order: the older request finishing first must not make the
     newer one look stale. A summary saved without a start time is never treated as newer."""
-    with _state_lock(
-        home
-    ):  # read-modify-write: concurrent workers must not drop each other's entries
-        data = load_blufs(home, strict=True)  # a damaged cache is repaired, not overwritten
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any] | None:
         existing = data.get(item_id)
-        if (
-            started_at is not None
-            and isinstance(existing, dict)
-            and _num(existing.get("started_at")) > started_at
-        ):
-            return
+        if started_at is not None and isinstance(existing, dict) and _num(existing.get("started_at")) > started_at:
+            return None
         data.pop(item_id, None)
         entry = {
             "version": version,
@@ -988,8 +1079,10 @@ def save_bluf(
         if fp is not None:
             entry["fp"] = fp
         data[item_id] = entry
-        data = _trim_blufs(data, item_id)
-        _write_json(_bluf_path(home), data, ordered=True)
+        return _trim_blufs(data, item_id)
+
+    # A damaged cache is refused for repair, never overwritten.
+    _update_state(home, _bluf_path(home), mutate, entry_ok=_bluf_entry_ok)
 
 
 def prune_blufs(
@@ -1004,21 +1097,18 @@ def prune_blufs(
     ``observed_at`` is when *items* was read: a summary saved after that was never in the
     caller's view, so it is kept rather than judged against a list that predates it."""
     current = {item["id"]: item["version"] for item in items}
-    with _state_lock(home):
-        data = load_blufs(home, strict=True)
-        kept = {
+
+    def mutate(data: dict[str, Any]) -> dict[str, Any] | None:
+        kept = _trim_blufs({
             item_id: value
             for item_id, value in data.items()
-            if isinstance(value, dict)
-            and (
-                (observed_at is not None and _num(value.get("at")) >= observed_at)
-                or item_id.startswith(preserve_prefixes)
-                or (item_id in current and value.get("version") == current[item_id])
-            )
-        }
-        kept = _trim_blufs(kept)
-        if kept != data:
-            _write_json(_bluf_path(home), kept, ordered=True)
+            if (observed_at is not None and _num(value.get("at")) >= observed_at)
+            or item_id.startswith(preserve_prefixes)
+            or (item_id in current and value.get("version") == current[item_id])
+        })
+        return kept if kept != data else None
+
+    _update_state(home, _bluf_path(home), mutate, entry_ok=_bluf_entry_ok)
 
 
 def attach_blufs(
@@ -1615,17 +1705,6 @@ def _same_author(a: Any, b: Any) -> bool:
     return str(a or "").casefold() == str(b or "").casefold()
 
 
-def _commented_after(events: Iterable[Any], block_id: int, author: str) -> bool:
-    """Did *author* comment after the block event? Kanban appends a ``commented`` event, with
-    the author in its payload, for every comment; event ids keep their order within one second."""
-    for e in events:
-        if getattr(e, "kind", None) != "commented" or int(getattr(e, "id", 0) or 0) <= block_id:
-            continue
-        if _same_author(_event_payload(e).get("author"), author):
-            return True
-    return False
-
-
 def _answered_since(
     conn: Any,
     kanban_db: Any,
@@ -1634,60 +1713,12 @@ def _answered_since(
     since: int,
     block_id: int | None = None,
 ) -> bool:
-    """Has *author* commented since the block began? The one test for "answered", used by
-    the queue and by answer_card. Names compare in Python (casefold) on both paths: SQLite's
-    LOWER() folds ASCII only, so "ZOË" and "Zoë" used to differ on the fast path alone.
-
-    Comment times have one-second resolution and a clock can step back. With the block's event
-    id, every comment that has its ``commented`` event is placed by that event alone (event ids
-    are ordered, clocks are not); only when some comment has no event (an import) does the
-    time rule apply, a comment counting when it is strictly later than the block. Without the
-    id the old same-second rule (>=) applies."""
-    cut = since or 0
-    strict = block_id is not None
-    try:
-        by_event_only = False
-        if strict:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
-            ).fetchone()[0]
-            logged = conn.execute(
-                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
-                (task_id,),
-            ).fetchone()[0]
-            by_event_only = logged >= total
-        rows = (
-            []
-            if by_event_only
-            else conn.execute(
-                "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
-                (task_id, cut + 1 if strict else cut),
-            ).fetchall()
-        )
-        if any(_same_author(r[0], author) for r in rows):
-            return True
-        if not strict:
-            return False
-        events = [
-            kanban_db.Event.from_row(r)
-            for r in conn.execute(
-                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
-                (task_id, block_id),
-            ).fetchall()
-        ]
-        return _commented_after(events, block_id, author)
-    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments = list(kanban_db.list_comments(conn, task_id))
-        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
-        by_event_only = strict and (
-            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
-        )
-        if not by_event_only and any(
-            _same_author(c.author, author) and c.created_at >= (cut + 1 if strict else cut)
-            for c in comments
-        ):
-            return True
-        return strict and _commented_after(all_events, block_id, author)
+    """Has *author* commented since the block began? The one test for "answered", used by the
+    queue and by answer_card: an author among :func:`_comments_since_block`. Names compare in
+    Python (casefold) on every path; SQLite's LOWER() folds ASCII only."""
+    return any(
+        _same_author(a, author) for a, _ in _comments_since_block(conn, kanban_db, task_id, since, block_id)
+    )
 
 
 class CardStatus(str, Enum):
@@ -2123,19 +2154,17 @@ def _open_chat_db(db: Path) -> sqlite3.Connection:
     """Open *db* read-only, only if it is the regular file it was when the search began. The
     check is made on the path itself (no link is followed) before and after the open, so a link
     put in its place between the listing and the open is refused, not read."""
-    first = os.lstat(db)
-    if not stat.S_ISREG(first.st_mode):
-        raise OSError("state.db is not a regular file")
-    path = Path(os.path.abspath(db))
-    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+    fd, _ = _pinned_open(db, os.O_RDONLY)
     try:
-        second = os.lstat(db)
-        same = (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
-        if not (stat.S_ISREG(second.st_mode) and same):
-            raise OSError("state.db changed while it was opened")
-    except BaseException:
-        conn.close()
-        raise
+        conn = sqlite3.connect(Path(os.path.abspath(db)).as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            if not _names_open_file(fd, db):
+                raise UnsafeStateFile("state.db changed while it was opened", "changed")
+        except BaseException:
+            conn.close()
+            raise
+    finally:
+        os.close(fd)
     return conn
 
 
@@ -2147,24 +2176,26 @@ def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
 
 
 BACKFILL_FILE = "chat-backfill.json"
-BACKFILL_IDS_MAX = 1000
 
 
-def _backfill_state(home: Path | None) -> tuple[float | None, list[str], bool]:
-    """``(floor, ids, readable)``: the oldest time any earlier queue read reached back to, and the
-    chats first listed from before it (a widened ``chat_window_days`` found them). Nothing here is
-    chat text: a time and the ids the dismissal and summary stores already hold."""
+def _backfill_floor(home: Path | None, since: float, *, record: bool, errors: list[str] | None) -> float:
+    """The start of the first window any queue build read (``{"floor": time}``, written once
+    under the state lock), or *since* before one exists. Nothing here is chat text. A floor
+    that cannot be read or saved counts as a day ago, so a widened window never passes for
+    an ordinary one."""
     try:
-        p = data_dir(home, create=False) / BACKFILL_FILE
-        if not os.path.lexists(p):
-            return None, [], True
-        data = json.loads(_read_plain_text(p))
-        floor = data.get("floor")
-        floor = float(floor) if isinstance(floor, (int, float)) and math.isfinite(floor) else None
-        ids = [i for i in data.get("ids", []) if isinstance(i, str)][-BACKFILL_IDS_MAX:]
-        return floor, ids, True
-    except (OSError, ValueError, AttributeError, TypeError, UnicodeError):
-        return None, [], False
+        if record:
+            data = _update_state(
+                home, data_dir(home) / BACKFILL_FILE, lambda d: None if "floor" in d else {"floor": since}
+            )
+        else:
+            data = _read_json(data_dir(home, create=False) / BACKFILL_FILE, strict=True)
+    except (OSError, RuntimeError) as exc:
+        if errors is not None:
+            errors.append(f"chat: the backfill floor could not be read or saved ({type(exc).__name__})")
+        return time.time() - 86400
+    floor = _finite(data.get("floor", since))
+    return floor if floor is not None else time.time() - 86400
 
 
 def _mark_backfill(
@@ -2173,42 +2204,20 @@ def _mark_backfill(
     since: float,
     *,
     record: bool,
-    complete: bool,
     errors: list[str] | None,
 ) -> None:
     """Flag chats that only a widened window reached (``backfilled``), so nothing is sent to a
-    model for them automatically. A chat is backfill when it is older than the default window or
-    older than anything an earlier read looked at; the flag then stays with it, so a later
-    refresh cannot turn it back into an ordinary ask. Only ``record`` (the queue build) saves."""
-    default_since = time.time() - CHAT_WINDOW_DAYS * 86400
-    floor, ids, readable = _backfill_state(home)
-    edge = floor if floor is not None else since
-    marked = dict.fromkeys(ids)
-    changed = False
+    model for them automatically: a chat older than the default window or than the first
+    window any queue build read. Both edges only move forward in time relative to a chat, so
+    the flag stays with it and a later refresh cannot turn it back into an ordinary ask. Only
+    ``record`` (the queue build) saves the floor."""
+    edge = max(
+        _backfill_floor(home, since, record=record, errors=errors),
+        time.time() - CHAT_WINDOW_DAYS * 86400,
+    )
     for it in items:
-        ts = it.get("since") or 0
-        if it["id"] not in marked and (ts < edge or not readable) and ts < time.time() - 86400:
-            marked[it["id"]] = None
-            changed = True
-        if ts < default_since or it["id"] in marked:
+        if (it.get("since") or 0) < edge:
             it["backfilled"] = True
-    if complete:  # a whole read: chats no longer listed need no flag
-        listed = {it["id"] for it in items}
-        kept = {i: None for i in marked if i in listed}
-        changed = changed or len(kept) != len(marked)
-        marked = kept
-    new_floor = min(edge, since)
-    if not record or not readable or (not changed and floor is not None and new_floor >= floor):
-        return
-    try:
-        _write_json(
-            data_dir(home) / BACKFILL_FILE,
-            {"floor": new_floor, "ids": list(marked)[-BACKFILL_IDS_MAX:]},
-            ordered=True,
-        )
-    except OSError as exc:
-        if errors is not None:
-            errors.append(f"chat: backfill marks could not be saved ({type(exc).__name__})")
 
 
 def chat_items(
@@ -2252,7 +2261,7 @@ def chat_items(
         """Whether a dismissal or a cached summary already exists under this profile's chat ids."""
         prefix = f"chat:{profile}:"
         try:
-            ids = list(load_hidden(home, create=False)) + list(load_blufs(home))
+            ids = list(load_hidden(home)) + list(load_blufs(home))
         except Exception:  # noqa: BLE001 - only a tie-break between aliases; the first one wins
             return False
         return any(str(i).startswith(prefix) for i in ids)
@@ -2462,12 +2471,7 @@ def chat_items(
     # Found only because chat_window_days reaches further back than an earlier read did (or past
     # the default window): listed, but never sent to a model without a deliberate action.
     if only is None:
-        _mark_backfill(
-            home, items, since,
-            record=record_backfill,
-            complete=not cov.get("sessions_omitted") and not (errors or []) and not unread_profiles,
-            errors=errors,
-        )
+        _mark_backfill(home, items, since, record=record_backfill, errors=errors)
     return items
 
 
@@ -2523,19 +2527,11 @@ def _pending_file_damage(path: Path) -> bool:
     such a file as "no requests", so it cannot tell a damaged store from an empty one. The content
     is parsed and dropped here, never kept, logged or reported."""
     try:
-        fd = os.open(path, os.O_RDONLY | _NONBLOCK)
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_STATE_BYTES:
-                return True
-            with os.fdopen(fd, "rb", closefd=False) as fh:
-                raw = fh.read(MAX_STATE_BYTES + 1)
-        finally:
-            os.close(fd)
-        return not isinstance(json.loads(raw.decode("utf-8-sig")), dict)
+        raw, _ = _read_plain_bytes_st(path)
+        return not isinstance(_json_loads_safe(raw.decode("utf-8-sig")), dict)
     except FileNotFoundError:
         return False
-    except (OSError, ValueError, RecursionError):  # too deeply nested is damage, not a crash
+    except (OSError, ValueError):
         return True
 
 
@@ -2642,11 +2638,7 @@ WAIT_MAX_AGE = (
 
 
 def _num(value: Any) -> float:
-    try:
-        number = float(value or 0)
-    except (TypeError, ValueError, OverflowError):  # OverflowError: a JSON integer past the float range
-        return 0.0
-    return number if math.isfinite(number) else 0.0  # NaN/inf are not times
+    return _finite(value or 0) or 0.0  # NaN, inf and overflowing integers are not times
 
 
 def _waits_dir(home: Path | None = None, *, create: bool = True) -> Path:
@@ -2983,7 +2975,7 @@ def wait_items(
             try:
                 f.unlink(missing_ok=True)
             except OSError as exc:
-                errors.append(f"prompt: {f.name}: {type(exc).__name__}; could not remove stale record")
+                errors.append(Notice(f"prompt: {f.name}: {type(exc).__name__}; could not remove stale record", "state"))
             continue
         rid = str(rec["request_id"])
         kind = str(rec.get("kind") or "")
@@ -3111,7 +3103,7 @@ def search_text(query: Any) -> dict[str, Any]:
         raise ValueError(f"use at most {SEARCH_MAX_TERMS} search terms")
     home = hermes_home()
     hidden_errors: list[str] = []
-    raw_hidden = _load_hidden_raw(home, errors=hidden_errors, create=False)
+    raw_hidden = _load_hidden_raw(home, errors=hidden_errors)
     hidden = {item_id: _split_hidden(value)[0] for item_id, value in raw_hidden.items()}
     # A dismissal that names no version (null, a number, a list, an empty string) cannot say what
     # was dismissed, so the card reads as shown: that is damage to report, like an unreadable file.
@@ -3164,7 +3156,7 @@ def search_text(query: Any) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             errors.append(f"{source}: could not be read, so it was not searched")
             continue
-        if any(not isinstance(e, Notice) for e in source_errors):
+        if any(getattr(e, "kind", None) != "capacity" for e in source_errors):
             errors.append(f"{source}: some records could not be read")
         window = items[:SEARCH_MAX_ITEMS]
         skipped = len(items) - len(window) + (unread[0] if source == "outside" else 0)
@@ -3222,6 +3214,19 @@ def _is_filed_record(rec: Any, stem: str) -> bool:
         )
         and isinstance(rec.get("text"), str)
     )
+
+
+def _load_filed(d: Path, stem: str) -> dict[str, Any]:
+    """The record filed as ``<stem>.json`` in *d*, or ``{}`` when there is none. A link, a
+    damaged file or a record this plugin did not file raises ``SourceUnavailable``: it is never
+    read, rewritten or deleted as ours, and it is never mistaken for "gone"."""
+    try:
+        rec = _read_json(d / f"{stem}.json", strict=True)
+    except RuntimeError as exc:
+        raise SourceUnavailable(str(exc)) from exc
+    if rec and not _is_filed_record(rec, stem):
+        raise SourceUnavailable("filed outside record is invalid; repair it")
+    return rec
 _OUTSIDE_LIMIT = 200
 _OUTSIDE_READ_LIMIT = 256 * 1024
 # Recursive intake (outside_recursive) is bounded three ways: nesting depth, directory
@@ -3283,11 +3288,7 @@ def _done_at(rec: dict[str, Any]) -> float | None:
     value = rec.get("done_at")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    try:
-        number = float(value)  # OverflowError for a JSON integer past the float range
-    except OverflowError:
-        return None
-    return number if math.isfinite(number) else None
+    return _finite(value)
 
 
 def _is_done(rec: dict[str, Any]) -> bool:
@@ -3308,15 +3309,24 @@ _TOO_MANY_FILED = (
 )
 
 
-def _filed_files(d: Path) -> tuple[list[Path], bool]:
-    """At most ``_PURGE_SCAN_LIMIT`` filed-record paths of *d*, and whether there were more."""
+def _bounded_scandir(d: Path, *, limit: int, deadline: float | None = None) -> tuple[list[Path], bool]:
+    """At most *limit* entries of *d*, and whether the listing was cut (more entries, or the
+    monotonic *deadline* passed). Every entry is charged before any caller filters it, so a
+    folder of other files cannot stretch the scan. A folder that cannot be listed raises."""
+    out: list[Path] = []
     with os.scandir(d) as entries:
-        # Every entry counts toward the bound, not just the JSON ones: a folder of other files
-        # must not be read to the end before the limit applies.
-        seen = list(itertools.islice(entries, _PURGE_SCAN_LIMIT + 1))
-    names = [Path(e.path) for e in seen[:_PURGE_SCAN_LIMIT] if e.name.endswith(".json")]
-    names.sort(key=lambda p: p.name)
-    return names, len(seen) > _PURGE_SCAN_LIMIT
+        for entry in entries:
+            if len(out) >= limit or (deadline is not None and time.monotonic() > deadline):
+                return out, True
+            out.append(Path(entry.path))
+    return out, False
+
+
+def _filed_files(d: Path) -> tuple[list[Path], bool]:
+    """The filed-record paths among the first ``_PURGE_SCAN_LIMIT`` entries of *d*, by name,
+    and whether the listing was cut."""
+    entries, cut = _bounded_scandir(d, limit=_PURGE_SCAN_LIMIT)
+    return sorted((p for p in entries if p.name.endswith(".json")), key=lambda p: p.name), cut
 
 
 def _count_active(files: list[Path], skip: Path | None = None) -> int:
@@ -3338,7 +3348,7 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
     errors = [] if errors is None else errors
     deadline = time.monotonic() + _PURGE_SECONDS
     done: list[tuple[float, Path]] = []
-    removed = failed = scanned = 0
+    removed = failed = 0
 
     def remove(f: Path) -> None:
         nonlocal removed, failed
@@ -3349,50 +3359,48 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
             failed += 1
 
     try:
-        scan = os.scandir(d)
+        entries, cut = _bounded_scandir(d, limit=_PURGE_SCAN_LIMIT, deadline=deadline)
     except OSError as exc:
         errors.append(f"outside: could not list filed records: {type(exc).__name__}")
         return 0
-    with scan as entries:
-        for entry in entries:
-            if scanned >= _PURGE_SCAN_LIMIT or time.monotonic() > deadline:
-                errors.append("outside: retention cleanup stopped early; some filed records were not checked")
-                break
-            scanned += 1  # every entry counts, so non-JSON files cannot stretch the scan
-            if not entry.name.endswith(".json"):
-                continue
-            f = Path(entry.path)
-            if f.is_symlink():
-                continue
-            rec = _read_json(f)
-            if not _is_filed_record(rec, f.stem):
-                continue
-            if _bad_done(rec):
-                errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
-                continue
-            done_at = _done_at(rec)
-            if done_at is None:
-                continue
-            if done_at > now:
-                # The clock stepped back since this Done: keep the record and restart its window.
-                try:
-                    rec["done_token"] = _done_token(rec)
-                    rec["done_at"] = now
-                    _write_json(f, rec)
-                except OSError:
-                    failed += 1
-                done_at = now
-            if now - done_at > OUTSIDE_UNDO_SECONDS:
-                remove(f)
-            else:
-                done.append((done_at, f))
+    for f in entries:
+        if time.monotonic() > deadline:
+            cut = True
+            break
+        if not f.name.endswith(".json") or f.is_symlink():
+            continue
+        rec = _read_json(f)
+        if not _is_filed_record(rec, f.stem):
+            continue
+        if _bad_done(rec):
+            errors.append(Notice(f"outside: {f.name}: invalid done_at; kept for repair", "state"))
+            continue
+        done_at = _done_at(rec)
+        if done_at is None:
+            continue
+        if done_at > now:
+            # The clock stepped back since this Done: keep the record and restart its window.
+            try:
+                rec["done_token"] = _done_token(rec)
+                rec["done_at"] = now
+                _write_json(f, rec)
+            except OSError:
+                failed += 1
+            done_at = now
+        if now - done_at > OUTSIDE_UNDO_SECONDS:
+            remove(f)
+        else:
+            done.append((done_at, f))
+    if cut:
+        errors.append(Notice("outside: retention cleanup stopped early; some filed records were not checked", "state"))
     done.sort()
     for _, f in done[: max(0, len(done) - _OUTSIDE_DONE_KEEP)]:
         remove(f)
     if failed:
-        errors.append(
-            f"outside: could not remove {failed} expired done record(s); their text stays until a later cleanup succeeds"
-        )
+        errors.append(Notice(
+            f"outside: could not remove {failed} expired done record(s); their text stays until a later cleanup succeeds",
+            "state",
+        ))
     return removed
 
 
@@ -3435,7 +3443,7 @@ def _purge_logged(d: Path) -> int:
     try:
         _purge_done(d, errors=errors)
     except OSError as exc:
-        errors.append(f"outside: retention cleanup failed: {type(exc).__name__}")
+        errors.append(Notice(f"outside: retention cleanup failed: {type(exc).__name__}", "state"))
     for error in errors:
         log.warning("unbl0ck: %s", error)
     return len(errors)
@@ -3449,9 +3457,6 @@ def file_outside(
     if action not in ("file", "resolve"):
         raise ValueError("action must be file or resolve")
     key = _outside_field(args, "dedupe_key", 120)
-    if len(str(args.get("dedupe_key") or "")) > 120:
-        # A cut key would let two different long keys collide into one record.
-        raise ValueError("dedupe_key must be at most 120 characters")
     # Hermes' tool dispatch passes task_id, session_id and user_task but not the profile, so
     # an absent kwarg falls back to the profile the process is running under, the same way
     # record_wait() resolves it. An explicit kwarg still wins.
@@ -3541,16 +3546,9 @@ def file_outside(
                     "an outside record could not be read; repair or remove it before filing or resolving"
                 )
         if action == "resolve":
-            if match is None or not match.is_file() or match.is_symlink():
-                raise LookupError("No filed outside item matches that id or dedupe_key")
-            try:
-                found = _read_json(match, strict=True)
-            except RuntimeError as exc:
-                raise SourceUnavailable(str(exc)) from exc
+            found = _load_filed(d, match.stem) if match is not None else {}
             if not found:
                 raise LookupError("No filed outside item matches that id or dedupe_key")
-            if not _is_filed_record(found, match.stem):
-                raise SourceUnavailable("filed outside record is invalid; repair it")
             if version is not None:
                 current = found.get("version")
                 if current != version:
@@ -3563,11 +3561,9 @@ def file_outside(
             # hidden.json is left as it is for repair rather than overwritten.
             marker_failed = False
             try:
-                # The raw view: it keeps every other dismissal's undo token intact.
-                marks = _load_hidden_raw(home, errors=(bad := []))
-                if not bad and resolved_id in marks:
-                    marks.pop(resolved_id)
-                    _write_json(_hidden_path(home), marks, ordered=True)
+                _update_state(home, _hidden_path(home), _dropper(resolved_id), entry_ok=_hidden_entry_ok)
+            except RuntimeError:
+                log.warning("unbl0ck: outside: hidden.json is damaged; a dismissal marker was left for repair")
             except OSError as exc:
                 # The record is already gone: report that, not a failure that would make the
                 # caller retry a resolve that can no longer find it. The stale marker is harmless.
@@ -4136,28 +4132,23 @@ def _folder_outside_item(
 def _stat_hidden(hidden: dict[str, Any], f: Path, st: os.stat_result) -> bool:
     """Whether a folder file is still dismissed at its current mtime, size and content.
 
-    A stored version names the content digest too. Time and size alone repeat after an in-place
-    edit with a restored timestamp, so a stat match is confirmed by reading the file (the same
-    bounded read that makes its version); a file that cannot be read or differs is not
-    dismissed. A version stored without a digest can only be matched on time and size."""
+    Time and size alone repeat after an in-place edit with a restored timestamp, so they only
+    pick the candidates: a dismissal holds only when the stored content digest matches the same
+    bounded read that makes the file's version. A version stored without a digest, a file that
+    cannot be read or one that differs is not dismissed."""
     stored = hidden.get("outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest())
-    if not isinstance(stored, str):
-        return False
-    key = f"{st.st_mtime_ns}:{st.st_size}"
-    if stored == key:
-        return True
-    if not stored.startswith(key + ":"):
+    key = f"{st.st_mtime_ns}:{st.st_size}:"
+    if not isinstance(stored, str) or not stored.startswith(key):
         return False
     try:
-        fd = os.open(f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        fd, now = _pinned_open(f, os.O_RDONLY)
         with os.fdopen(fd, "rb") as fh:
-            now = os.fstat(fh.fileno())
-            if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+            if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
                 return False
             raw = fh.read(_OUTSIDE_READ_LIMIT)
     except OSError:
         return False
-    return stored == f"{key}:{hashlib.sha256(raw).hexdigest()[:16]}"
+    return stored == f"{key}{hashlib.sha256(raw).hexdigest()[:16]}"
 
 
 def _scan_outside_folder(
@@ -4351,11 +4342,18 @@ def outside_items(
         else:
             filed, over = _filed_files(outside)
         if over:
-            errors.append(f"outside: more than {_PURGE_SCAN_LIMIT} filed entries; only the first {_PURGE_SCAN_LIMIT} are read")
+            errors.append(Notice(
+                f"outside: more than {_PURGE_SCAN_LIMIT} filed entries; only the first {_PURGE_SCAN_LIMIT} are read",
+                "listing_cut",
+            ))
     except OSError as exc:
         errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
         filed = []
-    for f in filed:
+    for tried, f in enumerate(filed):
+        if read_budget is not None and tried >= read_budget:
+            if unread is not None:
+                unread[0] += len(filed) - tried
+            break
         if f.is_symlink():
             continue
         before = len(errors)
@@ -4366,7 +4364,7 @@ def outside_items(
                 retained[rec["id"]] = rec["version"]
             continue
         if _bad_done(rec):
-            errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
+            errors.append(Notice(f"outside: {f.name}: invalid done_at; kept for repair", "state"))
             continue
         if _is_filed_record(rec, f.stem):
             if visible is None or visible(rec["id"], rec["version"]):
@@ -4379,7 +4377,8 @@ def outside_items(
         errors.append(
             Notice(
                 f"outside: {filed_waiting} agent-filed items are waiting (limit {_OUTSIDE_LIMIT}); "
-                "agents cannot file more until you finish some"
+                "agents cannot file more until you finish some",
+                "capacity",
             )
         )
     if done_seen and not readonly:
@@ -4391,17 +4390,19 @@ def outside_items(
                     del retained[item_id]
         except (OSError, TimeoutError, RuntimeError) as exc:
             # Reported, not swallowed: the text stays on disk until a later poll succeeds.
-            errors.append(f"outside: retention cleanup did not run: {type(exc).__name__}; it retries on the next poll")
+            errors.append(Notice(
+                f"outside: retention cleanup did not run: {type(exc).__name__}; it retries on the next poll", "state"
+            ))
     settings = _settings()  # one snapshot: the folders and the recursion flag cannot disagree
     raw = settings.get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
     recursive = outside_recursive(settings)
-    hidden = load_hidden(home, errors=errors, create=not readonly) if str(raw).strip() else {}
+    hidden = load_hidden(home, errors=errors) if str(raw).strip() else {}
     seen: set[Path] = set()
     # A file under two overlapping roots is listed once, where it is tried first.
     claimed: set[Path] = set()
     omitted: set[Path] = set()  # files never read, and dismissed ones never listed: each counted once
     hidden_omitted: set[Path] = set()
-    attempts = [max(0, read_budget - len(items))] if read_budget is not None else None
+    attempts = [max(0, read_budget - min(len(filed), read_budget))] if read_budget is not None else None
     for name in str(raw).split(","):
         if not name.strip():
             continue
@@ -4427,11 +4428,12 @@ def outside_items(
                     waiting, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors, attempts
                 )
                 if unattempted and len(shown) >= _OUTSIDE_LIMIT:
-                    errors.append(
+                    errors.append(Notice(
                         f"outside: {root.name}: folder limit, showing the newest {_OUTSIDE_LIMIT}; "
                         f"{len(unattempted)} older files are waiting. "
-                        "Finish or hide items to bring them into view"
-                    )
+                        "Finish or hide items to bring them into view",
+                        "listing_cut",
+                    ))
                 omitted.update(f for f, _ in unattempted)
                 # Every file tried here (read or failed) belongs to this root, so an overlapping
                 # root neither lists it again nor spends the read budget on it again.
@@ -4473,17 +4475,9 @@ def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
     (an unreadable folder, a corrupt record, a file that changed mid-read)."""
     match = _FILED_ID.fullmatch(item_id or "")
     if match:
-        f = _outside_dir(home) / (match.group(1) + ".json")
-        if f.is_symlink():
-            raise SourceUnavailable("filed outside record is not a regular file")
-        try:
-            rec = _read_json(f, strict=True)
-        except RuntimeError as exc:
-            raise SourceUnavailable(str(exc)) from exc
+        rec = _load_filed(_outside_dir(home), match.group(1))
         if not rec:
             raise LookupError("outside item is no longer available")
-        if not _is_filed_record(rec, match.group(1)):
-            raise SourceUnavailable("filed outside record is invalid; repair it")
         return rec
     if not _FOLDER_ID.fullmatch(item_id or ""):
         raise ValueError("id must identify an outside item")
@@ -4543,16 +4537,9 @@ def done_outside(
             d = _outside_dir(home)
             cleanup_failed = _purge_logged(d)
             f = d / (match.group(1) + ".json")
-            if f.is_symlink():
-                raise SourceUnavailable("filed outside record is not a regular file")
-            try:
-                rec = _read_json(f, strict=True)   # a corrupt record is a failure, not "gone"
-            except RuntimeError as exc:
-                raise SourceUnavailable(str(exc)) from exc
+            rec = _load_filed(d, match.group(1))  # a corrupt record is a failure, not "gone"
             if not rec:
                 raise LookupError("Filed outside item no longer exists")
-            if not _is_filed_record(rec, match.group(1)):
-                raise SourceUnavailable("filed outside record is invalid; repair it")
             if rec.get("version") != version:
                 raise RuntimeError(
                     "Outside item changed; refresh before marking it Done"
@@ -4783,8 +4770,10 @@ def capability_key(item: dict[str, Any]) -> str:
 
 
 def build_queue(
-    home: Path | None = None, *, include_hidden: bool = False
+    home: Path | None = None, *, include_hidden: bool = False, record: bool = True
 ) -> dict[str, Any]:
+    """The queue. ``record=False`` is a lookup that changes no state: it neither prunes
+    summaries, saves the backfill floor, clears stale prompts nor purges expired Done records."""
     home = home or hermes_home()
     observed_at = time.time()
     errors: list[str] = []
@@ -4815,14 +4804,14 @@ def build_queue(
         items.extend(
             chat_items(
                 home, errors=errors, coverage=chat_coverage, unread_profiles=unread_profiles,
-                record_backfill=True,
+                record_backfill=record,
             )
         )
     except Exception as exc:  # noqa: BLE001
         chat_coverage = None  # a failed source is not "covered"
         errors.append(f"chat: {type(exc).__name__}: {exc}")
     try:
-        items.extend(wait_items(home, errors=errors))
+        items.extend(wait_items(home, errors=errors, readonly=not record))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"prompt: {type(exc).__name__}: {exc}")
     try:
@@ -4832,7 +4821,8 @@ def build_queue(
     try:
         items.extend(
             outside_items(
-                home, errors=errors, retained=outside_retained, with_hidden=True, stats=outside_stats
+                home, errors=errors, retained=outside_retained, with_hidden=True, stats=outside_stats,
+                readonly=not record,
             )
         )
     except Exception as exc:  # noqa: BLE001
@@ -4863,12 +4853,13 @@ def build_queue(
         # Folder ids are shared across profiles, but their configured folders are not.
         preserve_prefixes += ("outside:folder:",)
     try:
-        prune_blufs(
-            items + [{"id": i, "version": v} for i, v in outside_retained.items()],
-            home,
-            preserve_prefixes=preserve_prefixes,
-            observed_at=observed_at,
-        )
+        if record:
+            prune_blufs(
+                items + [{"id": i, "version": v} for i, v in outside_retained.items()],
+                home,
+                preserve_prefixes=preserve_prefixes,
+                observed_at=observed_at,
+            )
     except (OSError, TimeoutError, RuntimeError) as exc:
         # RuntimeError: a damaged cache is left for repair, not rewritten.
         log.warning(
@@ -4891,10 +4882,11 @@ def build_queue(
         )
     )
     if include_hidden and outside_stats.get("hidden_unread"):
-        errors.append(
+        errors.append(Notice(
             f"outside: {outside_stats['hidden_unread']} hidden files are not listed "
-            f"(at most the newest {_OUTSIDE_LIMIT} per folder are shown)"
-        )
+            f"(at most the newest {_OUTSIDE_LIMIT} per folder are shown)",
+            "listing_cut",
+        ))
     summaries_on = bluf_enabled(settings)
     if summaries_on:
         attach_blufs(shown, home)
@@ -5120,32 +5112,6 @@ def _comments_since_block(
     return [rows[k] for k in sorted(rows)]
 
 
-# Callers in this process that rely on one recovery marker (data folder, card, block version):
-# {"users": callers still inside answer_card, "ours": one of them recorded it, "keep": one of
-# them posted an answer whose release failed, so the marker is that answer's only recovery}.
-_MARKER_USERS: dict[tuple[str, str, str | None], dict[str, Any]] = {}
-_MARKER_LOCK = threading.Lock()
-
-
-def _marker_join(key: tuple[str, str, str | None]) -> dict[str, Any]:
-    with _MARKER_LOCK:
-        entry = _MARKER_USERS.setdefault(key, {"users": 0, "ours": False, "keep": False})
-        entry["users"] += 1
-        return entry
-
-
-def _marker_leave(key: tuple[str, str, str | None], entry: dict[str, Any], *, keep: bool) -> bool:
-    """Leave the marker's user list. True only for the last user out when the marker was
-    recorded for this block and nobody needs it for a failed release: it is then safe to drop."""
-    with _MARKER_LOCK:
-        entry["keep"] = entry["keep"] or keep
-        entry["users"] -= 1
-        if entry["users"] > 0:
-            return False
-        _MARKER_USERS.pop(key, None)
-        return bool(entry["ours"] and not entry["keep"])
-
-
 def answer_card(
     board: str,
     task_id: str,
@@ -5178,11 +5144,10 @@ def answer_card(
         raise ValueError("answer text is required")
     if release and version is None:
         raise ValueError("queue version is required to release a card")
-    pending: dict[str, str] = {}
     if release:
         # Check recovery state before posting or releasing, so a damaged record cannot
         # turn a successful action into a late, misleading failure or be overwritten.
-        pending = load_pending_releases(home, strict=True)
+        load_pending_releases(home, strict=True)
     settings, settings_error = _settings_state()
     if settings_error:
         raise RuntimeError("could not read plugin settings; repair them before answering")
@@ -5196,26 +5161,19 @@ def answer_card(
     version_s = str(version) if version is not None else None
     comment_id: int | None = None
     post_answer = False
-    marker_reserved = False  # the recovery marker for this block is recorded
+    reserved: tuple[str, bool] | None = None  # (owner token, created) of the recovery marker
     marker_full = False
-    marker_key = (str(data_dir(home)), item_id, version_s)
-    marker_entry = _marker_join(marker_key) if release else None
     if release:
         # Reserve the failed-release marker BEFORE anything is written: a marker that cannot
         # be stored after the answer was posted would leave an answered card with no recovery
         # state. A full store is not a reason to refuse the answer; it is reported afterwards.
-        if pending.get(item_id) == version_s:
-            marker_reserved = True
-        else:
-            try:
-                _set_pending_release(item_id, version_s, home)
-                marker_reserved = True
-                marker_entry["ours"] = True
-            except PendingReleaseFull:
-                marker_full = True
-            except BaseException:
-                _marker_leave(marker_key, marker_entry, keep=False)
-                raise
+        # Reserving stamps the marker with this call's token, so another caller that created
+        # it for the same block can no longer remove it while this one relies on it.
+        try:
+            reserved = _set_pending_release(item_id, version_s, home)
+        except PendingReleaseFull:
+            marker_full = True
+    marker_reserved = reserved is not None
     released = False
     release_failed = False
     release_error: BaseException | None = None
@@ -5298,17 +5256,11 @@ def answer_card(
                         )
             committed = True
     finally:
-        # The marker is dropped only by the last caller out, and only when none of them wrote an
-        # answer whose release failed: another caller may rely on the marker this one reserved.
-        last_out = (
-            _marker_leave(marker_key, marker_entry, keep=release_failed)
-            if marker_entry is not None
-            else False
-        )
-        if not committed and last_out:
-            # Nothing was written (stale, refused, unreadable): drop the marker reserved for it.
+        if not committed and reserved is not None and reserved[1]:
+            # Nothing was written (stale, refused, unreadable): drop the marker this call
+            # created, unless another caller has stamped it since and relies on it now.
             try:
-                _set_pending_release(item_id, None, home, expected=version_s)
+                _set_pending_release(item_id, None, home, expected=reserved[0])
             except Exception:  # noqa: BLE001 - an inert marker (no answer exists) is harmless
                 log.warning("unbl0ck: could not remove an unused recovery marker for %s", item_id)
     if release_failed:
@@ -5877,29 +5829,7 @@ def _ask_harmless_secret_value(value: Any) -> bool:
     )
 
 
-_ASK_NUMERIC_SECRET_WORDS = frozenset(
-    {
-        "password",
-        "passwd",
-        "passphrase",
-        "pwd",
-        "pw",
-        "secret",
-        "api_key",
-        "access_key",
-        "secret_key",
-        "private_key",
-        "credential",
-        "storepass",
-        "token",
-        "auth",
-        "authentication",
-        "oauth",
-    }
-)
-
-
-def _ask_numeric_credential(key: str, value: Any, word: str) -> bool:
+def _ask_numeric_credential(key: str, value: Any) -> bool:
     """A number or digit-only string under an exact credential key (``password=123456``) is the
     credential itself. Counts under other keys (``password_attempts: 3``) are not."""
     if isinstance(value, bool):
@@ -5912,7 +5842,7 @@ def _ask_numeric_credential(key: str, value: Any, word: str) -> bool:
         return False
     if str(key).strip().strip("\"' ").casefold().endswith("tokens"):
         return False  # a count of tokens (``tokens: 12``), not a token
-    return digits and word in _ASK_NUMERIC_SECRET_WORDS and _ask_secret_key_is_exact(key)
+    return digits and _ask_secret_key_is_exact(key)
 
 
 def _ask_path_field_value(key: str, value: Any) -> bool:
@@ -5960,7 +5890,7 @@ def _ask_is_secret_key(key: str, value: Any = None) -> bool:
     word = _ask_secret_word(key)
     if word is None:
         return False
-    if _ask_harmless_secret_value(value) and not _ask_numeric_credential(key, value, word):
+    if _ask_harmless_secret_value(value) and not _ask_numeric_credential(key, value):
         return False
     if _ask_path_field_value(key, value):
         return False
@@ -6578,6 +6508,15 @@ def _ask_redact(text: str) -> str:
 ASK_CARD_CONTEXT_LIMIT = 24000
 _ASK_FIELD_CAP = 8000  # one field never takes more than this of the card budget
 _ASK_CUT = "…[truncated]"
+
+
+def _fit(text: str, room: int) -> str:
+    """*text* within *room* characters. A cut ends with ``_ASK_CUT``, counted in *room*; when
+    not even the marker fits, the text is cut bare and the caller's own flag says so."""
+    room = max(0, room)
+    if len(text) <= room:
+        return text
+    return text[: room - len(_ASK_CUT)] + _ASK_CUT if room > len(_ASK_CUT) else text[:room]
 # The decision comes first when the budget runs out; the description comes last.
 _ASK_VIEW_PRIORITY = {
     "title": 0,
@@ -6663,9 +6602,7 @@ def _ask_card_view(
         # is replaced as a whole instead of being left as a readable fragment.
         value = _ask_redact(value)
         if remaining is not None:
-            cap = min(remaining, _ASK_FIELD_CAP)
-            if len(value) > cap:
-                value = value[: max(0, cap - len(_ASK_CUT))] + _ASK_CUT
+            value = _fit(value, min(remaining, _ASK_FIELD_CAP))
             _text_budget[0] = remaining - len(value)
         return value
     return value
@@ -6737,7 +6674,7 @@ def build_ask_messages(
         if len(content) > room:
             if kept or room <= 0:
                 break
-            content = content[: max(0, room - len(_ASK_CUT))] + _ASK_CUT  # never silent
+            content = _fit(content, room)
         kept.append({"role": role, "content": content})
         used += len(content)
     messages.extend(reversed(kept))
@@ -6752,38 +6689,32 @@ POCKET_PROMPT_CHARS = 4000  # one card's prompt
 POCKET_TOTAL_PROMPT_CHARS = 20000  # all prompts in one pack
 
 
-# Queue errors are plain strings that start with the source they came from. Not every one means a
-# source could not be read: some say a listing was cut at its limit, and some are about cleanup or
-# stored state. Only a read failure is an "unread source".
 _READ_SOURCES = ("kanban", "chat", "prompt", "pairing", "outside")
-_CAPACITY_NOTICES = ("agent-filed items are waiting (limit",)  # every record was read
-_LISTING_CUT_NOTICES = (  # records exist that the list does not show
-    "folder limit, showing the newest",
-    "filed entries; only the first",
-    "hidden files are not listed",
-)
-_STATE_NOTICES = ("could not remove", "retention cleanup", "invalid done_at")
 
 
 def unread_sources(errors: list[str] | None) -> int:
     """How many sources (a Kanban board, a profile's chats, pairing, prompts, outside) could not be
-    read, counted once per source however many messages it produced. A capacity warning, a
-    cleanup problem or a cut listing is not an unread source."""
+    read, counted once per source however many messages it produced. A :class:`Notice` (a
+    capacity warning, a cut listing, a cleanup problem) is not an unread source."""
     sources = set()
     for error in errors or ():
-        text = str(error)
-        head = text.split(":", 1)[0]
-        if head.split("[", 1)[0] not in _READ_SOURCES:
-            continue
-        if any(m in text for m in _CAPACITY_NOTICES + _LISTING_CUT_NOTICES + _STATE_NOTICES):
-            continue
-        sources.add(head)
+        head = str(error).split(":", 1)[0]
+        if head.split("[", 1)[0] in _READ_SOURCES and not isinstance(error, Notice):
+            sources.add(head)
     return len(sources)
 
 
 def listing_cut(errors: list[str] | None) -> bool:
     """True when a source says some of its records are not in the list."""
-    return any(m in str(e) for e in errors or () for m in _LISTING_CUT_NOTICES)
+    return any(getattr(e, "kind", None) == "listing_cut" for e in errors or ())
+
+
+def queue_complete(queue: dict[str, Any]) -> bool:
+    """The one completeness predicate: every source was read, no listing was cut and no
+    coverage gap (such as unread older chat sessions) exists. Only then may a surface say
+    "nothing needs you" over an empty list."""
+    errors = queue.get("errors")
+    return not unread_sources(errors) and not listing_cut(errors) and not coverage_gaps(queue)
 
 
 def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
@@ -6891,13 +6822,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         cut = bool(it.get("ask_truncated") or it.get("truncated"))
         room = min(POCKET_PROMPT_CHARS, max(0, POCKET_TOTAL_PROMPT_CHARS - spent))
         if len(prompt) > room:
-            # The marker is part of the budget: with no room left for it, the card carries no
-            # prompt text and says it was cut through its flag and warning.
-            prompt = (
-                prompt[: room - len(_ASK_CUT)] + _ASK_CUT
-                if room > len(_ASK_CUT)
-                else prompt[:room]
-            )
+            prompt = _fit(prompt, room)  # with no room for the marker, the flag says it was cut
             cut = True
         spent += len(prompt)
         cards.append(
@@ -6929,7 +6854,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         "cards": cards,
         # False when a source could not be read or a card was cut or left out: an empty pack is
         # then not "nothing needs you".
-        "complete": not unread_sources(queue.get("errors")) and not listing_cut(queue.get("errors")) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
+        "complete": queue_complete(queue) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
         # What this pack leaves out, as counts only; the original surface has the rest.
         "omitted": {
             "unread_sources": unread_sources(queue.get("errors")),

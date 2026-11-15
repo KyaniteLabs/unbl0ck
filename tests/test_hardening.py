@@ -89,7 +89,7 @@ class FastPaths(unittest.TestCase):
         self.assertFalse(needs._answered_since(board_db(), kdb, "t1", "someone", 0))
 
     def test_answered_since_falls_back(self):
-        kdb = FakeKdb(comments=[types.SimpleNamespace(author="ADA", created_at=10)])
+        kdb = FakeKdb(comments=[types.SimpleNamespace(author="ADA", body="", created_at=10)])
         self.assertTrue(needs._answered_since(BrokenConn(), kdb, "t1", "ada", 9))
         self.assertEqual(kdb.calls, ["list_comments"])
 

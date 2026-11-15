@@ -184,7 +184,7 @@ class CardStatusMachine(unittest.TestCase):
         )
         fallback = types.SimpleNamespace(
             list_comments=lambda c, t: [
-                types.SimpleNamespace(author="ZOË", created_at=10)
+                types.SimpleNamespace(author="ZOË", body="", created_at=10)
             ]
         )
         self.assertTrue(needs._answered_since(conn, fallback, "t", "zoë", 5))
