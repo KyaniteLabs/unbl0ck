@@ -108,7 +108,16 @@ hc = _load("unbl0ck_host_compat_r5a", "scripts/host_compat.py")
 
 
 class HostCompat(unittest.TestCase):
-    pass
+    def test_metadata_without_a_version_is_unknown_identity_not_a_crash(self):
+        """R5-api-017: metadata.version() can answer None (no Version field) or fail oddly."""
+        def broken(dist):
+            raise ValueError("malformed metadata")
+
+        for fake in (lambda dist: None, lambda dist: 7, broken):
+            with patch.dict(sys.modules, {"hermes_cli": types.SimpleNamespace()}), \
+                    patch.object(hc.metadata, "version", fake):
+                self.assertEqual(hc._hermes_identity(), {"hermes_version": "unknown", "hermes_release_date": "unknown"})
+
 
 
 if __name__ == "__main__":

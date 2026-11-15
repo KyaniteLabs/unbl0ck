@@ -39,6 +39,11 @@ def _plugin_version() -> str:
 _PLACEHOLDERS = {"", "0.0.0", "0", "unknown", "none"}
 
 
+def _text(value) -> str:
+    """An external identity value as stripped text; None, a missing field or a non-string is ""."""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _hermes_identity() -> dict:
     """The Hermes release this process runs, from the runtime's own provenance.
 
@@ -50,21 +55,21 @@ def _hermes_identity() -> dict:
     try:
         import hermes_cli  # type: ignore
 
-        version = str(getattr(hermes_cli, "__version__", "") or "")
-        date = str(getattr(hermes_cli, "__release_date__", "") or "")
+        version = _text(getattr(hermes_cli, "__version__", None))
+        date = _text(getattr(hermes_cli, "__release_date__", None))
     except Exception:  # noqa: BLE001 - an unimportable Hermes has no runtime identity
         pass
-    if version.strip().lower() in _PLACEHOLDERS:
+    for dist in ("hermes-agent", "hermes_agent", "hermes"):
+        if version.lower() not in _PLACEHOLDERS:
+            break
+        try:
+            version = _text(metadata.version(dist))
+        except Exception:  # noqa: BLE001 - absent or malformed metadata is no identity
+            version = ""
+    if version.lower() in _PLACEHOLDERS:
         version = ""
-        for dist in ("hermes-agent", "hermes_agent", "hermes"):
-            try:
-                found = metadata.version(dist)
-            except metadata.PackageNotFoundError:
-                continue
-            if found.strip().lower() not in _PLACEHOLDERS:
-                version = found
-                break
     return {"hermes_version": version or "unknown", "hermes_release_date": date or "unknown"}
+
 
 
 def record() -> dict:
