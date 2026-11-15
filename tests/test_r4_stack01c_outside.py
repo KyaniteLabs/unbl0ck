@@ -3,8 +3,6 @@ and watched folders (identifiers, required fields, versions, races)."""
 
 import json
 import os
-import re
-import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -121,14 +119,14 @@ class VanishedRecords(OutsideFixture):
         """01-075 (class M): a normal concurrent cleanup is not an invalid record."""
         r = self.file()
         path = self.record(r)
-        real = needs._filed_files
+        real = needs._list_files
 
         def listed(*args, **kwargs):
             names = real(*args, **kwargs)
             path.unlink()  # another poll purged it after the listing
             return names
 
-        with patch.object(needs, "_filed_files", listed):
+        with patch.object(needs, "_list_files", listed):
             errors = []
             self.assertEqual(needs.outside_items(self.home, errors=errors), [])
         self.assertEqual(errors, [])

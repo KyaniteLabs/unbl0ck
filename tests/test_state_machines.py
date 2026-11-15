@@ -1,6 +1,7 @@
 """Every lifecycle UNBL0CK keeps, named and checked: the derived state tables, each legal
 transition, each illegal one refused, legacy values still read, and a seeded random walk per
-machine that checks the invariants after every step (stdlib only: CI has no Hypothesis)."""
+machine that checks the invariants after every step. These walks use the stdlib only; the
+Hypothesis state machines for Ask jobs and outside dismissals are in test_state_properties.py."""
 
 import importlib.util
 import json
@@ -320,8 +321,11 @@ class WaitMachine(unittest.TestCase):
         del r["proc_start"]
         self.assertIs(needs.wait_state(self.f, r, 1060), needs.WaitState.OPEN)
 
-    def test_proc_start_without_procfs_runs_only_ps_without_a_shell(self):
-        # The README discloses this one subprocess; keep it to a fixed ps argv, no shell.
+    def test_proc_start_without_procfs_calls_ps_with_a_fixed_argv_and_no_shell(self):
+        # Characterization of the one subprocess the README discloses: when /proc is missing,
+        # _proc_start calls ps with this argv and environment and no shell. It mocks
+        # subprocess.run, so it cannot show that nothing else runs; test_subprocess_sites.py
+        # checks that this is the only subprocess use in the shipped code.
         with (
             mock.patch("pathlib.Path.read_text", side_effect=OSError),
             mock.patch("pathlib.Path.exists", return_value=False),

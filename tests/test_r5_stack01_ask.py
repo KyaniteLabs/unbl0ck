@@ -4,6 +4,7 @@ import json
 import unittest
 
 from test_outside import needs
+from _redaction import assert_redacted
 
 SYNTH = "Zq81LmK4vP"
 BS = chr(92)
@@ -26,21 +27,21 @@ class AnUnterminatedPrivateKeyIsStillAPrivateKey(unittest.TestCase):
 
     def test_redaction_alone_withholds_an_unterminated_pem(self):
         text = "-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC"
-        self.assertNotIn("MIIEvQ", needs._ask_redact(text))
+        assert_redacted(needs._ask_redact(text), "MIIEvQ")
 
 
 class NumericCredentialsUnderTokenKeys(unittest.TestCase):
     def test_numeric_auth_token_is_redacted(self):
         """R5-needs-003 (class F): token and authentication keys keep their digits private."""
         self.assertEqual(needs._ask_card_view({"auth_token": 123456})["auth_token"], "[redacted]")
-        self.assertNotIn("123456", needs._ask_redact("auth_token=123456"))
+        assert_redacted(needs._ask_redact("auth_token=123456"), "123456")
         for text, digits in (
             ("access_token: 998877", "998877"),
             ("refresh_token=5551212", "5551212"),
             ("bearer_token = 424242", "424242"),
         ):
             with self.subTest(text=text):
-                self.assertNotIn(digits, needs._ask_redact(text))
+                assert_redacted(needs._ask_redact(text), digits)
 
     def test_counts_under_token_keys_stay_readable(self):
         for text in ("max_tokens: 4000", "token_count=5", "tokens: 12"):
@@ -52,11 +53,11 @@ class AnExhaustedJsonScanWithholdsEscapedSecrets(unittest.TestCase):
     def test_escaped_structured_secret_after_many_failed_decodes(self):
         s = "{x" * 129 + json.dumps('{"' + BS + 'u0070assword":"%s"}' % SYNTH)
         s = "{x" * 129 + json.dumps(BS + 'u0070assword' + '":"%s"}' % SYNTH).replace('{', '{', 1) if False else "{x" * 129 + json.dumps('{"' + BS + 'u0070assword":"%s"}' % SYNTH)
-        self.assertNotIn(SYNTH, needs._ask_redact(s))
+        assert_redacted(needs._ask_redact(s), SYNTH)
 
     def test_escaped_secret_in_a_plain_json_string_after_noise(self):
         s = "{x" * 300 + json.dumps({"log": '{"' + BS + 'u0070assword":"%s"}' % SYNTH})
-        self.assertNotIn(SYNTH, needs._ask_redact(s))
+        assert_redacted(needs._ask_redact(s), SYNTH)
 
 
 class WorkspacePathIsScrubbedFromKeys(unittest.TestCase):

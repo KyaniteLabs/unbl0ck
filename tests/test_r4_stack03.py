@@ -214,7 +214,7 @@ class RetentionIsReportedAndBounded(FiledFixture):
         with patch.object(needs, "_OUTSIDE_DONE_KEEP", 1):
             first, first_item, _ = self.done_one("first")
             self.rewrite(first, done_at=time.time() - 30)
-            second = self.file(dedupe_key="second")
+            self.file(dedupe_key="second")
             (item,) = self.queue()
             real = Path.unlink
 
@@ -438,7 +438,7 @@ class SummaryFreshness(FiledFixture):
 
     def test_a_done_item_keeps_its_summary_and_undo_does_not_ask_the_model_again(self):
         """03-013."""
-        result = self.file(dedupe_key="a")
+        self.file(dedupe_key="a")
         (item,) = self.queue()
         needs.save_bluf(item["id"], item["version"], "Pick a lane.", "Because.", self.home)
         reply = needs.done_outside(item["id"], item["version"])
@@ -547,6 +547,13 @@ const it={source:'outside',origin:'folder',kind:'notes',id:'outside:folder:'+'a'
  cursor=0;state=[];
  await find(Item({ctx,item:it,n:1,refresh,askEnabled:false}),'Done — hides until the file changes').onClick();
  assert.equal(undo.length,1);
+ assert.equal(undo[0].token,'srv-token');
+ // Not for me takes its token from the server too, never the item version.
+ undo=[];cursor=0;state=[];
+ const kb={source:'kanban',id:'kanban:default:t1',board:'default',task_id:'t1',version:'v1',title:'K',ask:'a',tier:'ask'};
+ await find(Item({ctx,item:kb,n:1,refresh,askEnabled:false}),'Not for me').onClick();
+ assert.equal(undo.length,1);
+ assert.equal(undo[0].kind,'hidden');
  assert.equal(undo[0].token,'srv-token');
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)

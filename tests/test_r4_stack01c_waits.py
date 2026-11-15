@@ -2,9 +2,6 @@
 their version and what happens when the hook cannot write or clear them."""
 
 import json
-import os
-import re
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch

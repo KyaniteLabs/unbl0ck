@@ -14,7 +14,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_outside import OutsideFixture, needs, plugin
+from test_outside import OutsideFixture, needs
+from _redaction import assert_redacted
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -349,7 +350,7 @@ class SummaryCache(Home):
         secret = "S3cr3tV4lue" * 60
         text = "Please use this: password=" + secret + " . Should I go ahead?"
         redacted_first = needs._excerpt(needs._ask_redact(text))
-        self.assertNotIn("S3cr3tV4lue", redacted_first)
+        assert_redacted(redacted_first, "S3cr3tV4lue")
         db = self.home / "state.db"
         con = sqlite3.connect(db)
         con.execute(

@@ -142,9 +142,12 @@ class FiledScanBounds(OutsideFixture):
 
     def test_filed_files_reads_at_most_the_limit_of_entries_when_none_are_json(self):
         d = self.crowd()
-        read, (files, over) = self.counted(lambda: needs._filed_files(d))
+        errors = []
+        read, _ = self.counted(lambda: needs._list_files(d, ".json", errors, "outside"))
         self.assertLessEqual(read, self.LIMIT + 1)
-        self.assertTrue(over, "more entries than the limit must be reported")
+        self.assertEqual([getattr(e, "kind", None) for e in errors], ["listing_cut"], "a cut must be reported")
+        with self.assertRaisesRegex(RuntimeError, "more than"):
+            self.counted(lambda: needs._list_files(d, ".json"))  # a caller needing every entry is refused
 
     def test_purge_stops_after_the_limit_even_when_the_entries_are_not_json(self):
         d = self.crowd()
@@ -156,8 +159,7 @@ class FiledScanBounds(OutsideFixture):
     def test_a_folder_inside_the_limit_still_lists_its_records(self):
         self.file(dedupe_key="a")
         d = needs.data_dir(self.home) / "outside"
-        files, over = needs._filed_files(d)
-        self.assertEqual((len(files), over), (1, False))
+        self.assertEqual(len(needs._list_files(d, ".json")), 1)
 
 
 @unittest.skipIf(FastAPI is None, "fastapi not installed")
@@ -184,7 +186,7 @@ class DismissalOrder(OutsideFixture):
         for n in range(4):
             reply = self.client.post("/hide", json={"id": f"chat:p:s{n}", "version": "1"}).json()
             orders.append(reply["order"])
-        filed = self.file(dedupe_key="a")
+        self.file(dedupe_key="a")
         (item,) = needs.build_queue()["items"]
         done = self.client.post("/outside/done", json={"id": item["id"], "version": item["version"]}).json()
         orders.append(done["order"])

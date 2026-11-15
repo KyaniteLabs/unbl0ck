@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from test_r4_stack01d_kanban import KanbanAnswerCase, kanban_db, needs
+from _redaction import assert_redacted
 
 
 class CardContextReadsAreBoundedByTheQuery(KanbanAnswerCase):
@@ -72,7 +73,7 @@ class NumericCredentialsAreStillCredentials(unittest.TestCase):
             ("PASSWORD = 424242", "424242"),
         ):
             with self.subTest(text=text):
-                self.assertNotIn(secret, needs._ask_redact(text))
+                assert_redacted(needs._ask_redact(text), secret)
 
     def test_numeric_json_values_under_credential_keys_are_redacted(self):
         view = needs._ask_card_view({"password": 123456, "api_key": "9876543210"})
@@ -91,17 +92,17 @@ class EmbeddedJsonCannotHideASecret(unittest.TestCase):
         """01-092 (class K): the key is decoded before it is judged."""
         escaped = "".join(f"\\u{ord(c):04x}" for c in "password")
         text = '{"%s":"%s"}' % (escaped, SYNTH)
-        self.assertNotIn(SYNTH, needs._ask_redact(text))
-        self.assertNotIn(SYNTH, needs._ask_redact('note {"\\u0070assword":"%s"} end' % SYNTH))
+        assert_redacted(needs._ask_redact(text), SYNTH)
+        assert_redacted(needs._ask_redact('note {"\\u0070assword":"%s"} end' % SYNTH), SYNTH)
 
     def test_many_leading_objects_do_not_exhaust_the_scan(self):
         """01-095 (class G): successes are not counted against the scan budget."""
         text = "{}" * 129 + '{"name":"DB_PASSWORD","metadata":"env","value":"%s"}' % SYNTH
-        self.assertNotIn(SYNTH, needs._ask_redact(text))
+        assert_redacted(needs._ask_redact(text), SYNTH)
 
     def test_an_exhausted_scan_withholds_the_remainder_rather_than_copying_it(self):
         text = "{x" * 300 + '{"name":"DB_PASSWORD","value":"%s"}' % SYNTH
-        self.assertNotIn(SYNTH, needs._ask_redact(text))
+        assert_redacted(needs._ask_redact(text), SYNTH)
 
 
 class WorkspacePathIsRemovedEverywhere(unittest.TestCase):

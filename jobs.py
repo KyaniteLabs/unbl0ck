@@ -1079,7 +1079,7 @@ class AskJobs:
         if not more and self._journal is not None:
             try:
                 more = any(self._journal.has_files(d) for d in dirs)
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001 - an unreadable journal must not stop re-arming; assume files remain
                 more = True
         if more:
             with self._lock:

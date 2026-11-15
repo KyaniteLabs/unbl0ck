@@ -11,6 +11,7 @@ from pathlib import Path
 from test_ask_coverage import ASK, make_chats
 from test_r4_stack01d_kanban import HERMES_ERROR, KanbanAnswerCase, kanban_db, needs
 from test_r7_M import comments_table
+from _redaction import assert_redacted
 
 
 BIG = 24 << 20  # one stored text; SQLite may hold only half of it at once in the child below
@@ -38,7 +39,7 @@ class CutComments(unittest.TestCase):
             'curl -u "alice:PARTSECRET' + "b" * 24000 + '" https://example.test',
         ):
             with self.subTest(body[:12]):
-                self.assertNotIn("PARTSECRET", needs._ask_redact(body))
+                assert_redacted(needs._ask_redact(body), "PARTSECRET")
                 (row,), _ = needs._newest_comments(comments_table(body), None, "t", 5)
                 card = {"title": "t", "comments": [{"author": row[1], "body": row[2]}]}
                 sent = json.dumps(needs.build_ask_messages(card, []))

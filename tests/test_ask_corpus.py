@@ -3,17 +3,14 @@
 Run ``python tests/test_ask_corpus.py`` to print the false-positive / false-negative report."""
 
 import collections
-import sqlite3
 import sys
-import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 from ask_corpus import CASES, KNOWN_GAPS, PRINCIPAL  # noqa: E402
-from test_needs import make_home, needs  # noqa: E402
+from test_needs import needs  # noqa: E402
 
 
 def detect(det, text, kind):

@@ -560,7 +560,6 @@ class BadEntries(RecoveryBase):
     def test_housekeeping_removes_a_dangling_symlink_and_never_follows_it(self):
         target = Path(self.tmp.name) / "precious.json"
         target.write_text("{}")
-        good = self.dir / f"{J1}.json"
         self.jobs.create(J2, card="c1")
         link = self.dir / f"{J3}.json"
         link.symlink_to(target)

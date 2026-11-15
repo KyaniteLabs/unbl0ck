@@ -3,7 +3,6 @@ nested files, summary-cache shape and the shape of filed outside records."""
 
 import contextlib
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path

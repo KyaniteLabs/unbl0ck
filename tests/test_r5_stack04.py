@@ -1,7 +1,6 @@
 """Round-5 review findings owned by the outside-paging branch."""
 
 import os
-import re
 import time
 import unittest
 from pathlib import Path

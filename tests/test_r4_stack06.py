@@ -243,9 +243,16 @@ const it={...item,id:'kanban:default:l1',version:'1'};
  const t=mount(ctx,it);
  assert.ok(texts(t).includes('Thinking'));
  assert.ok(timers.some(x=>x.on),'the remounted card subscribes to the running session');
+ const following=()=>timers.filter(x=>x.on&&x.ms===500).length;
+ assert.equal(following(),1);
+ mount(ctx,it);
+ assert.equal(following(),1,'a remount replaces the subscription instead of adding one');
+ tick();                                 // still running: the card keeps following it
+ assert.ok(texts(mount(ctx,it)).includes('Thinking'),'a tick while the request runs does not end it');
  // the other instance finishes and stores its result
  store.updateAskSession(it.id,{msgs:[{role:'user',content:'q'},{role:'assistant',content:'DONE LATER'}],running:false});
  tick();
+ assert.equal(following(),0,'the finished request stops its subscription');
  assert.ok(texts(mount(ctx,it)).includes('DONE LATER'),'the subscription restores the finished result');
  timers.length=0;
  mount(ctx,it);                          // a finished conversation subscribes to nothing
