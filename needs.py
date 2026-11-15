@@ -2150,15 +2150,32 @@ def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, ov
     return f"{mid}:{digest.hexdigest()[:12]}"
 
 
+def _other_fd_on(fd: int, st: os.stat_result) -> bool | None:
+    """Whether a descriptor other than *fd* is open on the file *st* describes, or None where
+    descriptors cannot be listed (Windows, whose open descriptor already keeps the path from
+    being replaced)."""
+    try:
+        names = os.listdir("/dev/fd")
+    except OSError:
+        return None
+    for name in names:
+        try:
+            if int(name) != fd and os.path.samestat(os.fstat(int(name)), st):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def _open_chat_db(db: Path) -> sqlite3.Connection:
-    """Open *db* read-only, only if it is the regular file it was when the search began. The
-    check is made on the path itself (no link is followed) before and after the open, so a link
-    put in its place between the listing and the open is refused, not read."""
-    fd, _ = _pinned_open(db, os.O_RDONLY)
+    """Open *db* read-only, only if it is the regular file it was when the search began. SQLite
+    opens the path again, so the open is accepted only when the path still names the pinned
+    file and a descriptor besides the pin (SQLite's) is open on that same file."""
+    fd, st = _pinned_open(db, os.O_RDONLY)
     try:
         conn = sqlite3.connect(Path(os.path.abspath(db)).as_uri() + "?mode=ro", uri=True, timeout=2)
         try:
-            if not _names_open_file(fd, db):
+            if not _names_open_file(fd, db) or _other_fd_on(fd, st) is False:
                 raise UnsafeStateFile("state.db changed while it was opened", "changed")
         except BaseException:
             conn.close()

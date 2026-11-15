@@ -29,5 +29,44 @@ class LegacyBackfill(s11.QueueCase):
         self.assertTrue(items["three"].get("backfilled"))
 
 
+def _chat_db(path: Path, text: str) -> None:
+    db = sqlite3.connect(path)
+    db.executescript(
+        "CREATE TABLE sessions(id TEXT, title TEXT);"
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL);"
+    )
+    db.execute("INSERT INTO messages VALUES(1, 's', 'assistant', ?, 0)", (text,))
+    db.commit()
+    db.close()
+
+
+class ChatDatabaseOpen(unittest.TestCase):
+    def test_a_path_swapped_only_while_sqlite_opens_it_is_refused(self):
+        """R6-003: SQLite's own open must land on the pinned file, not on a link's target."""
+        with tempfile.TemporaryDirectory() as d:
+            a, b, aside = Path(d) / "state.db", Path(d) / "other.db", Path(d) / "aside.db"
+            _chat_db(a, "pinned")
+            _chat_db(b, "elsewhere")
+            real = sqlite3.connect
+
+            def racing(*args, **kwargs):
+                os.rename(a, aside)
+                os.symlink(b, a)
+                try:
+                    return real(*args, **kwargs)
+                finally:
+                    os.unlink(a)
+                    os.rename(aside, a)
+
+            with patch.object(sqlite3, "connect", racing):
+                with self.assertRaises(needs.UnsafeStateFile):
+                    needs._open_chat_db(a).close()
+            conn = needs._open_chat_db(a)  # without the race the same file opens
+            try:
+                self.assertEqual(conn.execute("SELECT content FROM messages").fetchone()[0], "pinned")
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()
