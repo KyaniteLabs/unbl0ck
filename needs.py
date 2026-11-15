@@ -1713,39 +1713,42 @@ def _same_author(a: Any, b: Any) -> bool:
     return str(a or "").strip().casefold() == str(b or "").strip().casefold()
 
 
-def _comment_events(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> tuple[int, int]:
-    """How many ``commented`` events of *author* come before and after the block event (all after
-    when there is none). Kanban writes a comment with its event in one transaction and ids only
-    grow, so this places the author's comments by write order, without reading them."""
+PLACEMENT_ROWS = 500  # newest rows one placement check reads; past them it finds no answer
+
+
+def _comment_events(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> list[Any]:
+    """The logged ``len`` of each ``commented`` event of *author* after the block (all when there is
+    none), newest first. Kanban writes a comment with its event in one transaction and ids only grow."""
     try:
-        rows = conn.execute(
-            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'commented'", (task_id,)
-        ).fetchall()
+        rows = conn.execute(  # a payload is an author and a length: a longer one is not read
+            "SELECT SUBSTR(payload, 1, 4096) FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ? "
+            "ORDER BY id DESC LIMIT ?", (task_id, block_id or 0, PLACEMENT_ROWS)).fetchall()
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        rows = [(e.id, e.payload) for e in kanban_db.list_events(conn, task_id) if e.kind == "commented"]
-    mine = [int(i or 0) > (block_id or 0) for i, p in rows if _same_author(_json_payload(p).get("author"), author)]
-    return mine.count(False), mine.count(True)
+        rows = [(e.payload,) for e in kanban_db.list_events(conn, task_id)[::-1] if e.kind == "commented" and e.id > (block_id or 0)]
+    payloads = (_json_payload(p) for (p,) in rows[:PLACEMENT_ROWS])
+    return [p.get("len") for p in payloads if _same_author(p.get("author"), author)]
 
 
 def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> bool:
     """Has *author* commented since the block began: one of their ``commented`` events is later
     than the block's. The one test for "answered", used by the queue and by answer_card; a comment
     no event records never answers, so the card stays in front of you."""
-    return _comment_events(conn, kanban_db, task_id, author, block_id)[1] > 0
+    return bool(_comment_events(conn, kanban_db, task_id, author, block_id))
 
 
 def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
-    """Has *author* posted *text* since the block began? Their oldest comments, as many as their
-    events before the block, belong to earlier blocks; every later one counts (no body is read)."""
-    before = _comment_events(conn, kanban_db, task_id, author, block_id)[0]
+    """Has *author* posted *text* since the block began? Each event logs its comment's length, so the
+    k events of that length after the block logged the author's k newest comments of that length."""
+    k = _comment_events(conn, kanban_db, task_id, author, block_id).count(len(text))
     try:
-        rows = conn.execute(
-            "SELECT author, body = ? FROM task_comments WHERE task_id = ? ORDER BY id", (text, task_id)
-        ).fetchall()
+        rows = conn.execute(  # enough bytes to tell a longer body
+            "SELECT author, SUBSTR(CAST(body AS BLOB), 1, ?) FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
+            (4 * len(text) + 1, task_id, PLACEMENT_ROWS)).fetchall()
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: getattr(c, "id", 0) or 0)
-        rows = [(c.author, c.body == text) for c in listed]
-    return any([same for who, same in rows if _same_author(who, author)][before:])
+        listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: -(getattr(c, "id", 0) or 0))
+        rows = [(c.author, str(c.body).encode("utf-8", "replace")) for c in listed]
+    bodies = (bytes(b or b"").decode("utf-8", "replace") for a, b in rows[:PLACEMENT_ROWS] if _same_author(a, author))
+    return text in [b for b in bodies if len(b) == len(text)][:k]
 
 
 class CardStatus(str, Enum):
