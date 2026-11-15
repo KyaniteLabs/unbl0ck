@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **State stores no longer overwrite or delete what they cannot vouch for (#32 round 5).** A "Not for me" is judged against the dismissal stored under the lock, the lock file is refused when it is a link even where the open flag is missing, a deeply nested pairing file is reported as damaged, a summary entry in another shape is left for repair, and Done or resolve only delete a record this plugin filed.
 - **The chat reader hides a cut message's secret, refuses a swapped database and versions the whole message (#32 round 5).** A message read from its end drops the partial opening that could have been a credential or key body, the database is opened only if it is still the regular file that was listed, the version covers the whole message rather than its tail, text after a NUL byte is read, group names are matched where the ask was found, and an indented prompt offers Full text.
 - **Ask redaction withholds what it used to copy (#32 round 5).** A private key whose end marker lies beyond the model cut, numeric `auth_token`/`oauth`/`token` credentials, an escaped JSON string after an exhausted scan, and workspace paths used as object keys no longer reach the model; the Ask test module also loads when Hermes is absent.
 - **Stale desktop responses are now tested (#32 round 4).** The Full text tests track each effect and run its cleanup, and check that an older response arriving after a newer request is ignored, including a late failure.

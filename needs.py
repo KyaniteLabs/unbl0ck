@@ -287,7 +287,11 @@ def _state_lock(home: Path | None):
     try:
         d = data_dir(home)
         # O_NOFOLLOW: a dangling or redirected link is never created through or locked.
-        fd = os.open(d / ".state.lock", os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
+        lock_path = d / ".state.lock"
+        # Where O_NOFOLLOW is absent (Windows) the open below would follow a link.
+        if lock_path.is_symlink():
+            raise OSError("the state lock is not a regular file")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError("the state lock is not a regular file")
@@ -452,22 +456,29 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
     item_id, version = str(item_id or ""), str(version or "")
     if not item_id or len(item_id) > 300 or len(version) > 200:
         raise ValueError("item id and version must be short strings")
-    # An older tab's "Not for me" must not replace a newer dismissal. Checked outside the
-    # lock because the queue build takes it.
-    existing = load_hidden(home).get(item_id)
-    if existing and existing != version:
+    # An older tab's "Not for me" must not replace a newer dismissal. The queue lookup takes the
+    # state lock, so it runs outside it; the stored value is therefore re-read under the lock
+    # and a dismissal that changed in between is judged again, never overwritten blind.
+    current: str | None = None
+    looked_up = False
+    while True:
+        with _state_lock(home):
+            hidden = load_hidden(home, strict=True)
+            existing = hidden.get(item_id)
+            if existing and existing != version and looked_up:
+                if current is not None and current != version:
+                    raise StaleHide("the card changed since this view; refresh before hiding it")
+            if not existing or existing == version or looked_up:
+                hidden.pop(item_id, None)
+                hidden[item_id] = version
+                if (
+                    len(hidden) > _HIDDEN_KEEP
+                ):  # oldest hides first out; the store never grows unbounded
+                    hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
+                _write_json(_hidden_path(home), hidden, ordered=True)
+                return
         current = _current_version(item_id, home)
-        if current is not None and current != version:
-            raise StaleHide("the card changed since this view; refresh before hiding it")
-    with _state_lock(home):
-        hidden = load_hidden(home, strict=True)
-        hidden.pop(item_id, None)
-        hidden[item_id] = version
-        if (
-            len(hidden) > _HIDDEN_KEEP
-        ):  # oldest hides first out; the store never grows unbounded
-            hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
-        _write_json(_hidden_path(home), hidden, ordered=True)
+        looked_up = True
 
 
 def unhide(item_id: str, home: Path | None = None) -> bool:
@@ -561,7 +572,9 @@ def _bluf_path(home: Path | None) -> Path:
 
 
 def load_blufs(home: Path | None = None, *, strict: bool = False) -> dict[str, dict[str, str]]:
-    return _read_json(_bluf_path(home), strict=strict)
+    return _read_json(
+        _bluf_path(home), strict=strict, entry_ok=lambda v: isinstance(v, dict)
+    )
 
 
 def summary_fingerprint(item: dict[str, Any]) -> str:
@@ -1931,7 +1944,7 @@ def _pending_file_damage(path: Path) -> bool:
         return not isinstance(json.loads(raw.decode("utf-8-sig")), dict)
     except FileNotFoundError:
         return False
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):  # too deeply nested is damage, not a crash
         return True
 
 
@@ -2378,6 +2391,23 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
 # --- things waiting outside Hermes ----------------------------------------------------------
 
 _OUTSIDE_KINDS = ("draft", "notes", "approval", "other")
+
+
+def _is_filed_record(rec: Any, stem: str) -> bool:
+    """Whether *rec* is a record this plugin filed under ``<stem>.json``. One check for listing,
+    lookup, resolving and Done, so a foreign JSON file is never shown, read as ours or deleted."""
+    return (
+        isinstance(rec, dict)
+        and rec.get("id") == f"outside:filed:{stem}"
+        and bool(_FILED_ID.fullmatch(str(rec.get("id"))))
+        and rec.get("origin") == "filed"
+        and rec.get("kind") in _OUTSIDE_KINDS
+        and all(
+            isinstance(rec.get(key), str) and rec[key].strip()
+            for key in ("version", "title", "act_where")
+        )
+        and isinstance(rec.get("text"), str)
+    )
 _OUTSIDE_LIMIT = 200
 _OUTSIDE_READ_LIMIT = 256 * 1024
 _FILED_ID = re.compile(r"outside:filed:([a-f0-9]{32})\Z")
@@ -2474,11 +2504,16 @@ def file_outside(
         if action == "resolve":
             if match is None or not match.is_file() or match.is_symlink():
                 raise LookupError("No filed outside item matches that id or dedupe_key")
+            try:
+                found = _read_json(match, strict=True)
+            except RuntimeError as exc:
+                raise SourceUnavailable(str(exc)) from exc
+            if not found:
+                raise LookupError("No filed outside item matches that id or dedupe_key")
+            if not _is_filed_record(found, match.stem):
+                raise SourceUnavailable("filed outside record is invalid; repair it")
             if version is not None:
-                try:
-                    current = _read_json(match, strict=True).get("version")
-                except RuntimeError as exc:
-                    raise SourceUnavailable(str(exc)) from exc
+                current = found.get("version")
                 if current != version:
                     # Another agent refiled this item since: its newer text is not yours to delete.
                     raise StaleAnswer("the filed item changed since you filed it; re-read it first")
@@ -2629,15 +2664,7 @@ def outside_items(
             continue
         before = len(errors)
         rec = _read_json(f, errors=errors, source="outside")
-        if (
-            rec.get("id") == f"outside:filed:{f.stem}"
-            and _FILED_ID.fullmatch(rec["id"])
-            and rec.get("origin") == "filed"
-            and rec.get("kind") in _OUTSIDE_KINDS
-            and all(isinstance(rec.get(key), str) and rec[key].strip()
-                    for key in ("version", "title", "act_where"))
-            and isinstance(rec.get("text"), str)
-        ):
+        if _is_filed_record(rec, f.stem):
             items.append(rec)
         elif len(errors) == before and os.path.lexists(f):
             # (A record purged between the listing and the read is gone, not invalid.)
@@ -2719,7 +2746,7 @@ def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
             raise SourceUnavailable(str(exc)) from exc
         if not rec:
             raise LookupError("outside item is no longer available")
-        if rec.get("id") != item_id or rec.get("origin") != "filed" or not isinstance(rec.get("text"), str):
+        if not _is_filed_record(rec, match.group(1)):
             raise SourceUnavailable("filed outside record is invalid; repair it")
         return rec
     if not _FOLDER_ID.fullmatch(item_id or ""):
@@ -2784,6 +2811,8 @@ def done_outside(
                 raise SourceUnavailable(str(exc)) from exc
             if not rec:
                 raise LookupError("Filed outside item no longer exists")
+            if not _is_filed_record(rec, match.group(1)):
+                raise SourceUnavailable("filed outside record is invalid; repair it")
             if rec.get("version") != version:
                 raise RuntimeError(
                     "Outside item changed; refresh before marking it Done"
