@@ -93,8 +93,7 @@ _NEEDS: Any = None
 
 
 def _needs():
-    """The sibling needs.py, for the Hermes home and the shared state lock (the same flock the
-    plugin uses). Loaded once."""
+    """The sibling needs.py, for the Hermes home and the state lock's wait. Loaded once."""
     global _NEEDS
     if __package__:
         from . import needs  # noqa: PLC0415
@@ -115,10 +114,14 @@ class _Data:
         if not _DIR_FD:
             raise RuntimeError("this platform cannot open the state directory without following links; refusing to use it")
         self._fds: list[int] = []
-        base = Path(home) if home else _needs().hermes_home()
-        fd = self._open(str(base), None, os.O_RDONLY | os.O_DIRECTORY)  # the home itself is the operator's choice
-        for part in ("plugin-data", "unbl0ck"):
-            fd = None if fd is None else self._open(part, fd)
+        try:
+            base = Path(home) if home else _needs().hermes_home()
+            fd = self._open(str(base), None, os.O_RDONLY | os.O_DIRECTORY)  # the home itself is the operator's choice
+            for part in ("plugin-data", "unbl0ck"):
+                fd = None if fd is None else self._open(part, fd)
+        except BaseException:
+            self.__exit__()  # a refusal here must not leak the ancestors already opened
+            raise
         self.fd = fd
         self._rec: int | None | bool = False  # False: not opened yet
 
@@ -154,8 +157,35 @@ class _Data:
         return self
 
     def __exit__(self, *_exc: Any) -> None:
-        for fd in self._fds:
-            os.close(fd)
+        while self._fds:
+            os.close(self._fds.pop())
+
+
+def _open_lock(dfd: int, create: bool = False) -> int:
+    """The state lock file in the directory open at *dfd*, never through a link or a path."""
+    return os.open(LOCK_NAME, os.O_RDWR | _NOFOLLOW | _NONBLOCK | (os.O_CREAT if create else 0), 0o600, dir_fd=dfd)
+
+
+@contextlib.contextmanager
+def _state_lock(dfd: int):
+    """Hold the plugin's state lock (the same flock on ``.state.lock``) of the directory this tool
+    opened, not of whatever its path names now. TimeoutError when another process holds it."""
+    fd = _open_lock(dfd, create=True)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("the state lock is not a regular file")
+        deadline = time.monotonic() + _needs().STATE_LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("the state lock is held by another process") from None
+                time.sleep(0.02)
+        yield
+    finally:
+        os.close(fd)  # closing releases the lock
 
 
 def _writer_active(dfd: int) -> bool | None:
@@ -164,7 +194,7 @@ def _writer_active(dfd: int) -> bool | None:
     if fcntl is None:
         return None
     try:
-        fd = os.open(LOCK_NAME, os.O_RDWR | _NOFOLLOW | _NONBLOCK, dir_fd=dfd)
+        fd = _open_lock(dfd)
     except FileNotFoundError:
         return False  # no lock file: nobody has ever held it
     except OSError:
@@ -483,7 +513,7 @@ def restore(store: str, backup: str, home: Path | None = None, *, apply: bool = 
         if fcntl is None:
             return {"status": "refused", **plan, "reason": "this platform cannot confirm no other process is writing; not restoring"}
         try:
-            with _needs()._state_lock(Path(home) if home else None):
+            with _state_lock(d.fd):
                 return _apply(d, store, backup)
         except TimeoutError:
             return {"status": "writer_active", **plan, "reason": "another process holds the state lock; nothing was changed. "

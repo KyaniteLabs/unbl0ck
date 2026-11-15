@@ -218,7 +218,8 @@ class AskJournal:
     the job id, state, timestamps, the card id (isolation), provider/model, an error
     detail, the writing worker and, only when the job was created with reply persistence on,
     the reply text. Files expire with the job TTL and are capped. Any I/O failure degrades to
-    in-memory behaviour: ``failures`` counts them and Ask itself never breaks because of the journal.
+    in-memory behaviour: ``failures`` counts them. Only a lock held past the wait refuses a new job,
+    since another worker may be claiming the same id.
 
     The directory is opened through its parent's descriptor, neither followed through a link
     (the directory and its parent must be real directories, the directory owned by this user),
@@ -323,26 +324,30 @@ class AskJournal:
 
     @contextlib.contextmanager
     def _locked(self, fd: int, until: float):
-        """Hold the directory lock until ``until`` (monotonic) at most; yields False when not taken."""
+        """Hold the directory lock until ``until`` (monotonic) at most; yields "ok", "busy" (another
+        holder kept it past the deadline) or "failed"."""
         lfd = None
-        got = False
+        got = "failed"
         try:
             lfd = os.open(".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=fd)
             if fcntl is None:
-                got = True
+                got = "ok"
             else:
                 while True:
                     try:
                         fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        got = True
+                        got = "ok"
                         break
                     except OSError as exc:
-                        if exc.errno not in (errno.EAGAIN, errno.EACCES) or time.monotonic() >= until:
+                        if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                            break
+                        if time.monotonic() >= until:
+                            got = "busy"
                             break
                         time.sleep(0.01)
         except OSError:
-            got = False
-        if not got:
+            got = "failed"
+        if got != "ok":
             self.failures += 1
         try:
             yield got
@@ -598,7 +603,7 @@ class AskJournal:
 
     def _put(self, job: str, rec: dict[str, Any], d: Optional[Path], claim: bool) -> str:
         """"ok" (on disk and synced), "taken" (a tombstone, or with ``claim`` a record, holds this
-        id) or "failed" (not written: no journal, no room, or an I/O fault)."""
+        id), "busy" (another holder kept the lock) or "failed" (no journal, no room, or an I/O fault)."""
         if not self._valid(job):
             return "failed"
         try:
@@ -610,8 +615,8 @@ class AskJournal:
             if fd is None:
                 return "failed"
             with self._locked(fd, self.deadline()) as got:
-                if not got:
-                    return "failed"
+                if got != "ok":
+                    return got
                 if self._exists(fd, f"{job}.gone"):
                     return "taken"  # deleted: never written again, by its owner or anyone else
                 fresh = not self._exists(fd, f"{job}.json")
@@ -627,7 +632,7 @@ class AskJournal:
 
     def claim(self, job: str, rec: dict[str, Any], d: Optional[Path] = None) -> str:
         """Write a first record under the directory lock unless a record or tombstone holds the id:
-        "ok", "taken" or "failed"."""
+        "ok", "taken", "busy" or "failed"."""
         return self._put(job, rec, d, claim=True)
 
     def _touch(self, fd: int, name: str) -> bool:
@@ -649,10 +654,11 @@ class AskJournal:
             if fd is None:
                 return False
             name = f"{job}.json"
-            if tombstone and self._exists(fd, name) and not self._touch(fd, f"{job}.gone"):
-                return False
             with self._locked(fd, until or self.deadline()) as got:
-                if not got:
+                if got != "ok":
+                    return False
+                # Fenced under the lock, so a record published while this waited is fenced too.
+                if tombstone and self._exists(fd, name) and not self._touch(fd, f"{job}.gone"):
                     return False
                 try:
                     os.unlink(name, dir_fd=fd)
@@ -690,7 +696,7 @@ class AskJournal:
             if fd is None:
                 return 0
             with self._locked(fd, until or self.deadline()) as got:
-                return self._prune_locked(fd, ttl, keep) if got else 0
+                return self._prune_locked(fd, ttl, keep) if got == "ok" else 0
 
     def _prune_locked(self, fd: int, ttl: float, keep: Callable[[str], bool]) -> int:
         now = self._clock()
@@ -897,8 +903,11 @@ class AskJobs:
                 raise IllegalTransition(f"ask job {job} already exists")
             now = self._clock()
             if self._journal and where is not None:
-                if self._journal.claim(job, {"state": "queued", "started": now, "card": card}, d=where) == "taken":
+                got = self._journal.claim(job, {"state": "queued", "started": now, "card": card}, d=where)
+                if got == "taken":
                     raise IllegalTransition(f"ask job {job} already exists")
+                if got == "busy":  # another worker may be claiming this id: never admit it twice
+                    raise ScopeUnavailable(f"ask job {job} could not be claimed")
                 self._dirs.add(where)
             gen = secrets.token_hex(8)
             self._jobs[(where, job)] = {"status": AskState.PENDING, "started": now, "card": card, "dir": where,
