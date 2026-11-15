@@ -78,7 +78,7 @@ The things you would want to know before installing:
 - **Reads outside its own data:**
   - Kanban boards, through Hermes's Kanban modules (`hermes_cli.kanban_db`).
   - The `state.db` chat history of the root Hermes home and of every profile under it, opened **read-only**, so it can find chats that end with a question for you.
-  - Pending pairing requests for the Hermes home and each profile, through the gateway's `PairingStore.list_pending()` (never the codes): only the display name, platform, request age and the admin-side request id (for the approve command) are used. Listing goes through the store exactly as `hermes pairing list` does, so it also prunes expired requests and may create the store's folder.
+  - Pending pairing requests for the Hermes home and each profile, through the gateway's `PairingStore.list_pending()` (never the codes): only the display name, platform, request age and the admin-side request id (for the approve command) are used. Listing goes through the store exactly as `hermes pairing list` does, so it also prunes expired requests and may create the store's folder. Because that store reads a damaged pending-requests file as "no requests", UNBL0CK also parses each `*-pending.json` once and drops the result, only to report a damaged file as a failed Pairing source instead of an empty one; no field of it is read, kept or shown.
   - Hermes's `on_human_input_request` / `on_human_input_resolved` hook payloads (kind, redacted prompt, session id, platform).
   - Only the folders configured in `outside_dirs` (or `UNBL0CK_OUTSIDE_DIRS`): eligible `.eml`, `.md` and `.txt` files, read-only within the limits above.
 - **Writes:**

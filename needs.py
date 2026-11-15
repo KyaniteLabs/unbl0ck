@@ -237,7 +237,9 @@ def hermes_home() -> Path:
 
 
 def data_dir(home: Path | None = None) -> Path:
-    d = (home or hermes_home()) / "plugin-data" / "unbl0ck"
+    base = (home or hermes_home()) / "plugin-data"
+    _refuse_link(base)  # an ancestor link redirects every write as surely as a link on the folder
+    d = base / "unbl0ck"
     _refuse_link(d)
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -248,6 +250,13 @@ def _refuse_link(d: Path) -> None:
     plugin's data or an unrelated folder."""
     if d.is_symlink():
         raise OSError(f"{d.name} is a symbolic link; refusing to use it for state")
+
+
+def _list_files(d: Path, suffix: str = "") -> list[Path]:
+    """Entries of *d* whose name ends with *suffix*, sorted by name. Unlike ``Path.glob``, a
+    directory that cannot be listed raises instead of looking empty."""
+    with os.scandir(d) as entries:
+        return sorted((Path(e.path) for e in entries if e.name.endswith(suffix)), key=lambda p: p.name)
 
 
 # --- hidden items -------------------------------------------------------------------------
@@ -1427,13 +1436,43 @@ def kanban_items(
 # --- Chat source ---------------------------------------------------------------------------
 
 
-def _state_dbs(home: Path) -> list[tuple[str, Path]]:
-    out = []
+def _state_dbs(home: Path, errors: list[str] | None = None) -> list[tuple[str, Path]]:
+    """Every profile's chat database that lies inside *home*. A link (to a profile folder or to the
+    database itself) could aim the search at another Hermes home, so a linked one is reported and
+    skipped, and a profiles folder that cannot be listed is a failed source, not an empty one."""
+    out: list[tuple[str, Path]] = []
+
+    def refuse(profile: str, why: str) -> None:
+        if errors is not None:
+            errors.append(f"chat[{profile}]: {why}; not searched")
+
     root = home / "state.db"
-    if root.exists():
-        out.append(("default", root))
-    for db in sorted((home / "profiles").glob("*/state.db")):
-        out.append((db.parent.name, db))
+    if os.path.lexists(root):
+        if root.is_symlink():
+            refuse("default", "state.db is a symbolic link")
+        else:
+            out.append(("default", root))
+    try:
+        entries = _list_files(home / "profiles")
+    except FileNotFoundError:
+        return out
+    except OSError as exc:
+        if errors is not None:
+            errors.append(f"chat: profiles folder: {type(exc).__name__}; could not list profiles")
+        return out
+    base = home.resolve()
+    for prof in entries:
+        db = prof / "state.db"
+        if not os.path.lexists(db):
+            continue
+        if prof.is_symlink():
+            refuse(prof.name, "profile folder is a symbolic link")
+        elif db.is_symlink():
+            refuse(prof.name, "state.db is a symbolic link")
+        elif not db.resolve().is_relative_to(base):
+            refuse(prof.name, "state.db lies outside the Hermes home")
+        else:
+            out.append((prof.name, db))
     return out
 
 
@@ -1581,7 +1620,7 @@ def chat_items(
     names = _patterns(principal_names(settings), role_words(settings))["_NAMES"]
     owners = chat_owner_ids(settings)
     me = {n.lower() for n in principal_names(settings)}
-    for profile, db in _state_dbs(home):
+    for profile, db in _state_dbs(home, errors):
         try:
             conn = sqlite3.connect(
                 db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2
@@ -1716,13 +1755,23 @@ def chat_items(
 PAIRING_TTL = 3600  # gateway/pairing.py CODE_TTL_SECONDS: a code is dead after an hour
 
 
-def _pairing_profiles(home: Path) -> list[str]:
-    """Profiles that have a pairing store on disk. Only existence is checked here: the
-    files themselves are read by the gateway's own PairingStore, never by us."""
+def _pairing_dirs(home: Path, errors: list[str] | None = None) -> list[tuple[str, Path]]:
+    """(profile, folder) for every pairing store on disk. Existence only; a profile folder that is
+    a link is not followed."""
     seen: set[Path] = set()
-    out: list[str] = []
+    out: list[tuple[str, Path]] = []
     cands = [("default", home / "platforms" / "pairing"), ("default", home / "pairing")]
-    for prof in sorted((home / "profiles").glob("*/")):
+    try:
+        profiles = _list_files(home / "profiles")
+    except FileNotFoundError:
+        profiles = []
+    except OSError as exc:
+        profiles = []
+        if errors is not None:
+            errors.append(f"pairing: profiles folder: {type(exc).__name__}; could not list profiles")
+    for prof in profiles:
+        if prof.is_symlink() or not prof.is_dir():
+            continue
         cands += [
             (prof.name, prof / "platforms" / "pairing"),
             (prof.name, prof / "pairing"),
@@ -1734,9 +1783,39 @@ def _pairing_profiles(home: Path) -> list[str]:
             continue
         if d.is_dir() and real not in seen:
             seen.add(real)
-            if profile not in out:
-                out.append(profile)
+            out.append((profile, d))
     return out
+
+
+def _pairing_profiles(home: Path, errors: list[str] | None = None) -> list[str]:
+    """Profiles that have a pairing store on disk. Only existence is checked here: the
+    files themselves are read by the gateway's own PairingStore, never by us."""
+    out: list[str] = []
+    for profile, _ in _pairing_dirs(home, errors):
+        if profile not in out:
+            out.append(profile)
+    return out
+
+
+def _pending_file_damage(path: Path) -> bool:
+    """True when a pending-requests file cannot be parsed as a JSON object. The stock store loads
+    such a file as "no requests", so it cannot tell a damaged store from an empty one. The content
+    is parsed and dropped here, never kept, logged or reported."""
+    try:
+        fd = os.open(path, os.O_RDONLY | _NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_STATE_BYTES:
+                return True
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                raw = fh.read(MAX_STATE_BYTES + 1)
+        finally:
+            os.close(fd)
+        return not isinstance(json.loads(raw.decode("utf-8-sig")), dict)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
 
 
 def _stock_pairing_store(profile: str):
@@ -1759,7 +1838,16 @@ def pairing_items(
     store = store or _stock_pairing_store
     now = time.time()
     items: list[dict[str, Any]] = []
-    for profile in _pairing_profiles(home):
+    folders = _pairing_dirs(home, errors)
+    for profile, folder in folders:
+        try:
+            for f in _list_files(folder, "-pending.json"):
+                if _pending_file_damage(f) and errors is not None:
+                    errors.append(f"pairing[{profile}]: {f.name}: could not read pending requests")
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"pairing[{profile}]: {type(exc).__name__}; could not list requests")
+    for profile in dict.fromkeys(p for p, _ in folders):
         try:
             pending = store(profile).list_pending()
         except Exception as exc:  # noqa: BLE001 - an old Hermes API or locked store means skip
@@ -1993,7 +2081,14 @@ def wait_items(
     home = home or hermes_home()
     errors = errors if errors is not None else []
     items: list[dict[str, Any]] = []
-    for f in sorted(_waits_dir(home).glob("*.json")):
+    waits = _waits_dir(home)
+    try:
+        records = _list_files(waits, ".json")
+    except OSError as exc:
+        # An unreadable folder is not an empty one: the prompts in it are unknown.
+        errors.append(f"prompt: waits: {type(exc).__name__}; could not list live prompts")
+        return items
+    for f in records:
         before = len(errors)
         rec = _read_json(f, errors=errors, source="prompt")
         if len(errors) != before:
@@ -2146,7 +2241,7 @@ def file_outside(
             raise ValueError("resolve requires either id or dedupe_key")
     with _state_lock(home):
         d = _outside_dir(home)
-        files = list(d.glob("*.json"))
+        files = _list_files(d, ".json")  # a listing that fails must not look like "no match"
         match = None
         if action == "resolve" and item_id:
             match = d / (_FILED_ID.fullmatch(item_id).group(1) + ".json")
@@ -2273,7 +2368,13 @@ def outside_items(
     """Our filed records plus bounded, non-recursive reads of explicitly watched folders."""
     errors = errors if errors is not None else []
     items = []
-    for f in _outside_dir(home).glob("*.json"):
+    outside = _outside_dir(home)
+    try:
+        filed = _list_files(outside, ".json")
+    except OSError as exc:
+        errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
+        filed = []
+    for f in filed:
         if f.is_symlink():
             continue
         before = len(errors)
