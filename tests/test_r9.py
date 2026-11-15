@@ -39,6 +39,13 @@ class SingleQuoteBackslashIsLiteral(unittest.TestCase):
         ):
             self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
         self.assertNotIn("PARTSECRET", needs._ask_redact("curl -u 'alice:PART\\'SECRET' x"))
+        for text in (  # Sol r9c: the shell joins the quote to the rest of its word
+            "keytool -list -storepass 'prefix\\'PARTSECRET -v",
+            "mysql -u root -p'prefix\\'PARTSECRET db",
+            "curl -u 'alice:pre\\'PARTSECRET https://example.test",
+            "curl -b 'sid=pre\\'PARTSECRET https://example.test",
+        ):
+            self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
 
 
 class QuotedExplicitKeys(unittest.TestCase):
