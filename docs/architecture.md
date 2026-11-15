@@ -14,6 +14,7 @@ and performs explicit human-selected actions; it does not run a separate service
 | `desktop/src/plugin.src.js` | Desktop queue, local drafts, actions, recovery controls and host SDK integration |
 | `desktop/build.py` | Reproducible font/token inlining into `desktop/plugin.js` and `design/unbl0ck.css` |
 | `recovery.py` | Operator CLI: diagnose the shared state files, preserve their bytes, restore a verified backup; counts only, never clears a lock |
+| `adapter_contract.py` | Plan-only vocabulary and reconciliation rules for a future provider adapter; pure code, reads nothing, not wired into the queue (see [provider-integrations.md](provider-integrations.md)) |
 | `scripts/security_review.py` | Trusted CI relay and authenticated GitHub verdict reconciliation |
 | `scripts/install_security_review_route.py` | Owner-run installation of one native Hermes subscription |
 
