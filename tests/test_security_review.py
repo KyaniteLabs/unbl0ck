@@ -183,9 +183,11 @@ def test_native_receiver_accepts_signature_rejects_tampering_and_renders_valid_r
     client(receiver).deliver(23)
     _, request = receiver.requests[-1]
     adapter = object.__new__(WebhookAdapter)
-    signed = SimpleNamespace(headers=request["headers"])
-    assert adapter._validate_signature(signed, request["body"], SECRET)
-    assert not adapter._validate_signature(signed, request["body"] + b" ", SECRET)
+    # aiohttp requests always carry match_info; current Hermes reads route_name from it.
+    for match_info in ({}, {"route_name": relay.ROUTE}):
+        signed = SimpleNamespace(headers=request["headers"], match_info=match_info)
+        assert adapter._validate_signature(signed, request["body"], SECRET)
+        assert not adapter._validate_signature(signed, request["body"] + b" ", SECRET)
     rendered = adapter._render_prompt(installer.PROMPT, json.loads(request["body"]), relay.EVENT, relay.ROUTE)
     receiver.reviews = [security_review(receiver, body=rendered)]
     assert client(receiver).deliver(23)["status"] == "pass"
