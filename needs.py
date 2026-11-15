@@ -2040,6 +2040,26 @@ def file_outside(
                 for f in files
                 if not f.is_symlink() and _dedupe_matches(_read_json(f), key, scope, caller)
             ]
+            if scope == "profile" and caller and not found:
+                # Before profile resolution, a tool call stored no profile. That record is
+                # the only copy of the key. Adopt one of those; never guess among several.
+                legacy = []
+                for f in files:
+                    if f.is_symlink():
+                        continue
+                    rec = _read_json(f)
+                    if (
+                        rec.get("dedupe_key") == key
+                        and "dedupe_scope" not in rec
+                        and not str(rec.get("profile") or "")
+                    ):
+                        legacy.append(f)
+                if len(legacy) > 1:
+                    raise ValueError(
+                        f"dedupe_key matches {len(legacy)} legacy items with no profile; "
+                        "resolve by id or pass dedupe_scope"
+                    )
+                found = legacy
             if scope is None and len(found) > 1:
                 raise ValueError(
                     f"dedupe_key matches {len(found)} items in different profiles; "
