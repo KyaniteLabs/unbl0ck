@@ -2171,19 +2171,17 @@ def _drop_cut_prefix(text: str) -> str:
 
 
 def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, over: bool, budget: list[int]) -> str:
-    """Names the whole message: a cut one is hashed in full while the poll's *budget* of bytes
-    lasts; past it the version is new on every poll, so it is never taken as unchanged."""
+    """A cut message is hashed whole while the poll's byte *budget* lasts, else by its first 64 KiB
+    and the end read here (an edit between them is not seen); every hashed byte is charged."""
     if not over:
         return f"{mid}:{_text_digest(length, text)}"
-    if length > budget[0]:
-        return f"{mid}:unhashed-{uuid.uuid4().hex[:12]}"
-    budget[0] -= length
     digest = hashlib.sha256(f"{length}\0".encode())
     rowid = conn.execute("SELECT rowid FROM messages WHERE id=?", (mid,)).fetchone()[0]
     with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
-        for block in iter(lambda: blob.read(1 << 20), b""):
-            digest.update(block)
-    digest.update(text.encode("utf-8", "replace"))
+        blocks = iter(lambda: blob.read(1 << 20), b"")
+        for part in blocks if length <= budget[0] else (blob.read(1 << 16), text.encode("utf-8", "replace")):
+            digest.update(part)
+            budget[0] -= len(part)
     return f"{mid}:{digest.hexdigest()[:12]}"
 
 

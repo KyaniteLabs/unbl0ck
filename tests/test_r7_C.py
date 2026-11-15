@@ -55,9 +55,9 @@ class ChatDatabaseOpen(unittest.TestCase):
 
 
 class ChatVersionBudget(unittest.TestCase):
-    def test_one_poll_hashes_a_bounded_number_of_bytes_and_unhashed_asks_stay_visible(self):
-        """R7-005: cut messages are hashed within a per-poll byte budget, a message that is not
-        an ask is not hashed at all, and an ask past the budget is never taken as unchanged."""
+    def test_one_poll_hashes_a_bounded_number_of_bytes_and_asks_past_it_can_still_be_dismissed(self):
+        """R7-005: cut messages are hashed within a per-poll byte budget and a message that is not
+        an ask is not hashed at all; an ask past the budget keeps a stable version (R8-007)."""
         big = "x " * (1 << 20)  # 2 MiB: far past what a poll reads of one message
         rows = [(f"s{i}", "cli", "dm", "u", 1, big + ASK) for i in range(4)]
         rows.append(("plain", "cli", "dm", "u", 1, big + "Done, nothing to ask."))
@@ -86,7 +86,7 @@ class ChatVersionBudget(unittest.TestCase):
             self.assertLessEqual(hashed[0], (3 << 20) + (1 << 20))
             dismissed = set(first.values())
             again = needs.chat_items(home, visible=lambda _id, version: version not in dismissed)
-            self.assertGreaterEqual(len(again), 3)  # only the asks that fit the budget can be hidden
+            self.assertEqual(again, [])
 
 
 if __name__ == "__main__":
