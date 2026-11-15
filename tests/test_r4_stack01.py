@@ -469,11 +469,11 @@ const tldr = src.match(/const TLDR_ASK = .*\n/)[0];
 const views = tldr + src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
 const noop = () => {};
 const node = (type, props) => ({type, props});
-let state = [], cursor = 0, effects = [], deps = [], undoSet = [];
+let state = [], cursor = 0, effects = [], deps = [], effectCursor = 0, undoSet = [];
 const env = {
   jsx: node, jsxs: node,
   useState: init => { const i = cursor++; if (!(i in state)) state[i] = init; return [state[i], v => { state[i] = typeof v === 'function' ? v(state[i]) : v; }]; },
-  useEffect: (fn, d) => { const i = effects.length; const prev = deps[i]; if (!prev || !d || d.some((x, k) => x !== prev[k])) { effects.push([i, fn, d]); } deps[i] = d; },
+  useEffect: (fn, d) => { const i = effectCursor++; const prev = deps[i]; if (!prev || !d || d.some((x, k) => x !== prev[k])) { effects.push([i, fn, d]); } deps[i] = d; },
   useRef: () => ({}), platformLabel: x => x, LOCAL_PLATFORMS: [], KEEP_BLOCKED: /keep blocked/i,
   button: props => node('button', props), openBoard: noop, ago: () => '', ageClass: () => '', pad: String,
   sfx: {play: noop}, petEmit: noop, host: {notify: noop, notifyError: e => {throw e}},
@@ -503,7 +503,7 @@ class DesktopExcerptLabel(unittest.TestCase):
         multi-line message says it was flattened rather than claiming it was cut."""
         self.check(r"""
 const ctx = {rest: async () => ({text: 'FIRST\nSECOND', truncated: false})};
-function render(item) { cursor = 0; effects = []; return Item({ctx, item, n: 1, refresh: async () => {}, askEnabled: false}); }
+function render(item) { cursor = 0; effects = []; effectCursor = 0; return Item({ctx, item, n: 1, refresh: async () => {}, askEnabled: false}); }
 (async () => {
   const item = {id: 'chat:p:s1', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
   let tree = render(item);
@@ -591,7 +591,7 @@ const tick = () => new Promise(r => setImmediate(r));
 const chat = {source: 'kanban', id: 'kanban:default:task', board: 'default', task_id: 'task', version: '1', title: 'Launch', ask: 'Which day?', tier: 'ask', since: 1};
 function mount(ctx, item = chat, extra = {}) {
   state = []; deps = []; effects = [];
-  const render = () => { cursor = 0; effects = []; return Item({ctx, item, n: 1, refresh: extra.refresh || (async () => {}), askEnabled: true}); };
+  const render = () => { cursor = 0; effects = []; effectCursor = 0; return Item({ctx, item, n: 1, refresh: extra.refresh || (async () => {}), askEnabled: true}); };
   return render;
 }
 """
