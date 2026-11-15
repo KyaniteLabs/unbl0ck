@@ -18,6 +18,7 @@ try:
     kanban_db_connect = importlib.import_module("hermes_cli.kanban_db_connect")
     HERMES_ERROR = None
 except ImportError as exc:  # pragma: no cover
+    kanban_db = kanban_db_connect = None  # importers still load; their Kanban cases skip
     HERMES_ERROR = str(exc)
 
 

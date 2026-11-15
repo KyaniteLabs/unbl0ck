@@ -24,3 +24,10 @@ def test_readme_develop_uses_pytest_like_ci():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "python -m pytest -rs tests" in readme
     assert "unittest discover" not in readme
+
+
+def test_ask_markers_are_documented_as_not_written_without_fcntl():
+    doc = " ".join((ROOT / "docs" / "architecture.md").read_text(encoding="utf-8").split())
+    assert "Ask restart markers are stricter: without `fcntl`" in doc
+    assert "not written at all" in doc
+    assert "Without fcntl" in (ROOT / "jobs.py").read_text(encoding="utf-8")
