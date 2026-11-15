@@ -215,8 +215,8 @@ to a model, adds no duplicates, and keeps cards you hid or answered hidden. A ch
 that is older than 14 days, or older than any earlier read (widening 1 to 7 days reaches
 three-day-old asks), is listed but never summarized automatically, even when summaries are
 on; the Summarize action still works on it. To keep that flag across refreshes the queue keeps a
-small `chat-backfill.json` in the plugin data folder: the oldest time any read reached and the
-ids of such chats (at most 1000), never chat text. If a chat database cannot be read, the coverage note says so instead of naming a window. The labeled
+small `chat-backfill.json` in the plugin data folder: the start of the first window any read
+reached, written once, never chat text. If a chat database cannot be read, the coverage note says so instead of naming a window. The labeled
 corpus in `tests/ask_corpus.py` lists the known misses (`KNOWN_GAPS`); run
 `python tests/test_ask_corpus.py --report` to print the false-positive and false-negative
 report.
