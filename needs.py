@@ -295,7 +295,11 @@ def _state_lock(home: Path | None):
     try:
         d = data_dir(home)
         # O_NOFOLLOW: a dangling or redirected link is never created through or locked.
-        fd = os.open(d / ".state.lock", os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
+        lock_path = d / ".state.lock"
+        # Where O_NOFOLLOW is absent (Windows) the open below would follow a link.
+        if lock_path.is_symlink():
+            raise OSError("the state lock is not a regular file")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError("the state lock is not a regular file")
@@ -460,22 +464,29 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
     item_id, version = str(item_id or ""), str(version or "")
     if not item_id or len(item_id) > 300 or len(version) > 300:
         raise ValueError("item id and version must be short strings")
-    # An older tab's "Not for me" must not replace a newer dismissal. Checked outside the
-    # lock because the queue build takes it.
-    existing = load_hidden(home).get(item_id)
-    if existing and existing != version:
+    # An older tab's "Not for me" must not replace a newer dismissal. The queue lookup takes the
+    # state lock, so it runs outside it; the stored value is therefore re-read under the lock
+    # and a dismissal that changed in between is judged again, never overwritten blind.
+    current: str | None = None
+    looked_up = False
+    while True:
+        with _state_lock(home):
+            hidden = load_hidden(home, strict=True)
+            existing = hidden.get(item_id)
+            if existing and existing != version and looked_up:
+                if current is not None and current != version:
+                    raise StaleHide("the card changed since this view; refresh before hiding it")
+            if not existing or existing == version or looked_up:
+                hidden.pop(item_id, None)
+                hidden[item_id] = version
+                if (
+                    len(hidden) > _HIDDEN_KEEP
+                ):  # oldest hides first out; the store never grows unbounded
+                    hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
+                _write_json(_hidden_path(home), hidden, ordered=True)
+                return
         current = _current_version(item_id, home)
-        if current is not None and current != version:
-            raise StaleHide("the card changed since this view; refresh before hiding it")
-    with _state_lock(home):
-        hidden = load_hidden(home, strict=True)
-        hidden.pop(item_id, None)
-        hidden[item_id] = version
-        if (
-            len(hidden) > _HIDDEN_KEEP
-        ):  # oldest hides first out; the store never grows unbounded
-            hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
-        _write_json(_hidden_path(home), hidden, ordered=True)
+        looked_up = True
 
 
 def unhide(item_id: str, home: Path | None = None) -> bool:
@@ -569,7 +580,9 @@ def _bluf_path(home: Path | None) -> Path:
 
 
 def load_blufs(home: Path | None = None, *, strict: bool = False) -> dict[str, dict[str, str]]:
-    return _read_json(_bluf_path(home), strict=strict)
+    return _read_json(
+        _bluf_path(home), strict=strict, entry_ok=lambda v: isinstance(v, dict)
+    )
 
 
 def summary_fingerprint(item: dict[str, Any]) -> str:
@@ -1120,6 +1133,13 @@ _CLOSER = re.compile(
 _ANSWERED = re.compile(r"(?:because|answer:|a:|it was|the answer)\b", re.IGNORECASE)
 
 
+def chat_ask_text(text: str) -> str:
+    """The text ask detection reads: URLs carry "?" query strings and names, and a polite sign-off
+    ("Anything else you need?") asks nothing. A span from ``chat_ask_span`` indexes this text."""
+    text = _URL.sub(" ", text or "")
+    return _CLOSER.sub("", text.strip()).strip()
+
+
 def chat_ask_span(text: str) -> int:
     """How many trailing characters of a bot's final turn hold its ask (0 when it asks nothing).
 
@@ -1127,9 +1147,7 @@ def chat_ask_span(text: str) -> int:
     ("…Platform's, on your word.") is not an ask. Packet/option-list shapes are
     exempt from the question mark and may be long; other cues need a ``?`` after the cue.
     A name that must address you has to lie inside the same span."""
-    # URLs carry "?" query strings; a polite sign-off ("Anything else you need?") asks nothing.
-    text = _URL.sub(" ", text or "")
-    text = _CLOSER.sub("", text.strip()).strip()
+    text = chat_ask_text(text)
     tail = text[-900:]
     if not tail:
         return 0
@@ -1162,9 +1180,17 @@ FULL_TEXT_LIMIT = 20_000  # most characters one on-demand full-text read returns
 
 def _is_excerpted(text: str, n: int = EXCERPT_CHARS) -> bool:
     """True when ``_excerpt`` would change *text*: cut it, or flatten its line breaks and spacing."""
-    original = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    collapsed = re.sub(r"\s+", " ", original)
+    # Compared with what Full text shows: the first line's indentation is content there, and the
+    # excerpt removes it.
+    original, _ = _full_text(text)
+    collapsed = re.sub(r"\s+", " ", original).strip()
     return len(collapsed) > n or collapsed != original
+
+
+def _is_cut(text: str, n: int = EXCERPT_CHARS) -> bool:
+    """True when ``_excerpt`` drops the start of *text* (a literal leading ellipsis is not a cut)."""
+    original, _ = _full_text(text)
+    return len(re.sub(r"\s+", " ", original).strip()) > n
 
 
 def _full_text(text: str) -> tuple[str, bool]:
@@ -1252,17 +1278,32 @@ def _answered_since(
     the queue and by answer_card. Names compare in Python (casefold) on both paths: SQLite's
     LOWER() folds ASCII only, so "ZOË" and "Zoë" used to differ on the fast path alone.
 
-    Comment times have one-second resolution, so a comment made just before a re-block can
-    share the block's second. With the block's event id, a comment counts when it is strictly
-    later than the block or its ``commented`` event follows the block event; without it the
-    old same-second rule (>=) applies."""
+    Comment times have one-second resolution and a clock can step back. With the block's event
+    id, every comment that has its ``commented`` event is placed by that event alone (event ids
+    are ordered, clocks are not); only when some comment has no event (an import) does the
+    time rule apply, a comment counting when it is strictly later than the block. Without the
+    id the old same-second rule (>=) applies."""
     cut = since or 0
     strict = block_id is not None
     try:
-        rows = conn.execute(
-            "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
-            (task_id, cut + 1 if strict else cut),
-        ).fetchall()
+        by_event_only = False
+        if strict:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            logged = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
+                (task_id,),
+            ).fetchone()[0]
+            by_event_only = logged >= total
+        rows = (
+            []
+            if by_event_only
+            else conn.execute(
+                "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
+                (task_id, cut + 1 if strict else cut),
+            ).fetchall()
+        )
         if any(_same_author(r[0], author) for r in rows):
             return True
         if not strict:
@@ -1276,12 +1317,17 @@ def _answered_since(
         ]
         return _commented_after(events, block_id, author)
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        if any(
+        comments = list(kanban_db.list_comments(conn, task_id))
+        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
+        by_event_only = strict and (
+            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
+        )
+        if not by_event_only and any(
             _same_author(c.author, author) and c.created_at >= (cut + 1 if strict else cut)
-            for c in kanban_db.list_comments(conn, task_id)
+            for c in comments
         ):
             return True
-        return strict and _commented_after(kanban_db.list_events(conn, task_id), block_id, author)
+        return strict and _commented_after(all_events, block_id, author)
 
 
 class CardStatus(str, Enum):
@@ -1622,10 +1668,71 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # Most characters of one chat message that are read from the database and processed. The ask
 # sits at the end of a turn, so a longer message is read from its end.
 CHAT_READ_CHARS = 100_000
+CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_CHARS characters
+CHAT_VERSION_BYTES = 16 * 1024 * 1024  # most bytes of one message hashed into its version
 
 
 def _text_digest(length: Any, text: str) -> str:
     return hashlib.sha256(f"{length}\0{text}".encode("utf-8", "replace")).hexdigest()[:12]
+
+
+_CUT_TOKEN = re.compile(r"\s*[A-Za-z0-9+/=_.\-]{32,}(?=\s|$)")
+_CUT_PEM_TAIL = re.compile(r"[A-Za-z0-9+/=\s]*(?=-----END )")
+
+
+def _drop_cut_prefix(text: str) -> str:
+    """A message read from its end starts in the middle of something. Whatever it began with, a
+    credential label, a key header, lies before the cut and cannot be seen, so the fragment that
+    follows cannot be judged: the partial first word and the run of long key-like words after it
+    are dropped, which leaves the readable ending where the ask is."""
+    rest = text[re.match(r"\S*", text).end() :]
+    while True:
+        hit = _CUT_TOKEN.match(rest)
+        if not hit:
+            break
+        rest = rest[hit.end() :]
+    pem = _CUT_PEM_TAIL.match(rest)
+    if pem:
+        rest = rest[pem.end() :]
+    return rest.lstrip()
+
+
+def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, over: bool) -> str:
+    """Names the whole message: the retained text alone cannot, when only its end was read, so a
+    cut message is hashed from the database in blocks (up to CHAT_VERSION_BYTES)."""
+    if not over:
+        return f"{mid}:{_text_digest(length, text)}"
+    digest = hashlib.sha256(f"{length}\0".encode())
+    step = 1 << 20
+    pos = 1
+    while pos <= min(length, CHAT_VERSION_BYTES):
+        block = conn.execute(
+            "SELECT SUBSTR(CAST(content AS BLOB), ?, ?) FROM messages WHERE id=?", (pos, step, mid)
+        ).fetchone()
+        digest.update(bytes(block[0] or b""))
+        pos += step
+    digest.update(text.encode("utf-8", "replace"))
+    return f"{mid}:{digest.hexdigest()[:12]}"
+
+
+def _open_chat_db(db: Path) -> sqlite3.Connection:
+    """Open *db* read-only, only if it is the regular file it was when the search began. The
+    check is made on the path itself (no link is followed) before and after the open, so a link
+    put in its place between the listing and the open is refused, not read."""
+    first = os.lstat(db)
+    if not stat.S_ISREG(first.st_mode):
+        raise OSError("state.db is not a regular file")
+    path = Path(os.path.abspath(db))
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+    try:
+        second = os.lstat(db)
+        same = (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+        if not (stat.S_ISREG(second.st_mode) and same):
+            raise OSError("state.db changed while it was opened")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
@@ -1659,9 +1766,11 @@ def chat_items(
     me = {n.lower() for n in principal_names(settings)}
     for profile, db in _state_dbs(home, errors, only[0] if only else None):
         try:
-            conn = sqlite3.connect(
-                db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2
-            )
+            conn = _open_chat_db(db)
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"chat[{profile}]: {exc}; not searched")
+            continue
         except sqlite3.Error as exc:
             if errors is not None:
                 errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
@@ -1717,7 +1826,9 @@ def chat_items(
                 continue
             # Only the columns this profile's schema has: an old schema must not fail per session.
             last_sql = (
-                "SELECT id, role, SUBSTR(content, ?), LENGTH(content), timestamp FROM messages "
+                # Bytes, not text: SQLite's text functions stop at an embedded NUL.
+                "SELECT id, role, SUBSTR(CAST(content AS BLOB), ?), LENGTH(CAST(content AS BLOB)), "
+                "timestamp FROM messages "
                 "WHERE session_id=? "
                 "AND role IN ('user','assistant') AND content IS NOT NULL AND TRIM(content) != '' "
                 + (
@@ -1742,23 +1853,32 @@ def chat_items(
                     # neither (an older local one) carries no remote identity to check.
                     continue
                 try:
-                    row = conn.execute(last_sql, (-CHAT_READ_CHARS, sid)).fetchone()
+                    row = conn.execute(last_sql, (-CHAT_READ_BYTES, sid)).fetchone()
                 except sqlite3.Error as exc:
                     if errors is not None:
                         errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
                     break  # same schema for every session: say it once
                 if not row:
                     continue
-                mid, role, content, length, ts = row
-                content = str(content)
+                mid, role, raw, length, ts = row
+                length = int(length or 0)
+                raw = bytes(raw or b"") if not isinstance(raw, str) else raw.encode("utf-8", "replace")
+                content = raw.decode("utf-8", "replace")
+                over = length > len(raw) or len(content) > CHAT_READ_CHARS
+                if over:  # only the end of a very long message was read
+                    content = content[-CHAT_READ_CHARS:]
+                    if length > len(raw):
+                        content = content.lstrip("\ufffd")  # a character cut in two
+                    content = _drop_cut_prefix(content)
+                version = _chat_version(conn, mid, length, content, over)
+                content = content.replace("\x00", " ")
                 span = chat_ask_span(content) if role == "assistant" and (ts or 0) >= since else 0
                 if not span:
                     continue
                 if str(chat_type or "").lower() in CHAT_GROUP_TYPES and not names.search(
-                    content[-span:]
+                    chat_ask_text(content)[-span:]
                 ):
                     continue
-                over = (length or 0) > len(content)  # only the end of a very long message was read
                 bot_chat = title in CHAT_TITLES
                 # Redact the whole turn before it is cut to an excerpt: the cut keeps the tail,
                 # so a long secret would otherwise leave a readable fragment.
@@ -1773,7 +1893,7 @@ def chat_items(
                         "id": f"chat:{profile}:{sid}",
                         # The message row id and a digest of the text: Hermes can rewrite a
                         # message in place, and the row id alone would not change.
-                        "version": f"{mid}:{_text_digest(length, content)}",
+                        "version": version,
                         "source": "chat",
                         "profile": profile,
                         "session_id": sid,
@@ -1784,6 +1904,7 @@ def chat_items(
                         "title": f"{_bot_name(home, profile)} is asking you",
                         "ask": _excerpt(shown),
                         "ask_truncated": over or _is_excerpted(shown),
+                        "ask_cut": over or _is_cut(shown),
                         **(_chat_full_fields(shown, over) if full else {}),
                         "why": f"Last turn in this {where_} is a question for you",
                         "owner": profile,
@@ -1858,7 +1979,7 @@ def _pending_file_damage(path: Path) -> bool:
         return not isinstance(json.loads(raw.decode("utf-8-sig")), dict)
     except FileNotFoundError:
         return False
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):  # too deeply nested is damage, not a crash
         return True
 
 
@@ -2036,34 +2157,124 @@ WAIT_FAULT_LIMIT = 50
 # (home, request id) -> (what failed, the record to write). The hooks run in the agent; when a
 # write or removal fails there, polling in the same process retries it and says so until it works.
 _WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
+# Faults dropped because the list was full, per home: never retried, so reported, not forgotten.
+_WAIT_FAULTS_LOST: dict[str, int] = {}
+# Hooks and polls in one process settle a prompt one at a time: a retry in flight must not
+# recreate a record that a clear has just removed.
+_WAIT_FAULT_LOCK = threading.RLock()
+_FAULT_LOST_KEY = "+lost"  # not a request id, so it never collides with one
+
+
+def _fault_path(home: Path) -> Path:
+    return data_dir(home) / "wait-faults.json"
+
+
+def _journal_fault(
+    home: Path, rid: str, what: str | None, *, lost: int = 0
+) -> None:
+    """Best effort: tell other processes that this one holds a prompt it could not record or
+    clear. It holds only the request id, what failed and this process's identity, never the
+    prompt, and it is removed when the fault is settled. ``what=None`` removes *rid*."""
+    try:
+        with _state_lock(home):
+            data = _read_json(_fault_path(home))
+            if what is None and not lost and rid not in data:
+                return
+            if what is not None:
+                pid = os.getpid()
+                data[rid] = {
+                    "what": what,
+                    "pid": pid,
+                    "proc_start": _proc_start(pid),
+                    "since": int(time.time()),
+                }
+            else:
+                data.pop(rid, None)
+            if lost:
+                pid = os.getpid()
+                old = data.get(_FAULT_LOST_KEY)
+                count = int(old.get("count") or 0) if isinstance(old, dict) else 0
+                data[_FAULT_LOST_KEY] = {
+                    "count": count + lost,
+                    "pid": pid,
+                    "proc_start": _proc_start(pid),
+                }
+            if data:
+                _write_json(_fault_path(home), data, ordered=True)
+            else:
+                _fault_path(home).unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001 - the hooks must never break a human prompt
+        log.warning("unbl0ck: could not note a live-prompt fault: %s", type(exc).__name__)
 
 
 def _remember_wait_fault(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
-    _WAIT_FAULTS.pop((str(home), rid), None)
-    _WAIT_FAULTS[(str(home), rid)] = (what, rec)
-    while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
-        _WAIT_FAULTS.pop(next(iter(_WAIT_FAULTS)))
+    with _WAIT_FAULT_LOCK:
+        _WAIT_FAULTS.pop((str(home), rid), None)
+        _WAIT_FAULTS[(str(home), rid)] = (what, rec)
+        dropped: list[tuple[str, str]] = []
+        while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
+            dropped.append(next(iter(_WAIT_FAULTS)))
+            _WAIT_FAULTS.pop(dropped[-1])
+        for h, r in dropped:
+            _WAIT_FAULTS_LOST[h] = _WAIT_FAULTS_LOST.get(h, 0) + 1
+    _journal_fault(home, rid, what)
+    for h, r in dropped:
+        _journal_fault(Path(h), r, None, lost=1)
 
 
 def _unlink_wait(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-def _reconcile_waits(home: Path, errors: list[str]) -> None:
-    """Retry hook writes/removals that failed; what still fails is a reported source error."""
-    for (h, rid), (what, rec) in list(_WAIT_FAULTS.items()):
-        if h != str(home):
+def _other_process_faults(home: Path, errors: list[str]) -> None:
+    """Faults another live process (the agent running a hook) reported but could not retry here."""
+    try:
+        data = _read_json(_fault_path(home))
+    except Exception:  # noqa: BLE001
+        return
+    for rid, entry in data.items():
+        if not isinstance(entry, dict):
             continue
         try:
-            path = _waits_dir(home) / f"{rid}.json"
-            if what == "record" and rec is not None:
-                _write_json(path, rec)
-            else:
-                _unlink_wait(path)
-            _WAIT_FAULTS.pop((h, rid), None)
-        except Exception as exc:  # noqa: BLE001
-            verb = "record" if what == "record" else "clear"
-            errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
+            pid = int(entry.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or pid == os.getpid():
+            continue
+        if not _alive(pid, entry.get("proc_start")):
+            _journal_fault(home, rid, None)  # its prompts died with it
+            continue
+        if rid == _FAULT_LOST_KEY:
+            errors.append(
+                f"prompt: {int(_num(entry.get('count')))} live prompts could not be recorded or cleared "
+                "and are no longer retried"
+            )
+        elif _SAFE_ID.match(rid):
+            verb = "record" if entry.get("what") == "record" else "clear"
+            errors.append(f"prompt: {rid}: could not {verb} a live prompt (reported by the agent)")
+
+
+def _reconcile_waits(home: Path, errors: list[str]) -> None:
+    """Retry hook writes/removals that failed; what still fails is a reported source error."""
+    _other_process_faults(home, errors)
+    lost = _WAIT_FAULTS_LOST.get(str(home), 0)
+    if lost:
+        errors.append(f"prompt: {lost} live prompts could not be recorded or cleared and are no longer retried")
+    with _WAIT_FAULT_LOCK:
+        for (h, rid), (what, rec) in list(_WAIT_FAULTS.items()):
+            if h != str(home) or _WAIT_FAULTS.get((h, rid)) != (what, rec):
+                continue
+            try:
+                path = _waits_dir(home) / f"{rid}.json"
+                if what == "record" and rec is not None:
+                    _write_json(path, rec)
+                else:
+                    _unlink_wait(path)
+                _WAIT_FAULTS.pop((h, rid), None)
+                _journal_fault(home, rid, None)
+            except Exception as exc:  # noqa: BLE001
+                verb = "record" if what == "record" else "clear"
+                errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
 
 
 def record_wait(home: Path | None = None, **payload: Any) -> None:
@@ -2093,12 +2304,15 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
             "proc_start": _proc_start(pid),
             "since": int(time.time()),
         }
-        _WAIT_FAULTS.pop((str(home), rid), None)
-        try:
-            _write_json(_waits_dir(home) / f"{rid}.json", rec)
-        except Exception:
-            _remember_wait_fault(home, rid, "record", rec)
-            raise
+        with _WAIT_FAULT_LOCK:
+            had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
+            try:
+                _write_json(_waits_dir(home) / f"{rid}.json", rec)
+            except Exception:
+                _remember_wait_fault(home, rid, "record", rec)
+                raise
+        if had_fault:
+            _journal_fault(home, rid, None)
     except Exception as exc:  # noqa: BLE001 - observability must never break a human prompt
         log.warning("unbl0ck: could not record wait: %s", type(exc).__name__)
 
@@ -2109,12 +2323,15 @@ def clear_wait(home: Path | None = None, **payload: Any) -> None:
         rid = str(payload.get("request_id") or "")
         if _SAFE_ID.match(rid):
             home = home or hermes_home()
-            _WAIT_FAULTS.pop((str(home), rid), None)
-            try:
-                _unlink_wait(_waits_dir(home) / f"{rid}.json")
-            except Exception:
-                _remember_wait_fault(home, rid, "clear", None)
-                raise
+            with _WAIT_FAULT_LOCK:
+                had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
+                try:
+                    _unlink_wait(_waits_dir(home) / f"{rid}.json")
+                except Exception:
+                    _remember_wait_fault(home, rid, "clear", None)
+                    raise
+            if had_fault:
+                _journal_fault(home, rid, None)
     except Exception as exc:  # noqa: BLE001
         log.warning("unbl0ck: could not clear wait: %s", type(exc).__name__)
 
@@ -2232,6 +2449,7 @@ def wait_items(
                 "ask": _excerpt(shown) or "(prompt text withheld by Hermes)",
                 # A password prompt is never expanded: its excerpt is all the queue ever shows.
                 "ask_truncated": kind != "sudo" and (cut or _is_excerpted(shown)),
+                "ask_cut": kind != "sudo" and (cut or _is_cut(shown)),
                 **(
                     {
                         **_full_fields(prompt),
@@ -2305,6 +2523,23 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
 # --- things waiting outside Hermes ----------------------------------------------------------
 
 _OUTSIDE_KINDS = ("draft", "notes", "approval", "other")
+
+
+def _is_filed_record(rec: Any, stem: str) -> bool:
+    """Whether *rec* is a record this plugin filed under ``<stem>.json``. One check for listing,
+    lookup, resolving and Done, so a foreign JSON file is never shown, read as ours or deleted."""
+    return (
+        isinstance(rec, dict)
+        and rec.get("id") == f"outside:filed:{stem}"
+        and bool(_FILED_ID.fullmatch(str(rec.get("id"))))
+        and rec.get("origin") == "filed"
+        and rec.get("kind") in _OUTSIDE_KINDS
+        and all(
+            isinstance(rec.get(key), str) and rec[key].strip()
+            for key in ("version", "title", "act_where")
+        )
+        and isinstance(rec.get("text"), str)
+    )
 _OUTSIDE_LIMIT = 200
 _OUTSIDE_READ_LIMIT = 256 * 1024
 _FILED_ID = re.compile(r"outside:filed:([a-f0-9]{32})\Z")
@@ -2401,11 +2636,16 @@ def file_outside(
         if action == "resolve":
             if match is None or not match.is_file() or match.is_symlink():
                 raise LookupError("No filed outside item matches that id or dedupe_key")
+            try:
+                found = _read_json(match, strict=True)
+            except RuntimeError as exc:
+                raise SourceUnavailable(str(exc)) from exc
+            if not found:
+                raise LookupError("No filed outside item matches that id or dedupe_key")
+            if not _is_filed_record(found, match.stem):
+                raise SourceUnavailable("filed outside record is invalid; repair it")
             if version is not None:
-                try:
-                    current = _read_json(match, strict=True).get("version")
-                except RuntimeError as exc:
-                    raise SourceUnavailable(str(exc)) from exc
+                current = found.get("version")
                 if current != version:
                     # Another agent refiled this item since: its newer text is not yours to delete.
                     raise StaleAnswer("the filed item changed since you filed it; re-read it first")
@@ -2556,15 +2796,7 @@ def outside_items(
             continue
         before = len(errors)
         rec = _read_json(f, errors=errors, source="outside")
-        if (
-            rec.get("id") == f"outside:filed:{f.stem}"
-            and _FILED_ID.fullmatch(rec["id"])
-            and rec.get("origin") == "filed"
-            and rec.get("kind") in _OUTSIDE_KINDS
-            and all(isinstance(rec.get(key), str) and rec[key].strip()
-                    for key in ("version", "title", "act_where"))
-            and isinstance(rec.get("text"), str)
-        ):
+        if _is_filed_record(rec, f.stem):
             items.append(rec)
         elif len(errors) == before and os.path.lexists(f):
             # (A record purged between the listing and the read is gone, not invalid.)
@@ -2646,7 +2878,7 @@ def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
             raise SourceUnavailable(str(exc)) from exc
         if not rec:
             raise LookupError("outside item is no longer available")
-        if rec.get("id") != item_id or rec.get("origin") != "filed" or not isinstance(rec.get("text"), str):
+        if not _is_filed_record(rec, match.group(1)):
             raise SourceUnavailable("filed outside record is invalid; repair it")
         return rec
     if not _FOLDER_ID.fullmatch(item_id or ""):
@@ -2711,6 +2943,8 @@ def done_outside(
                 raise SourceUnavailable(str(exc)) from exc
             if not rec:
                 raise LookupError("Filed outside item no longer exists")
+            if not _is_filed_record(rec, match.group(1)):
+                raise SourceUnavailable("filed outside record is invalid; repair it")
             if rec.get("version") != version:
                 raise RuntimeError(
                     "Outside item changed; refresh before marking it Done"
@@ -2925,18 +3159,33 @@ def _comments_since_block(
 ) -> list[tuple[str, str]]:
     """``(author, body)`` of the comments made since the current block began, oldest first.
 
-    With the block's event id a comment counts when its ``commented`` event follows the block
-    (event ids keep their order within one second) or its time is strictly later; without it,
-    when it is at or after the block's second. Older blocks' comments never count."""
+    With the block's event id a comment is placed by its ``commented`` event when every comment
+    has one (event ids are ordered, clocks are not); when some comment has none, its time
+    decides as well, a comment counting when strictly later than the block. Without the id, a
+    comment counts when it is at or after the block's second. Older blocks' comments never count."""
     strict = block_id is not None
     cut = (since or 0) + 1 if strict else (since or 0)
     try:
+        by_event_only = False
+        if strict:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            logged = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
+                (task_id,),
+            ).fetchone()[0]
+            by_event_only = logged >= total
         rows = {
             r[0]: (r[1], r[2])
-            for r in conn.execute(
-                "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-                (task_id, cut),
-            ).fetchall()
+            for r in (
+                []
+                if by_event_only
+                else conn.execute(
+                    "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+                    (task_id, cut),
+                ).fetchall()
+            )
         }
         if strict:
             n = conn.execute(
@@ -2953,17 +3202,47 @@ def _comments_since_block(
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
         comments = list(kanban_db.list_comments(conn, task_id))
         keyed = [(getattr(c, "id", None) or i, c) for i, c in enumerate(comments, 1)]
-        rows = {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
+        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
+        by_event_only = strict and (
+            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
+        )
+        rows = {} if by_event_only else {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
         if strict:
             n = sum(
                 1
-                for e in kanban_db.list_events(conn, task_id)
+                for e in all_events
                 if getattr(e, "kind", None) == "commented"
                 and int(getattr(e, "id", 0) or 0) > block_id
             )
             for k, c in keyed[len(keyed) - n :] if n else []:
                 rows[k] = (c.author, c.body)
     return [rows[k] for k in sorted(rows)]
+
+
+# Callers in this process that rely on one recovery marker (data folder, card, block version):
+# {"users": callers still inside answer_card, "ours": one of them recorded it, "keep": one of
+# them posted an answer whose release failed, so the marker is that answer's only recovery}.
+_MARKER_USERS: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+_MARKER_LOCK = threading.Lock()
+
+
+def _marker_join(key: tuple[str, str, str | None]) -> dict[str, Any]:
+    with _MARKER_LOCK:
+        entry = _MARKER_USERS.setdefault(key, {"users": 0, "ours": False, "keep": False})
+        entry["users"] += 1
+        return entry
+
+
+def _marker_leave(key: tuple[str, str, str | None], entry: dict[str, Any], *, keep: bool) -> bool:
+    """Leave the marker's user list. True only for the last user out when the marker was
+    recorded for this block and nobody needs it for a failed release: it is then safe to drop."""
+    with _MARKER_LOCK:
+        entry["keep"] = entry["keep"] or keep
+        entry["users"] -= 1
+        if entry["users"] > 0:
+            return False
+        _MARKER_USERS.pop(key, None)
+        return bool(entry["ours"] and not entry["keep"])
 
 
 def answer_card(
@@ -3017,8 +3296,9 @@ def answer_card(
     comment_id: int | None = None
     post_answer = False
     marker_reserved = False  # the recovery marker for this block is recorded
-    marker_ours = False  # ... and this call recorded it (a refused call removes only its own)
     marker_full = False
+    marker_key = (str(data_dir(home)), item_id, version_s)
+    marker_entry = _marker_join(marker_key) if release else None
     if release:
         # Reserve the failed-release marker BEFORE anything is written: a marker that cannot
         # be stored after the answer was posted would leave an answered card with no recovery
@@ -3028,9 +3308,13 @@ def answer_card(
         else:
             try:
                 _set_pending_release(item_id, version_s, home)
-                marker_reserved = marker_ours = True
+                marker_reserved = True
+                marker_entry["ours"] = True
             except PendingReleaseFull:
                 marker_full = True
+            except BaseException:
+                _marker_leave(marker_key, marker_entry, keep=False)
+                raise
     released = False
     release_failed = False
     release_error: BaseException | None = None
@@ -3113,7 +3397,14 @@ def answer_card(
                         )
             committed = True
     finally:
-        if not committed and marker_ours:
+        # The marker is dropped only by the last caller out, and only when none of them wrote an
+        # answer whose release failed: another caller may rely on the marker this one reserved.
+        last_out = (
+            _marker_leave(marker_key, marker_entry, keep=release_failed)
+            if marker_entry is not None
+            else False
+        )
+        if not committed and last_out:
             # Nothing was written (stale, refused, unreadable): drop the marker reserved for it.
             try:
                 _set_pending_release(item_id, None, home, expected=version_s)
@@ -3443,7 +3734,7 @@ _ASK_SECRET_PATTERNS = (
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted]"),
     (
         re.compile(
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
         ),
         "[redacted]",
     ),
@@ -3699,6 +3990,10 @@ _ASK_NUMERIC_SECRET_WORDS = frozenset(
         "private_key",
         "credential",
         "storepass",
+        "token",
+        "auth",
+        "authentication",
+        "oauth",
     }
 )
 
@@ -3714,6 +4009,8 @@ def _ask_numeric_credential(key: str, value: Any, word: str) -> bool:
         digits = bool(re.fullmatch(r"\d+", value.strip().strip("\"' ")))
     else:
         return False
+    if str(key).strip().strip("\"' ").casefold().endswith("tokens"):
+        return False  # a count of tokens (``tokens: 12``), not a token
     return digits and word in _ASK_NUMERIC_SECRET_WORDS and _ask_secret_key_is_exact(key)
 
 
@@ -4272,6 +4569,11 @@ def _ask_withhold_unscanned(rest: str) -> str:
                 out.append("[redacted: too much structured text to scan]" if risky(rest[i:]) else rest[i:])
                 break
             end = _ask_json_container_end(rest, i)
+            if end is None and risky(rest[i:]):
+                # A container that cannot be delimited (an escaped or unclosed JSON string) cannot
+                # be judged piece by piece: the remainder is withheld rather than copied.
+                out.append("[redacted: too much structured text to scan]")
+                break
             if end is not None and risky(rest[i:end]):
                 out.append("[redacted]")
                 i = end
@@ -4433,7 +4735,18 @@ def _ask_card_view(
                 done[k] = "[redacted]"
             else:
                 done[k] = _ask_card_view(v, key, _text_budget, _scrub)
-        return {k: done[k] for k in value if k in done}
+        shown: dict[Any, Any] = {}
+        for k in value:
+            if k not in done:
+                continue
+            name = k
+            if isinstance(k, str):
+                for path in _scrub:
+                    name = name.replace(path, "[workspace]")
+                while name != k and name in shown:  # two keys that scrub alike both survive
+                    name += "#"
+            shown[name] = done[k]
+        return shown
     if isinstance(value, (list, tuple)):
         if _text_budget is None:
             return [_ask_card_view(v, _key, None, _scrub) for v in value]
@@ -4639,7 +4952,13 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         cut = bool(it.get("ask_truncated") or it.get("truncated"))
         room = min(POCKET_PROMPT_CHARS, max(0, POCKET_TOTAL_PROMPT_CHARS - spent))
         if len(prompt) > room:
-            prompt = prompt[: max(0, room - len(_ASK_CUT))] + _ASK_CUT
+            # The marker is part of the budget: with no room left for it, the card carries no
+            # prompt text and says it was cut through its flag and warning.
+            prompt = (
+                prompt[: room - len(_ASK_CUT)] + _ASK_CUT
+                if room > len(_ASK_CUT)
+                else prompt[:room]
+            )
             cut = True
         spent += len(prompt)
         cards.append(

@@ -131,7 +131,10 @@ class CardAsk(BaseModel):
     id: str = Field(default="", max_length=MAX_ID)
     board: str = Field(default="", max_length=MAX_ID)
     task_id: str = Field(default="", max_length=MAX_ID)
-    messages: list[AskMessage] = Field(default_factory=list, max_length=MAX_MESSAGES)
+    # validate_default: a body that leaves "messages" out is judged like one that sends [].
+    messages: list[AskMessage] = Field(
+        default_factory=list, max_length=MAX_MESSAGES, validate_default=True
+    )
     # The queue version the human read; an Ask about an older question is refused (409).
     version: Optional[str] = Field(default=None, max_length=MAX_ID)
     # Client-chosen job id: re-sending the same id returns the same job instead of a second
