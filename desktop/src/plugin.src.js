@@ -959,11 +959,8 @@ function endAskScope(scope) {
   for (const key of [...answerDrafts.keys()]) if (key.startsWith(`${scope}|`)) answerDrafts.delete(key)
   for (const key of [...askLatest.keys()]) if (key.startsWith(`${scope}|`)) askLatest.delete(key)
 }
-// What an answer draft, an Ask conversation, its request id and job, and the Context and Full text
-// caches were made from: the block version plus the card text. The version alone does not move when
-// the title, the question, the description or a comment changes (body_sig and comments_sig are
-// digests of those). JSON, not a delimiter: a field that contains the delimiter would move text
-// between fields and look unchanged. Everything bound to a card compares this one stamp.
+// The one stamp everything bound to a card compares: block version plus card text (the version does
+// not move on a text edit). JSON, so text cannot move between fields and look unchanged.
 function cardStamp(item) {
   return JSON.stringify([item.version, item.title, item.ask, item.owner, item.comments_sig, item.body_sig].map(v => String(v ?? '')))
 }
@@ -971,9 +968,8 @@ function cardStamp(item) {
 // keep the newest messages within a message and character budget and say when older ones were dropped.
 const ASK_KEEP_MESSAGES = 100
 const ASK_KEEP_CHARS = 200000
-// Every message that is stored or sent passes here, replies included: each is cut to the server's
-// per-message limit (a longer one would be refused with every later request), and the history
-// starts with a user turn. `keep` is the stored cap, or the API's 50-message transport cap.
+// Every stored or sent message passes here: each cut to the server's per-message limit, history
+// starting with a user turn. `keep` is the stored cap or the API's 50-message cap.
 function boundAsk(msgs, keep = ASK_KEEP_MESSAGES) {
   let out = msgs.slice(-keep).map(m => ({ ...m, content: Array.from(String(m.content || '')).slice(0, ASK_MAX_CHARS).join('') }))
   let chars = out.reduce((n, m) => n + m.content.length, 0)
@@ -983,9 +979,8 @@ function boundAsk(msgs, keep = ASK_KEEP_MESSAGES) {
   }
   return { msgs: out, dropped: msgs.length - out.length }
 }
-// Every awaited step of one Ask (the request, each sleep, each poll) runs against what is left of
-// its 150 s budget: it fails when the budget runs out while it waits, and a step that settles after
-// the limit is refused, terminal replies included. The timer re-reads the clock when it fires.
+// Every awaited step of one Ask runs against what is left of its 150 s budget; a step that settles
+// after the limit is refused, terminal replies included.
 function withinDeadline(t0, step) {
   const late = () => Date.now() - t0 >= ASK_DEADLINE_MS
   const tooSlow = () => new Error('The model took too long (over 150 s)')
@@ -1241,9 +1236,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     : null
 
   const lastTurn = askMsgs.length ? askMsgs[askMsgs.length - 1].role : ''
-  // What Retry does, decided once for the button and the click: resend the last user turn (or ask
-  // again from scratch), or, after a refused follow-up rolled the history back to an assistant turn,
-  // send the refused text that is back in the input. Null: nothing to retry, so no button.
+  // One Retry decision for the button and the click: resend the last user turn, send the refused
+  // text restored to the input, or null (no button).
   const retryPlan = askStale || lastTurn === 'user' ? 'resend' : askInput.trim() ? 'input' : askMsgs.length ? null : 'resend'
   const askSend = async (retry = false, preset = '') => {
     if (retry && !retryPlan) return
@@ -1270,8 +1264,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     const { msgs: next, dropped } = boundAsk(built)
     const trimmed = (askStale ? false : askTrimmed) || dropped > 0
     const before = { msgs: askMsgs, stamp: askStamp, trimmed: askTrimmed }
-    // One id per ask, reused by Retry, so a lost response never starts a second model call. The id
-    // and the job belong to the stamp the conversation was asked under: a stale one is never reused.
+    // One id per ask, reused by Retry under the same stamp, so a lost response never starts a second model call.
     const follow = retry && !askStale
     const reqId = follow && askReq ? askReq : newAskRequestId()
     setAskReq(reqId)

@@ -72,13 +72,8 @@ def _hermes_identity() -> dict:
 
 
 def matrix_row_problems(row: list[str]) -> list[str]:
-    """What stops one acceptance-matrix row in docs/verification.md from identifying its run.
-
-    ``row`` is the five cells: receipt, host, revision, recorded at, result. A "not run" row
-    claims nothing and has no problems. Any other row needs a revision cell naming
-    ``source <commit>``, ``Hermes <version>`` (not a placeholder) and the Hermes release date
-    (``YYYY.M.D`` as Hermes prints it, or ``YYYY-MM-DD``), and a UTC ``recorded at`` time.
-    """
+    """Why a run row of the docs/verification.md acceptance matrix (five cells) does not identify
+    its run, per the format stated above that table; a "not run" row has none."""
     _receipt, _host, revision, when, result = row
     if result.strip().lower().startswith("not run"):
         return []

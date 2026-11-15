@@ -145,9 +145,8 @@ def _valid_seq(seq: Any) -> bool:
 def reconcile(local: Mapping[Key, Local], batch: ChangeBatch, accounts: Iterable[tuple[str, str]] = ()) -> Plan:
     """Turn one batch into actions. Pure: no I/O, no clock. The account scope (``accounts`` or
     ``batch.accounts``) is required for every read except a rate limit: a failed batch carries no
-    items, so the scope is the only way to know whose items to hold. The events of an ``ok`` batch
-    are applied one by one in the order received, so a batch ends exactly where the same events
-    delivered one batch each would end."""
+    items, so the scope is the only way to know whose items to hold. Events apply in order, as if
+    each came in its own batch."""
     plan = Plan()
     if batch.status == RATE_LIMITED:
         plan.retry_after = batch.retry_after
@@ -208,8 +207,7 @@ def _scope(accounts: Iterable[tuple[str, str]], batch: ChangeBatch) -> set[tuple
 
 
 def _hold(cur: Local) -> str | None:
-    """Why ``cur`` is held (ACCESS or LEFT_VIEW), or None. ``held=True`` and the state "held" are
-    the legacy spellings of an access hold."""
+    """ACCESS, LEFT_VIEW or None (``held=True`` and state "held" are legacy access holds)."""
     if cur.state == "gone":
         return None
     if cur.held in (ACCESS, LEFT_VIEW):
@@ -218,10 +216,8 @@ def _hold(cur: Local) -> str | None:
 
 
 def _releases(cur: Local, item: ExternalItem | None, complete: bool) -> bool:
-    """The one release rule. An access hold ends when a successful read of its account mentions
-    the item (even as a stale event) or, unmentioned, when the read is complete. A left-view hold
-    ends only when the provider lists the item again with a newer seq; reads working says nothing
-    about where it went."""
+    """An access hold ends when a read mentions the item or a complete read omits it; a left-view
+    hold ends only when the item is listed again at a newer seq."""
     if item is not None and item.state not in ITEM_STATES - {LEFT_VIEW}:
         return False
     hold = _hold(cur)
@@ -235,9 +231,8 @@ def _view(cur: Local) -> tuple[str, str | None]:
 
 
 def _same_seq_conflict(item: ExternalItem, cur: Local) -> bool:
-    """An event at the stored seq must repeat what the provider said at that seq: same revision
-    and the same state. An agent's claim or a guessed completion is not a provider state, so the
-    provider showing that item open or done at the same seq contradicts or upgrades it instead."""
+    """An event at the stored seq must repeat the stored revision and provider state (an agent's
+    claim or a guess is not a provider state)."""
     if item.seq != cur.seq:
         return False
     if item.revision != cur.revision:
@@ -319,7 +314,7 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
 
 
 def _advance(cur: Local, a: Action) -> Local:
-    """Move the watermark: seq and revision always together, for every action that carries a newer seq."""
+    """Move seq and revision together for any action carrying a newer seq."""
     if a.seq is None or a.seq <= cur.seq:
         return cur
     return replace(cur, seq=a.seq, revision=cur.revision if a.revision is None else a.revision)
