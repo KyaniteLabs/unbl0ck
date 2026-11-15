@@ -208,7 +208,7 @@ class Pairing(unittest.TestCase):
         self.assertEqual(src.count("-pending.json"), 1)
         check = src[src.index("def _pending_file_damage"):]
         check = check[: check.index("\n\n\n")]
-        self.assertIn("return not isinstance(json.loads(", check)
+        self.assertIn("return not isinstance(_json_loads_safe(", check)
         for field in ("salt", "hash", "code", "user_id"):
             self.assertNotIn(f'"{field}"', check)
         with tempfile.TemporaryDirectory() as d:

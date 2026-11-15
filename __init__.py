@@ -14,6 +14,9 @@ def _needs():
     return needs
 
 
+APPROVE_COMMAND_SHOWN = 400
+
+
 def _other_work(q: dict) -> list[str]:
     """Counts of cards a list of asks leaves out: stuck and answered. Counts only, no text."""
     parts = []
@@ -22,9 +25,6 @@ def _other_work(q: dict) -> list[str]:
         if n:
             parts.append(f"{n} {tier}")
     return parts
-
-
-APPROVE_COMMAND_SHOWN = 400
 
 
 def _gaps(n, q) -> list:

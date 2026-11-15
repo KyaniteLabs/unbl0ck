@@ -131,9 +131,6 @@ import json, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import needs
-# hide() consults the queue, whose build prunes summaries of cards it cannot see; these workers
-# test the lock, so the lookup is switched off and every summary they save must survive.
-needs._current_version = lambda *a, **k: None
 home, tag, count = Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 for i in range(count):
     needs.hide(f"hid-{tag}-{i}", "1", home)

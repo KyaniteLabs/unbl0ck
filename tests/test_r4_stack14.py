@@ -40,12 +40,6 @@ class HiddenContent(Mail):
         '<span style="font-size:0px">PRIVATE</span>',
         '<div style="width:0;height:0;overflow:hidden">PRIVATE</div>',
         '<div style="max-height:0;overflow:hidden">PRIVATE</div>',
-        "<style>.hide{display:none}</style><div class=hide>PRIVATE</div>",
-        "<style>div.hide, .other{display:none !important}</style><div class='x hide'>PRIVATE</div>",
-        "<style>#gone{opacity:0}</style><p id=gone>PRIVATE</p>",
-        "<style>/* c */ .a .b{display:none}</style><div class=a><p><span class=b>PRIVATE</span></p></div>",
-        "<style>.a > .b{display:none}</style><div class=a><span class=b>PRIVATE</span></div>",
-        "<style>p{display:none}</style><p>PRIVATE</p>",
         "<div hidden><span style='display:block'>PRIVATE</span></div>",
         "<div style='display:none'><span style='display:block'>PRIVATE</span></div>",
         "<div style='opacity:0'><span style='opacity:1'>PRIVATE</span></div>",
@@ -56,6 +50,24 @@ class HiddenContent(Mail):
         for html in self.LEAKS:
             with self.subTest(html=html):
                 self.assertNotIn("PRIVATE", self.text("<p>Real</p>" + html + "<p>tail</p>"))
+
+    SHEETS = (
+        "<style>.hide{display:none}</style><div class=hide>PRIVATE</div>",
+        "<style>div.hide, .other{display:none !important}</style><div class='x hide'>PRIVATE</div>",
+        "<style>#gone{opacity:0}</style><p id=gone>PRIVATE</p>",
+        "<style>/* c */ .a .b{display:none}</style><div class=a><p><span class=b>PRIVATE</span></p></div>",
+        "<style>.a > .b{display:none}</style><div class=a><span class=b>PRIVATE</span></div>",
+        "<style>p{display:none}</style><p>PRIVATE</p>",
+    )
+
+    def test_stylesheet_rules_are_not_matched_and_the_card_says_so(self):
+        # Round 5 (R5-needs-033..037): stylesheet rules are never matched to elements; text they
+        # may hide is kept and the not-evaluated note is shown, so visible text is never deleted.
+        for html in self.SHEETS:
+            with self.subTest(html=html):
+                t = self.text("<p>Real</p>" + html + "<p>tail</p>")
+                self.assertIn("PRIVATE", t)
+                self.assertIn("not evaluated", t)
 
     def test_visible_text_next_to_hidden_text_stays(self):
         t = self.text("<style>.hide{display:none}</style><p>Real</p><div class=hide>PRIVATE</div><p>tail</p>")
@@ -146,8 +158,6 @@ class FailureReported(Mail):
         self.assertIn("Important tail", t)
 
     def test_a_hex_reference_that_overflows_does_not_drop_the_tail(self):
-        # Guard only: the stdlib parser already turns any hexadecimal reference into U+FFFD, so this
-        # passes with or without converter code (the decimal case above is the one the converter fixes).
         t = self.text("<p>Start</p>&#x" + "f" * 5000 + ";<p>Important tail</p>")
         self.assertIn("Important tail", t)
 

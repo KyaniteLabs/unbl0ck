@@ -41,7 +41,7 @@ does not prove focus, accessible controls or the operator journey in a browser.
 | Full text / Context / search / keys | `test_desktop_quality`, `test_desktop_contract`, rendered operator checks | Retry controls work; filters preserve mounted state; Escape and focus follow the documented order |
 | Typed answer recovery | `test_operator_recovery`, rendered partial-source checks | Card disappears and returns with draft intact; changed question keeps recovered draft disabled |
 | Surface contract | `test_surface_contract` | Same item order and identity on the CLI list and Pocket pack; every surface agrees on the ask count; remote output carries counts only (no title, text, name, id or command) yet discloses stuck and answered counts; limited output states what it omits; unknown platforms are remote; docs matrix lists every surface and dimension |
-| Capability matrix | `test_capability_matrix` | Every source classified (supported, by design, not yet) with a reason; docs table equals the code; Desktop explains missing model help; non-Kanban ids are refused by the interactive Ask route (automatic one-line summaries are separate and covered by the summary rows); the set of write routes is pinned; password prompts and pairing secrets carry no inline action or secret; Pocket packs carry no secret, and a Kanban card carries only two fixed choices that name its board and block; disabled/unreachable provider fails closed |
+| Capability matrix | `test_capability_matrix` | Every source classified (supported, by design, not yet) with a reason; docs table equals the code; Desktop explains missing model help; non-Kanban ids are refused by the interactive Ask route (automatic one-line summaries are separate and covered by the summary rows); the set of write routes is pinned; password prompts, pairing secrets and Pocket packs carry no inline action or secret; disabled/unreachable provider fails closed |
 | Ask restart recovery | `test_ask_job_recovery`, `test_desktop_ask_recovery` | Restart before send, after send, after completion (with and without answer persistence) and after failure; repeated polling; TTL, cap and settled eviction; corrupt, foreign and symlinked markers; 0600/0700 modes; no answer text on disk by default; card isolation; delete; the provider is never called by recovery |
 | Summary / Ask | `test_bluf*`, `test_ask_job`, `test_ask_privacy`, `test_state_machines`, rendered operator checks | Bounded admission; reasoning stripped; lost terminal response can be collected with no second model POST |
 | Config read failure and repair | `test_failure_quality`, independent actual Hermes parser probes | Raised, marked-dictionary and import failures fail closed, both cold and after a good config; concurrent refresh shares one settled read; another caller's repair cannot erase an in-flight fault |
@@ -107,9 +107,6 @@ prints one JSON record (UTC time, plugin version, Hermes runtime version and rel
 and exits 1 if an interface is missing. It reads no settings, chats, cards or credentials. A
 row is filled only from such a record plus the source commit that was tested: a row that cannot
 name the source commit, the Hermes version and release date, and the UTC time stays "not run".
-A filled row writes the revision column as `source <sha> / Hermes <version> (<release date>)`
-and the time as `YYYY-MM-DDTHH:MM:SSZ`; an `unknown` or `0.0.0` Hermes version is not an
-identity, so a host that reports one cannot fill a row.
 
 Interfaces taken from Hermes that are not documented plugin APIs are listed in
 `needs.HOST_API` (six of them are private helpers: four in `kanban_db`, two in the webhook
@@ -119,6 +116,8 @@ what the source imports and calls. A name that appears only in a comment is not 
 a Kanban board then fails to read, the queue adds a single
 `host: this Hermes lacks N of the M interfaces UNBL0CK uses (...)` line to its errors instead
 of failing deep in a card read.
+
+A row that was run fills the revision cell as `source <commit> / Hermes <version> released <YYYY.M.D>` and the time as `YYYY-MM-DDTHH:MM:SSZ`; `scripts/host_compat.py` (`matrix_row_problems`) rejects any other run row.
 
 | Receipt | Host and OS | Plugin / Hermes revision | Recorded at (UTC) | Result |
 | --- | --- | --- | --- | --- |

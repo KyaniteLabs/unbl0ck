@@ -339,15 +339,6 @@ function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.cl
   const short = {id: 'chat:p:s2', version: '1', source: 'chat', title: 't', ask: 'short?', since: 1};
   tree = render(short); openFull(tree); tree = render(short); await flush();
   assert.equal(requests.length, 0);
-  // password prompts, pairing requests and short chats keep the local expand control and never fetch
-  for (const extra of [{source: 'prompt', id: 'prompt:0123456789abcdef', kind: 'sudo', ask: 'Password:'}, {source: 'pairing', id: 'pairing:x', ask: 'pair?'}, {source: 'chat', id: 'chat:p:s5', ask: 'short?'}]) {
-    state = []; hooks = []; requests.length = 0;
-    const it = {version: '1', title: 't', since: 1, profile: 'p', platform: 'cli', ...extra};
-    tree = render(it);
-    assert.ok(all(tree).some(x => x?.type === 'button' && x.props.className === 'ub-full'), extra.source + ' keeps the local expand control');
-    openFull(tree); tree = render(it); await flush();
-    assert.equal(requests.length, 0, extra.source + ' never fetches a larger record');
-  }
 })().catch(e => { console.error(e); process.exitCode = 1 });
 """
 

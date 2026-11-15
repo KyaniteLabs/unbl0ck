@@ -138,9 +138,11 @@ class RecoveryCli(Base):
         target = self.home / "lock-target"
         target.write_text("")
         (d / rec.LOCK_NAME).symlink_to(target)
-        self.assertIsNone(rec._writer_active(d))
+        dfd = os.open(d, os.O_RDONLY)
+        self.addCleanup(os.close, dfd)
+        self.assertIsNone(rec._writer_active(dfd))
         (d / rec.LOCK_NAME).unlink()
-        self.assertFalse(rec._writer_active(d))  # no lock file: no writer
+        self.assertFalse(rec._writer_active(dfd))  # no lock file: no writer
 
 
 if __name__ == "__main__":

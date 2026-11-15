@@ -555,7 +555,8 @@ assert.ok(det0 && !det0.props.open, 'details stay collapsed when nothing is omit
         script = r"""
 const fs = require('fs'), assert = require('node:assert/strict');
 const src = fs.readFileSync(process.argv[1], 'utf8');
-const body = src.slice(src.indexOf('function Chip('), src.indexOf('export default'));
+const body = src.slice(src.indexOf('function omittedChats('), src.indexOf('function coverageNote(')) +
+  src.slice(src.indexOf('function Chip('), src.indexOf('export default'));
 let q = null;
 const env = {jsx: (t, p) => ({type: t, props: p}), useValue: () => q, askCount: x => x.count || 0,
   host: {navigate() {}}, PATH: '/x', $queue: 'queue'};
@@ -642,15 +643,13 @@ class WidenedWindowIsBackfill(QueueCase):
         needs.chat_items(home)
         self.assertFalse((home / "plugin-data" / "unbl0ck" / needs.BACKFILL_FILE).exists())
 
-    def test_the_marks_hold_a_time_and_ids_only_and_are_bounded(self):
+    def test_the_marks_hold_one_time_only(self):
         home = self._home([("three", "cli", "dm", "u", 3, ASK)])
         self._queue(home, 1)
         self._queue(home, 7)
         data = json.loads((home / "plugin-data" / "unbl0ck" / needs.BACKFILL_FILE).read_text())
-        self.assertEqual(sorted(data), ["floor", "id_ts", "ids"])  # times and ids; `before` only past the cap
-        self.assertEqual(data["ids"], ["chat:work:three"])
+        self.assertEqual(sorted(data), ["floor"])
         self.assertNotIn("Should I open", json.dumps(data))
-        self.assertLessEqual(needs.BACKFILL_IDS_MAX, 1000)
 
     def test_the_documented_promise_matches_the_behavior(self):
         root = Path(__file__).resolve().parents[1]

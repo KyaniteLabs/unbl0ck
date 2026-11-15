@@ -13,6 +13,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
+from conftest import ask_gen
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -176,21 +177,13 @@ class CardStatusMachine(unittest.TestCase):
         # Bug: the queue's SQL path used LOWER(), which folds ASCII only, while answer_card
         # used str.lower(): "ZOË" counted as answered for one and not the other.
         conn = sqlite3.connect(":memory:")
-        conn.execute(
-            "CREATE TABLE task_comments(id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INT)"
-        )
-        conn.execute(
-            "INSERT INTO task_comments(task_id, author, body, created_at) VALUES('t','ZOË','ok',10)"
-        )
+        conn.execute("CREATE TABLE task_events(id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)")
+        conn.execute("""INSERT INTO task_events VALUES(10, 't', 'commented', '{"author": "ZOË"}')""")
         fallback = types.SimpleNamespace(
-            list_comments=lambda c, t: [
-                types.SimpleNamespace(author="ZOË", created_at=10)
-            ]
+            list_events=lambda c, t: [types.SimpleNamespace(id=10, kind="commented", payload={"author": "ZOË"})]
         )
         self.assertTrue(needs._answered_since(conn, fallback, "t", "zoë", 5))
-        self.assertTrue(
-            needs._answered_since(object(), fallback, "t", "zoë", 5)
-        )  # fallback path agrees
+        self.assertTrue(needs._answered_since(object(), fallback, "t", "zoë", 5))  # fallback path agrees
         self.assertFalse(needs._answered_since(conn, fallback, "t", "zoë", 11))
 
 
@@ -532,7 +525,7 @@ class AskJobsMachine(unittest.TestCase):
     def test_done_path(self):
         self.j.create("a")
         self.assertIs(self.j.get("a")["status"], jobs.AskState.PENDING)
-        self.assertTrue(self.j.finish("a", "Pick A", "p", "m"))
+        self.assertTrue(self.j.finish("a", "Pick A", "p", "m", gen=ask_gen(self.j, "a")))
         st = self.j.consume("a")
         self.assertEqual(
             (st["status"], st["reply"], st["provider"], st["model"]),
@@ -542,7 +535,7 @@ class AskJobsMachine(unittest.TestCase):
 
     def test_error_path(self):
         self.j.create("a")
-        self.assertTrue(self.j.fail("a", "model call failed"))
+        self.assertTrue(self.j.fail("a", "model call failed", gen=ask_gen(self.j, "a")))
         st = self.j.consume("a")
         self.assertEqual(
             (st["status"], st["ok"], st["detail"]),
@@ -555,8 +548,8 @@ class AskJobsMachine(unittest.TestCase):
             self.j.consume("a")  # still pending
         with self.assertRaises(jobs.IllegalTransition):
             self.j.create("a")  # duplicate
-        self.j.finish("a", "x")
-        for move in (lambda: self.j.finish("a", "y"), lambda: self.j.fail("a", "z")):
+        self.j.finish("a", "x", gen=ask_gen(self.j, "a"))
+        for move in (lambda: self.j.finish("a", "y", gen=ask_gen(self.j, "a")), lambda: self.j.fail("a", "z", gen=ask_gen(self.j, "a"))):
             with self.assertRaises(jobs.IllegalTransition):
                 move()  # already settled
         with self.assertRaises(KeyError):
@@ -567,12 +560,12 @@ class AskJobsMachine(unittest.TestCase):
         self.clock.t += jobs.AskJobs.TTL_S + 1
         self.j.create("new")  # expires "old"
         self.assertIsNone(self.j.get("old"))
-        self.assertFalse(self.j.finish("old", "late"))  # never resurrected
+        self.assertFalse(self.j.finish("old", "late", gen=ask_gen(self.j, "old")))  # never resurrected
         self.assertIsNone(self.j.get("old"))
 
     def test_settled_record_is_complete_when_seen(self):
         self.j.create("a")
-        self.j.finish("a", "r")
+        self.j.finish("a", "r", gen=ask_gen(self.j, "a"))
         st = self.j.get("a")
         self.assertTrue(
             {"status", "ok", "reply", "provider", "model", "started"} <= set(st)
@@ -605,9 +598,9 @@ class AskJobsMachine(unittest.TestCase):
                     model[job] = ("pending", self.clock.t)
             elif op in ("finish", "fail"):
                 fn = (
-                    (lambda job=job: self.j.finish(job, "r"))
+                    (lambda job=job: self.j.finish(job, "r", gen=ask_gen(self.j, job)))
                     if op == "finish"
-                    else (lambda job=job: self.j.fail(job, "d"))
+                    else (lambda job=job: self.j.fail(job, "d", gen=ask_gen(self.j, job)))
                 )
                 if job not in model:
                     self.assertFalse(fn())

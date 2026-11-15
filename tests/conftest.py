@@ -1,22 +1,32 @@
-"""Shared test hygiene.
+"""Shared test helpers."""
 
-Loading ``dashboard/plugin_api.py`` starts the Ask housekeeping timer at import. Many test files
-load it and only one used to stop it, so each load left a live timer thread behind that kept
-touching a profile directory after its fixture had been removed."""
-
-import sys
-
-import pytest
+import contextlib
+import os
+from unittest.mock import patch
 
 
-@pytest.fixture(autouse=True)
-def _stop_ask_housekeeping_timers():
-    yield
-    for module in list(sys.modules.values()):
-        table = getattr(module, "_ASK_JOBS", None)
-        stop = getattr(table, "stop_background", None)
-        if callable(stop):
-            try:
-                stop()
-            except Exception:  # noqa: BLE001 - teardown must never fail a test
-                pass
+def ask_gen(table, job):
+    """The generation token of ``job`` in an AskJobs table (None when it is not there)."""
+    return next((st["gen"] for (_d, j), st in table._jobs.items() if j == job), None)
+
+
+@contextlib.contextmanager
+def checks_see_a_regular_file(names, regular):
+    """Every no-follow stat of a path named in ``names`` reports ``regular`` (a real small file),
+    as if the entry was swapped for a link or FIFO right after the check: only a reader that
+    judges what it actually opened refuses it."""
+    real_lstat, real_stat, fake = os.lstat, os.stat, os.lstat(regular)
+
+    def named(p):
+        return os.path.basename(os.fsdecode(p)) in names if isinstance(p, (str, bytes, os.PathLike)) else False
+
+    def lstat(p, *a, **k):
+        return fake if named(p) else real_lstat(p, *a, **k)
+
+    def stat_(p, *a, follow_symlinks=True, **k):
+        if not follow_symlinks and named(p):
+            return fake
+        return real_stat(p, *a, follow_symlinks=follow_symlinks, **k)
+
+    with patch.object(os, "lstat", lstat), patch.object(os, "stat", stat_):
+        yield

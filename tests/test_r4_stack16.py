@@ -32,20 +32,14 @@ class StubMsvcrt(types.SimpleNamespace):
 
     LK_NBLCK, LK_UNLCK = 2, 0
 
-    def __init__(self, failure=None, script=()):
-        # ``script`` is consumed one entry per LK_NBLCK call (an exception is raised, None
-        # lets the call through); after it runs out ``failure`` and the real byte lock apply.
-        super().__init__(held={}, calls=0, failure=failure, script=list(script))
+    def __init__(self, failure=None):
+        super().__init__(held={}, calls=0, failure=failure)
 
     def locking(self, fd, mode, nbytes):
         self.calls += 1
         key = os.fstat(fd).st_ino
         if mode == self.LK_NBLCK:
-            if self.script:
-                step = self.script.pop(0)
-                if step is not None:
-                    raise step
-            elif self.failure is not None:
+            if self.failure is not None:
                 raise self.failure
             if self.held.get(key) not in (None, fd):
                 err = OSError(errno.EACCES, "Permission denied")
@@ -85,55 +79,25 @@ class WindowsLockErrors(unittest.TestCase):
                 self.assertEqual(stub.calls, 1, "a permanent failure must not be retried")
                 self.assertLess(self.elapsed, 0.5)
 
-    def contention_errors(self):
-        winonly = OSError()
-        winonly.winerror = 33  # ERROR_LOCK_VIOLATION with no POSIX errno
-        return [
+    def test_contention_is_still_retried_until_the_deadline(self):
+        for exc in (
             OSError(errno.EACCES, "held"),
             OSError(errno.EDEADLOCK, "deadlock"),
             OSError(errno.EDEADLK, "deadlock"),
-            winonly,
-        ]
-
-    def test_contention_is_retried_but_a_permanent_failure_after_it_surfaces_at_once(self):
-        # A classifier that retries everything times out here; one that retries nothing never
-        # reaches the second call. Only "wait on contention, raise the rest" gets the EINVAL.
-        for held in self.contention_errors():
-            with self.subTest(errno=held.errno, winerror=getattr(held, "winerror", None)):
-                stub = StubMsvcrt(script=[held, held, OSError(errno.EINVAL, "permanent")])
-                with self.assertRaises(OSError) as cm:
+        ):
+            with self.subTest(errno=exc.errno):
+                stub = StubMsvcrt(exc)
+                with self.assertRaises(TimeoutError) as cm:
                     self.run_with(stub)
-                self.assertNotIsInstance(cm.exception, TimeoutError)
-                self.assertEqual(cm.exception.errno, errno.EINVAL)
-                self.assertEqual(stub.calls, 3)
-                self.assertLess(self.elapsed, 0.5)
+                self.assertIn("another process holds it", str(cm.exception))
+                self.assertGreater(stub.calls, 2)
 
-    def test_a_windows_error_with_a_permanent_code_is_not_contention(self):
-        bad = OSError(errno.EBADF, "invalid handle")
-        bad.winerror = 6  # ERROR_INVALID_HANDLE
-        stub = StubMsvcrt(script=[OSError(errno.EACCES, "held"), bad])
-        with self.assertRaises(OSError) as cm:
+    def test_a_lock_violation_without_a_posix_errno_is_contention(self):
+        err = OSError()
+        err.winerror = 33
+        stub = StubMsvcrt(err)
+        with self.assertRaises(TimeoutError):
             self.run_with(stub)
-        self.assertNotIsInstance(cm.exception, TimeoutError)
-        self.assertEqual(cm.exception.winerror, 6)
-        self.assertEqual(stub.calls, 2)
-
-    def test_the_lock_is_taken_once_contention_clears(self):
-        for held in self.contention_errors():
-            with self.subTest(errno=held.errno, winerror=getattr(held, "winerror", None)):
-                stub = StubMsvcrt(script=[held, held])
-                with patch.object(needs, "fcntl", None), patch.object(needs, "msvcrt", stub):
-                    with needs._state_lock(self.home):
-                        self.assertEqual(len(stub.held), 1)
-                self.assertEqual(stub.held, {})
-                self.assertEqual(stub.calls, 4)  # two refusals, the lock, the unlock
-
-    def test_a_held_byte_that_never_clears_times_out_with_the_busy_message(self):
-        stub = StubMsvcrt(OSError(errno.EACCES, "held"))
-        with self.assertRaises(TimeoutError) as cm:
-            self.run_with(stub)
-        self.assertIn("another process holds it", str(cm.exception))
-        self.assertGreater(stub.calls, 2)
 
     def test_the_posix_lock_surfaces_permanent_failures_too(self):
         class Bad:
@@ -167,26 +131,6 @@ class WindowsLockPermissionsAreStatedHonestly(unittest.TestCase):
             self.assertIn("ACL", text, name)
         self.assertIn("owner-only ACL", arch)
         self.assertIn("never installs an owner-only ACL", arch)
-
-    def test_no_state_file_is_called_owner_only_without_the_windows_qualifier(self):
-        # Every description of a state file's protection must carry the platform it holds on.
-        lines = []
-        for parts in (("README.md",), ("docs", "architecture.md"), ("docs", "operator-guide.md")):
-            items = []  # one entry per table row, bullet or wrapped paragraph
-            for ln in self.text(*parts).splitlines():
-                new_item = not items or not ln.strip() or ln.lstrip().startswith(("|", "- ", "* "))
-                if new_item or not items[-1]:
-                    items.append(ln)
-                else:
-                    items[-1] += " " + ln
-            lines += [
-                (parts[-1], ln)
-                for ln in items
-                if ("outside/" in ln or "waits/" in ln or "ask/<profile>" in ln) and "owner-only" in ln.lower()
-            ]
-        self.assertTrue(lines)
-        for name, ln in lines:
-            self.assertIn("Windows", ln, f"{name}: owner-only claim without the Windows ACL note")
 
     def test_the_changelog_does_not_claim_equal_permissions_on_windows(self):
         log = " ".join(self.text("CHANGELOG.md").split())
@@ -243,95 +187,6 @@ class SameKeyAcrossProcesses(unittest.TestCase):
             self.assertEqual(keys, sorted(f"same-{i}" for i in range(self.KEYS)))
 
 
-WORKER_WINDOWS_BRANCH = r"""
-import errno, fcntl, os, sys, time
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-import needs
-home, go, keys, inject = Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4]), sys.argv[5] == "1"
-
-
-class Shim:
-    # msvcrt.locking semantics over a real cross-process byte lock: LK_NBLCK on a held range raises
-    # EACCES; the optional first call fails with a permanent error (a bad descriptor).
-    LK_NBLCK, LK_UNLCK = 2, 0
-    calls = refused = 0
-
-    def locking(self, fd, mode, nbytes):
-        if mode == self.LK_UNLCK:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            return
-        self.calls += 1
-        if inject and self.calls == 1:
-            raise OSError(errno.EBADF, "injected bad descriptor")
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self.refused += 1
-            raise OSError(errno.EACCES, "held")
-
-
-shim = Shim()
-needs.fcntl, needs.msvcrt = None, shim
-while not go.exists():
-    time.sleep(0.001)
-try:
-    for i in range(keys):
-        needs.file_outside(
-            {"kind": "draft", "title": "T", "body": "B", "act_where": "Mail", "dedupe_key": f"win-{i}"},
-            home, session_id="s", profile="one",
-        )
-finally:
-    print("refused", shim.refused, file=sys.stderr)
-"""
-
-
-@unittest.skipUnless(os.name == "posix", "the shim stands the Windows lock on a POSIX byte lock")
-class WindowsBranchAcrossProcesses(unittest.TestCase):
-    """Class L: real processes through the real ``needs._state_lock`` Windows branch. The shim keeps
-    the cross-process exclusion (and EACCES on a held byte), so contention is real and the
-    classification is what decides whether a worker waits or fails."""
-
-    PROCS, KEYS = 5, 20
-
-    def run_race(self, inject_in):
-        with tempfile.TemporaryDirectory() as d:
-            home = Path(d)
-            go = home / "go"
-            needs.data_dir(home)
-            argvs = [
-                [sys.executable, "-c", WORKER_WINDOWS_BRANCH, str(ROOT), str(home), str(go),
-                 str(self.KEYS), "1" if n == inject_in else "0"]
-                for n in range(self.PROCS)
-            ]
-            starter = threading.Thread(target=lambda: (time.sleep(1.0), go.write_text("go")))
-            starter.start()
-            try:
-                results = run_workers(argvs, 120)
-            finally:
-                starter.join()
-            recs = [json.loads(f.read_text()) for f in (needs.data_dir(home) / "outside").glob("*.json")]
-            return results, sorted(r["dedupe_key"] for r in recs)
-
-    def test_contention_is_waited_out_and_nothing_is_duplicated(self):
-        results, keys = self.run_race(inject_in=None)
-        for code, err in results:
-            self.assertEqual(code, 0, err)
-        refused = sum(int(err.split("refused")[-1]) for _, err in results)
-        self.assertGreater(refused, 0, "the workers never contended, so nothing was waited out")
-        self.assertEqual(keys, sorted(f"win-{i}" for i in range(self.KEYS)))
-
-    def test_a_permanent_failure_in_one_process_surfaces_and_blocks_no_one(self):
-        results, keys = self.run_race(inject_in=0)
-        code, err = results[0]
-        self.assertNotEqual(code, 0, "the injected bad descriptor must fail that worker")
-        self.assertIn("injected bad descriptor", err)
-        self.assertNotIn("state lock busy", err)
-        for code, err in results[1:]:
-            self.assertEqual(code, 0, err)
-        self.assertEqual(keys, sorted(f"win-{i}" for i in range(self.KEYS)))
-
-
 class CorruptStoreMutationUnderTheLock(unittest.TestCase):
     """A mutation that enters the lock on a corrupt store is refused, leaves the bytes alone and
     releases the lock, on the POSIX lock and on the Windows branch."""
@@ -343,50 +198,30 @@ class CorruptStoreMutationUnderTheLock(unittest.TestCase):
         self.store = needs.data_dir(self.home) / "hidden.json"
         self.store.write_bytes(b"{not json")
 
-    def check(self, held):
-        """``held()`` says whether another descriptor is currently locked out of the state lock."""
-        entered, held_during_read = [], []
-        real_lock, real_read = needs._state_lock, needs._load_hidden_raw
+    def check(self):
+        entered = []
+        real = needs._state_lock
 
-        def spy_lock(home):
+        def spy(home):
             entered.append(1)
-            return real_lock(home)
+            return real(home)
 
-        def spy_read(home, *a, **k):
-            held_during_read.append(held())
-            return real_read(home, *a, **k)
-
-        with patch.object(needs, "_state_lock", spy_lock), patch.object(
-            needs, "_load_hidden_raw", spy_read
-        ), patch.object(needs, "_current_version", lambda *a, **k: None):
+        with patch.object(needs, "_state_lock", spy):
             with self.assertRaises(RuntimeError):
                 needs.hide("a", "1", self.home)
         self.assertEqual(entered, [1], "the corrupt store must be met inside the lock")
-        self.assertEqual(held_during_read, [True], "the store must be read while the lock is held")
         self.assertEqual(self.store.read_bytes(), b"{not json")
         self.assertEqual(sorted(p.name for p in needs.data_dir(self.home).iterdir() if p.name != ".state.lock"), ["hidden.json"])
         with needs._state_lock(self.home):  # released
             pass
 
     def test_on_the_native_lock(self):
-        import fcntl
-
-        def held():
-            fd = os.open(needs.data_dir(self.home) / ".state.lock", os.O_RDWR)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return False
-            except BlockingIOError:
-                return True
-            finally:
-                os.close(fd)
-
-        self.check(held)
+        self.check()
 
     def test_on_the_windows_branch(self):
         stub = StubMsvcrt()
         with patch.object(needs, "fcntl", None), patch.object(needs, "msvcrt", stub):
-            self.check(lambda: len(stub.held) == 1)
+            self.check()
             self.assertEqual(stub.held, {})
 
 

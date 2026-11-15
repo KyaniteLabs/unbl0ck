@@ -39,6 +39,11 @@ def _plugin_version() -> str:
 _PLACEHOLDERS = {"", "0.0.0", "0", "unknown", "none"}
 
 
+def _text(value) -> str:
+    """An external identity value as stripped text; None, a missing field or a non-string is ""."""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def _hermes_identity() -> dict:
     """The Hermes release this process runs, from the runtime's own provenance.
 
@@ -50,22 +55,50 @@ def _hermes_identity() -> dict:
     try:
         import hermes_cli  # type: ignore
 
-        version = str(getattr(hermes_cli, "__version__", "") or "")
-        date = str(getattr(hermes_cli, "__release_date__", "") or "")
+        version = _text(getattr(hermes_cli, "__version__", None))
+        date = _text(getattr(hermes_cli, "__release_date__", None))
     except Exception:  # noqa: BLE001 - an unimportable Hermes has no runtime identity
         pass
-    if version.strip().lower() in _PLACEHOLDERS:
+    for dist in ("hermes-agent", "hermes_agent", "hermes"):
+        if version.lower() not in _PLACEHOLDERS:
+            break
+        try:
+            version = _text(metadata.version(dist))
+        except Exception:  # noqa: BLE001 - absent or malformed metadata is no identity
+            version = ""
+    if version.lower() in _PLACEHOLDERS:
         version = ""
-        for dist in ("hermes-agent", "hermes_agent", "hermes"):
-            try:
-                found = metadata.version(dist)
-            except Exception:  # noqa: BLE001 - absent or malformed metadata is no identity
-                continue
-            # A distribution without a Version field answers None: that is no identity either.
-            if isinstance(found, str) and found.strip().lower() not in _PLACEHOLDERS:
-                version = found
-                break
     return {"hermes_version": version or "unknown", "hermes_release_date": date or "unknown"}
+
+
+def _real_time(text: str, fmt: str) -> bool:
+    """True when text is a real calendar date or time in fmt: month 99 or hour 25 is not one."""
+    try:
+        datetime.strptime(text, fmt)
+    except ValueError:
+        return False
+    return True
+
+
+def matrix_row_problems(row: list[str]) -> list[str]:
+    """Why a run row of the docs/verification.md acceptance matrix (five cells) does not identify
+    its run, per the format stated above that table; a "not run" row has none."""
+    _receipt, _host, revision, when, result = row
+    if result.strip().lower().startswith("not run"):
+        return []
+    problems = []
+    if not (re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", when.strip())
+            and _real_time(when.strip(), "%Y-%m-%dT%H:%M:%SZ")):
+        problems.append("recorded at is not a UTC time")
+    if not re.search(r"\bsource [0-9a-f]{7,40}\b", revision):
+        problems.append("no source commit")
+    hermes = re.search(r"\bHermes (\S+)(.*)", revision)
+    if not hermes or hermes.group(1).lower() in _PLACEHOLDERS:
+        problems.append("no Hermes version")
+    dates = re.finditer(r"\b(\d{4})([.-])(\d{1,2})\2(\d{1,2})\b", hermes.group(2)) if hermes else ()
+    if not any(_real_time("-".join(m.group(1, 3, 4)), "%Y-%m-%d") for m in dates):
+        problems.append("no Hermes release date")
+    return problems
 
 
 def record() -> dict:

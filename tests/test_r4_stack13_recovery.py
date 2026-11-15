@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+from conftest import checks_see_a_regular_file
+
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("unbl0ck_needs_r4s13r", ROOT / "needs.py")
 needs = importlib.util.module_from_spec(_spec)
@@ -63,10 +65,8 @@ class Base(unittest.TestCase):
         def opener(path, flags, *a, **k):
             if str(path).endswith(name_suffix) and not done and not (flags & os.O_CREAT):
                 done.append(1)
-                if k.get("dir_fd") is not None:  # the tool opens the bare name inside its checked directory
-                    path = next(c for c in (self.d / str(path), self.d / "recovery" / str(path)) if c.exists())
-                os.unlink(path)
-                os.symlink(foreign, path)
+                os.unlink(path, dir_fd=k.get("dir_fd"))
+                os.symlink(foreign, path, dir_fd=k.get("dir_fd"))
             return real(path, flags, *a, **k)
 
         return opener
@@ -130,10 +130,10 @@ class Durability(Base):
         self.put("hidden.json", "{}")
         synced = []
         real = rec._fsync_dir
-        with mock.patch.object(rec, "_fsync_dir", lambda p: (synced.append(Path(p)), real(p))[1]):
+        with mock.patch.object(rec, "_fsync_dir", lambda fd: (synced.append(os.fstat(fd)), real(fd))[1]):
             self.assertEqual(rec.preserve("hidden", self.home)["status"], "preserved")
-        self.assertIn(self.d, synced)  # the parent of the new recovery directory
-        self.assertIn(self.d / "recovery", synced)
+        for d in (self.d, self.d / "recovery"):  # the parent of the new recovery directory, and it
+            self.assertTrue(any(os.path.samestat(st, d.stat()) for st in synced), d.name)
 
     def _fail_dir_sync(self, only):
         real = os.fsync
@@ -211,35 +211,45 @@ class PlainReads(Base):
     def test_a_backup_swapped_for_a_link_after_the_name_was_checked_is_refused(self):
         name = self.backup("hidden-ok.bak", '{"a": "v"}')
         self.put("hidden.json", b"{")
-        with mock.patch.object(os, "open", self.swap_to_link(name)):
-            raw, check = rec._check_backup(self.d, "hidden", name)
+        with rec._Data(self.home) as d, mock.patch.object(os, "open", self.swap_to_link(name)):
+            raw, check = rec._check_backup(d, "hidden", name)
         self.assertIsNone(raw)
         self.assertEqual(check["status"], "refused")
         self.assertEqual((self.d / "hidden.json").read_bytes(), b"{")
 
-    def test_the_same_swap_is_refused_where_there_is_no_nofollow(self):
-        name = self.backup("hidden-ok.bak", '{"a": "v"}')
-        n = rec._needs()
-        with mock.patch.object(n, "_NOFOLLOW", 0), mock.patch.object(os, "open", self.swap_to_link(name)):
-            raw, check = rec._check_backup(self.d, "hidden", name)
-        self.assertIsNone(raw)
-        self.assertEqual(check["status"], "refused")
+    def test_a_platform_that_cannot_open_relative_to_a_directory_is_refused(self):
+        self.backup("hidden-ok.bak", '{"a": "v"}')
+        with mock.patch.object(rec, "_DIR_FD", False):
+            for call in (lambda: rec.diagnose(self.home), lambda: rec.preserve("hidden", self.home)):
+                with self.assertRaises(RuntimeError):
+                    call()
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
     def test_a_fifo_in_place_of_a_store_or_backup_does_not_hang(self):
+        """The FIFOs appear after every type check, so only a reader that judges what it opened
+        (without blocking) refuses them."""
         os.mkfifo(self.d / "hidden.json")
         r = self.d / "recovery"
         r.mkdir(mode=0o700)
         os.mkfifo(r / "hidden-fifo.bak")
+        regular = Path(self.tmp.name) / "regular"
+        regular.write_text("{}")
         out = []
 
         def run():
-            out.append(rec.diagnose(self.home))
-            out.append(rec.restore("hidden", "hidden-fifo.bak", self.home))
+            with checks_see_a_regular_file({"hidden.json", "hidden-fifo.bak"}, regular):
+                out.append(rec.diagnose(self.home))
+                out.append(rec.restore("hidden", "hidden-fifo.bak", self.home))
 
         t = threading.Thread(target=run, daemon=True)
         t.start()
         t.join(10)
+        if t.is_alive():  # release the blocked reader so the test process can exit
+            for f in (self.d / "hidden.json", r / "hidden-fifo.bak"):
+                try:
+                    os.close(os.open(f, os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:  # nobody is reading this one
+                    pass
         self.assertFalse(t.is_alive(), "a FIFO blocked the reader")
         self.assertEqual(out[0]["stores"][0]["status"], "unsafe")
         self.assertEqual(out[0]["backups"][0]["status"], "unsafe")
@@ -256,27 +266,14 @@ class PlainReads(Base):
             return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid, 2, 0, 0, 0))
 
         real_read = rec._read_file
-        with mock.patch.object(rec, "_read_file", lambda p, limit=100: real_read(p, min(limit, 100))), \
+        with rec._Data(self.home) as d, \
+                mock.patch.object(rec, "_read_file", lambda dfd, n, limit=0, budget=None: real_read(dfd, n, 100, budget)), \
                 mock.patch.object(os, "fstat", small):
-            self.assertEqual(rec._check_backup(self.d, "hidden", name)[1]["status"], "refused")
-            self.assertEqual(rec._read_store(self.d, "hidden"), (None, "too_large"))
-            self.assertEqual(rec._inspect(self.d, "hidden")["status"], "corrupt")
-            listed = rec._list_backups(self.d)["items"]
+            self.assertEqual(rec._check_backup(d, "hidden", name)[1]["status"], "refused")
+            self.assertEqual(rec._read_store(d, "hidden"), (None, "too_large"))
+            self.assertEqual(rec._inspect(d, "hidden")["status"], "corrupt")
+            listed = rec._list_backups(d)["items"]
         self.assertEqual(listed[0]["status"], "corrupt")
-
-
-class PlatformPermissions(Base):
-    """13-011 (class M, platform): Windows permission bits are not a signal."""
-
-    def test_a_backup_with_synthesized_windows_modes_is_accepted_there_and_refused_here(self):
-        self.put("hidden.json", b"{")
-        name = self.backup("hidden-w.bak", '{"a": "v"}', mode=0o666)
-        self.assertEqual(rec.restore("hidden", name, self.home)["status"], "refused")
-        with mock.patch.object(rec, "_POSIX_MODES", False):
-            r = rec.restore("hidden", name, self.home)
-            row = rec.diagnose(self.home)
-        self.assertEqual(r["status"], "dry_run")
-        self.assertNotIn("owner_only", row["backups"][0])
 
 
 class PlanAndInstall(Base):
@@ -289,18 +286,17 @@ class PlanAndInstall(Base):
 
     @unittest.skipIf(rec.fcntl is None, "needs flock")
     def test_the_reported_plan_is_the_one_that_was_installed(self):
-        n = rec._needs()
-        real_lock = n._state_lock
+        real_lock = rec._state_lock
         two = json.dumps({"k1": "v", "k2": "v"})
 
         @contextmanager
-        def lock(home):
-            with real_lock(home):
+        def lock(dfd):
+            with real_lock(dfd):
                 (self.d / "recovery" / self.name).write_text(two)  # replaced while we waited
                 self.cur.write_text(json.dumps({"healthy": "now"}))
                 yield
 
-        with mock.patch.object(n, "_state_lock", lock):
+        with mock.patch.object(rec, "_state_lock", lock):
             r = rec.restore("hidden", self.name, self.home, apply=True)
         self.assertEqual(r["status"], "restored")
         self.assertEqual(r["backup_entries"], 2)
@@ -334,12 +330,11 @@ class PlanAndInstall(Base):
         os.chmod(planted, 0o600)
         real = os.replace
 
-        def replace(src, dst, **kw):  # the tool replaces by name inside the checked directory
+        def replace(src, dst, **k):
             if ".restore." in str(src) and str(src).endswith(".tmp"):
-                tmp = self.d / Path(src).name
-                os.unlink(tmp)
-                os.symlink(planted, tmp)
-            return real(src, dst, **kw)
+                os.unlink(src, dir_fd=k.get("src_dir_fd"))
+                os.symlink(planted, src, dir_fd=k.get("src_dir_fd"))
+            return real(src, dst, **k)
 
         with mock.patch.object(os, "replace", replace):
             r = rec.restore("hidden", self.name, self.home, apply=True)
@@ -360,10 +355,10 @@ class PlanAndInstall(Base):
 
         real_write = rec._write_new
 
-        def write_new(path, raw):
-            if ".restore." in path.name:
+        def write_new(dfd, name, raw):
+            if ".restore." in name:
                 raise OSError(errno.ENOSPC, "full")
-            return real_write(path, raw)
+            return real_write(dfd, name, raw)
 
         with mock.patch.object(rec, "_write_new", write_new), mock.patch.object(rec, "_read_store", read_store):
             r = rec.restore("hidden", self.name, self.home, apply=True)
@@ -374,8 +369,10 @@ class PlanAndInstall(Base):
     def test_a_copy_that_reads_back_differently_is_removed_and_never_kept(self):
         real = rec._read_back
         with mock.patch.object(rec, "_read_back", lambda fd, n: real(fd, n)[:-1] + b"X"):
+            dfd = os.open(self.d, os.O_RDONLY)
+            self.addCleanup(os.close, dfd)
             with self.assertRaises(OSError):
-                rec._write_new(self.d / "copy.tmp", b'{"abc": "v"}')
+                rec._write_new(dfd, "copy.tmp", b'{"abc": "v"}')
         self.assertFalse((self.d / "copy.tmp").exists())
 
     @unittest.skipIf(rec.fcntl is None, "needs flock")
@@ -412,11 +409,12 @@ class DocsMatchBehavior(unittest.TestCase):
         doc = rec.__doc__
         self.assertNotIn("* changes nothing unless", doc)  # the blanket claim preserve contradicts
         self.assertIn("``restore`` changes nothing unless ``apply`` is set", doc)
-        self.assertIn("``preserve`` only adds a backup file", doc)
+        self.assertIn("``preserve`` adds a backup file (creating the recovery directory on first use), sets that directory", doc)
         self.assertIn("creates the recovery directory", self.guide)
 
-    def test_windows_dry_runs_are_documented(self):
-        self.assertIn("dry runs and `preserve` still work", self.guide)
+    def test_the_windows_refusal_is_documented(self):
+        self.assertIn("refuses every command there", self.guide)
+        self.assertNotIn("dry runs and `preserve` still work", self.guide)
 
     def test_ask_markers_are_documented_where_the_code_puts_them(self):
         self.assertNotIn("profile's own data directory", self.guide)

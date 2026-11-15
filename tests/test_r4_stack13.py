@@ -145,7 +145,9 @@ class JournalInstallsTheFileItWrote(Tmp):
 
         with mock.patch.object(jobs.os, "fsync", fsync):
             self.assertFalse(journal.write(job, {"state": "running", "started": 2.0}))
-        self.assertEqual((ask / f"{job}.json").read_bytes(), before)
+        # The installed entry is checked against the file written: the stranger is taken out again.
+        self.assertFalse((ask / f"{job}.json").exists())
+        self.assertNotEqual(before, b"")
         self.assertEqual(list(ask.glob(".*.tmp")), [])
 
 

@@ -12,6 +12,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from conftest import ask_gen
 
 ROOT = Path(__file__).parents[1]
 
@@ -70,7 +71,7 @@ class RestartStates(RecoveryBase):
 
     def test_restart_after_send_is_unknown_not_resent(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
         self.boot()
         st = self.jobs.get(J1)
         self.assertEqual(jobs.ASK_WIRE[st["status"]], "unknown")
@@ -78,8 +79,8 @@ class RestartStates(RecoveryBase):
 
     def test_restart_after_completion_without_persistence_is_unknown(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
-        self.jobs.finish(J1, "SECRET REPLY TEXT", "p", "m")
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
+        self.jobs.finish(J1, "SECRET REPLY TEXT", "p", "m", gen=ask_gen(self.jobs, J1))
         self.assertNotIn("SECRET REPLY TEXT", (self.dir / f"{J1}.json").read_text())
         self.boot()
         st = self.jobs.get(J1)
@@ -89,8 +90,8 @@ class RestartStates(RecoveryBase):
     def test_restart_after_completion_with_persistence_is_complete(self):
         self.keep = True
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
-        self.jobs.finish(J1, "Pick A", "p", "m")
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
+        self.jobs.finish(J1, "Pick A", "p", "m", gen=ask_gen(self.jobs, J1))
         self.boot()
         st = self.jobs.get(J1)
         self.assertEqual(jobs.ASK_WIRE[st["status"]], "complete")
@@ -98,8 +99,8 @@ class RestartStates(RecoveryBase):
 
     def test_restart_after_failure_is_failed(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
-        self.jobs.fail(J1, "provider said no")
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
+        self.jobs.fail(J1, "provider said no", gen=ask_gen(self.jobs, J1))
         self.boot()
         st = self.jobs.get(J1)
         self.assertEqual(jobs.ASK_WIRE[st["status"]], "failed")
@@ -107,12 +108,12 @@ class RestartStates(RecoveryBase):
 
     def test_live_pending_stays_pending(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
         self.assertEqual(jobs.ASK_WIRE[self.jobs.get(J1)["status"]], "pending")
 
     def test_repeated_polling_is_idempotent(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
         self.boot()
         first = self.jobs.get(J1)
         for _ in range(5):
@@ -121,22 +122,22 @@ class RestartStates(RecoveryBase):
 
     def test_slow_completion_before_ttl_still_settles(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
         self.clock.t += jobs.AskJobs.TTL_S - 5
-        self.assertTrue(self.jobs.finish(J1, "late", "p", "m"))
+        self.assertTrue(self.jobs.finish(J1, "late", "p", "m", gen=ask_gen(self.jobs, J1)))
         self.assertEqual(jobs.ASK_WIRE[self.jobs.get(J1)["status"]], "complete")
 
     def test_late_worker_after_expiry_cannot_resurrect(self):
         self.jobs.create(J1, card="c1")
         self.clock.t += jobs.AskJobs.TTL_S + 1
         self.assertIsNone(self.jobs.get(J1))
-        self.assertFalse(self.jobs.finish(J1, "late", "p", "m"))
+        self.assertFalse(self.jobs.finish(J1, "late", "p", "m", gen=ask_gen(self.jobs, J1)))
         self.assertEqual(self.files(), [])
 
     def test_recovered_job_never_invokes_the_provider(self):
         calls = []
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
         self.boot()
         for _ in range(3):
             self.jobs.get(J1)
@@ -176,18 +177,18 @@ class RetentionAndDeletion(RecoveryBase):
         for i in range(4):
             job = f"{i:032x}"
             self.jobs.create(job, card="c")
-            self.jobs.fail(job, "x")
+            self.jobs.fail(job, "x", gen=ask_gen(self.jobs, job))
         self.assertEqual(len(self.files()), 2)
 
     def test_consumed_job_leaves_no_file(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.fail(J1, "x")
+        self.jobs.fail(J1, "x", gen=ask_gen(self.jobs, J1))
         self.jobs.consume(J1)
         self.assertEqual(self.files(), [])
 
     def test_discard_deletes_memory_and_disk(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
         self.assertTrue(self.jobs.discard(J1))
         self.assertIsNone(self.jobs.get(J1))
         self.assertEqual(self.files(), [])
@@ -202,12 +203,12 @@ class RetentionAndDeletion(RecoveryBase):
     def test_discard_reports_failure_when_the_saved_record_cannot_be_deleted(self):
         self.keep = True
         self.jobs.create(J1, card="c1")
-        self.jobs.finish(J1, "secret answer")
+        self.jobs.finish(J1, "secret answer", gen=ask_gen(self.jobs, J1))
         with patch.object(os, "unlink", side_effect=PermissionError):
             with self.assertRaises(jobs.DiscardFailed):
                 self.jobs.discard(J1)
-        # Nothing was reported as deleted, and the job is still one consistent thing.
-        self.assertEqual(self.jobs.get(J1)["reply"], "secret answer")
+        # Nothing was reported as deleted, but the fence is down: the answer is never served again.
+        self.assertIsNone(self.jobs.get(J1))
         self.assertEqual(self.files(), [f"{J1}.json"])
         # Once the file can be removed, discard succeeds and nothing is left to recover.
         self.assertTrue(self.jobs.discard(J1))
@@ -228,9 +229,10 @@ class RetentionAndDeletion(RecoveryBase):
         self.journal.MAX_FILES = 2
         self.jobs.create(J1, card="c")
         self.jobs.create(J2, card="c")
-        self.jobs.create(J3, card="c")  # no room and nothing evictable: memory only
+        with self.assertRaises(jobs.ScopeUnavailable):  # no room and nothing evictable: refused
+            self.jobs.create(J3, card="c")
         self.assertEqual(self.files(), [f"{J1}.json", f"{J2}.json"])
-        self.assertEqual(self.jobs.get(J3)["status"], jobs.AskState.PENDING)
+        self.assertIsNone(self.jobs.get(J3))
 
 
 class Protection(RecoveryBase):
@@ -241,15 +243,15 @@ class Protection(RecoveryBase):
 
     def test_markers_hold_no_card_text(self):
         self.jobs.create(J1, card="board:card-1")
-        self.jobs.mark_sent(J1)
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
         body = (self.dir / f"{J1}.json").read_text()
         self.assertNotIn("messages", body)
         self.assertNotIn("reply", body)
 
     def test_no_tmp_files_left(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
-        self.jobs.fail(J1, "x")
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
+        self.jobs.fail(J1, "x", gen=ask_gen(self.jobs, J1))
         self.assertEqual([p.name for p in self.dir.iterdir() if p.name.endswith(".tmp")], [])
 
     def test_bad_job_ids_never_touch_disk(self):
@@ -293,21 +295,19 @@ class Corruption(RecoveryBase):
         (self.dir / f"{J1}.json").write_text('{"v":1,"job":"%s","state":"weird","started":1000}' % J1)
         self._unknown(J1)
 
-    def test_unwritable_directory_degrades_to_memory(self):
+    def test_unwritable_directory_refuses_the_job(self):
         blocked = Path(self.tmp.name) / "file"
         blocked.write_text("x")
         journal = jobs.AskJournal(lambda: blocked / "ask", lambda: False, self.clock)
         table = jobs.AskJobs(self.clock, journal)
-        table.create(J1, card="c")
-        table.mark_sent(J1)
-        table.finish(J1, "ok", "p", "m")
-        self.assertEqual(table.get(J1)["reply"], "ok")
-        self.assertGreater(journal.failures, 0)
+        with self.assertRaises(jobs.ScopeUnavailable):
+            table.create(J1, card="c")
+        self.assertEqual(len(table), 0)
 
     def test_no_journal_is_plain_memory(self):
         table = jobs.AskJobs(self.clock)
         table.create(J1)
-        table.finish(J1, "ok")
+        table.finish(J1, "ok", gen=ask_gen(table, J1))
         self.assertEqual(table.get(J1)["reply"], "ok")
         self.assertIsNone(jobs.AskJobs(self.clock).get(J1))
 
@@ -412,7 +412,7 @@ class AskApiRecovery(unittest.TestCase):
     def test_restart_mid_send_reports_unknown(self):
         job = "e" * 32
         self.api._ASK_JOBS.create(job, card=CARD)
-        self.api._ASK_JOBS.mark_sent(job)
+        self.api._ASK_JOBS.mark_sent(job, gen=ask_gen(self.api._ASK_JOBS, job))
         self.restart()
         p = self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").json()
         self.assertEqual((p["state"], p["resubmit_safe"]), ("unknown", False))
@@ -436,7 +436,7 @@ class AskApiRecovery(unittest.TestCase):
         self.assertEqual(self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").status_code, 200)
 
     def test_model_is_not_called_when_the_request_cannot_be_recorded(self):
-        self.api._ASK_JOBS.mark_sent = lambda job: False
+        self.api._ASK_JOBS.mark_sent = lambda job, gen: False
         job = self._ask()
         p = self._wait(job)
         self.assertEqual(p["state"], "failed")
@@ -472,14 +472,15 @@ class AskApiRecovery(unittest.TestCase):
             r = self.c.delete(f"/card/ask/{job}?card={CARD}")
         self.assertEqual(r.status_code, 500)
         self.assertNotIn("deleted", r.json())
-        self.assertEqual(self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").json()["state"], "complete")
+        # The record is still on disk (so not "deleted"), but fenced: it is never served again.
+        self.assertEqual(self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").status_code, 404)
         self.assertEqual(self.c.delete(f"/card/ask/{job}?card={CARD}").json(), {"ok": True, "deleted": True})
 
 
 class MarkSentFailure(RecoveryBase):
     """The "sent" marker is what keeps a restart from offering a resend after the model may have run."""
 
-    def test_failed_sent_write_invalidates_the_stale_queued_marker(self):
+    def test_failed_sent_write_keeps_the_job_from_the_model(self):
         self.jobs.create(J1, card="c1")
         real = os.rename
 
@@ -490,22 +491,22 @@ class MarkSentFailure(RecoveryBase):
 
         self.addCleanup(setattr, os, "rename", real)
         os.rename = failing
-        self.assertTrue(self.jobs.mark_sent(J1))
+        self.assertFalse(self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1)))
         os.rename = real
-        self.assertEqual(self.files(), [], "the stale queued marker is gone")
+        self.assertEqual(self.files(), [f"{J1}.json"], "the queued marker stays")
         self.boot()
-        self.assertIsNone(self.jobs.get(J1), "unknown, never not_submitted with resubmit_safe")
+        self.assertEqual(self.jobs.get(J1)["status"], jobs.AskState.NOT_SUBMITTED, "true: it was never sent")
 
     def test_unrecordable_request_must_not_reach_the_model(self):
         self.jobs.create(J1, card="c1")
         self.journal.write = lambda job, rec, **kw: False
         self.journal.delete = lambda job, **kw: False
-        self.assertFalse(self.jobs.mark_sent(J1))
+        self.assertFalse(self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1)))
 
     def test_no_journal_still_allows_the_send(self):
         plain = jobs.AskJobs(self.clock)
         plain.create(J1)
-        self.assertTrue(plain.mark_sent(J1))
+        self.assertTrue(plain.mark_sent(J1, gen=ask_gen(plain, J1)))
 
 
 class UnavailableStorage(RecoveryBase):
@@ -520,7 +521,7 @@ class UnavailableStorage(RecoveryBase):
         self.jobs.create(J1, card="c1")
         self.assertEqual(self.files(), [f"{J1}.json"])
         self.lose_directory()
-        self.assertFalse(self.jobs.mark_sent(J1))
+        self.assertFalse(self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1)))
 
     def test_discard_does_not_claim_success_while_the_saved_record_cannot_be_checked(self):
         self.jobs.create(J1, card="c1")
@@ -582,8 +583,8 @@ class Housekeeping(RecoveryBase):
 
     def test_saved_answer_expires_without_any_later_ask(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
-        self.jobs.finish(J1, "PRIVATE ANSWER", "p", "m")
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
+        self.jobs.finish(J1, "PRIVATE ANSWER", "p", "m", gen=ask_gen(self.jobs, J1))
         self.assertEqual(len(self.files()), 1)
         self.clock.t += jobs.AskJobs.TTL_S + 1
         self.jobs.housekeeping()
@@ -591,7 +592,7 @@ class Housekeeping(RecoveryBase):
 
     def test_background_timer_removes_expired_files(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.finish(J1, "PRIVATE ANSWER", "p", "m")
+        self.jobs.finish(J1, "PRIVATE ANSWER", "p", "m", gen=ask_gen(self.jobs, J1))
         self.clock.t += jobs.AskJobs.TTL_S + 1
         self.jobs.start_background(0.05)
         for _ in range(60):
@@ -623,7 +624,7 @@ class ProfileDirectory(unittest.TestCase):
             a = jobs.AskJobs(clock, jobs.AskJournal(lambda: dirs["work"], lambda: True, clock))
             b = jobs.AskJobs(clock, jobs.AskJournal(lambda: dirs["home"], lambda: True, clock))
             a.create(J1, card="c1")
-            a.finish(J1, "WORK ANSWER", "p", "m")
+            a.finish(J1, "WORK ANSWER", "p", "m", gen=ask_gen(a, J1))
             self.assertIsNone(b.get(J1))
             self.assertIsNone(b.card(J1))
             self.assertFalse(b.discard(J1))
@@ -636,8 +637,8 @@ class ClassSweepJournal(RecoveryBase):
         # reply stayed on disk and the next lookup recovered the job it had just consumed.
         self.keep = True
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
-        self.jobs.finish(J1, "Pick A", "p", "m")
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
+        self.jobs.finish(J1, "Pick A", "p", "m", gen=ask_gen(self.jobs, J1))
         with patch.object(self.journal, "delete", return_value=False), \
                 patch.object(self.journal, "verified_absent", return_value=False):
             with self.assertRaises(jobs.DiscardFailed):
@@ -647,7 +648,7 @@ class ClassSweepJournal(RecoveryBase):
 
     def test_consume_still_works_when_the_record_is_already_gone(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.fail(J1, "no")
+        self.jobs.fail(J1, "no", gen=ask_gen(self.jobs, J1))
         (self.dir / f"{J1}.json").unlink()
         self.assertEqual(self.jobs.consume(J1)["detail"], "no")
 
