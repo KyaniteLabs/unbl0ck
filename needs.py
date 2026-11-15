@@ -3646,6 +3646,8 @@ _HTML_CLOSES_P = frozenset(
     "address article aside blockquote center details dialog dir div dl fieldset figcaption figure footer "
     "form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre section table ul li dd dt".split()
 )
+# Format characters are dropped (they hide text), except the joiners that spell real words and emoji.
+_HTML_JOINERS = frozenset("\u200c\u200d")
 _HTML_SCOPE = frozenset("table td th caption html button object marquee applet template".split())
 _HTML_MAX_OPEN = 1000  # open elements tracked; deeper nesting ends the readable text, and is reported
 
@@ -3959,7 +3961,7 @@ class _InertText(html.parser.HTMLParser):
         kept: list[str] = []
         tail, newlines = self._tail, self._newlines
         for ch in text:
-            if unicodedata.category(ch) == "Cf":
+            if unicodedata.category(ch) == "Cf" and ch not in _HTML_JOINERS:
                 continue
             if ch == "\n":
                 if newlines >= 2:
@@ -4209,7 +4211,7 @@ def _html_convert(markup: str, limit: int) -> tuple[str, list[str]]:
     if parser.spent:
         state["uncertain"] = True
     text = "".join(parser.out)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf" or ch in _HTML_JOINERS)
     lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in text.split("\n")]
     cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
     if len(cleaned) > limit:

@@ -172,6 +172,19 @@ class Notices(unittest.TestCase):
         self.assertEqual(notes, [needs._HTML_TRUNCATED])
 
 
+class JoinersSurvive(unittest.TestCase):
+    def test_zero_width_joiners_that_spell_words_and_emoji_are_kept(self):
+        persian = "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645"
+        family = "\U0001f468\u200d\U0001f469\u200d\U0001f467"
+        text, _ = convert(f"<p>{persian}</p><p>{family}</p>")
+        self.assertIn(persian, text)
+        self.assertIn(family, text)
+
+    def test_other_invisible_format_characters_are_still_dropped(self):
+        text, _ = convert("<p>a\u200bb\u202ec\ufeffd</p>")
+        self.assertEqual(text, "abcd")
+
+
 class StyleWorkIsBudgeted(unittest.TestCase):
     def test_many_rules_against_many_elements_stop_at_a_budget_and_say_so(self):
         from unittest.mock import patch
