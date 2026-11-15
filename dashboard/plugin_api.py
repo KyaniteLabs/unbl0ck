@@ -102,7 +102,7 @@ def _safe_attr(obj: Any, name: str) -> Any:
     attribute of a host object can raise ImportError, not only AttributeError."""
     try:
         return getattr(obj, name, None)
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - a host attribute may raise anything on lazy resolution; treat as absent
         return None
 
 
@@ -483,7 +483,7 @@ def _ask_journal_dir():
 def _ask_keep_replies() -> bool:
     try:
         return bool(_needs().ask_persist_replies())
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - a failing setting read defaults to not keeping replies
         return False
 
 

@@ -2752,7 +2752,7 @@ def _profile_of(home: Path) -> str:
         from hermes_constants import get_hermes_home  # type: ignore
 
         own = Path(get_hermes_home())
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 - host constants may be missing or fail to import; fall back to HERMES_HOME
         own = Path(os.environ.get("HERMES_HOME") or home)
     return own.name if own.parent.name == "profiles" else "default"
 
@@ -2838,7 +2838,7 @@ def _other_process_faults(home: Path, errors: list[str]) -> None:
     """Faults another live process (the agent running a hook) reported but could not retry here."""
     try:
         data = _read_json(_fault_path(home), errors=errors, source="prompt")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - any read failure is reported as a fault, never raised into the hook
         errors.append(f"prompt: {type(exc).__name__}; could not read live-prompt faults")
         return
     for rid, entry in data.items():
@@ -2871,7 +2871,7 @@ def _reconcile_waits(home: Path, errors: list[str]) -> None:
                 _WAIT_FAULTS.pop((h, rid), None)
                 _WAIT_FAULTS_LOST.pop((h, rid), None)
                 _journal_fault(home, rid, None)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - a failed retry of one fault must not block the others; it is reported below
                 if (h, rid) not in _WAIT_FAULTS_LOST:  # those are counted below, not listed
                     verb = "record" if what == "record" else "clear"
                     errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
@@ -2918,7 +2918,7 @@ def clear_wait(home: Path | None = None, **payload: Any) -> None:
         rid = str(payload.get("request_id") or "")
         if _SAFE_ID.match(rid):
             _settle_wait(home or hermes_home(), rid, "clear", None)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - a hook must never raise into the agent; the failure is logged
         log.warning("unbl0ck: could not clear wait: %s", type(exc).__name__)
 
 
@@ -3094,7 +3094,7 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
         items = (chat_items if source == "chat" else wait_items)(
             hermes_home(), errors=errors, full=True, **look
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - any source read failure becomes SourceUnavailable for the caller
         raise SourceUnavailable(f"{source} source unreadable: {type(exc).__name__}") from exc
     item = next((i for i in items if i.get("id") == item_id), None)
     if item is None:
@@ -3187,7 +3187,7 @@ def search_text(query: Any) -> dict[str, Any]:
         source_errors: list[str] = []
         try:
             items = read(source_errors)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - one unreadable source is reported and skipped so the rest is still searched
             errors.append(f"{source}: could not be read, so it was not searched")
             continue
         if any(getattr(e, "kind", None) != "capacity" for e in source_errors):
@@ -4873,7 +4873,7 @@ def build_queue(
         items.extend(kanban_items(errors=errors))
         # kanban_items records a failing board itself and returns normally.
         kanban_failed = any(e.startswith("kanban[") for e in errors)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - one broken source must not hide the others; recorded in errors
         kanban_failed = True
         errors.append(f"kanban: {type(exc).__name__}: {exc}")
     if kanban_failed:
@@ -4892,16 +4892,16 @@ def build_queue(
                 record_backfill=record,
             )
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - one broken source must not hide the others; recorded in errors
         chat_coverage = None  # a failed source is not "covered"
         errors.append(f"chat: {type(exc).__name__}: {exc}")
     try:
         items.extend(wait_items(home, errors=errors, readonly=not record))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - one broken source must not hide the others; recorded in errors
         errors.append(f"prompt: {type(exc).__name__}: {exc}")
     try:
         items.extend(pairing_items(home, errors=errors))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - one broken source must not hide the others; recorded in errors
         errors.append(f"pairing: {type(exc).__name__}: {exc}")
     try:
         items.extend(
@@ -4910,7 +4910,7 @@ def build_queue(
                 readonly=not record,
             )
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - one broken source must not hide the others; recorded in errors
         outside_source_failed = True
         errors.append(f"outside: {type(exc).__name__}: {exc}")
     # One settings snapshot (and the fault from that same refresh) for everything this response
@@ -5291,7 +5291,7 @@ def answer_card(
         # released; failing to tidy the marker must not turn that into a failed request.
         try:
             _set_pending_release(item_id, None, home, expected=version_s)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - tidying the marker is best effort; the release already succeeded and is logged
             log.warning(
                 "unbl0ck: released %s but could not clear its recovery marker",
                 item_id,
