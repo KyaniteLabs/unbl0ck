@@ -2328,6 +2328,10 @@ def answer_card(
     without posting the answer twice. Triage cards (``block_loop_detected``) accept
     the answer but cannot be released here.
     """
+    board = str(board or "").strip()
+    task_id = str(task_id or "").strip()
+    if not board or not task_id:
+        raise ValueError("board and task_id are required")
     from hermes_cli import kanban_db  # type: ignore
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
 
@@ -2425,6 +2429,10 @@ def _event_payload(event: Any) -> dict[str, Any]:
 def card_context(board: str, task_id: str) -> dict[str, Any]:
     """Read-only context for one Kanban card: description, comments, graph, workspace,
     recent events, last run, attachments and who filed it."""
+    board = str(board or "").strip()
+    task_id = str(task_id or "").strip()
+    if not board or not task_id:
+        raise ValueError("board and task_id are required")
     from hermes_cli import kanban_db  # type: ignore
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
 
@@ -2458,6 +2466,9 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
     body = getattr(task, "body", None)
     return {
         "id": f"kanban:{board}:{task_id}",
+        # The version the queue shows for this card (the latest block event), so Ask can
+        # refuse a question about a card that was blocked again after the human read it.
+        "version": str(block.id if block else _block_since(block, task)),
         "board": board,
         "task_id": task_id,
         "title": task.title,
@@ -3737,7 +3748,11 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     }
 
 
-def write_pocket_pack(queue: dict[str, Any], home: Path | None = None) -> Path:
+def write_pocket_pack(
+    queue: dict[str, Any], home: Path | None = None, *, pack: dict[str, Any] | None = None
+) -> Path:
+    """Write *pack* when the caller already built it (so the file and the HTTP response are
+    the same object), otherwise build one from *queue*."""
     p = data_dir(home) / "pocket-pack.json"
-    _write_json(p, pocket_pack(queue))
+    _write_json(p, pack if pack is not None else pocket_pack(queue))
     return p

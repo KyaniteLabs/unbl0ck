@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Ask and answer requests are validated and admitted before any work (#32 round 4).** Ask rejects malformed message lists (unknown roles, extra keys, non-text content, a trailing assistant turn) instead of dropping them, decides capacity before reading the card, refuses a question about a card that was blocked again (409), returns the same job for a repeated request id, and re-checks the Ask and summary settings right before the model call so a turned-off feature sends nothing. An answer needs a board and a card id, and POST Pack writes the same pack it returns.
 - **Summaries stop when switched off, terminal output is cleaned, and an empty ask list no longer reads as all clear (#32 round 4).** A cached summary is no longer attached to cards once summaries are disabled, the CLI and slash output strip control characters from every field, and the CLI, slash command and Desktop say that stuck or answered cards are listed instead of "Nothing is blocked on you" or ALL CLEAR. The README now describes the real queue order, and GET Card applies the same 300-character limit as the POST models (documented in the architecture guide).
 - **Full text shows the whole chat message or live prompt (#32).** Polling still carries a 480-character tail, now labelled; opening Full text reads the complete record (up to 20,000 characters) for that version via `GET /source/text`. Stale, missing and unreadable sources report errors with retry; password prompts are never expanded and nothing is sent to a model.
 

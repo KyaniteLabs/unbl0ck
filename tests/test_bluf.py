@@ -39,6 +39,7 @@ class BlufTest(unittest.TestCase):
         pydantic.BaseModel = type("BaseModel", (), {})
         pydantic.Field = lambda *a, **k: None
         pydantic.field_validator = lambda *a, **k: lambda fn: fn
+        pydantic.ConfigDict = dict
         with mock.patch.dict(sys.modules, {"fastapi": fastapi, "pydantic": pydantic}):
             spec.loader.exec_module(api := importlib.util.module_from_spec(spec))
         return api
@@ -225,6 +226,7 @@ class BlufTest(unittest.TestCase):
         pydantic.BaseModel = type("BaseModel", (), {})
         pydantic.Field = lambda *a, **k: None
         pydantic.field_validator = lambda *a, **k: lambda fn: fn
+        pydantic.ConfigDict = dict
         with mock.patch.dict(sys.modules, {"fastapi": fastapi, "pydantic": pydantic}):
             spec.loader.exec_module(api)
         calls = {}
@@ -251,6 +253,7 @@ class BlufTest(unittest.TestCase):
                 bluf_messages=lambda item, comments: [],
                 parse_bluf=needs.parse_bluf,
                 save_bluf=lambda *args: None,
+                bluf_enabled=lambda: True,
             )
             api._run_bluf(
                 n, types.SimpleNamespace(llm=LLM()), {"id": "x", "version": "1"}

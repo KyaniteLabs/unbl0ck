@@ -51,7 +51,7 @@ control and are not a standalone public API.
 | `GET /card` | Kanban context by validated ID or board/task reference |
 | `GET /outside/text` | Current bounded outside text; matching item version required |
 | `GET /source/text` | Full text of one current chat or live-prompt record, read on demand; version required (409 if stale, 404 if gone, 503 if the source cannot be read, 403 for password prompts) |
-| `POST /card/ask` | Validated question history; returns a job ID immediately or an explicit admission error |
+| `POST /card/ask` | Strictly validated question history (user and assistant turns only, ending with a user question), optional card `version` (409 if the card was blocked again) and optional `request_id` (a repeat returns the same job); returns a job ID immediately or an explicit admission error. Admission (429) is decided before the card is read |
 | `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502 |
 | `GET /card/ask/{job}?poll=true` | Same job, with terminal model failures encoded as `{ok:false,detail}` for the client |
 | `POST /kanban/answer` | Versioned native comment and optional release; settings uncertainty prevents writes |

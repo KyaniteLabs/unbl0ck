@@ -200,5 +200,190 @@ class CardReferenceBound(unittest.TestCase):
                 self.assertEqual(client.get("/card", params=params).status_code, 400)
 
 
+def load_api(tag):
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location(f"ub_api_r4_{tag}", ROOT / "dashboard/plugin_api.py")
+    api = importlib.util.module_from_spec(spec)
+    sys.modules[f"ub_api_r4_{tag}"] = api
+    spec.loader.exec_module(api)
+    return api
+
+
+class AskAdmission(unittest.TestCase):
+    def setUp(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        self.api = load_api("ask")
+        self.calls = []
+        self.enabled = True
+        self.version = "7"
+
+        def card_context(b, t):
+            self.calls.append("card_context")
+            return {"id": t, "version": self.version}
+
+        def build(card, history):
+            self.calls.append("build")
+            return list(history)
+
+        self.needs = types.SimpleNamespace(
+            ask_enabled=lambda: self.enabled, card_context=card_context, build_ask_messages=build,
+            bluf_enabled=lambda: self.enabled,
+        )
+        self.api._needs = lambda: self.needs
+        self.api._checked_card_ref = lambda i, b, t: ("factory", "t_1")
+        self.llm_calls = []
+
+        def complete(messages, **kw):
+            self.llm_calls.append(messages)
+            return types.SimpleNamespace(text="Pick A", provider="p", model="m")
+
+        self.api._loaded_ctx = lambda: types.SimpleNamespace(llm=types.SimpleNamespace(complete=complete))
+        app = FastAPI()
+        app.include_router(self.api.router)
+        self.c = TestClient(app)
+
+    def post(self, **over):
+        body = {"id": "x", "messages": [{"role": "user", "content": "which?"}]}
+        body.update(over)
+        return self.c.post("/card/ask", json=body)
+
+    def test_malformed_messages_are_rejected_not_dropped(self):
+        """01-004: unknown roles, extra keys, non-text content and a trailing assistant turn fail."""
+        bad = [
+            [{"role": "system", "content": "x"}],
+            [{"role": "user", "content": "x", "extra": 1}],
+            [{"role": "user", "content": 5}],
+            [{"role": "user", "content": {"a": 1}}],
+            [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}],
+            [{"role": "user", "content": "   "}],
+            [{"role": "tool", "content": "q"}, {"role": "user", "content": "q"}],
+            [],
+        ]
+        for msgs in bad:
+            with self.subTest(msgs=msgs):
+                self.assertIn(self.post(messages=msgs).status_code, (400, 422))
+        self.assertEqual(self.calls, [])
+        ok = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, {"role": "user", "content": "c"}]
+        self.assertEqual(self.post(messages=ok).status_code, 200)
+
+    def test_busy_server_does_no_card_work_before_refusing(self):
+        """01-008: a 429 is decided before the card is read or the prompt built."""
+        held = []
+        while self.api._ASK_SLOTS.acquire(blocking=False):
+            held.append(1)
+        try:
+            self.assertEqual(self.post().status_code, 429)
+        finally:
+            for _ in held:
+                self.api._ASK_SLOTS.release()
+        self.assertEqual(self.calls, [])
+
+    def test_a_failed_card_read_releases_the_slot(self):
+        self.needs.card_context = lambda b, t: (_ for _ in ()).throw(LookupError("gone"))
+        for _ in range(6):
+            self.assertEqual(self.post().status_code, 404)
+        self.assertEqual(self.post(version=None).status_code, 404)
+
+    def test_an_ask_for_an_old_question_version_is_refused(self):
+        """01-016: the card moved on after the human read it."""
+        self.assertEqual(self.post(version="6").status_code, 409)
+        self.assertEqual(self.llm_calls, [])
+        self.assertEqual(self.post(version="7").status_code, 200)
+
+    def test_a_repeated_request_id_returns_the_same_job(self):
+        """01-017: a lost response can be retried without a second model call."""
+        import time
+
+        rid = "ab" * 16
+        first = self.post(request_id=rid).json()
+        again = self.post(request_id=rid).json()
+        self.assertEqual(first["job"], rid)
+        self.assertEqual(again["job"], rid)
+        for _ in range(40):
+            if self.llm_calls:
+                break
+            time.sleep(0.05)
+        time.sleep(0.2)
+        self.assertEqual(len(self.llm_calls), 1)
+        self.assertEqual(self.post(request_id="not hex!").status_code, 422)
+
+    def test_a_model_call_is_skipped_when_ask_is_turned_off_meanwhile(self):
+        """01-005: the setting is re-read at the model boundary."""
+        import time
+
+        self.enabled = True
+        job = self.api.uuid.uuid4().hex
+        self.api._ASK_JOBS.create(job)
+        self.enabled = False
+        self.api._run_ask(job, self.api._loaded_ctx(), [{"role": "user", "content": "q"}])
+        self.assertEqual(self.llm_calls, [])
+        self.assertEqual(self.api._ASK_JOBS.get(job)["status"], self.api.jobs.AskState.ERROR)
+
+    def test_a_summary_is_not_requested_or_saved_when_summaries_are_turned_off(self):
+        saved = []
+        self.needs.recent_comments = lambda it: []
+        self.needs.bluf_messages = lambda it, c: [{"role": "user", "content": "x"}]
+        self.needs.parse_bluf = lambda t: ("b", "w")
+        self.needs.save_bluf = lambda *a: saved.append(a)
+        self.enabled = False
+        item = {"id": "kanban:b:t", "version": "1"}
+        self.api._BLUF_JOBS.start(("kanban:b:t", "1"))
+        self.api._run_bluf(self.needs, self.api._loaded_ctx(), item)
+        self.assertEqual(self.llm_calls, [])
+        self.assertEqual(saved, [])
+
+
+class AnswerAndPackRoutes(unittest.TestCase):
+    def setUp(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        self.api = load_api("routes")
+        real = needs
+        self.answered = []
+        self.writes = []
+        self.api._needs = lambda: types.SimpleNamespace(
+            normalize_board_slug=real.normalize_board_slug,
+            answer_card=lambda *a, **k: self.answered.append(a) or {"ok": True},
+            build_queue=lambda: {"items": [], "count": 0, "errors": [], "bluf_enabled": False, "at": __import__("time").time()},
+            pocket_pack=real.pocket_pack,
+            write_pocket_pack=lambda q, home=None, pack=None: self.writes.append(pack) or Path("p.json"),
+        )
+        app = FastAPI()
+        app.include_router(self.api.router)
+        self.c = TestClient(app)
+
+    def test_an_answer_needs_a_board_and_a_card(self):
+        """01-010: an empty board must not fall through to the ambient board, nor an empty card id."""
+        for body in ({"board": "", "task_id": "t", "text": "yes"}, {"board": "b", "task_id": "", "text": "yes"},
+                     {"board": "  ", "task_id": "t", "text": "yes"}):
+            with self.subTest(body=body):
+                self.assertEqual(self.c.post("/kanban/answer", json=body).status_code, 400)
+        self.assertEqual(self.answered, [])
+
+    def test_the_card_context_and_answer_reject_empty_targets(self):
+        for fn in (real_needs().answer_card,):
+            with self.assertRaises(ValueError):
+                fn("", "t", "x", release=False)
+            with self.assertRaises(ValueError):
+                fn("b", "", "x", release=False)
+        with self.assertRaises(ValueError):
+            real_needs().card_context("b", "")
+
+    def test_post_pack_writes_the_pack_it_returns(self):
+        """01-011: one pack object is built, written and returned."""
+        out = self.c.post("/pack").json()
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self.writes[0], out)
+
+
+def real_needs():
+    return needs
+
+
 if __name__ == "__main__":
     unittest.main()
