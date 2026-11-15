@@ -85,6 +85,15 @@ class TheBiteCheck(unittest.TestCase):
         code, out = self.check()
         self.assertEqual(code, 0, out)
 
+    def test_a_file_the_fix_turns_into_a_folder_is_restored(self):
+        """#81 review: the parent's file was restored before the fix's folder of the same name was
+        removed, so the snapshot failed and a correct fix was rejected."""
+        self.commit("fix: legacy is a folder", {"legacy.py/value": "1\n", "tests/test_layout.py": (
+            "from pathlib import Path\n\ndef test_layout():\n    assert Path('legacy.py/value').is_file()\n")},
+            gone=["legacy.py"])
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+
 
 if __name__ == "__main__":
     unittest.main()

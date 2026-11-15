@@ -60,11 +60,13 @@ def passing_on_parent(commit: str, ids: list[str]) -> list[str]:
         wt = str(Path(tmp) / "wt")
         git("worktree", "add", "--detach", wt, commit)
         try:
-            for path in changed(commit, ".", ":!tests"):
-                if git("ls-tree", f"{commit}^", "--", path, cwd=wt):
-                    git("checkout", f"{commit}^", "--", path, cwd=wt)
-                else:
+            paths = changed(commit, ".", ":!tests")
+            on_parent = {p for p in paths if git("ls-tree", f"{commit}^", "--", p, cwd=wt)}
+            for path in paths:  # remove first: a file the fix turned into a folder needs the folder gone
+                if path not in on_parent:
                     git("rm", "-q", "--", path, cwd=wt)
+            for path in on_parent:
+                git("checkout", f"{commit}^", "--", path, cwd=wt)
             out = ""
             for path in dict.fromkeys(i.split("::", 1)[0] for i in ids):  # one run per file: a file that
                 out += subprocess.run(  # fails to import on the parent must not stop the others
