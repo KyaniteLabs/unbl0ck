@@ -2151,19 +2151,17 @@ def _open_chat_db(db: Path) -> sqlite3.Connection:
     """Open *db* read-only, only if it is the regular file it was when the search began. The
     check is made on the path itself (no link is followed) before and after the open, so a link
     put in its place between the listing and the open is refused, not read."""
-    first = os.lstat(db)
-    if not stat.S_ISREG(first.st_mode):
-        raise OSError("state.db is not a regular file")
-    path = Path(os.path.abspath(db))
-    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+    fd, _ = _pinned_open(db, os.O_RDONLY)
     try:
-        second = os.lstat(db)
-        same = (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
-        if not (stat.S_ISREG(second.st_mode) and same):
-            raise OSError("state.db changed while it was opened")
-    except BaseException:
-        conn.close()
-        raise
+        conn = sqlite3.connect(Path(os.path.abspath(db)).as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            if not _names_open_file(fd, db):
+                raise UnsafeStateFile("state.db changed while it was opened", "changed")
+        except BaseException:
+            conn.close()
+            raise
+    finally:
+        os.close(fd)
     return conn
 
 
