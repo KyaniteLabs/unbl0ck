@@ -671,9 +671,7 @@ def _hidden_entry_ok(value: Any) -> bool:
     return value is None or isinstance(value, str)
 
 
-# A hide stores ``version`` plus a per-dismissal token (``version \x1f token``), so an Undo can
-# name this dismissal and not just the content version two dismissals share. Entries written
-# before tokens existed hold the bare version, which stays their token.
+# A hide stores ``version \x1f token`` so an Undo names this dismissal; a pre-token bare version is its own token.
 _HIDDEN_TOKEN = re.compile(r"(.*)\x1f([0-9a-f]{32})\Z", re.S)
 
 
@@ -781,31 +779,33 @@ ORDER_FILE = "dismissal-order.json"
 
 
 def _dismissal_order(home: Path | None) -> int:
-    """A number that grows with each dismissal any process commits (milliseconds, never repeated
-    or lowered by a clock that stands still or steps back). The last one is kept in ORDER_FILE
-    and taken under the state lock, so it follows the order dismissals were committed in, which
-    the client cannot see from the order of its clicks or of the responses. A missing counter
-    restarts above every stored order; a malformed one refuses the dismissal."""
+    """A new dismissal's commit order: milliseconds above ORDER_FILE's last, under the state lock. A lost
+    counter restarts above every stored order; an order that is malformed or overflows a token refuses."""
     out: dict[str, int] = {}
 
     def bump(data: dict[str, Any]) -> dict[str, Any]:
         out["order"] = max(int(time.time() * 1000), (data["last"] if "last" in data else _orders_issued(home)) + 1)
+        if not _order_ok(out["order"]):
+            raise RuntimeError(f"{ORDER_FILE} has passed the largest order a dismissal token holds")
         return {"last": out["order"]}
 
-    _update_state(home, data_dir(home) / ORDER_FILE, bump, entry_ok=lambda v: type(v) is int and v >= 0)
+    _update_state(home, data_dir(home) / ORDER_FILE, bump, entry_ok=_order_ok)
     return out["order"]
 
 
+def _order_ok(value: Any) -> bool:  # fits the 13 hex digits a hide token starts with
+    return type(value) is int and 0 <= value < 16**13
+
+
 def _orders_issued(home: Path | None) -> int:
-    """The highest order a stored dismissal carries (a hidden token's 13-hex prefix, a Done's
-    done_order). Raises when a record cannot be read or the filed listing is cut."""
+    """The highest stored order (hide token prefixes, Done orders); raises when one cannot be read."""
     tokens = (_split_hidden(v)[1] for v in _load_hidden_raw(home, strict=True).values())
     d, errors = _outside_dir(home, create=False), []
     files, cut = _filed_files(d) if d.is_dir() else ([], False)
-    recs = [_read_json(f, errors=errors) for f in files]
-    if cut or errors:
+    orders = [r["done_order"] for r in (_read_json(f, errors=errors) for f in files) if "done_order" in r]
+    if cut or errors or not all(map(_order_ok, orders)):
         raise RuntimeError(f"{ORDER_FILE} is missing and the stored orders could not all be read; restore it")
-    return max([int(t[:13], 16) for t in tokens if t] + [_done_order(r) for r in recs if "done_order" in r], default=0)
+    return max([int(t[:13], 16) for t in tokens if t] + orders, default=0)
 
 
 class StaleHide(RuntimeError):
@@ -834,11 +834,8 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
     item_id, version = str(item_id or ""), str(version or "")
     if not item_id or len(item_id) > 300 or len(version) > 300 or "\x1f" in version:
         raise ValueError("item id and version must be short strings")
-    # An older tab's "Not for me" must not replace a newer dismissal. The queue lookup takes the
-    # state lock, so it runs outside it. Every dismissal is judged against the card's current
-    # version, whether or not an earlier dismissal exists: a hide for an older version hid
-    # nothing the operator saw. The stored value is re-read under the lock, and a dismissal for
-    # another version that appeared since the lookup is judged again, never overwritten blind.
+    # Every hide is judged against the card's current version (looked up outside the state lock);
+    # a dismissal for another version that appears before the write is judged again, never overwritten.
     judged: str | None = None
     while True:
         current = _current_version(item_id, home)
@@ -852,7 +849,7 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
                 out["existing"] = existing
                 return None
             hidden.pop(item_id, None)
-            out["order"] = _dismissal_order(home)  # the token starts with it, so a lost counter can restart above it
+            out["order"] = _dismissal_order(home)  # the token starts with it (13 hex, see _order_ok)
             out["token"] = f"{out['order']:013x}{uuid.uuid4().hex[:19]}"
             hidden[item_id] = f"{version}\x1f{out['token']}"
             return _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
@@ -3323,8 +3320,8 @@ _DONE_FIELDS = ("done_at", "done_token", "done_order")
 
 def _done_marks(rec: dict[str, Any]) -> dict[str, Any]:
     """Everything that names one Done (time, token, order), pinned so that rewriting the record
-    or its ``done_at`` keeps the same dismissal with the same token and rank."""
-    return {"done_at": rec.get("done_at"), "done_token": _done_token(rec), "done_order": _done_order(rec)}
+    or its ``done_at`` keeps the same dismissal with the same token and rank (a malformed order stays, to refuse)."""
+    return {"done_at": rec.get("done_at"), "done_token": _done_token(rec), "done_order": rec.get("done_order", _done_order(rec))}
 
 
 def _done_at(rec: dict[str, Any]) -> float | None:
