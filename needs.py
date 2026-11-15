@@ -3855,13 +3855,15 @@ class _InertText(html.parser.HTMLParser):
             raise _HtmlStop
         gone, vis, font = (parent.gone, parent.vis, parent.font) if parent else (None, None, None)
         own: tuple[_Region, ...] = ()
-        if gone is None:
+        if tag in _HTML_DROP:  # inert whatever its ancestors' visibility, never borrowing their doubt
+            gone = _Region("drop")
+            own = (gone,)
+        elif gone is None:
             a = {k: (v or "") for k, v in attrs}
             d = _css_declarations(a.get("style", ""))
             clip = any(v in ("hidden", "clip", "scroll", "auto") for p in _CSS_OVERFLOW for v in d.get(p, ()))
             cause = (
-                "drop" if tag in _HTML_DROP
-                else "display" if "none" in d.get("display", ())
+                "display" if "none" in d.get("display", ())
                 else "hidden" if "hidden" in a and "display" not in d
                 else "opacity" if any(_css_zero(v) for v in d.get("opacity", ()))
                 else "clip" if clip and any(_css_zero(v) for p in _CSS_SIZES for v in d.get(p, ()))
