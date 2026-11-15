@@ -178,7 +178,8 @@ provider and model names and an error message. It holds no card text, no questio
 answer. Finished answers are written to the marker only when `ask_persist_replies` is
 true (default false; a restart then shows the answer for the rest of the 15 minutes).
 An unreadable, oversized, foreign or symlinked marker is treated as `unknown`; an answer too large to keep is reported as such; if the storage cannot be checked the poll reports `unknown` instead of claiming the job never existed. A job whose worker is still running in another gateway process stays `pending`. A job id answers only for the card it was
-created for. Markers belong to the profile's own data directory, so profiles do not see
+created for. The directory is the organization home's plugin data, shared by every profile, with one
+subdirectory per profile; a profile reads and deletes only its own, so profiles do not see
 each other's jobs.
 
 Requests send the conversation's latest 50 messages; the server then applies
@@ -249,10 +250,17 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
 1. **Diagnose.** Each store is `healthy`, `absent`, `corrupt` (truncated or not JSON),
    `unsupported_schema` (valid JSON this version does not read) or `unsafe` (not a regular
    file, such as a symlink). `writer_active` is reported separately: another process holds
-   the state lock. Records written by older releases with a null or empty version are valid
-   and count as healthy.
+   the state lock (`lock_check` says when this filesystem cannot report it). Records
+   written by older releases with a null or empty version are valid and count as healthy.
+   `recovery_dir` is `absent`, `ok` or `unsafe` (a file or link where the directory
+   belongs; the command exits 1). A diagnosis lists at most 100 backups, newest label
+   first, and reads at most 64 MiB of them; the rest are counted in `backups_omitted` or
+   marked `not_checked`. A link anywhere in `plugin-data/unbl0ck` makes every command
+   refuse.
 2. **Preserve.** `preserve` copies the exact current bytes, readable or not, into
-   `plugin-data/unbl0ck/recovery/` and checks the copy. Nothing else changes. These backups
+   `plugin-data/unbl0ck/recovery/` (it creates the recovery directory, mode 700, on first
+   use), checks the copy and syncs it and its directory to disk; a sync that fails is
+   reported as a failure. The store itself is not changed. These backups
    hold the same private content as the store and are never deleted by the plugin or this
    tool; remove them yourself when you no longer need them.
 3. **Restore.** Put a backup you trust in that directory as `<store>-<label>.bak` with mode
@@ -262,7 +270,12 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
    version reads for that store; a backup for another store, a symlink, or one readable by
    others is refused. With `--apply` the tool takes the same state lock the plugin uses,
    copies the current bytes aside first, writes the backup beside the store, verifies it and
-   swaps it in atomically. If anything fails, the store is left as it was.
+   swaps it in atomically, then reads the installed file back and syncs the directory.
+   A failure before the swap leaves the store as it was. A failure after it (the directory
+   sync or the readback) is reported as `failed` with `store_unchanged` false and the
+   preserved copy of the previous bytes in `preserved_current`; the tool does not roll
+   back. The reported entry counts and warnings are those of the backup and store actually
+   replaced, rebuilt after the lock is held.
 
 Consequences to expect: everything changed after the backup was made is lost (dismissals,
 pending releases, summaries). The tool never creates defaults for a record it cannot read,

@@ -6,7 +6,9 @@ restore from a verified backup. It is stdlib only, runs outside the dashboard, a
 
 * never prints a record, id, version or any text from a store (counts, sizes and fixed sentences);
 * never clears or bypasses a lock, and never substitutes defaults for a record it cannot read;
-* changes nothing unless ``apply`` is set, and copies the current bytes aside first.
+* ``restore`` changes nothing unless ``apply`` is set, and copies the current bytes aside first;
+  ``preserve`` only adds a backup file (creating the recovery directory on first use) and never
+  changes the store; ``diagnose`` writes nothing.
 
 Backups live in ``plugin-data/unbl0ck/recovery/`` (directory 0700, files 0600). They hold the same
 private content as the stores they copy and are never deleted here.
@@ -41,6 +43,11 @@ RECOVERY_DIR = "recovery"
 LOCK_NAME = ".state.lock"
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # absent on Windows
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_POSIX_MODES = os.name != "nt"  # Windows reports 0666/0444 for any file: permission bits mean nothing there
+# One diagnosis reads a bounded amount however many backups pile up (they are never deleted).
+MAX_LISTED_BACKUPS = 100
+BACKUP_READ_BUDGET = 64 * 1024 * 1024
+BACKUP_SCAN_SECONDS = 5.0
 BACKUP_NAME = re.compile(r"^(?P<stem>hidden|pending-release|bluf)-[A-Za-z0-9._-]{1,80}\.bak$")
 
 
@@ -73,24 +80,42 @@ ADVICE = {
 }
 
 
+_NEEDS: Any = None
+
+
 def _needs():
-    """The sibling needs.py, for the data directory and the shared state lock (same flock the plugin uses)."""
+    """The sibling needs.py, for the data directory, the shared state lock (the same flock the
+    plugin uses) and the plain-file reader. Loaded once."""
+    global _NEEDS
     if __package__:
         from . import needs  # noqa: PLC0415
         return needs
-    spec = importlib.util.spec_from_file_location("unbl0ck_recovery_needs", Path(__file__).with_name("needs.py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    if _NEEDS is None:
+        spec = importlib.util.spec_from_file_location("unbl0ck_recovery_needs", Path(__file__).with_name("needs.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _NEEDS = mod
+    return _NEEDS
+
+
+def _is_link(p: Path) -> bool:
+    return p.is_symlink() or bool(getattr(os.path, "isjunction", lambda _p: False)(p))
 
 
 def _dir(home: Path | None) -> Path:
-    """The plugin data directory, without creating it."""
-    return (Path(home) if home else _needs().hermes_home()) / "plugin-data" / "unbl0ck"
+    """The plugin data directory, without creating it. The two directories below the chosen
+    home must be real directories: a link at either place would send every read, backup and
+    replacement to another folder, whatever the file names there look like."""
+    base = Path(home) if home else _needs().hermes_home()
+    for part in (base / "plugin-data", base / "plugin-data" / "unbl0ck"):
+        if _is_link(part):
+            raise RuntimeError("the plugin data path contains a link; refusing to use it")
+    return base / "plugin-data" / "unbl0ck"
 
 
 def _writer_active(d: Path) -> bool | None:
-    """True when another process holds the state lock, None when this platform cannot say."""
+    """True when another process holds the state lock, None when this platform or filesystem
+    cannot say (no flock, an unreadable or linked lock file, a filesystem without locks)."""
     if fcntl is None:
         return None
     try:
@@ -104,9 +129,30 @@ def _writer_active(d: Path) -> bool | None:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return True
+        except OSError:
+            return None  # for example EOPNOTSUPP: unknown, never "no writer"
         return False
     finally:
         os.close(fd)  # closing drops our probe; the holder keeps its own lock
+
+
+def _read_file(p: Path, limit: int = MAX_STORE_BYTES):
+    """``(raw, fstat, None, None)`` or ``(None, None, why, error)``. The bytes come from one open
+    descriptor that is not a link, FIFO or device, are bounded by what is actually read, and
+    carry the ``fstat`` of the file read, so nothing is decided on a name that can change."""
+    try:
+        raw, st = _needs()._read_plain_bytes_st(p, limit)
+        return raw, st, None, None
+    except FileNotFoundError:
+        return None, None, "absent", None
+    except OSError as exc:
+        why = getattr(exc, "reason", None)
+        return None, None, "too_large" if why == "too_large" else "unsafe", type(exc).__name__
+
+
+def _owner_only(st: os.stat_result) -> bool | None:
+    """None where the platform does not report real permission bits (Windows)."""
+    return not (st.st_mode & 0o077) if _POSIX_MODES else None
 
 
 def _inspect_bytes(store: str, raw: bytes) -> dict[str, Any]:
@@ -127,27 +173,23 @@ def _inspect_bytes(store: str, raw: bytes) -> dict[str, Any]:
 
 def _inspect(d: Path, store: str) -> dict[str, Any]:
     p = d / STORES[store][0]
-    try:
-        st = p.lstat()
-    except FileNotFoundError:
-        return {"store": store, "file": p.name, "status": "absent", "entries": 0}
-    except OSError as exc:
-        return {"store": store, "file": p.name, "status": "unsafe", "error": type(exc).__name__}
-    if not _regular(st):
-        return {"store": store, "file": p.name, "status": "unsafe"}
-    out: dict[str, Any] = {"store": store, "file": p.name, "bytes": st.st_size, "owner_only": not (st.st_mode & 0o077)}
-    if st.st_size > MAX_STORE_BYTES:
-        return {**out, "status": "corrupt", "entries": None, "error": "too large to be a state file"}
-    try:
-        raw = p.read_bytes()
-    except OSError as exc:
-        return {**out, "status": "unsafe", "error": type(exc).__name__}
+    base = {"store": store, "file": p.name}
+    raw, st, why, err = _read_file(p)
+    if why == "absent":
+        return {**base, "status": "absent", "entries": 0}
+    if why == "too_large":
+        try:
+            size = p.lstat().st_size
+        except OSError:
+            size = None
+        return {**base, "bytes": size, "status": "corrupt", "entries": None, "error": "too large to be a state file"}
+    if why:
+        return {**base, "status": "unsafe", **({"error": err} if err else {})}
+    out = {**base, "bytes": st.st_size}
+    owner = _owner_only(st)
+    if owner is not None:
+        out["owner_only"] = owner
     return {**out, **_inspect_bytes(store, raw)}
-
-
-def _regular(st: os.stat_result) -> bool:
-    import stat  # noqa: PLC0415
-    return stat.S_ISREG(st.st_mode)
 
 
 def diagnose(home: Path | None = None) -> dict[str, Any]:
@@ -159,88 +201,137 @@ def diagnose(home: Path | None = None) -> dict[str, Any]:
         row = _inspect(d, store)
         row["advice"] = ADVICE[row["status"]]
         stores.append(row)
+    listing = _list_backups(d)
     return {
         "stores": stores,
         "writer_active": writer,
         "lock_check": "could not be checked here" if writer is None else "ok",
-        "backups": _list_backups(d),
+        "recovery_dir": listing["state"],
+        "backups": listing["items"],
+        "backups_total": listing["total"],
+        "backups_omitted": listing["omitted"],
         "note": "Counts only. A held lock is never cleared; wait for the writer or stop it in its owning installation.",
     }
 
 
+def _fsync_dir(p: Path) -> None:
+    """Make a directory's entries durable. A failure is raised: a backup or a replacement whose
+    directory entry may not survive a crash must not be reported as done. Windows cannot open a
+    directory to sync it, so it is skipped there."""
+    if not _POSIX_MODES:
+        return
+    fd = os.open(p, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _recovery_dir(d: Path, create: bool) -> Path | None:
     r = d / RECOVERY_DIR
-    if r.is_symlink():
+    if _is_link(r):
         raise RuntimeError("recovery directory is a symlink; refusing to use it")
     if r.exists() and not r.is_dir():
         raise RuntimeError("recovery path is not a directory; refusing to use it")
     if not r.exists():
         if not create:
             return None
-        r.mkdir(mode=0o700, parents=True)
+        r.mkdir(mode=0o700)
+        _fsync_dir(d)  # the new directory's entry lives in its parent
     os.chmod(r, 0o700)
     return r
 
 
-def _list_backups(d: Path) -> list[dict[str, Any]]:
+def _list_backups(d: Path) -> dict[str, Any]:
+    """Backups, newest label first, within a fixed budget (count, bytes read and time), so a
+    large archive cannot turn a read-only diagnosis into a multi-gigabyte scan. What the budget
+    left unchecked is counted, never silently dropped."""
     r = d / RECOVERY_DIR
-    if r.is_symlink() or not r.is_dir():
-        return []
+    if _is_link(r) or (r.exists() and not r.is_dir()):
+        return {"state": "unsafe", "items": [], "total": 0, "omitted": 0}
+    if not r.is_dir():
+        return {"state": "absent", "items": [], "total": 0, "omitted": 0}
+    try:
+        with os.scandir(r) as entries:
+            names = sorted((e.name for e in entries if BACKUP_NAME.match(e.name)), reverse=True)
+    except OSError:
+        return {"state": "unsafe", "items": [], "total": 0, "omitted": 0}
+    shown = names[:MAX_LISTED_BACKUPS]
+    budget = BACKUP_READ_BUDGET
+    deadline = time.monotonic() + BACKUP_SCAN_SECONDS
     out = []
-    for p in sorted(r.iterdir()):
-        m = BACKUP_NAME.match(p.name)
-        if not m:
-            continue
+    for name in shown:
+        p = r / name
+        m = BACKUP_NAME.match(name)
+        row: dict[str, Any] = {"name": name, "store": m["stem"]}
         try:
-            st = p.lstat()
+            size = p.lstat().st_size
         except OSError:
             continue
-        row: dict[str, Any] = {"name": p.name, "store": m["stem"], "bytes": st.st_size}
-        if not _regular(st):
-            row["status"] = "unsafe"
-        elif st.st_size > MAX_STORE_BYTES:
+        row["bytes"] = size
+        if size > budget or time.monotonic() > deadline:
+            row["status"] = "not_checked"  # over the read budget of this diagnosis
+            out.append(row)
+            continue
+        raw, st, why, _err = _read_file(p)
+        if why == "too_large":
             row["status"] = "corrupt"
+        elif why:
+            row["status"] = "unsafe"
         else:
-            try:
-                row["status"] = _inspect_bytes(m["stem"], p.read_bytes())["status"]
-            except OSError:
-                row["status"] = "unsafe"
-            row["owner_only"] = not (st.st_mode & 0o077)
+            budget -= len(raw)
+            row["bytes"] = st.st_size
+            row["status"] = _inspect_bytes(m["stem"], raw)["status"]
+            owner = _owner_only(st)
+            if owner is not None:
+                row["owner_only"] = owner
         out.append(row)
-    return out
+    return {"state": "ok", "items": out, "total": len(names), "omitted": len(names) - len(shown)}
 
 
 def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _fsync_dir(p: Path) -> None:
+def _read_back(fd: int, expected: int) -> bytes:
+    """The first ``expected + 1`` bytes of what is on disk behind *fd* (one more than written, so a
+    longer file cannot pass as equal)."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    got = 0
+    while got <= expected:
+        chunk = os.read(fd, expected + 1 - got)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        got += len(chunk)
+    return b"".join(chunks)
+
+
+def _write_new(path: Path, raw: bytes) -> os.stat_result:
+    """Create ``path`` exclusively with mode 0600 (never through a link), write, flush to disk and
+    read the same descriptor back. Returns the ``fstat`` of the file written, so a caller can
+    tell later whether the name still holds it. A copy that does not match is removed."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
     try:
-        fd = os.open(p, os.O_RDONLY)
-    except OSError:
-        return
-    try:
+        view = memoryview(raw)
+        while view:
+            view = view[os.write(fd, view):]
         os.fsync(fd)
-    except OSError:
-        pass
+        if _read_back(fd, len(raw)) != raw:
+            raise OSError("written copy does not match the original bytes")
+        st = os.fstat(fd)
+        if not os.path.samestat(st, os.lstat(path)):
+            raise OSError("the new file was replaced before it could be verified")
+        return st
+    except BaseException:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     finally:
         os.close(fd)
-
-
-def _write_new(path: Path, raw: bytes) -> None:
-    """Create ``path`` exclusively with mode 0600, write, flush to disk and read it back."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(raw)
-            fh.flush()
-            os.fsync(fh.fileno())
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
-    if path.read_bytes() != raw:
-        path.unlink(missing_ok=True)
-        raise OSError("written copy does not match the original bytes")
 
 
 def _preserve_raw(d: Path, store: str, raw: bytes) -> str:
@@ -258,21 +349,14 @@ def _preserve_raw(d: Path, store: str, raw: bytes) -> str:
 
 
 def _read_store(d: Path, store: str) -> tuple[bytes | None, str | None]:
-    """The store's exact bytes, or (None, reason) when it is absent or not a regular file."""
-    p = d / STORES[store][0]
-    try:
-        st = p.lstat()
-    except FileNotFoundError:
-        return None, "absent"
-    if not _regular(st):
-        return None, "unsafe"
-    if st.st_size > MAX_STORE_BYTES:
-        return None, "too_large"
-    return p.read_bytes(), None
+    """The store's exact bytes, or (None, reason) when it is absent, not a regular file or too large."""
+    raw, _st, why, _err = _read_file(d / STORES[store][0])
+    return (raw, None) if why is None else (None, why)
 
 
 def preserve(store: str, home: Path | None = None) -> dict[str, Any]:
-    """Copy the store's current bytes, readable or not, into the recovery directory. Changes nothing else."""
+    """Copy the store's current bytes, readable or not, into the recovery directory (creating it,
+    0700, on first use). The store itself is not changed."""
     if store not in STORES:
         return {"status": "refused", "reason": "unknown store"}
     d = _dir(home)
@@ -281,7 +365,13 @@ def preserve(store: str, home: Path | None = None) -> dict[str, Any]:
         return {"status": "refused", "reason": {"absent": "nothing to preserve: the store does not exist",
                                                 "unsafe": "the store is not a regular file; not copying it",
                                                 "too_large": "the store is too large to be a state file"}[why]}
-    name = _preserve_raw(d, store, raw)
+    try:
+        name = _preserve_raw(d, store, raw)
+    except (OSError, RuntimeError) as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        return {"status": "failed", "error": type(exc).__name__,
+                "reason": "the copy could not be completed and made durable; the store was not changed"}
     return {"status": "preserved", "backup": f"{RECOVERY_DIR}/{name}", "bytes": len(raw), "sha256": _sha(raw)}
 
 
@@ -290,20 +380,17 @@ def _check_backup(d: Path, store: str, backup: str) -> tuple[bytes | None, dict[
     if not m or m["stem"] != store:
         return None, {"status": "refused", "reason": f"backup name must be a file in {RECOVERY_DIR}/ named {store}-<label>.bak"}
     r = d / RECOVERY_DIR
-    p = r / backup
-    if r.is_symlink():
+    if _is_link(r):
         return None, {"status": "refused", "reason": "recovery directory is a symlink"}
-    try:
-        st = p.lstat()
-    except FileNotFoundError:
+    raw, st, why, _err = _read_file(r / backup)
+    if why == "absent":
         return None, {"status": "refused", "reason": "backup not found"}
-    if not _regular(st):
-        return None, {"status": "refused", "reason": "backup is not a regular file"}
-    if st.st_mode & 0o077:
-        return None, {"status": "refused", "reason": "backup is readable by others; chmod 600 it first"}
-    if st.st_size > MAX_STORE_BYTES:
+    if why == "too_large":
         return None, {"status": "refused", "reason": "backup is too large to be a state file"}
-    raw = p.read_bytes()
+    if why:
+        return None, {"status": "refused", "reason": "backup is not a regular file"}
+    if _POSIX_MODES and st.st_mode & 0o077:  # Windows reports 0666/0444 for any file: not a signal there
+        return None, {"status": "refused", "reason": "backup is readable by others; chmod 600 it first"}
     info = _inspect_bytes(store, raw)
     if info["status"] != "healthy":
         return None, {"status": "refused", "reason": {"corrupt": "backup is not valid JSON",
@@ -312,23 +399,7 @@ def _check_backup(d: Path, store: str, backup: str) -> tuple[bytes | None, dict[
     return raw, {"status": "ok", "entries": info["entries"], "sha256": _sha(raw)}
 
 
-def restore(store: str, backup: str, home: Path | None = None, *, apply: bool = False) -> dict[str, Any]:
-    """Replace the store with a verified backup. Dry run unless ``apply``.
-
-    Order: validate the backup, refuse if another process holds the state lock, copy the current
-    bytes aside and verify the copy, write the backup beside the store, verify it, then replace
-    atomically. A failure at any step leaves the store as it was."""
-    if store not in STORES:
-        return {"status": "refused", "reason": "unknown store"}
-    d = _dir(home)
-    if not d.is_dir():
-        return {"status": "refused", "reason": "no plugin data directory"}
-    raw, check = _check_backup(d, store, backup)
-    if raw is None:
-        return check
-    current = _inspect(d, store)
-    if current["status"] == "unsafe":
-        return {"status": "refused", "reason": "the store is not a regular file; not replacing it"}
+def _plan(store: str, backup: str, check: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     plan = {
         "store": store,
         "backup": f"{RECOVERY_DIR}/{backup}",
@@ -343,42 +414,82 @@ def restore(store: str, backup: str, home: Path | None = None, *, apply: bool = 
     }
     if current["status"] == "healthy":
         plan["consequences"].append("The current file is healthy: this replaces working state.")
+    return plan
+
+
+def restore(store: str, backup: str, home: Path | None = None, *, apply: bool = False) -> dict[str, Any]:
+    """Replace the store with a verified backup. Dry run unless ``apply``.
+
+    Order: validate the backup, refuse if another process holds the state lock, copy the current
+    bytes aside and verify the copy, write the backup beside the store, verify it, then replace
+    atomically and read the installed file back. A failure before the replacement leaves the
+    store as it was; a failure after it is reported with ``store_unchanged`` false and the
+    preserved copy of the previous bytes. The plan is rebuilt under the lock, so what is
+    reported is what was installed."""
+    if store not in STORES:
+        return {"status": "refused", "reason": "unknown store"}
+    d = _dir(home)
+    if not d.is_dir():
+        return {"status": "refused", "reason": "no plugin data directory"}
+    raw, check = _check_backup(d, store, backup)
+    if raw is None:
+        return check
+    current = _inspect(d, store)
+    if current["status"] == "unsafe":
+        return {"status": "refused", "reason": "the store is not a regular file; not replacing it"}
+    plan = _plan(store, backup, check, current)
     if not apply:
         return {"status": "dry_run", **plan, "next": "Repeat with apply to make the change."}
     if fcntl is None:
         return {"status": "refused", **plan, "reason": "this platform cannot confirm no other process is writing; not restoring"}
     try:
         with _needs()._state_lock(Path(home) if home else None):
-            return _apply(d, store, backup, plan)
+            return _apply(d, store, backup)
     except TimeoutError:
         return {"status": "writer_active", **plan, "reason": "another process holds the state lock; nothing was changed. "
                 "Wait for it or stop it in its owning installation. The lock is never cleared here."}
 
 
-def _apply(d: Path, store: str, backup: str, plan: dict[str, Any]) -> dict[str, Any]:
+def _apply(d: Path, store: str, backup: str) -> dict[str, Any]:
     raw, check = _check_backup(d, store, backup)  # again, now that no one else can write
     if raw is None:
         return check
+    current = _inspect(d, store)
+    plan = _plan(store, backup, check, current)  # what the lock now protects, not what was seen before it
+    if current["status"] == "unsafe":
+        return {"status": "refused", **plan, "reason": "the store is not a regular file; not replacing it"}
     target = d / STORES[store][0]
     before, why = _read_store(d, store)
     if why == "unsafe" or why == "too_large":
-        return {"status": "refused", "reason": "the store is not a regular file of a sane size; not replacing it"}
+        return {"status": "refused", **plan, "reason": "the store is not a regular file of a sane size; not replacing it"}
     tmp = d / f".restore.{os.getpid()}.tmp"
     preserved = None
     try:
         if before is not None:
             preserved = f"{RECOVERY_DIR}/{_preserve_raw(d, store, before)}"
         tmp.unlink(missing_ok=True)
-        _write_new(tmp, raw)
+        written = _write_new(tmp, raw)
+        if not os.path.samestat(written, os.lstat(tmp)):  # the name must still hold the verified bytes
+            raise OSError("the restore file was replaced before it was installed")
         os.replace(tmp, target)
         _fsync_dir(d)
-    except BaseException as exc:  # noqa: BLE001 - report, leave the store as it was
-        tmp.unlink(missing_ok=True)
-        after, _ = _read_store(d, store)
+        installed, _st, why, _err = _read_file(target)
+        if installed != raw:
+            raise OSError("the installed file is not the verified backup")
+    except BaseException as exc:  # noqa: BLE001 - report, never raise away the preserved reference
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
         if not isinstance(exc, Exception):
             raise
+        try:
+            after, _ = _read_store(d, store)
+            unchanged: bool | None = after == before
+        except Exception:  # noqa: BLE001 - the reread failed too: say it is unknown, keep the rest
+            unchanged = None
         return {"status": "failed", **plan, "error": type(exc).__name__, "preserved_current": preserved,
-                "store_unchanged": after == before}
+                "store_unchanged": unchanged}
     return {"status": "restored", **plan, "preserved_current": preserved, "sha256": check["sha256"]}
 
 
@@ -397,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if a.cmd == "diagnose":
             out = diagnose(home)
-            bad = any(s["status"] not in ("healthy", "absent") for s in out["stores"])
+            bad = any(s["status"] not in ("healthy", "absent") for s in out["stores"]) or out["recovery_dir"] == "unsafe"
         elif a.cmd == "preserve":
             out = preserve(a.store, home)
             bad = out["status"] != "preserved"
