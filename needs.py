@@ -1952,6 +1952,39 @@ def _purge_done(d: Path, now: float | None = None) -> int:
     return removed
 
 
+_DEDUPE_SCOPES = ("profile", "global")
+
+
+def _dedupe_scope(args: dict[str, Any], profile: str) -> str:
+    """The deduplication scope for this call: ``profile`` (default when the caller's profile
+    is known) keeps a key private to that profile; ``global`` shares it across profiles."""
+    raw = args.get("dedupe_scope")
+    if raw in (None, ""):
+        return "profile" if profile else "global"
+    if raw not in _DEDUPE_SCOPES:
+        raise ValueError("dedupe_scope must be profile or global")
+    if raw == "profile" and not profile:
+        raise ValueError("dedupe_scope profile needs a caller profile; use global instead")
+    return raw
+
+
+def _dedupe_matches(rec: dict[str, Any], key: str, scope: str | None, profile: str) -> bool:
+    """Whether a stored record is the one this key means for this caller.
+
+    Records written before scopes existed carry no ``dedupe_scope`` and stay global for
+    global callers, but a profile-scoped caller only adopts a legacy record its own profile
+    filed, so one profile never replaces or resolves another profile's item by key."""
+    if not key or rec.get("dedupe_key") != key:
+        return False
+    stored = rec.get("dedupe_scope")
+    owner = str(rec.get("profile") or "")
+    if scope is None:  # resolve from a caller with no profile: any scope, see the ambiguity check
+        return True
+    if scope == "global":
+        return stored in (None, "global")
+    return stored in (None, "profile") and owner == profile
+
+
 def file_outside(
     args: dict[str, Any], home: Path | None = None, **kwargs: Any
 ) -> dict[str, Any]:
@@ -1960,6 +1993,10 @@ def file_outside(
     if action not in ("file", "resolve"):
         raise ValueError("action must be file or resolve")
     key = _outside_field(args, "dedupe_key", 120)
+    caller = str(kwargs.get("profile") or "")
+    scope = _dedupe_scope(args, caller) if (key or action == "file") else "global"
+    if action == "resolve" and not caller and args.get("dedupe_scope") in (None, ""):
+        scope = None  # unknown caller: resolve only an unambiguous key
     if action == "file":
         kind = args.get("kind")
         if kind not in _OUTSIDE_KINDS:
@@ -1973,7 +2010,7 @@ def file_outside(
             "act_where": _outside_field(args, "act_where", 120, required=True),
             "ref": _outside_field(args, "ref", 300),
             "dedupe_key": key,
-            "profile": str(kwargs.get("profile") or ""),
+            "profile": caller,
             "session_id": str(kwargs.get("session_id") or ""),
         }
     else:
@@ -1992,14 +2029,17 @@ def file_outside(
         if action == "resolve" and item_id:
             match = d / (_FILED_ID.fullmatch(item_id).group(1) + ".json")
         elif key:
-            match = next(
-                (
-                    f
-                    for f in files
-                    if not f.is_symlink() and _read_json(f).get("dedupe_key") == key
-                ),
-                None,
-            )
+            found = [
+                f
+                for f in files
+                if not f.is_symlink() and _dedupe_matches(_read_json(f), key, scope, caller)
+            ]
+            if scope is None and len(found) > 1:
+                raise ValueError(
+                    f"dedupe_key matches {len(found)} items in different profiles; "
+                    "resolve by id or pass dedupe_scope"
+                )
+            match = found[0] if found else None
         if action == "resolve":
             if match is None or not match.is_file() or match.is_symlink():
                 raise LookupError("No filed outside item matches that id or dedupe_key")
@@ -2028,6 +2068,9 @@ def file_outside(
             "source": "outside",
             "origin": "filed",
             "tier": "normal",
+            # Provenance only: not part of the version, so adopting a legacy record keeps
+            # its version and a human's local Done.
+            "dedupe_scope": scope,
             "since": old.get("since") or time.time(),
         }
         # Re-filing identical content does not undo a local Done; a changed claim is new
@@ -2035,7 +2078,13 @@ def file_outside(
         if _is_done(old) and old.get("version") == version:
             rec["done_at"] = old["done_at"]
         _write_json(d / f"{record_id}.json", rec)
-        return {"ok": True, "id": item_id, "version": version}
+        return {
+            "ok": True,
+            "id": item_id,
+            "version": version,
+            "dedupe_scope": scope,
+            "profile": caller,
+        }
 
 
 def _folder_outside_item(

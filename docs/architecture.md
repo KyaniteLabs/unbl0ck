@@ -74,7 +74,7 @@ as private. Settings and source files remain owned by their original application
 | --- | --- |
 | `hidden.json` | Version-specific hides, capped at 1,000; shared by local operator surfaces |
 | `pending-release.json` | Recovery state for comments whose release remains unfinished |
-| `outside/*.json` | Owner-only agent-filed records, capped at 200; shared across profiles |
+| `outside/*.json` | Owner-only agent-filed records, capped at 200; visible to every profile, with `dedupe_key` private to the filing profile unless `dedupe_scope` is `global` |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
 | `bluf.json` | Summary cache capped at 2,000, version-bound; failed-source entries retained subject to cap |
 | `pocket-pack.json` | Written only on explicit pack request |

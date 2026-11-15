@@ -97,6 +97,7 @@ FILE_SCHEMA = {
             "act_where": {"type": "string", "maxLength": 120, "description": "Where the human acts, e.g. Outlook → Drafts or Plaud app"},
             "ref": {"type": "string", "maxLength": 300, "description": "Plain-text id, URL or path; never opened automatically"},
             "dedupe_key": {"type": "string", "maxLength": 120, "description": "Re-file this key to update in place; also usable with resolve"},
+            "dedupe_scope": {"type": "string", "enum": ["profile", "global"], "description": "Who shares dedupe_key: profile (default when your profile is known) keeps it private to your profile; global shares it across profiles"},
             "id": {"type": "string", "description": "Previously returned item id, for resolve"},
         },
         "description": "file requires kind, title, body and act_where; resolve requires either id or dedupe_key",

@@ -111,8 +111,9 @@ is implemented and verified.
 
 Bounded folder selection discloses older omissions instead of silently scanning an
 unbounded directory. Folder pagination and automatic export archiving were not adopted;
-the latter would change the read-only source contract. Filed dedupe keys remain shared
-across profiles; callers can namespace them without migrating existing records.
+the latter would change the read-only source contract. Filed dedupe keys are
+profile-scoped by default, with an explicit global scope; existing records are adopted
+in place by their own profile.
 
 The review link reuses native signed ingress and verifies GitHub review identity rather
 than adding a listener, executing PR code with secrets, or treating duplicate responses

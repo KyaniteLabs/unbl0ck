@@ -103,9 +103,18 @@ HTML-only mail shows an explicit no-plain-body notice; HTML is never rendered.
 
 Agent-filed records waiting for you are capped at 200; at the cap the queue says how
 many are waiting, new filings are refused with that count (nothing is dropped,
-and existing items can still be updated), and finishing one makes room. A `dedupe_key` identifies an item across the
-installation's profiles, so callers needing separate records must namespace their
-keys. The tool's record proves what was filed, not whether the external app changed.
+and existing items can still be updated), and finishing one makes room.
+
+A `dedupe_key` is scoped by `dedupe_scope`. `profile` (the default whenever the caller's
+profile is known) keeps the key private to that profile, so two profiles using the same key
+file two items and never update or resolve each other's. `global` shares the key across
+profiles on purpose, so they update one record. A caller with no known profile defaults to
+`global`. Every filed item records its `profile` and `dedupe_scope`, and the tool's reply
+returns both. Records filed before scopes existed keep their keys: a profile adopts a legacy
+record its own profile filed (same id, version and any local Done, so nothing resurfaces),
+a `global` caller still updates it, and a different profile gets its own item. Resolving by
+`id` is always unambiguous; resolving by key from a caller with no profile fails when the key
+matches items in several profiles. The tool's record proves what was filed, not whether the external app changed.
 
 See [disclosure](../README.md#disclosure) before enabling model summaries or adding
 watched folders. Do not include private card text, exports or raw settings in public
