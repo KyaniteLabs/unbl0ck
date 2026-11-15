@@ -2783,8 +2783,9 @@ def _unlink_wait(path: Path) -> None:
 def _other_process_faults(home: Path, errors: list[str]) -> None:
     """Faults another live process (the agent running a hook) reported but could not retry here."""
     try:
-        data = _read_json(_fault_path(home))
-    except Exception:  # noqa: BLE001
+        data = _read_json(_fault_path(home), errors=errors, source="prompt")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"prompt: {type(exc).__name__}; could not read live-prompt faults")
         return
     for rid, entry in data.items():
         if not isinstance(entry, dict):

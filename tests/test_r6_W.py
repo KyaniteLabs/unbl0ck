@@ -76,6 +76,16 @@ class WaitCase(HomeCase):
         return proc
 
 
+class AnUnreadableFaultJournalIsReported(WaitCase):
+    def test_a_corrupt_fault_journal_adds_a_queue_error(self):
+        """R6-014: a truncated wait-faults.json may hide another process's missing prompt, so the
+        poll must say it could not read it rather than treat it as empty."""
+        needs._fault_path(self.home).write_text("{")
+        errors: list[str] = []
+        needs.wait_items(self.home, errors=errors)
+        self.assertTrue(any(e.startswith("prompt") and "wait-faults.json" in e for e in errors), errors)
+
+
 class OutOfRangePidsAreRefused(WaitCase):
     def test_a_huge_pid_in_the_fault_journal_does_not_abort_the_poll(self):
         """R6-018: an out-of-range pid is malformed input, not an OverflowError from os.kill."""
