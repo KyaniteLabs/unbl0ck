@@ -311,7 +311,7 @@ class Containment(JobsBase):
             return real(path, *a, **k)
 
         table = self.make(directory=lambda: prof / "ask")
-        with patch.object(os, "open", opener):
+        with patch.object(os, "open", opener), self.assertRaises(jobs.ScopeUnavailable):
             table.create(J1, card="c1")
         self.assertTrue(done)
         self.assertEqual(list((foreign / "ask").iterdir()), [])

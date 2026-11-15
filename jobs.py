@@ -217,9 +217,8 @@ class AskJournal:
     One small JSON file per job (0600 in a 0700 directory), written atomically. It holds
     the job id, state, timestamps, the card id (isolation), provider/model, an error
     detail, the writing worker and, only when the job was created with reply persistence on,
-    the reply text. Files expire with the job TTL and are capped. Any I/O failure degrades to
-    in-memory behaviour: ``failures`` counts them. Only a lock held past the wait refuses a new job,
-    since another worker may be claiming the same id.
+    the reply text. Files expire with the job TTL and are capped. ``failures`` counts I/O faults; a job
+    whose first record cannot be claimed is refused, since another worker may be claiming the same id.
 
     The directory is opened through its parent's descriptor, neither followed through a link
     (the directory and its parent must be real directories, the directory owned by this user),
@@ -906,7 +905,7 @@ class AskJobs:
                 got = self._journal.claim(job, {"state": "queued", "started": now, "card": card}, d=where)
                 if got == "taken":
                     raise IllegalTransition(f"ask job {job} already exists")
-                if got == "busy":  # another worker may be claiming this id: never admit it twice
+                if got != "ok":  # unclaimed, another worker may admit this id too: never admit it twice
                     raise ScopeUnavailable(f"ask job {job} could not be claimed")
                 self._dirs.add(where)
             gen = secrets.token_hex(8)
@@ -918,28 +917,18 @@ class AskJobs:
     def mark_sent(self, job: str, *, gen: str) -> bool:
         """Record, durably, that the model call is about to start (before it starts).
 
-        False means the caller must not call the model: the "sent" marker could not be written
-        and the older "queued" marker could not be removed, so after a restart the job would
-        claim that nothing was sent and offer a safe resubmit although the model may have run.
-        It is also False when the job was deleted meanwhile."""
+        False means the caller must not call the model: the "sent" marker could not be written (or
+        the job was deleted meanwhile), so the "queued" marker still truthfully says nothing was sent."""
         with self._lock:
             key = self._entry(job, gen)
             st = self._jobs.get(key) if key else None
             if st is None or st["status"] is not AskState.PENDING:
                 return False
-            st["sent"] = True
             where = key[0]
             if not self._journal or where is None:
                 return True
-            if self._journal.write(job, {"state": "sent", "started": st["started"], "card": st.get("card"),
-                                         "sent_at": self._clock()}, d=where):
-                return True
-            if self._gone_elsewhere(key, st):
-                return False
-            # Could not record it. A stale "queued" marker would turn into a false not_submitted,
-            # so remove it: an unknown job is reported as unknown, never as safe to resend.
-            self._journal.delete(job, d=where)
-            return self._journal.verified_absent(job, owned=True, d=where)
+            return self._journal.write(job, {"state": "sent", "started": st["started"], "card": st.get("card"),
+                                             "sent_at": self._clock()}, d=where)
 
     def discard(self, job: str) -> bool:
         """Delete a job and its journal file at the caller's request, whatever its state.

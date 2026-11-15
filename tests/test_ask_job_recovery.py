@@ -229,9 +229,10 @@ class RetentionAndDeletion(RecoveryBase):
         self.journal.MAX_FILES = 2
         self.jobs.create(J1, card="c")
         self.jobs.create(J2, card="c")
-        self.jobs.create(J3, card="c")  # no room and nothing evictable: memory only
+        with self.assertRaises(jobs.ScopeUnavailable):  # no room and nothing evictable: refused
+            self.jobs.create(J3, card="c")
         self.assertEqual(self.files(), [f"{J1}.json", f"{J2}.json"])
-        self.assertEqual(self.jobs.get(J3)["status"], jobs.AskState.PENDING)
+        self.assertIsNone(self.jobs.get(J3))
 
 
 class Protection(RecoveryBase):
@@ -294,16 +295,14 @@ class Corruption(RecoveryBase):
         (self.dir / f"{J1}.json").write_text('{"v":1,"job":"%s","state":"weird","started":1000}' % J1)
         self._unknown(J1)
 
-    def test_unwritable_directory_degrades_to_memory(self):
+    def test_unwritable_directory_refuses_the_job(self):
         blocked = Path(self.tmp.name) / "file"
         blocked.write_text("x")
         journal = jobs.AskJournal(lambda: blocked / "ask", lambda: False, self.clock)
         table = jobs.AskJobs(self.clock, journal)
-        table.create(J1, card="c")
-        table.mark_sent(J1, gen=ask_gen(table, J1))
-        table.finish(J1, "ok", "p", "m", gen=ask_gen(table, J1))
-        self.assertEqual(table.get(J1)["reply"], "ok")
-        self.assertGreater(journal.failures, 0)
+        with self.assertRaises(jobs.ScopeUnavailable):
+            table.create(J1, card="c")
+        self.assertEqual(len(table), 0)
 
     def test_no_journal_is_plain_memory(self):
         table = jobs.AskJobs(self.clock)
@@ -481,7 +480,7 @@ class AskApiRecovery(unittest.TestCase):
 class MarkSentFailure(RecoveryBase):
     """The "sent" marker is what keeps a restart from offering a resend after the model may have run."""
 
-    def test_failed_sent_write_invalidates_the_stale_queued_marker(self):
+    def test_failed_sent_write_keeps_the_job_from_the_model(self):
         self.jobs.create(J1, card="c1")
         real = os.rename
 
@@ -492,11 +491,11 @@ class MarkSentFailure(RecoveryBase):
 
         self.addCleanup(setattr, os, "rename", real)
         os.rename = failing
-        self.assertTrue(self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1)))
+        self.assertFalse(self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1)))
         os.rename = real
-        self.assertEqual(self.files(), [], "the stale queued marker is gone")
+        self.assertEqual(self.files(), [f"{J1}.json"], "the queued marker stays")
         self.boot()
-        self.assertIsNone(self.jobs.get(J1), "unknown, never not_submitted with resubmit_safe")
+        self.assertEqual(self.jobs.get(J1)["status"], jobs.AskState.NOT_SUBMITTED, "true: it was never sent")
 
     def test_unrecordable_request_must_not_reach_the_model(self):
         self.jobs.create(J1, card="c1")
