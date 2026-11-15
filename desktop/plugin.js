@@ -1046,11 +1046,11 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     )
   const hide = async () => {
     const r = await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
-    if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden' })
+    if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: item.version })
   }
   const outsideDone = async () => {
     const r = await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null)
-    if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done' })
+    if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.done ? r.token : item.version })
   }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
@@ -1416,7 +1416,7 @@ function Page({ ctx, refresh }) {
     const same = x => x.id === u.id && x.at === u.at
     const drop = () => $undo.set(($undo.get() || []).filter(x => !same(x)))
     try {
-      const r = await ctx.rest('/unhide', { method: 'POST', body: { id: u.id } })
+      const r = await ctx.rest('/unhide', { method: 'POST', body: u.token ? { id: u.id, token: u.token } : { id: u.id } })
       drop()
       if (r && r.restored === false) {
         host.notify({ kind: 'info', message: `Nothing to restore for "${u.title}": it changed or its undo period ended.` })

@@ -378,33 +378,46 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
         _write_json(_hidden_path(home), hidden)
 
 
-def unhide(item_id: str, home: Path | None = None) -> bool:
+def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:
     """Undo "Not for me" or a local Done. Returns whether anything was restored.
 
-    One filed item can be both marked done and hidden (Done and Not for me). The queue
-    stays empty until both are cleared, so one Undo clears both and only then reports
-    success. Clearing just the done mark used to return True while the hide kept the card out.
-    """
-    restored = False
-    filed = _FILED_ID.fullmatch(str(item_id))
+    ``token`` names the dismissal being undone: the version that was hidden, or the ``token``
+    a Done returned. A caller holding one may only restore that dismissal: a newer one (the
+    item resurfaced with changed content and was dismissed again) is left alone and the
+    answer is False. Without a token every dismissal of the id is restored (older callers).
+    A filed record dismissed twice (Done in one tab, "Not for me" in another) carries both
+    markers; one matching token clears both, under one lock, so the card cannot stay hidden
+    behind the marker the undo did not name."""
+    item_id = str(item_id)
+    token = None if token is None else str(token)
+    filed = _FILED_ID.fullmatch(item_id)
     with _state_lock(home):
+        hidden = load_hidden(home, strict=True)
+        rec = f = None
         if filed:
             d = _outside_dir(home)
             _purge_done(d)
             f = d / (filed.group(1) + ".json")
             if not f.is_symlink() and f.is_file():
                 rec = _read_json(f)
-                if _is_done(rec):
-                    rec.pop("done_at")
-                    _write_json(f, rec)
-                    restored = True
-        hidden = load_hidden(home, strict=True)
+        done = bool(rec) and _is_done(rec)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
-        if item_id in hidden:
+        is_hidden = item_id in hidden
+        if token is not None:
+            matches = (done and token in (_done_token(rec), str(rec.get("version")))) or (
+                is_hidden and hidden[item_id] == token
+            )
+            if not matches:
+                return False
+        if not done and not is_hidden:
+            return False
+        if done:
+            rec.pop("done_at")
+            _write_json(f, rec)
+        if is_hidden:
             del hidden[item_id]
             _write_json(_hidden_path(home), hidden)
-            restored = True
-    return restored
+        return True
 
 
 # --- Releases that failed after the answer was posted ---------------------------------------
@@ -1926,6 +1939,11 @@ def _outside_field(
     return value[:limit]
 
 
+def _done_token(rec: dict[str, Any]) -> str:
+    """Names one Done: a later Done of the same record gets a new token."""
+    return repr(rec.get("done_at"))
+
+
 def _is_done(rec: dict[str, Any]) -> bool:
     return isinstance(rec.get("done_at"), (int, float))
 
@@ -2306,7 +2324,8 @@ def done_outside(
                 rec["done_at"] = time.time()
                 _write_json(f, rec)
                 _purge_done(d)  # enforce the keep limit now that this one counts
-        return {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS}
+            token = _done_token(rec)
+        return {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS, "token": token}
     if not _FOLDER_ID.fullmatch(item_id):
         raise ValueError("id must identify an outside item")
     hide(item_id, version, home)
