@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_outside import OutsideFixture, needs, plugin
+from test_outside import OutsideFixture, needs
 
 ROOT = Path(__file__).resolve().parents[1]
 

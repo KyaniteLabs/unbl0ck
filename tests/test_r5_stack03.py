@@ -186,7 +186,7 @@ class DismissalOrder(OutsideFixture):
         for n in range(4):
             reply = self.client.post("/hide", json={"id": f"chat:p:s{n}", "version": "1"}).json()
             orders.append(reply["order"])
-        filed = self.file(dedupe_key="a")
+        self.file(dedupe_key="a")
         (item,) = needs.build_queue()["items"]
         done = self.client.post("/outside/done", json={"id": item["id"], "version": item["version"]}).json()
         orders.append(done["order"])

@@ -3,8 +3,6 @@ and watched folders (identifiers, required fields, versions, races)."""
 
 import json
 import os
-import re
-import shutil
 import unittest
 from pathlib import Path
 from unittest.mock import patch

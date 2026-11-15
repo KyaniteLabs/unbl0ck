@@ -30,7 +30,6 @@ import collections
 import errno
 import hashlib
 import html.parser
-import itertools
 import math
 import json
 import logging

@@ -3,7 +3,6 @@ records that are ours and readable, never guesses among several, and global keys
 their scope."""
 
 import json
-import re
 from unittest.mock import patch
 
 from test_outside import ROOT, OutsideFixture, needs, plugin

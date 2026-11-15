@@ -1,7 +1,6 @@
 """Round-4 review findings owned by the first stack branch (full text), group by group."""
 
 import os
-import re
 import subprocess
 import types
 import unittest
@@ -315,7 +314,6 @@ class AskAdmission(unittest.TestCase):
 
     def test_a_model_call_is_skipped_when_ask_is_turned_off_meanwhile(self):
         """01-005: the setting is re-read at the model boundary."""
-        import time
 
         self.enabled = True
         job = self.api.uuid.uuid4().hex

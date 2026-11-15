@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from test_needs import make_home, needs  # noqa: E402
+from test_needs import needs  # noqa: E402
 
 DAY = 86400
 

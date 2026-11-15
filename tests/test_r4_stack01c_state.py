@@ -3,13 +3,12 @@ finding's reproducer on the real code path (real files, real sqlite)."""
 
 import json
 import os
-import stat
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from r4c_common import ASK, RID, HomeCase, chat_db, needs
+from r4c_common import RID, HomeCase, chat_db, needs
 
 
 def listing_denied(path: Path, case: unittest.TestCase):

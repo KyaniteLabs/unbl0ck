@@ -5,6 +5,7 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -24,6 +25,8 @@ jobs:
           ref: 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19  # v0.23.0
           path: .hermes-runtime
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+        with:
+          enable-cache: true
       - name: Install Hermes from its own lockfile
         run: uv sync --frozen --python 3.14 --directory .hermes-runtime
       - name: Tests in the Hermes runtime (pytest collects the plain test functions; a skipped test fails the gate)
@@ -44,3 +47,15 @@ jobs:
         with:
           name: plugin-validation
           path: receipts/
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.14"
+      - name: Install ruff (exact version)
+        run: python -m pip install ruff==0.16.5
+      - name: Lint (rules and ignores live in ruff.toml)
+        run: ruff check .

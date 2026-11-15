@@ -17,7 +17,7 @@ except Exception:  # noqa: BLE001
     fastapi = None
 
 sys.path.insert(0, str(Path(__file__).parent))
-from test_needs import make_home, needs  # noqa: E402
+from test_needs import needs  # noqa: E402
 from test_outside import OutsideFixture  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
