@@ -114,10 +114,14 @@ class _Data:
         if not _DIR_FD:
             raise RuntimeError("this platform cannot open the state directory without following links; refusing to use it")
         self._fds: list[int] = []
-        base = Path(home) if home else _needs().hermes_home()
-        fd = self._open(str(base), None, os.O_RDONLY | os.O_DIRECTORY)  # the home itself is the operator's choice
-        for part in ("plugin-data", "unbl0ck"):
-            fd = None if fd is None else self._open(part, fd)
+        try:
+            base = Path(home) if home else _needs().hermes_home()
+            fd = self._open(str(base), None, os.O_RDONLY | os.O_DIRECTORY)  # the home itself is the operator's choice
+            for part in ("plugin-data", "unbl0ck"):
+                fd = None if fd is None else self._open(part, fd)
+        except BaseException:
+            self.__exit__()  # a refusal here must not leak the ancestors already opened
+            raise
         self.fd = fd
         self._rec: int | None | bool = False  # False: not opened yet
 
@@ -153,8 +157,8 @@ class _Data:
         return self
 
     def __exit__(self, *_exc: Any) -> None:
-        for fd in self._fds:
-            os.close(fd)
+        while self._fds:
+            os.close(self._fds.pop())
 
 
 def _open_lock(dfd: int, create: bool = False) -> int:
