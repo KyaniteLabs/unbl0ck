@@ -64,7 +64,7 @@ config_schema:
   chat_window_days:
     type: int
     default: 14
-    description: "How many days back chats are read for unanswered asks (1 to 90; anything else uses 14). Widening it is a read-only backfill of the same local chat database: nothing is sent to a model, chats are read in place, at most 500 sessions per profile per refresh, and hidden or answered items stay hidden. The queue reports the window it actually used."
+    description: "How many days back chats are read for unanswered asks (1 to 90; anything else uses 14). Widening it is a read-only backfill of the same local chat database: nothing is sent to a model, and chats older than 14 days are never summarized automatically even when summaries are on, chats are read in place, at most 500 sessions per profile per refresh, and hidden or answered items stay hidden. The queue reports the window it actually used."
   outside_dirs:
     type: str
     default: ""

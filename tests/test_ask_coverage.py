@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -160,6 +161,68 @@ class QueuePayload(unittest.TestCase):
                 q = needs.build_queue(Path(d))
             self.assertIsNone(q["coverage"]["chat"])
             self.assertTrue(any(e.startswith("chat:") for e in q["errors"]))
+
+
+class ReviewRound3(unittest.TestCase):
+    """Round-3 review of #40: coverage must not claim more than was read or summarized."""
+
+    def setUp(self):
+        self._k = needs.kanban_items
+        needs.kanban_items = lambda boards=None, errors=None: []
+        self.addCleanup(setattr, needs, "kanban_items", self._k)
+
+    def test_full_text_search_reports_chat_sessions_the_scan_cap_left_unread(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(needs, "_settings", settings()), \
+                patch.object(needs, "CHAT_SESSION_CAP", 3), patch.object(needs, "hermes_home", lambda: Path(d)):
+            make_chats(Path(d), [(f"s{i}", "cli", "dm", "u", 1 + i / 100, "Should I open the PR now?") for i in range(2)]
+                       + [(f"o{i}", "cli", "dm", "u", 2 + i / 100, "Should I ship the zebra release?") for i in range(6)])
+            r = needs.search_text("zebra")
+            self.assertGreater(r["chat_sessions_unread"], 0)
+            self.assertTrue(r["partial"])
+
+    def test_full_text_search_is_not_partial_when_every_session_was_read(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(needs, "_settings", settings()), \
+                patch.object(needs, "hermes_home", lambda: Path(d)):
+            make_chats(Path(d), [("a", "cli", "dm", "u", 1, "Should I ship the zebra release?")])
+            r = needs.search_text("zebra")
+            self.assertEqual((r["chat_sessions_unread"], r["partial"], len(r["matches"])), (0, False, 1))
+
+    def test_a_corrupt_chat_database_is_not_reported_as_a_covered_window(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(needs, "_settings", settings()):
+            home = make_chats(Path(d), [("a", "cli", "dm", "u", 1, ASK)])
+            (home / "profiles" / "work" / "state.db").write_bytes(b"not a database" * 100)
+            q = needs.build_queue(home)
+            cov = q["coverage"]
+            self.assertTrue(cov["chat"]["failed"])
+            self.assertTrue(any("could not be read" in n for n in cov["not_covered"]))
+
+    def test_a_healthy_read_is_not_marked_failed(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(needs, "_settings", settings()):
+            q = needs.build_queue(make_chats(Path(d), [("a", "cli", "dm", "u", 1, ASK)]))
+            self.assertFalse(q["coverage"]["chat"]["failed"])
+
+    def test_chats_older_than_the_default_window_are_flagged_backfilled(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(needs, "_settings", settings(chat_window_days=60)):
+            home = make_chats(Path(d), [("old", "cli", "dm", "u", 20, ASK), ("new", "cli", "dm", "u", 1, ASK)])
+            got = {i["session_id"]: i for i in needs.chat_items(home)}
+            self.assertTrue(got["old"].get("backfilled"))
+            self.assertFalse(got["new"].get("backfilled"))
+
+    def test_backfilled_chats_are_never_sent_to_a_model_automatically(self):
+        import test_bluf
+
+        api = test_bluf.BlufTest().load_api_without_fastapi()
+        sent = []
+        base = {"source": "chat", "tier": "ask", "version": "1", "title": "t", "text": "x"}
+        q = {"bluf_enabled": True, "items": [dict(base, id="old", backfilled=True), dict(base, id="new")]}
+        n = types.SimpleNamespace(build_queue=lambda: q)
+        with patch.object(api, "_needs", lambda: n), patch.object(api, "_loaded_ctx", lambda: types.SimpleNamespace(llm=object())), \
+                patch.object(api, "_queue_bluf", lambda n_, ctx, it: sent.append(it["id"])):
+            try:
+                api.queue()
+            except Exception:  # noqa: BLE001 - only the summary decision is under test
+                pass
+        self.assertEqual(sent, ["new"])
 
 
 if __name__ == "__main__":
