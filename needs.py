@@ -380,14 +380,13 @@ def unhide(item_id: str, home: Path | None = None) -> bool:
             d = _outside_dir(home)
             _purge_done(d)
             f = d / (filed.group(1) + ".json")
-            if f.is_symlink() or not f.is_file():
-                return False
-            rec = _read_json(f)
-            if not _is_done(rec):
-                return False
-            rec.pop("done_at")
-            _write_json(f, rec)
-            return True
+            if not f.is_symlink() and f.is_file():
+                rec = _read_json(f)
+                if _is_done(rec):
+                    rec.pop("done_at")
+                    _write_json(f, rec)
+                    return True
+        # Not locally done: it may have been hidden with "Not for me"; restore that below.
     with _state_lock(home):
         hidden = load_hidden(home, strict=True)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
