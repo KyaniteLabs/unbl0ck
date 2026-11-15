@@ -24,35 +24,48 @@ def _other_work(q: dict) -> list[str]:
     return parts
 
 
+def _gaps(n, q) -> list:
+    """Fixed sentences on chat sessions the queue did not read (empty when it read them all)."""
+    fn = getattr(n, "coverage_gaps", None)
+    return list(fn(q)) if callable(fn) else []
+
+
 def _summary(limit: int = 12) -> str:
-    q = _needs().build_queue()
+    n = _needs()
+    q = n.build_queue()
+    c = lambda value, size=200: n._clean(value, size)  # noqa: E731  (display sanitizer)
     other = _other_work(q)
-    if not q["count"] and not q["errors"]:
+    gaps = _gaps(n, q)
+    if not q["count"] and not q["errors"] and not gaps:
         if other:
             return f"Nothing is waiting on you, but {' and '.join(other)} card(s) need a look. Open /unblock in Desktop."
         return "Nothing is blocked on you."
     asks = [it for it in q["items"] if it.get("tier") not in ("stuck", "answered")]
     lines = [f"{q['count']} thing(s) waiting on you:" if q["count"]
-             else "No asks detected; the queue is incomplete."]
+             else "No asks detected; the queue is incomplete." if q["errors"] or gaps
+             else "No asks, but listed cards are stuck or answered:"]
+    limit = max(0, int(limit))
     for it in asks[:limit]:
-        where = (f"{it['board']}:{it['task_id']}" if it["source"] == "kanban"
-                 else f"{it.get('kind') or 'prompt'} {it['profile']}" if it["source"] == "prompt"
-                 else f"pairing {it.get('platform')}" if it["source"] == "pairing"
-                 else f"outside {it['kind']} · {it['act_where']}" if it["source"] == "outside"
-                 else f"chat {it.get('platform') or it['profile']}"
-                 + (f" with {it['chat_with']}" if it.get("chat_with") else ""))
-        lead = it.get("bluf") or " ".join(str(it.get("ask") or "").split())[:140]
-        lines.append(f"- [{where}] {it['title']}: {lead}")
+        where = (f"{c(it['board'], 80)}:{c(it['task_id'], 80)}" if it["source"] == "kanban"
+                 else f"{c(it.get('kind') or 'prompt', 40)} {c(it.get('profile'), 80)}" if it["source"] == "prompt"
+                 else f"pairing {c(it.get('platform'), 40)}" if it["source"] == "pairing"
+                 else f"outside {c(it.get('kind'), 40)} · {c(it.get('act_where'), 120)}" if it["source"] == "outside"
+                 else f"chat {c(it.get('platform') or it.get('profile'), 80)}"
+                 + (f" with {c(it['chat_with'], 120)}" if it.get("chat_with") else ""))
+        lead = (n._SUDO_WITHHELD if it.get("kind") == "sudo" else c(it.get("bluf") or it.get("ask"), 140))
+        lines.append(f"- [{where}] {c(it.get('title'), 160)}: {lead}")
         if it.get("approve_command"):
-            lines.append(f"  approve: {it['approve_command']}")
+            lines.append(f"  approve: {c(it['approve_command'], 300)}")
     if q["count"] > limit:
         lines.append(f"…and {q['count'] - limit} more. Open /unblock in Desktop.")
     if other:
         # Also when the ask list is empty because a source failed: stuck and answered
         # cards are still omitted from the lines above, so the counts have to be said.
         lines.append(f"Not listed here: {', '.join(other)}. Open /unblock in Desktop.")
+    for gap in gaps:
+        lines.append(f"(not complete: {gap})")
     for err in q["errors"]:
-        lines.append(f"(source error: {err})")
+        lines.append(f"(source error: {c(err, 300)})")
     return "\n".join(lines)
 
 
@@ -63,15 +76,17 @@ LOCAL_SURFACES = frozenset({"cli", "tui", "desktop", "local"})
 
 
 def _count_only() -> str:
-    q = _needs().build_queue()
+    n = _needs()
+    q = n.build_queue()
     other = _other_work(q)
-    if not q["count"] and not q["errors"] and not other:
+    gaps = _gaps(n, q)
+    if not q["count"] and not q["errors"] and not other and not gaps:
         return "Nothing is blocked on you."
     lead = f"{q['count']} thing(s) waiting on you. " if q["count"] else ""
     if other:
         # Counts of other cards only: remote senders never see a title, a reason or an id.
         lead += f"Also {' and '.join(other)} card(s). " if q["count"] else f"No new asks, but {' and '.join(other)} card(s) need a look. "
-    if q["errors"]:
+    if q["errors"] or gaps:
         lead += "The queue is incomplete. "
     return (lead + "Open UNBL0CK in Hermes Desktop or run "
             "hermes unbl0ck on the machine to see them.")
@@ -118,8 +133,9 @@ FILE_SCHEMA = {
             "act_where": {"type": "string", "maxLength": 120, "description": "Where the human acts, e.g. Outlook → Drafts or Plaud app"},
             "ref": {"type": "string", "maxLength": 300, "description": "Plain-text id, URL or path; never opened automatically"},
             "dedupe_key": {"type": "string", "maxLength": 120, "description": "Re-file this key to update in place; also usable with resolve"},
-            "dedupe_scope": {"type": "string", "enum": ["profile", "global"], "description": "Who shares dedupe_key: profile (default when your profile is known) keeps it private to your profile; global shares it across profiles"},
+            "dedupe_scope": {"type": "string", "enum": ["profile", "global"], "description": "Who shares dedupe_key: profile (default when your profile is known) keeps it private to your profile; global shares it across profiles. Pass the same dedupe_scope when you resolve by dedupe_key"},
             "id": {"type": "string", "description": "Previously returned item id, for resolve"},
+            "version": {"type": "string", "description": "The version returned when the item was filed. Required when resolving by id; a changed item is not resolved"},
         },
         "description": "file requires kind, title, body and act_where; resolve requires either id or dedupe_key",
         "additionalProperties": False,

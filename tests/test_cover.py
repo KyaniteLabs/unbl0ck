@@ -201,9 +201,16 @@ class Pairing(unittest.TestCase):
             self.assertEqual(errors, ["pairing[default]: ImportError"])
 
     def test_never_reads_the_pending_files_itself(self):
-        # The pending files hold the pairing codes; only the gateway's store may open them.
+        # The pending files hold the pairing codes; only the gateway's store reads their fields.
+        # The one other open is a well-formedness check whose parsed content is dropped on the spot
+        # (the stock store loads a damaged file as "no requests", so it cannot report damage).
         src = (ROOT / "needs.py").read_text()
-        self.assertNotIn("-pending.json", src)
+        self.assertEqual(src.count("-pending.json"), 1)
+        check = src[src.index("def _pending_file_damage"):]
+        check = check[: check.index("\n\n\n")]
+        self.assertIn("return not isinstance(json.loads(", check)
+        for field in ("salt", "hash", "code", "user_id"):
+            self.assertNotIn(f'"{field}"', check)
         with tempfile.TemporaryDirectory() as d:
             home, f = pairing_home(
                 Path(d),

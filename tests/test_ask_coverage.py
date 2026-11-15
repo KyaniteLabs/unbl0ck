@@ -45,7 +45,7 @@ ASK = "Should I open the PR now?"
 
 class Window(unittest.TestCase):
     def test_default_is_14_days_and_the_setting_is_clamped(self):
-        for raw, want in [(None, 14), (30, 30), ("45", 45), (0, 14), (-3, 14), (500, 90), ("soon", 14), (True, 14), (7.5, 14)]:
+        for raw, want in [(None, 14), (30, 30), ("45", 45), (0, 14), (-3, 14), (500, 14), (90, 90), (91, 14), ("soon", 14), (True, 14), (7.5, 14)]:
             with self.subTest(raw=raw), patch.object(needs, "_settings", settings(**({} if raw is None else {"chat_window_days": raw}))):
                 self.assertEqual(needs.chat_window_days(), want)
 

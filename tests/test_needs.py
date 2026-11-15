@@ -367,7 +367,8 @@ class Chats(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             items = needs.chat_items(make_home(Path(d)))
             self.assertEqual([i["session_id"] for i in items], ["s1"])
-            self.assertEqual(items[0]["version"], "2")
+            # The message row id plus a digest of its text (round 4, 01-067).
+            self.assertRegex(items[0]["version"], r"\A2:[0-9a-f]{12}\Z")
 
     def test_user_replied_last(self):
         with tempfile.TemporaryDirectory() as d:
@@ -385,9 +386,8 @@ class Chats(unittest.TestCase):
             self.assertEqual(q["count"], 1)
             needs.hide(q["items"][0]["id"], q["items"][0]["version"], home)
             self.assertEqual(needs.build_queue(home)["count"], 0)
-            needs.hide(
-                q["items"][0]["id"], "older", home
-            )  # source changed → shows again
+            # The source changed after it was hidden: the stored version no longer matches.
+            needs._write_json(needs._hidden_path(home), {q["items"][0]["id"]: "older"})
             self.assertEqual(needs.build_queue(home)["count"], 1)
 
     def test_queue_count_and_pocket_pack_include_only_unanswered_asks(self):
@@ -579,16 +579,24 @@ class FakeKanban(unittest.TestCase):
 
     def test_a_failed_pending_marker_clear_does_not_turn_a_released_card_into_a_failure(self):
         # Class sweep (G): the card was released; clearing the retry marker afterwards failed.
-        with mock.patch.object(needs, "_set_pending_release", side_effect=OSError("disk")):
+        real = needs._set_pending_release
+
+        def flaky(item_id, version, home=None, **kw):
+            if version is None:
+                raise OSError("disk")
+            return real(item_id, version, home, **kw)
+
+        with mock.patch.object(needs, "_set_pending_release", side_effect=flaky):
             r = needs.answer_card("factory", "t_1", "Go", release=True, version="11")
         self.assertTrue(r["ok"])
         self.assertTrue(r["released"])
 
-    def test_a_failed_pending_marker_write_does_not_mask_the_unblock_failure(self):
-        self.release_behavior = lambda *args: False
+    def test_a_marker_that_cannot_be_reserved_refuses_the_answer_before_anything_is_written(self):
+        # The marker is reserved first; an unwritable store means no answer and no half-state.
         with mock.patch.object(needs, "_set_pending_release", side_effect=OSError("disk")):
-            with self.assertRaises(needs.UnblockFailed):
+            with self.assertRaises(OSError):
                 needs.answer_card("factory", "t_1", "Go", release=True, version="11")
+        self.assertEqual(self.calls, [])
 
     def test_answer_to_an_old_block_is_refused(self):
         # The card was blocked again (event 12) after the human read the block-11 question.
