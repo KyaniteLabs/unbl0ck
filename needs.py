@@ -1280,17 +1280,8 @@ def recent_comments(item: dict[str, Any], limit: int = 6) -> list[dict[str, Any]
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
 
     with closing(kbc.connect(board=item["board"])) as conn:
-        try:
-            rows = conn.execute(
-                "SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-                (item["task_id"], limit),
-            ).fetchall()
-            return [{"author": r[0], "body": r[1]} for r in reversed(rows)]
-        except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-            return [
-                {"author": c.author, "body": c.body}
-                for c in kanban_db.list_comments(conn, item["task_id"])[-limit:]
-            ]
+        rows, _ = _newest_comments(conn, kanban_db, item["task_id"], limit)
+    return [{"author": r[1], "body": r[2]} for r in rows]
 
 
 # --- classification (pure) -----------------------------------------------------------------
@@ -1718,23 +1709,42 @@ def _latest_block(conn: Any, kanban_db: Any, task_id: str) -> Any | None:
 
 
 def _same_author(a: Any, b: Any) -> bool:
-    return str(a or "").casefold() == str(b or "").casefold()
+    return str(a or "").strip().casefold() == str(b or "").strip().casefold()
 
 
-def _answered_since(
-    conn: Any,
-    kanban_db: Any,
-    task_id: str,
-    author: str,
-    since: int,
-    block_id: int | None = None,
-) -> bool:
-    """Has *author* commented since the block began? The one test for "answered", used by the
-    queue and by answer_card: an author among :func:`_comments_since_block`. Names compare in
-    Python (casefold) on every path; SQLite's LOWER() folds ASCII only."""
-    return any(
-        _same_author(a, author) for a, _ in _comments_since_block(conn, kanban_db, task_id, since, block_id)
-    )
+def _comment_events(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> tuple[int, int]:
+    """How many ``commented`` events of *author* come before and after the block event (all after
+    when there is none). Kanban writes a comment with its event in one transaction and ids only
+    grow, so this places the author's comments by write order, without reading them."""
+    try:
+        rows = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'commented'", (task_id,)
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        rows = [(e.id, e.payload) for e in kanban_db.list_events(conn, task_id) if e.kind == "commented"]
+    mine = [int(i or 0) > (block_id or 0) for i, p in rows if _same_author(_json_payload(p).get("author"), author)]
+    return mine.count(False), mine.count(True)
+
+
+def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> bool:
+    """Has *author* commented since the block began: one of their ``commented`` events is later
+    than the block's. The one test for "answered", used by the queue and by answer_card; a comment
+    no event records never answers, so the card stays in front of you."""
+    return _comment_events(conn, kanban_db, task_id, author, block_id)[1] > 0
+
+
+def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
+    """Has *author* posted *text* since the block began? Their oldest comments, as many as their
+    events before the block, belong to earlier blocks; every later one counts (no body is read)."""
+    before = _comment_events(conn, kanban_db, task_id, author, block_id)[0]
+    try:
+        rows = conn.execute(
+            "SELECT author, body = ? FROM task_comments WHERE task_id = ? ORDER BY id", (text, task_id)
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: getattr(c, "id", 0) or 0)
+        rows = [(c.author, c.body == text) for c in listed]
+    return any([same for who, same in rows if _same_author(who, author)][before:])
 
 
 class CardStatus(str, Enum):
@@ -1803,29 +1813,34 @@ def _digest(*texts: Any) -> str:
 
 def _comments_sig(conn: Any, kanban_db: Any, task_id: str) -> str:
     """"count:newest id:digest" of a card's comments: it changes when a comment is added and when
-    one that a model call can see (the newest CARD_CONTEXT_COMMENTS, each up to
-    ASK_CARD_CONTEXT_LIMIT characters) is rewritten, so advice or a summary written from the old
-    text is not shown for the card as it is now. The bounds are applied by the query."""
+    the bounded read every model call and Desktop are given (:func:`_newest_comments`) changes."""
+    rows, count = _newest_comments(conn, kanban_db, task_id, CARD_CONTEXT_COMMENTS)
+    return f"{count}:{max((r[0] or 0 for r in rows), default=0)}:{_digest(*(p for r in rows for p in r[:3]))}"
+
+
+def _newest_comments(conn: Any, kanban_db: Any, task_id: str, limit: int) -> tuple[list[tuple[Any, ...]], int]:
+    """The newest *limit* ``(id, author, body, created_at)`` comments of a card, oldest first, and
+    its comment count. A body is its first ASK_CARD_CONTEXT_LIMIT bytes (past any NUL), ending in
+    ``_ASK_CUT`` when cut: the one bounded read the signature, Ask, summaries and Desktop share."""
     try:
-        count, newest = conn.execute(
-            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,)
-        ).fetchone()
+        count = conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)).fetchone()[0]
         rows = conn.execute(
-            "SELECT id, author, LENGTH(body), SUBSTR(body, 1, ?) FROM task_comments WHERE task_id = ? "
-            "ORDER BY created_at DESC, id DESC LIMIT ?",
-            (ASK_CARD_CONTEXT_LIMIT, task_id, CARD_CONTEXT_COMMENTS),
-        ).fetchall()
+            "SELECT id, author, SUBSTR(CAST(body AS BLOB), 1, ?), created_at FROM task_comments "
+            "WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (ASK_CARD_CONTEXT_LIMIT + 1, task_id, limit),
+        ).fetchall()[::-1]
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments, count = _newest_rows(
-            conn, kanban_db, "task_comments", "Comment", "list_comments", task_id, CARD_CONTEXT_COMMENTS
-        )
-        newest = max((getattr(c, "id", 0) or 0 for c in comments), default=0)
+        listed = list(kanban_db.list_comments(conn, task_id))
+        count = len(listed)
         rows = [
-            (getattr(c, "id", 0) or 0, getattr(c, "author", ""), len(body), body[:ASK_CARD_CONTEXT_LIMIT])
-            for c in reversed(comments)
-            for body in (str(getattr(c, "body", "") or ""),)
+            (getattr(c, "id", 0), c.author, str(c.body or "").encode("utf-8", "replace"), getattr(c, "created_at", None))
+            for c in listed[-limit:]
         ]
-    return f"{count}:{newest}:{_digest(*(part for r in rows for part in r))}"
+    cut = ASK_CARD_CONTEXT_LIMIT
+    return [
+        (i, a, bytes(b or b"")[:cut].decode("utf-8", "replace") + (_ASK_CUT if len(b or b"") > cut else ""), t)
+        for i, a, b, t in rows
+    ], int(count)
 
 
 def kanban_items(
@@ -1876,9 +1891,7 @@ def kanban_items(
                     # Answered cards leave the queue in both tiers, so a card the queue shows
                     # is exactly a card answer_card accepts.
                     version = str(block.id if block else since)
-                    if _answered_since(
-                        conn, kanban_db, task.id, author, since, block.id if block else None
-                    ):
+                    if _answered_since(conn, kanban_db, task.id, author, block.id if block else None):
                         if pending is None:
                             pending = load_pending_releases(errors=errors)
                         if pending.get(f"kanban:{board}:{task.id}") == version:
@@ -5113,93 +5126,12 @@ def _unblock_task_at_version(
         return True
 
 
-def _event_logs(payload: Any, author: Any, body: Any) -> bool:
-    """Whether a ``commented`` event's payload can record this comment: same author, and a
-    length the stored (stripped) body fits in. A payload without them matches any comment."""
-    payload = payload if isinstance(payload, dict) else {}
-    who, size = payload.get("author"), payload.get("len")
-    return (not isinstance(who, str) or _same_author(who.strip(), author)) and (
-        not isinstance(size, int) or len(str(body or "")) <= size
-    )
-
-
-def _after_block(
-    comments: Iterable[tuple[Any, Any, Any, Any]], events: Iterable[tuple[int, Any]], cut: int, block_id: int
-) -> list[tuple[str, str]]:
-    """Walk ``(id, author, body, created_at)`` comments and ``(id, payload)`` commented events,
-    both newest first, pairing each event with the next comment it can record. A paired comment
-    counts when its event is later than the block, and the walk ends at the first that is not;
-    a comment no event records counts when its time is at or after *cut*."""
-    out: list[tuple[str, str]] = []
-    pending = iter(events)
-    event = next(pending, None)
-    for _, author, body, created_at in comments:
-        if event is not None and _event_logs(event[1], author, body):
-            if event[0] <= block_id:
-                break
-            out.append((author, body))
-            event = next(pending, None)
-        elif (_num(created_at) or 0) >= cut:
-            out.append((author, body))
-    return out[::-1]
-
-
-def _comments_since_block(
-    conn: Any, kanban_db: Any, task_id: str, since: int, block_id: int | None
-) -> list[tuple[str, str]]:
-    """``(author, body)`` of the comments made since the current block began, oldest first.
-
-    With the block's event id a comment is placed by the ``commented`` event that records it
-    (event ids are ordered, clocks are not; see :func:`_after_block`); a comment no event records
-    counts when strictly later than the block. Without the id, a comment counts when it is at or
-    after the block's second. Older blocks' comments never count."""
-    if block_id is None:
-        try:
-            return [
-                (r[0], r[1])
-                for r in conn.execute(
-                    "SELECT author, body FROM task_comments WHERE task_id = ? AND created_at >= ? ORDER BY id",
-                    (task_id, since or 0),
-                ).fetchall()
-            ]
-        except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-            return [(c.author, c.body) for c in kanban_db.list_comments(conn, task_id) if c.created_at >= (since or 0)]
-    cut = (since or 0) + 1
+def _json_payload(raw: Any) -> dict[str, Any]:
     try:
-        comments = conn.execute(
-            "SELECT id, author, body, created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC",
-            (task_id,),
-        )
-        events = (
-            (r[0], _json_payload(r[1]))
-            for r in conn.execute(
-                "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'commented' ORDER BY id DESC",
-                (task_id,),
-            )
-        )
-        return _after_block(comments, events, cut, block_id)
-    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        listed = list(kanban_db.list_comments(conn, task_id))
-        keyed = sorted(
-            ((getattr(c, "id", None) or i, c) for i, c in enumerate(listed, 1)), key=lambda kc: kc[0], reverse=True
-        )
-        logged = sorted(
-            (
-                (int(getattr(e, "id", 0) or 0), getattr(e, "payload", None))
-                for e in kanban_db.list_events(conn, task_id)
-                if getattr(e, "kind", None) == "commented"
-            ),
-            key=lambda e: e[0],
-            reverse=True,
-        )
-        return _after_block(((k, c.author, c.body, c.created_at) for k, c in keyed), logged, cut, block_id)
-
-
-def _json_payload(raw: Any) -> Any:
-    try:
-        return _json_loads_safe(raw) if isinstance(raw, (str, bytes)) else raw
+        value = _json_loads_safe(raw) if isinstance(raw, (str, bytes)) else raw
     except ValueError:
-        return None
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def answer_card(
@@ -5289,25 +5221,16 @@ def answer_card(
                         "or released; refresh to see the new question"
                     )
                 # The same "answered since this block" test the queue uses.
-                already_answered = _answered_since(
-                    conn, kanban_db, task_id, author, since, block.id if block else None
-                )
+                already_answered = _answered_since(conn, kanban_db, task_id, author, block.id if block else None)
                 if already_answered:
                     if not release:
                         raise RuntimeError(
                             f"card {task_id} was already answered since it was blocked"
                         )
-                    if text:
-                        # Only this block's comments: an earlier block's identical answer
-                        # is not this block's answer.
-                        prior = _comments_since_block(
-                            conn, kanban_db, task_id, since, block.id if block else None
-                        )
-                        post_answer = not any(
-                            str(a or "").casefold() == author.casefold()
-                            and str(b or "").strip() == text
-                            for a, b in prior
-                        )
+                    # An earlier block's identical answer is not this block's answer.
+                    post_answer = bool(text) and not _answered_with(
+                        conn, kanban_db, task_id, author, block.id if block else None, text
+                    )
                 elif not text:
                     raise ValueError("answer text is required")
                 else:
@@ -5447,9 +5370,7 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
         recent, events_total = _newest_rows(
             conn, kanban_db, "task_events", "Event", "list_events", task_id, CARD_CONTEXT_EVENTS
         )
-        comments, comments_total = _newest_rows(
-            conn, kanban_db, "task_comments", "Comment", "list_comments", task_id, CARD_CONTEXT_COMMENTS
-        )
+        comments, comments_total = _newest_comments(conn, kanban_db, task_id, CARD_CONTEXT_COMMENTS)
         receipt_event = _latest_event_of_kind(conn, kanban_db, task_id, "pr_acceptance")
         graph = kanban_db.task_graph_context(conn, task_id)
         attachments, attachments_total = _newest_rows(
@@ -5509,15 +5430,7 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
             "since": getattr(block, "created_at", None)
             or getattr(task, "created_at", None),
         },
-        "comments": [
-            {
-                "id": c.id,
-                "author": c.author,
-                "body": c.body,
-                "created_at": c.created_at,
-            }
-            for c in comments
-        ],
+        "comments": [dict(zip(("id", "author", "body", "created_at"), c)) for c in comments],
         "graph": {
             "parents": list(graph.get("parents") or [])[:CARD_CONTEXT_GRAPH],
             "children": list(graph.get("children") or [])[:CARD_CONTEXT_GRAPH],

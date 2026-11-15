@@ -303,7 +303,7 @@ class KanbanOrder(KanbanAnswerCase):
         with self.conn() as c:
             c.execute("UPDATE task_comments SET created_at = ? WHERE task_id = ?", (int(block.created_at) + 1, task))
             c.commit()
-            self.assertFalse(needs._answered_since(c, kanban_db, task, "operator", block.created_at, block.id))
+            self.assertFalse(needs._answered_since(c, kanban_db, task, "operator", block.id))
 
     def test_a_failed_callers_cleanup_keeps_the_marker_another_caller_stamped(self):
         """R5-needs-013: a marker is removed by its owner token, never by its value."""

@@ -29,11 +29,9 @@ class ACommentIsPlacedByItsEventNotByTheClock(KanbanAnswerCase):
         self.set_comment_time(task, int(block.created_at) + 1)  # the clock stepped back
         with self.conn() as c:
             self.assertFalse(
-                needs._answered_since(c, kanban_db, task, "operator", block.created_at, block.id)
+                needs._answered_since(c, kanban_db, task, "operator", block.id)
             )
-            self.assertEqual(
-                needs._comments_since_block(c, kanban_db, task, block.created_at, block.id), []
-            )
+            self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "old answer"))
 
     def test_a_later_comment_with_an_earlier_clock_still_answers_the_block(self):
         task = self.card()
@@ -43,14 +41,12 @@ class ACommentIsPlacedByItsEventNotByTheClock(KanbanAnswerCase):
         self.set_comment_time(task, int(block.created_at) - 5)
         with self.conn() as c:
             self.assertTrue(
-                needs._answered_since(c, kanban_db, task, "operator", block.created_at, block.id)
+                needs._answered_since(c, kanban_db, task, "operator", block.id)
             )
-            self.assertEqual(
-                needs._comments_since_block(c, kanban_db, task, block.created_at, block.id),
-                [("operator", "new answer")],
-            )
+            self.assertTrue(needs._answered_with(c, kanban_db, task, "operator", block.id, "new answer"))
 
-    def test_a_comment_with_no_event_keeps_the_time_rule(self):
+    def test_a_comment_with_no_event_does_not_answer_the_block(self):
+        # Round 7 (R7-006..008): Kanban logs every answer; an unlogged comment is placed by no clock.
         task = self.card()
         block = self.block(task)
         with self.conn() as c:
@@ -59,8 +55,8 @@ class ACommentIsPlacedByItsEventNotByTheClock(KanbanAnswerCase):
                 (task, "operator", "imported", int(block.created_at) + 10),
             )
             c.commit()
-            self.assertTrue(
-                needs._answered_since(c, kanban_db, task, "operator", block.created_at, block.id)
+            self.assertFalse(
+                needs._answered_since(c, kanban_db, task, "operator", block.id)
             )
 
 
