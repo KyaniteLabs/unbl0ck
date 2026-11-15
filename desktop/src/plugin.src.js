@@ -899,6 +899,9 @@ function rememberAnswerDraft(id, text, version) {
 // again. `gen` identifies the latest request so an old response cannot overwrite newer work.
 const ASK_SESSION_TTL = 30 * 60 * 1000
 const askSessions = new Map()
+// Request tokens come from one counter for the whole page. A per-card counter restarted at 1 when a
+// cache entry expired or was evicted, so a request still outstanding could match a newer one.
+let askGenSeq = 0
 function readAskSession(id) {
   const cutoff = Date.now() - ASK_SESSION_TTL
   for (const [key, s] of askSessions) if (s.at < cutoff) askSessions.delete(key)
@@ -1115,7 +1118,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     if (!retry && !preset) setAskInput('')
     setAskBusy(true)
     setAskError('')
-    const gen = (readAskSession(item.id)?.gen || 0) + 1
+    const gen = ++askGenSeq
     const mine = () => readAskSession(item.id)?.gen === gen
     updateAskSession(item.id, { msgs: next, version: item.version, running: true, error: '', gen,
       job: retry && !askStale && askJob?.version === item.version ? askJob : null })
