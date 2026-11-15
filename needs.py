@@ -2491,6 +2491,38 @@ SOURCE_ORDER = {s: i for i, s in enumerate(SOURCES)}
 # Sources whose text is already one plain line; a model summary would only add latency and cost.
 NO_BLUF_SOURCES = ("prompt", "pairing")
 
+# Which sources can reach a model provider, by surface (issue #42). "summary" is the automatic
+# one-line summary, "ask" is the TL;DR / follow-up panel (Kanban cards only: it needs a board
+# and task), "search" is the opt-in full-text search, which reads locally and never calls a
+# model. "cross_profile" marks sources read from every profile under the Hermes home.
+# docs/architecture.md carries the same table and a test keeps the two equal.
+SURFACES = {
+    "prompt": {"ask": False, "search": True, "cross_profile": True},
+    "pairing": {"ask": False, "search": False, "cross_profile": True},
+    "kanban": {"ask": True, "search": False, "cross_profile": False},
+    "outside": {"ask": False, "search": True, "cross_profile": False},
+    "chat": {"ask": False, "search": True, "cross_profile": True},
+}
+
+
+def disclosure_matrix(settings: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Per source: may its text go to the model provider right now. Booleans only, no text.
+
+    ``summary`` and ``ask`` are false when the setting is off or its read failed (the settings
+    loader turns both off after a fault), so the answer is the one the queue acts on."""
+    s = settings if settings is not None else _settings()
+    summaries, asks = bluf_enabled(s), ask_enabled(s)
+    return [
+        {
+            "source": source,
+            "summary": summaries and source not in NO_BLUF_SOURCES,
+            "ask": asks and SURFACES[source]["ask"],
+            "search": SURFACES[source]["search"],
+            "cross_profile": SURFACES[source]["cross_profile"],
+        }
+        for source in SOURCES
+    ]
+
 # What each kind of card lets you do inside UNBL0CK, and why not when it does not.
 # "supported": built. "restricted": withheld on purpose (safety, privacy or native
 # authorization); not a gap and not planned. "missing": not built yet; a real gap.
@@ -2652,6 +2684,7 @@ def build_queue(
         "errors": errors,
         "ask_enabled": ask_enabled(),
         "bluf_enabled": bluf_enabled(),
+        "disclosure": disclosure_matrix(),
         "capabilities": CAPABILITIES,
         "coverage": {"chat": chat_coverage, "not_covered": not_covered_notes(chat_coverage)},
     }

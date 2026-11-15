@@ -66,6 +66,36 @@ to 300; GET Card does not apply the same length limit. Invalid/stale/missing ref
 different item. Ask capacity returns 429; unavailable model infrastructure returns 503;
 unknown/expired jobs return 404. Not every error is retryable without refreshing.
 
+## Disclosure matrix
+
+What can reach the configured model provider, by source. `needs.SURFACES` and
+`needs.disclosure_matrix()` are the code; `GET /queue` returns the live matrix as
+`disclosure` (booleans only, no text) and a test keeps this table equal to the code at
+default settings. Turning `bluf_enabled` or `ask_enabled` off, or a failed settings read,
+turns the matching columns off in the payload and in behavior.
+
+| Source | Summary to model | Ask to model | Full-text search | Read across profiles |
+| --- | --- | --- | --- | --- |
+| `prompt` | no | no | yes | yes |
+| `pairing` | no | no | no | yes |
+| `kanban` | yes | yes | no | no |
+| `outside` | yes | no | yes | no |
+| `chat` | yes | no | yes | yes |
+
+Notes. `outside` covers agent-filed items and watched-folder files. Full-text search reads
+local text and never calls a model; it skips password prompts and returns ids, versions and
+counts only. Summaries and Ask run the card text, comments and owner through the same
+redaction (secrets, home directory and workspace path); the operator's own typed Ask
+question is sent as typed. Password prompts and pairing codes are never summarized, asked
+about or returned by search. Cached summaries are keyed by item id (which carries the
+profile or board) and version, so one profile's or source's summary is never attached to
+another's; a corrupt cache shows no summary. Remote slash output stays counts only.
+
+Missing evidence (issue #42): the exact-head independent Security verdict, and real-host
+runs of these controls across several profiles and a live provider. Both need a reviewer or
+host this repository cannot supply; the tests above run against synthetic secrets and
+temporary homes.
+
 ## State lifecycle
 
 Plugin-owned files live under `<HERMES_HOME>/plugin-data/unbl0ck/`. Treat their contents
