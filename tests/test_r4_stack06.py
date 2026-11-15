@@ -253,6 +253,32 @@ const it={...item,id:'kanban:default:l1',version:'1'};
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)
 
+    # R5-desk-022 (class L): the subscription must stop when the card unmounts while work is pending.
+    def test_unmounting_while_a_request_is_pending_stops_the_recovery_and_expiry_timers(self):
+        self.run_views(r"""
+const ctx={rest:()=>new Promise(()=>{})};
+const it={...item,id:'kanban:default:l3',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ find(mount(ctx,it),'TL;DR').onClick();
+ await new Promise(r=>setTimeout(r,5));
+ state=[];
+ timers.length=0;
+ mount(ctx,it);                                       // remounted with the request still running
+ assert.ok(timers.some(x=>x.on&&x.ms===500),'the recovery timer is running while work is pending');
+ cleanups.forEach(c=>typeof c==='function'&&c());     // the card unmounts; the request is still pending
+ assert.ok(store.readAskSession(it.id).running,'the request is still pending');
+ assert.ok(!timers.some(x=>x.on&&x.ms===500),'the recovery timer must be cleared on unmount');
+ // a settled conversation shows an expiry check; it must also be cleared on unmount
+ store.updateAskSession(it.id,{msgs:[{role:'user',content:'q'},{role:'assistant',content:'done'}],running:false});
+ state=[];timers.length=0;
+ mount(ctx,it);
+ assert.ok(timers.some(x=>x.on&&x.ms===15000),'the expiry check is running for a settled conversation');
+ cleanups.forEach(c=>typeof c==='function'&&c());
+ assert.ok(!timers.some(x=>x.on&&x.ms===15000),'the expiry check must be cleared on unmount');
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
     def test_retry_button_restores_a_failed_ask(self):
         self.run_views(r"""
 let calls=0;
