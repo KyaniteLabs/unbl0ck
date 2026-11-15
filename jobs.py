@@ -186,6 +186,10 @@ ASK_WIRE = {
 }
 
 
+class JournalConflict(Exception):
+    """A guarded write found another worker's record where it expected its own (or none)."""
+
+
 def _reject_constant(name: str) -> Any:
     raise ValueError(f"non-finite number {name} is not valid in a record")
 
@@ -545,6 +549,29 @@ class AskJournal:
             raise ValueError("record too large")
         return body
 
+    def _installed(self, fd: int, name: str, body: bytes) -> bool:
+        """True when the file now at ``name`` is a regular file holding exactly ``body``."""
+        try:
+            rfd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=fd)
+        except OSError:
+            return False
+        try:
+            st = os.fstat(rfd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size != len(body):
+                return False
+            chunks, total = [], 0
+            while total <= len(body):
+                part = os.read(rfd, 65536)
+                if not part:
+                    break
+                total += len(part)
+                chunks.append(part)
+            return b"".join(chunks) == body
+        except OSError:
+            return False
+        finally:
+            os.close(rfd)
+
     def _publish(self, fd: int, job: str, body: bytes) -> bool:
         tmp = f".{job}.{secrets.token_hex(6)}.tmp"
         try:
@@ -562,6 +589,16 @@ class AskJournal:
             finally:
                 os.close(tfd)
             os.rename(tmp, f"{job}.json", src_dir_fd=fd, dst_dir_fd=fd)
+            if not self._installed(fd, f"{job}.json", body):
+                # Something else took the temporary file's place before the rename: what is
+                # installed is not what was meant to be published, so it must not stand.
+                self.failures += 1
+                try:
+                    os.unlink(f"{job}.json", dir_fd=fd)
+                except OSError:
+                    pass
+                self._written.discard(job)
+                return False
         except OSError:
             self.failures += 1
             try:
@@ -577,8 +614,23 @@ class AskJournal:
             return False
         return True
 
-    def write(self, job: str, rec: dict[str, Any], d: Optional[Path] = None) -> bool:
+    def _expectation_met(self, expect: Any, cur: Optional[dict[str, Any]]) -> bool:
+        if expect == "absent":
+            return cur is None
+        # A tuple of states this process may move the record on from: its own record in one of
+        # them, or nothing usable. Another worker's valid record is never overwritten.
+        if cur is None or cur.get("corrupt") or cur.get("unavailable"):
+            return True
+        owner = cur.get("owner")
+        return isinstance(owner, dict) and owner.get("inst") == self.inst and cur.get("state") in expect
+
+    def write(self, job: str, rec: dict[str, Any], d: Optional[Path] = None, expect: Any = None) -> bool:
         """True when the record is on disk and synced. False when it is not (or no journal is available).
+
+        ``expect`` makes the write a compare-and-set under the directory lock: ``"absent"`` claims
+        the id (nothing may be stored under it), a tuple of states moves this process's own record
+        on from one of them. A record that is not as expected raises ``JournalConflict``, so two
+        workers that both looked and found nothing cannot both take the same request.
 
         A new file first evicts the oldest evictable ones (``protect`` names jobs alive in
         memory), under the directory lock, so the directory never exceeds MAX_FILES however many
@@ -596,6 +648,8 @@ class AskJournal:
             with self._locked(fd) as got:
                 if not got or self._exists(fd, f"{job}.gone"):
                     return False
+                if expect is not None and not self._expectation_met(expect, self._read_fd(fd, f"{job}.json", job)):
+                    raise JournalConflict(job)
                 if not self._exists(fd, f"{job}.json") and not self._make_room(fd, lambda stem: self.protect(stem, d)):
                     return False
                 return self._publish(fd, job, body)
@@ -935,13 +989,21 @@ class AskJobs:
             # The profile's persistence setting is read here, in the request's own context: the
             # worker thread that settles the job resolves the default profile instead.
             keep = self._journal.keeps_replies() if self._journal else False
+            if self._journal and where is not None:
+                # Claim the id on disk first, atomically: another worker that also found nothing
+                # under it must not go on to send the same request a second time. A record this
+                # table already treats as deleted (its removal is only pending) may be replaced.
+                try:
+                    self._journal.write(job, {"state": "queued", "started": now, "card": card}, d=where,
+                                        expect=None if key in self._undeleted else "absent")
+                except JournalConflict:
+                    raise IllegalTransition(f"ask job {job} already exists") from None
+                self._undeleted.pop(key, None)
+                self._note_dir(where)
             self._gen += 1
             self._jobs[key] = {"status": AskState.PENDING, "started": now, "card": card, "dir": where,
                                "gen": self._gen, "keep": keep}
             if self._journal:
-                if where is not None:
-                    self._journal.write(job, {"state": "queued", "started": now, "card": card}, d=where)
-                    self._note_dir(where)
                 self._arm()
             return AskTicket(job, where, self._gen)
 
@@ -960,9 +1022,14 @@ class AskJobs:
             where = st.get("dir")
             if not self._journal or where is None:
                 return True
-            if self._journal.write(key[1], {"state": "sent", "started": st["started"], "card": st.get("card"),
-                                            "sent_at": self._clock()}, d=where):
-                return True
+            try:
+                if self._journal.write(key[1], {"state": "sent", "started": st["started"], "card": st.get("card"),
+                                                "sent_at": self._clock()}, d=where, expect=("queued",)):
+                    return True
+            except JournalConflict:
+                # Another worker owns this request now: it is theirs to send, not ours.
+                self._jobs.pop(key, None)
+                return False
             if self._gone_elsewhere(key, st):
                 return False
             # Could not record it. A stale "queued" marker would turn into a false not_submitted,
@@ -1015,13 +1082,17 @@ class AskJobs:
                                "gen": st["gen"], "keep": st["keep"], **out}
             if self._journal and where is not None:
                 done = out["status"] is AskState.DONE
-                wrote = self._journal.write(jid, {
-                    "state": "done" if done else "error",
-                    "started": st["started"], "card": st.get("card"), "settled_at": self._clock(),
-                    "provider": out.get("provider"), "model": out.get("model"),
-                    "detail": None if done else out.get("detail"),
-                    **({"reply": out["reply"]} if done and st["keep"] else {}),
-                }, d=where)
+                try:
+                    wrote = self._journal.write(jid, {
+                        "state": "done" if done else "error",
+                        "started": st["started"], "card": st.get("card"), "settled_at": self._clock(),
+                        "provider": out.get("provider"), "model": out.get("model"),
+                        "detail": None if done else out.get("detail"),
+                        **({"reply": out["reply"]} if done and st["keep"] else {}),
+                    }, d=where, expect=("queued", "sent"))
+                except JournalConflict:
+                    self._jobs.pop(key, None)  # another worker's record: never answer over it
+                    return False
                 if not wrote and self._journal.tombstoned(jid, d=where):
                     self._jobs.pop(key, None)
                     return False

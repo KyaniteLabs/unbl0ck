@@ -410,7 +410,13 @@ def card_ask(body: CardAsk):
             # The canonical card identity from the validated board/task pair, never the optional raw id.
             ticket = _ASK_JOBS.create(job, card=f"kanban:{board}:{task_id}")
         except jobs.IllegalTransition:
-            return {"ok": True, "pending": True, "job": job}   # a concurrent twin got there first
+            # A concurrent twin got there first. It answers only for its own card, like a retry.
+            twin = _ASK_JOBS.get(job)
+            if twin is not None and twin.get("unavailable"):
+                raise HTTPException(status_code=503, detail="the saved state for this request cannot be read right now. Retry in a moment.")
+            if twin is not None and twin.get("card") != f"kanban:{board}:{task_id}":
+                raise HTTPException(status_code=409, detail="this request id belongs to a different card")
+            return {"ok": True, "pending": True, "job": job}
         except jobs.JournalUnavailable:
             raise HTTPException(status_code=503, detail="Ask cannot tell which profile this request belongs to right now. Retry in a moment.")
         try:

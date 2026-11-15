@@ -165,6 +165,68 @@ class IdsPerProfile(Profiles):
         self.assertEqual(table.get(J1)["card"], "home-card")
 
 
+class ClaimIsExclusive(Profiles):
+    """R5-jobs-004 (class B)."""
+
+    def test_two_workers_that_both_found_nothing_cannot_both_send_the_request(self):
+        a, b = self.table(), self.table()
+        gate = threading.Barrier(2, timeout=10)
+        sent, created = [], []
+
+        def worker(table):
+            self.assertIsNone(table.get(J1))
+            gate.wait()  # both looked before either created
+            try:
+                ticket = table.create(J1, card="c1")
+            except jobs.IllegalTransition:
+                return
+            created.append(1)
+            sent.append(table.mark_sent(ticket))
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in (a, b)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+        self.assertEqual(len(created), 1, "only one worker may claim the request")
+        self.assertEqual(sent, [True])
+
+    def test_a_record_another_worker_owns_is_not_overwritten_by_a_send_marker(self):
+        a, b = self.table(), self.table()
+        ta = a.create(J1, card="c1")
+        # b holds a ticket for the same id from before a claimed it (its entry was never claimed on disk)
+        b._jobs[(self.dirs["home"], J1)] = {"status": jobs.AskState.PENDING, "started": self.clock(),
+                                            "card": "c1", "dir": self.dirs["home"], "gen": 99, "keep": True}
+        self.assertFalse(b.mark_sent(J1))
+        self.assertTrue(a.mark_sent(ta))
+
+
+class PublishVerifiesWhatItInstalled(Profiles):
+    """R5-jobs-007 (class A)."""
+
+    def test_a_substituted_temporary_file_does_not_publish_as_the_sent_marker(self):
+        table = self.table()
+        ticket = table.create(J1, card="c1")
+        real = os.rename
+
+        def swapping(src, dst, *a, **kw):
+            if str(dst) == f"{J1}.json" and "src_dir_fd" in kw:
+                fake = f".{J1}.fake.tmp"
+                forged = {"v": 1, "job": J1, "state": "queued", "started": self.clock(), "card": "c1"}
+                fd = os.open(fake, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=kw["src_dir_fd"])
+                os.write(fd, json.dumps(forged).encode())
+                os.close(fd)
+                real(fake, src, src_dir_fd=kw["src_dir_fd"], dst_dir_fd=kw["src_dir_fd"])
+            return real(src, dst, *a, **kw)
+
+        with patch("os.rename", swapping):
+            table.mark_sent(ticket)
+        restarted = self.table()
+        st = restarted.get(J1)
+        self.assertTrue(st is None or jobs.ASK_WIRE[st["status"]] != "not_submitted",
+                        "a forged queued record must not report that resubmitting is safe")
+
+
 try:
     import fastapi
     from fastapi.testclient import TestClient
@@ -231,6 +293,39 @@ class ApiScope(ApiBase):
         r = self.post()
         self.assertEqual(r.status_code, 503)
         self.assertEqual(len(self.api._ASK_JOBS), 0)
+
+    def test_a_concurrent_twin_for_another_card_is_refused_not_given_the_other_cards_job(self):
+        """R5-api-007 (class F)."""
+        gate = threading.Barrier(2, timeout=10)
+        card_var = contextvars.ContextVar("card")
+        seen_var = contextvars.ContextVar("seen")  # the request's own flag, shared with its worker thread
+        real_get = self.api._ASK_JOBS.get
+
+        def synced_get(job):
+            out = real_get(job)
+            seen = seen_var.get(None)
+            if seen is not None and not seen:
+                seen.append(1)
+                gate.wait()  # both lookups happen before either creates
+            return out
+
+        self.api._ASK_JOBS.get = synced_get
+        self.api._checked_card_ref = lambda i, b, t: card_var.get()
+        rid = "e" * 32
+        results = {}
+
+        def go(name, card):
+            card_var.set(card)
+            seen_var.set([])
+            body = {"id": "x", "request_id": rid, "messages": [{"role": "user", "content": "q"}]}
+            results[name] = self.c.post("/card/ask", json=body).status_code
+
+        threads = [threading.Thread(target=go, args=(n, c)) for n, c in (("a", ("factory", "t_a")), ("b", ("factory", "t_b")))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(20)
+        self.assertEqual(sorted(results.values()), [200, 409], results)
 
     def test_a_worker_for_a_deleted_job_cannot_answer_its_replacement(self):
         release = threading.Event()
