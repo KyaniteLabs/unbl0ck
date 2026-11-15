@@ -986,15 +986,19 @@ def _ask_redact_value(value: Any, scrub: str | None = None, _key: str = "") -> A
             v for k, v in value.items()
             if str(k).casefold() in {"name", "key"} and isinstance(v, str) and _ask_names_credential(v)
         ]
-        return {
-            _ask_redact_value(k, scrub) if isinstance(k, str) else k: "[redacted]"
-            if _ask_is_secret_key(str(k), v)
-            or str(k).casefold() in {"value", "val", "default"}
-            and any(_ask_secret_word(n) is not None or _ask_is_secret_key(n, v) for n in named)
-            else _ask_redact_value(v, scrub, str(k))
-            for k, v in value.items()
-            if not (_key == "workspace" and k == "path")
-        }
+        out: dict[Any, Any] = {}
+        for k, v in value.items():
+            if _key == "workspace" and k == "path":
+                continue
+            name = _ask_redact_value(k, scrub) if isinstance(k, str) else k
+            while name in out:  # keys that redact alike all stay (#79)
+                name += "#"
+            out[name] = "[redacted]" if _ask_is_secret_key(str(k), v) or str(k).casefold() in {
+                "value", "val", "default"
+            } and any(_ask_secret_word(n) is not None or _ask_is_secret_key(n, v) for n in named) else (
+                _ask_redact_value(v, scrub, str(k))
+            )
+        return out
     if isinstance(value, (list, tuple)):
         return [_ask_redact_value(v, scrub, _key) for v in value]
     return _ask_redact(value.replace(scrub, "[workspace]") if scrub else value) if isinstance(value, str) else value

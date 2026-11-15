@@ -101,6 +101,12 @@ class OnlyNamedFieldsReachTheModel(unittest.TestCase):
         ):
             self.assertNotIn("/srv/private", content)
 
+    def test_keys_that_redact_alike_both_stay(self):
+        """#79: two keys that rewrite to the same text collapsed into one, dropping a value."""
+        for first, second in (("/srv/repo/result", "[workspace]/result"), ("[workspace]/result", "/srv/repo/result")):
+            out = needs._ask_redact_value({"workspace": {"path": "/srv/repo"}, first: "failed", second: "passed"})
+            self.assertEqual(sorted(v for k, v in out.items() if k.startswith("[workspace]/result")), ["failed", "passed"])
+
 
 class TheAskTestsLoadWithoutHermes(unittest.TestCase):
     def test_the_pure_payload_tests_import_when_hermes_is_absent(self):
