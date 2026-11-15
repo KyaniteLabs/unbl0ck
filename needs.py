@@ -2746,8 +2746,14 @@ def file_outside(
             match = d / (_FILED_ID.fullmatch(item_id).group(1) + ".json")
         elif key:
             unreadable: list[str] = []
+            # Only a file named for its record id can be ours; a stray JSON file is neither a
+            # match nor a reason to refuse. Its id and origin are checked once it is read.
             candidates = [
-                (f, _read_json(f, errors=unreadable)) for f in files if not f.is_symlink()
+                (f, rec)
+                for f in files
+                if not f.is_symlink() and _FILED_NAME.fullmatch(f.name)
+                for rec in (_read_json(f, errors=unreadable),)
+                if not rec or _is_filed_record(f, rec)
             ]
             found = [f for f, rec in candidates if _dedupe_matches(rec, key, scope, caller)]
             if scope == "profile" and caller and not found:
@@ -2766,10 +2772,11 @@ def file_outside(
                         "resolve by id or pass dedupe_scope"
                     )
                 found = legacy
-            if scope is None and len(found) > 1:
+            if len(found) > 1:
+                # Several records claim this key: overwriting or deleting whichever the
+                # directory lists first would be a guess.
                 raise ValueError(
-                    f"dedupe_key matches {len(found)} items in different profiles; "
-                    "resolve by id or pass dedupe_scope"
+                    f"dedupe_key matches {len(found)} items; resolve by id or repair the duplicates"
                 )
             match = found[0] if found else None
             if match is None and unreadable:
@@ -2794,11 +2801,21 @@ def file_outside(
             # A "Not for me" marker names a record that no longer exists: drop it here,
             # under the same lock, so hidden.json does not keep dead ids. A damaged
             # hidden.json is left as it is for repair rather than overwritten.
-            marks = load_hidden(home, errors=(bad := []))
-            if not bad and resolved_id in marks:
-                marks.pop(resolved_id)
-                _write_json(_hidden_path(home), marks, ordered=True)
-            return {"ok": True, "resolved": True, "id": resolved_id}
+            marker_failed = False
+            try:
+                marks = load_hidden(home, errors=(bad := []))
+                if not bad and resolved_id in marks:
+                    marks.pop(resolved_id)
+                    _write_json(_hidden_path(home), marks, ordered=True)
+            except OSError as exc:
+                # The record is already gone: report that, not a failure that would make the
+                # caller retry a resolve that can no longer find it. The stale marker is harmless.
+                marker_failed = True
+                log.warning("unbl0ck: outside: could not drop a dismissal marker: %s", type(exc).__name__)
+            out = {"ok": True, "resolved": True, "id": resolved_id}
+            if marker_failed:
+                out["note"] = "resolved; a stale Not for me marker could not be removed and is harmless"
+            return out
         if action == "file" and not key:
             files, over = _filed_files(d)
             if over:
