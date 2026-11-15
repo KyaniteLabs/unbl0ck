@@ -453,7 +453,8 @@ class ShortMultilineText(OutsideFixture):
         self.assertTrue(needs._is_excerpted("Line one\nLine two\n\n  - item"))
         self.assertTrue(needs._is_excerpted("a\r\nb"))
         self.assertFalse(needs._is_excerpted("One plain line."))
-        self.assertFalse(needs._is_excerpted("  trailing newline stripped\n"))
+        self.assertFalse(needs._is_excerpted("trailing newline stripped\n"))
+        self.assertTrue(needs._is_excerpted("  leading indent is content Full text shows"))  # round 5: the excerpt drops it
         self.assertTrue(needs._is_excerpted("x" * 481))
 
     def test_desktop_note_matches_what_was_changed(self):

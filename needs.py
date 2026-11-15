@@ -1112,6 +1112,13 @@ _CLOSER = re.compile(
 _ANSWERED = re.compile(r"(?:because|answer:|a:|it was|the answer)\b", re.IGNORECASE)
 
 
+def chat_ask_text(text: str) -> str:
+    """The text ask detection reads: URLs carry "?" query strings and names, and a polite sign-off
+    ("Anything else you need?") asks nothing. A span from ``chat_ask_span`` indexes this text."""
+    text = _URL.sub(" ", text or "")
+    return _CLOSER.sub("", text.strip()).strip()
+
+
 def chat_ask_span(text: str) -> int:
     """How many trailing characters of a bot's final turn hold its ask (0 when it asks nothing).
 
@@ -1119,9 +1126,7 @@ def chat_ask_span(text: str) -> int:
     ("…Platform's, on your word.") is not an ask. Packet/option-list shapes are
     exempt from the question mark and may be long; other cues need a ``?`` after the cue.
     A name that must address you has to lie inside the same span."""
-    # URLs carry "?" query strings; a polite sign-off ("Anything else you need?") asks nothing.
-    text = _URL.sub(" ", text or "")
-    text = _CLOSER.sub("", text.strip()).strip()
+    text = chat_ask_text(text)
     tail = text[-900:]
     if not tail:
         return 0
@@ -1154,8 +1159,10 @@ FULL_TEXT_LIMIT = 20_000  # most characters one on-demand full-text read returns
 
 def _is_excerpted(text: str, n: int = EXCERPT_CHARS) -> bool:
     """True when ``_excerpt`` would change *text*: cut it, or flatten its line breaks and spacing."""
-    original = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    collapsed = re.sub(r"\s+", " ", original)
+    # Compared with what Full text shows: the first line's indentation is content there, and the
+    # excerpt removes it.
+    original, _ = _full_text(text)
+    collapsed = re.sub(r"\s+", " ", original).strip()
     return len(collapsed) > n or collapsed != original
 
 
@@ -1614,10 +1621,71 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # Most characters of one chat message that are read from the database and processed. The ask
 # sits at the end of a turn, so a longer message is read from its end.
 CHAT_READ_CHARS = 100_000
+CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_CHARS characters
+CHAT_VERSION_BYTES = 16 * 1024 * 1024  # most bytes of one message hashed into its version
 
 
 def _text_digest(length: Any, text: str) -> str:
     return hashlib.sha256(f"{length}\0{text}".encode("utf-8", "replace")).hexdigest()[:12]
+
+
+_CUT_TOKEN = re.compile(r"\s*[A-Za-z0-9+/=_.\-]{32,}(?=\s|$)")
+_CUT_PEM_TAIL = re.compile(r"[A-Za-z0-9+/=\s]*(?=-----END )")
+
+
+def _drop_cut_prefix(text: str) -> str:
+    """A message read from its end starts in the middle of something. Whatever it began with, a
+    credential label, a key header, lies before the cut and cannot be seen, so the fragment that
+    follows cannot be judged: the partial first word and the run of long key-like words after it
+    are dropped, which leaves the readable ending where the ask is."""
+    rest = text[re.match(r"\S*", text).end() :]
+    while True:
+        hit = _CUT_TOKEN.match(rest)
+        if not hit:
+            break
+        rest = rest[hit.end() :]
+    pem = _CUT_PEM_TAIL.match(rest)
+    if pem:
+        rest = rest[pem.end() :]
+    return rest.lstrip()
+
+
+def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, over: bool) -> str:
+    """Names the whole message: the retained text alone cannot, when only its end was read, so a
+    cut message is hashed from the database in blocks (up to CHAT_VERSION_BYTES)."""
+    if not over:
+        return f"{mid}:{_text_digest(length, text)}"
+    digest = hashlib.sha256(f"{length}\0".encode())
+    step = 1 << 20
+    pos = 1
+    while pos <= min(length, CHAT_VERSION_BYTES):
+        block = conn.execute(
+            "SELECT SUBSTR(CAST(content AS BLOB), ?, ?) FROM messages WHERE id=?", (pos, step, mid)
+        ).fetchone()
+        digest.update(bytes(block[0] or b""))
+        pos += step
+    digest.update(text.encode("utf-8", "replace"))
+    return f"{mid}:{digest.hexdigest()[:12]}"
+
+
+def _open_chat_db(db: Path) -> sqlite3.Connection:
+    """Open *db* read-only, only if it is the regular file it was when the search began. The
+    check is made on the path itself (no link is followed) before and after the open, so a link
+    put in its place between the listing and the open is refused, not read."""
+    first = os.lstat(db)
+    if not stat.S_ISREG(first.st_mode):
+        raise OSError("state.db is not a regular file")
+    path = Path(os.path.abspath(db))
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+    try:
+        second = os.lstat(db)
+        same = (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+        if not (stat.S_ISREG(second.st_mode) and same):
+            raise OSError("state.db changed while it was opened")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
@@ -1651,9 +1719,11 @@ def chat_items(
     me = {n.lower() for n in principal_names(settings)}
     for profile, db in _state_dbs(home, errors, only[0] if only else None):
         try:
-            conn = sqlite3.connect(
-                db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2
-            )
+            conn = _open_chat_db(db)
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"chat[{profile}]: {exc}; not searched")
+            continue
         except sqlite3.Error as exc:
             if errors is not None:
                 errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
@@ -1709,7 +1779,9 @@ def chat_items(
                 continue
             # Only the columns this profile's schema has: an old schema must not fail per session.
             last_sql = (
-                "SELECT id, role, SUBSTR(content, ?), LENGTH(content), timestamp FROM messages "
+                # Bytes, not text: SQLite's text functions stop at an embedded NUL.
+                "SELECT id, role, SUBSTR(CAST(content AS BLOB), ?), LENGTH(CAST(content AS BLOB)), "
+                "timestamp FROM messages "
                 "WHERE session_id=? "
                 "AND role IN ('user','assistant') AND content IS NOT NULL AND TRIM(content) != '' "
                 + (
@@ -1734,23 +1806,32 @@ def chat_items(
                     # neither (an older local one) carries no remote identity to check.
                     continue
                 try:
-                    row = conn.execute(last_sql, (-CHAT_READ_CHARS, sid)).fetchone()
+                    row = conn.execute(last_sql, (-CHAT_READ_BYTES, sid)).fetchone()
                 except sqlite3.Error as exc:
                     if errors is not None:
                         errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
                     break  # same schema for every session: say it once
                 if not row:
                     continue
-                mid, role, content, length, ts = row
-                content = str(content)
+                mid, role, raw, length, ts = row
+                length = int(length or 0)
+                raw = bytes(raw or b"") if not isinstance(raw, str) else raw.encode("utf-8", "replace")
+                content = raw.decode("utf-8", "replace")
+                over = length > len(raw) or len(content) > CHAT_READ_CHARS
+                if over:  # only the end of a very long message was read
+                    content = content[-CHAT_READ_CHARS:]
+                    if length > len(raw):
+                        content = content.lstrip("\ufffd")  # a character cut in two
+                    content = _drop_cut_prefix(content)
+                version = _chat_version(conn, mid, length, content, over)
+                content = content.replace("\x00", " ")
                 span = chat_ask_span(content) if role == "assistant" and (ts or 0) >= since else 0
                 if not span:
                     continue
                 if str(chat_type or "").lower() in CHAT_GROUP_TYPES and not names.search(
-                    content[-span:]
+                    chat_ask_text(content)[-span:]
                 ):
                     continue
-                over = (length or 0) > len(content)  # only the end of a very long message was read
                 bot_chat = title in CHAT_TITLES
                 # Redact the whole turn before it is cut to an excerpt: the cut keeps the tail,
                 # so a long secret would otherwise leave a readable fragment.
@@ -1765,7 +1846,7 @@ def chat_items(
                         "id": f"chat:{profile}:{sid}",
                         # The message row id and a digest of the text: Hermes can rewrite a
                         # message in place, and the row id alone would not change.
-                        "version": f"{mid}:{_text_digest(length, content)}",
+                        "version": version,
                         "source": "chat",
                         "profile": profile,
                         "session_id": sid,

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **The chat reader hides a cut message's secret, refuses a swapped database and versions the whole message (#32 round 5).** A message read from its end drops the partial opening that could have been a credential or key body, the database is opened only if it is still the regular file that was listed, the version covers the whole message rather than its tail, text after a NUL byte is read, group names are matched where the ask was found, and an indented prompt offers Full text.
 - **Ask redaction withholds what it used to copy (#32 round 5).** A private key whose end marker lies beyond the model cut, numeric `auth_token`/`oauth`/`token` credentials, an escaped JSON string after an exhausted scan, and workspace paths used as object keys no longer reach the model; the Ask test module also loads when Hermes is absent.
 - **Stale desktop responses are now tested (#32 round 4).** The Full text tests track each effect and run its cleanup, and check that an older response arriving after a newer request is ignored, including a late failure.
 - **The Pocket pack says what it cut and which block it answers (#32 round 4).** Each card's text is bounded (4,000 characters, 20,000 per pack) and a cut ends in `[truncated]`; cards carry `truncated` and `warning`, and the pack reports `omitted` and `complete`. Kanban actions name the board and the block, and block-loop cards are no longer offered an unblock the plugin would refuse.
