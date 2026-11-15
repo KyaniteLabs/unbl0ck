@@ -192,6 +192,14 @@ class HtmlOnly(OutsideFixture):
         it = self.one(mail("<p>The zebra clause is HTML only</p>"))
         self.assertNotIn("<p>", it["text"])
         self.assertIn("zebra clause", it["text"])
+        # The downstream consumers, not just the queue item: search and the model prompt.
+        hit = needs.search_text("zebra clause")
+        self.assertEqual([m["id"] for m in hit["matches"]], [it["id"]])
+        self.assertEqual(needs.search_text("<p>The")["matches"], [])
+        (queued,) = needs.build_queue()["items"]
+        content = needs.bluf_messages(queued)[1]["content"]
+        self.assertIn("zebra clause", content)
+        self.assertNotIn("<p>", content)
 
 
 class Purpose(OutsideFixture):

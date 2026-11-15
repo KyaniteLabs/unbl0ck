@@ -64,11 +64,11 @@ config_schema:
   outside_eml_kind:
     type: str
     default: draft
-    description: "What a watched-folder .eml is called when its own headers do not say: draft (default), notes, approval or other. A message marked unsent by its mail client is always a draft, and one with received-mail headers is never called a draft. Only changes the label; the text is read the same way."
+    description: "What a watched-folder .eml is called when its own headers do not say: draft (default), notes, approval or other. A message marked unsent by its mail client is always a draft, even with received-mail headers; otherwise one with received-mail headers is not called a draft. Only changes the label; the text is read the same way."
   chat_window_days:
     type: int
     default: 14
-    description: "How many days back chats are read for unanswered asks (1 to 90; anything else uses 14). Widening it is a read-only backfill of the same local chat database: nothing is sent to a model, and chats older than 14 days are never summarized automatically even when summaries are on, chats are read in place, at most 500 sessions per profile per refresh, and hidden or answered items stay hidden. The queue reports the window it actually used."
+    description: "How many days back chats are read for unanswered asks (1 to 90; anything else uses 14). Widening it is a read-only backfill of the same local chat database: nothing is sent to a model, and a chat that is older than 14 days or older than any earlier read is listed but never summarized automatically, even when summaries are on (a small file, chat-backfill.json, remembers the oldest time read and the ids of such chats; no chat text), chats are read in place, at most 500 sessions per profile per refresh, and hidden or answered items stay hidden. The queue reports the window it actually used."
   outside_dirs:
     type: str
     default: ""

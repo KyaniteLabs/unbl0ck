@@ -12,14 +12,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
-from ask_corpus import CASES, KNOWN_GAPS  # noqa: E402
+from ask_corpus import CASES, KNOWN_GAPS, PRINCIPAL  # noqa: E402
 from test_needs import make_home, needs  # noqa: E402
 
 
 def detect(det, text, kind):
     if det == "chat":
         return needs.chat_asks_you(text)
-    return bool(needs.kanban_needs_you(text, kind))
+    with patch.object(needs, "_settings", lambda: {"principal_name": PRINCIPAL}):
+        return bool(needs.kanban_needs_you(text, kind))
 
 
 def report():
@@ -73,6 +74,22 @@ class Corpus(unittest.TestCase):
             KNOWN_GAPS,
             "a case that now passes must leave KNOWN_GAPS; a new miss is a regression",
         )
+
+    def test_named_cases_contain_the_configured_name_and_fail_without_it(self):
+        """11-009: breaking literal principal-name matching must not still pass the corpus."""
+        named = [c for c in CASES if "named" in c[5] and c[1] == "kanban"]
+        literal = [c for c in named if PRINCIPAL.lower() in c[2].lower()]
+        self.assertGreaterEqual(len(literal), 6)
+        self.assertTrue(any(c[4] for c in literal) and any(not c[4] for c in literal))
+        with patch.object(needs, "principal_names", lambda settings=None: []):
+            needs._PATTERN_CACHE.clear()
+            broken = {c[0] for c in literal if detect(c[1], c[2], c[3]) != c[4]}
+        needs._PATTERN_CACHE.clear()
+        self.assertTrue(
+            {"kb-named-gate", "kb-named-waiting", "kb-named-possessive", "kb-named-input"} <= broken,
+            "the corpus must go red when the configured name stops matching",
+        )
+        self.assertEqual({c[0] for c in literal if detect(c[1], c[2], c[3]) != c[4]}, set())
 
     def test_already_fixed_protections_stay_fixed(self):
         # Ask vs stuck, relayed orders, historical packets, self-answered questions, sign-offs.
