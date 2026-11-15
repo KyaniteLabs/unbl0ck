@@ -2630,13 +2630,15 @@ NO_BLUF_SOURCES = ("prompt", "pairing")
 # Which sources can reach a model provider, by surface (issue #42). "summary" is the automatic
 # one-line summary, "ask" is the TL;DR / follow-up panel (Kanban cards only: it needs a board
 # and task), "search" is the opt-in full-text search, which reads locally and never calls a
-# model. "cross_profile" marks sources read from every profile under the Hermes home.
+# model. "cross_profile" marks sources the queue reads without filtering by profile: chats and
+# prompts from every profile under the Hermes home, and the shared filed-item folder and watched
+# folders (the queue has no reading profile; a filed item records its profile only for dedupe).
 # docs/architecture.md carries the same table and a test keeps the two equal.
 SURFACES = {
     "prompt": {"ask": False, "search": True, "cross_profile": True},
     "pairing": {"ask": False, "search": False, "cross_profile": True},
     "kanban": {"ask": True, "search": False, "cross_profile": False},
-    "outside": {"ask": False, "search": True, "cross_profile": False},
+    "outside": {"ask": False, "search": True, "cross_profile": True},
     "chat": {"ask": False, "search": True, "cross_profile": True},
 }
 

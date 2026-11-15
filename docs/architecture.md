@@ -79,10 +79,10 @@ turns the matching columns off in the payload and in behavior.
 | `prompt` | no | no | yes | yes |
 | `pairing` | no | no | no | yes |
 | `kanban` | yes | yes | no | no |
-| `outside` | yes | no | yes | no |
+| `outside` | yes | no | yes | yes |
 | `chat` | yes | no | yes | yes |
 
-Notes. `outside` covers agent-filed items and watched-folder files. Full-text search reads
+Notes. `outside` covers agent-filed items and watched-folder files; both are read for every profile (filed items live in one shared folder and record their profile only for dedupe). Full-text search reads
 local text and never calls a model; it skips password prompts and returns ids, versions and
 counts only. Summaries and Ask run the card text, comments and owner through the same
 redaction (secrets, home directory and workspace path); the operator's own typed Ask
