@@ -204,8 +204,11 @@ file two items and never update or resolve each other's. `global` shares the key
 profiles on purpose, so they update one record. A caller with no known profile defaults to
 `global`. Every filed item records its `profile` and `dedupe_scope`, and the tool's reply
 returns both. Records filed before scopes existed keep their keys: a profile adopts a legacy
-record its own profile filed (same id, version and any local Done, so nothing resurfaces),
-a `global` caller still updates it, and a different profile gets its own item. Resolving by
+record its own profile filed (same id, version and any local Done, so nothing resurfaces).
+A legacy record that stored no profile, because the tool call did not carry one, is adopted
+once by the next profile-scoped caller and then belongs to that profile. Several such records
+for one key fail the call instead of choosing one. A `global` caller still updates a legacy
+record, and a different profile gets its own item. Resolving by
 `id` is always unambiguous; resolving by key from a caller with no profile fails when the key
 matches items in several profiles. The tool's record proves what was filed, not whether the external app changed.
 
