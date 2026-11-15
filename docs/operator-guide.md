@@ -71,9 +71,12 @@ authorization: it is not a gap and will not be added. **Not yet** is a real gap.
 <!-- capability-matrix:end -->
 
 - **Context** is the Context panel for Kanban and the Full text view for chats, live prompts
-  and outside items. Chats and live prompts show Full text only when the card holds a
-  shortened tail; password prompts never offer Full text, and pairing requests show neither
-  (the code and the person's platform id are never shown).
+  and outside items. The **+ Full text** button is on every card without a summary: it
+  expands or collapses the text already on the card. Only chats and live prompts that hold a
+  shortened tail, and outside items, load the whole record from the source; short chats,
+  password prompts and pairing requests never fetch anything. Password prompts are never
+  expanded to a larger record, and a pairing request never shows its code or the person's
+  platform id.
 - **Model help** is the interactive TL;DR: it sends card text to your configured provider
   only on an explicit click, and only for Kanban. It is separate from the one-line summary,
   which is on by default and is sent automatically in the background when the queue is
