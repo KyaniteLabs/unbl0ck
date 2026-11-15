@@ -367,7 +367,8 @@ class Chats(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             items = needs.chat_items(make_home(Path(d)))
             self.assertEqual([i["session_id"] for i in items], ["s1"])
-            self.assertEqual(items[0]["version"], "2")
+            # The message row id plus a digest of its text (round 4, 01-067).
+            self.assertRegex(items[0]["version"], r"\A2:[0-9a-f]{12}\Z")
 
     def test_user_replied_last(self):
         with tempfile.TemporaryDirectory() as d:
@@ -385,9 +386,8 @@ class Chats(unittest.TestCase):
             self.assertEqual(q["count"], 1)
             needs.hide(q["items"][0]["id"], q["items"][0]["version"], home)
             self.assertEqual(needs.build_queue(home)["count"], 0)
-            needs.hide(
-                q["items"][0]["id"], "older", home
-            )  # source changed → shows again
+            # The source changed after it was hidden: the stored version no longer matches.
+            needs._write_json(needs._hidden_path(home), {q["items"][0]["id"]: "older"})
             self.assertEqual(needs.build_queue(home)["count"], 1)
 
     def test_queue_count_and_pocket_pack_include_only_unanswered_asks(self):

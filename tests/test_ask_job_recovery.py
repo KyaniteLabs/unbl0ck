@@ -203,7 +203,7 @@ class RetentionAndDeletion(RecoveryBase):
         self.keep = True
         self.jobs.create(J1, card="c1")
         self.jobs.finish(J1, "secret answer")
-        with patch.object(Path, "unlink", side_effect=PermissionError):
+        with patch.object(os, "unlink", side_effect=PermissionError):
             with self.assertRaises(jobs.DiscardFailed):
                 self.jobs.discard(J1)
         # Nothing was reported as deleted, and the job is still one consistent thing.
@@ -372,7 +372,7 @@ class AskApiRecovery(unittest.TestCase):
 
     def _wait(self, job):
         for _ in range(60):
-            p = self.c.get(f"/card/ask/{job}?poll=true").json()
+            p = self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").json()
             if not p.get("pending"):
                 return p
             time.sleep(0.05)
@@ -387,10 +387,10 @@ class AskApiRecovery(unittest.TestCase):
         self._wait(job)
         n = len(self.sent)
         self.restart()
-        p = self.c.get(f"/card/ask/{job}?poll=true").json()
+        p = self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").json()
         self.assertEqual((p["ok"], p["state"], p["resubmit_safe"]), (False, "unknown", False))
         self.assertEqual(len(self.sent), n)
-        self.assertEqual(self.c.get(f"/card/ask/{job}").status_code, 409)
+        self.assertEqual(self.c.get(f"/card/ask/{job}?card={CARD}").status_code, 409)
         self.assertEqual(len(self.sent), n)
 
     def test_restart_after_complete_with_persistence_returns_reply(self):
@@ -398,23 +398,23 @@ class AskApiRecovery(unittest.TestCase):
         job = self._ask()
         self._wait(job)
         self.restart()
-        p = self.c.get(f"/card/ask/{job}?poll=true").json()
+        p = self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").json()
         self.assertEqual((p["state"], p["reply"]), ("complete", "Pick A"))
 
     def test_restart_before_send_reports_not_submitted_and_resubmit_safe(self):
         job = "d" * 32
-        self.api._ASK_JOBS.create(job, card="x")
+        self.api._ASK_JOBS.create(job, card=CARD)
         self.restart()
-        p = self.c.get(f"/card/ask/{job}?poll=true").json()
+        p = self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").json()
         self.assertEqual((p["state"], p["resubmit_safe"]), ("not_submitted", True))
         self.assertEqual(self.sent, [])
 
     def test_restart_mid_send_reports_unknown(self):
         job = "e" * 32
-        self.api._ASK_JOBS.create(job, card="x")
+        self.api._ASK_JOBS.create(job, card=CARD)
         self.api._ASK_JOBS.mark_sent(job)
         self.restart()
-        p = self.c.get(f"/card/ask/{job}?poll=true").json()
+        p = self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").json()
         self.assertEqual((p["state"], p["resubmit_safe"]), ("unknown", False))
 
     def test_other_card_cannot_read_a_job(self):
@@ -460,15 +460,15 @@ class AskApiRecovery(unittest.TestCase):
         self._wait(job)
         self.assertEqual(self.c.delete(f"/card/ask/{job}?card=other").status_code, 404)
         self.assertEqual(self.c.delete(f"/card/ask/{job}?card={CARD}").json(), {"ok": True, "deleted": True})
-        self.assertEqual(self.c.get(f"/card/ask/{job}").status_code, 404)
+        self.assertEqual(self.c.get(f"/card/ask/{job}?card={CARD}").status_code, 404)
         self.assertEqual(list(self.dir.glob("*.json")), [])
-        self.assertEqual(self.c.delete(f"/card/ask/{job}").json(), {"ok": True, "deleted": False})
+        self.assertEqual(self.c.delete(f"/card/ask/{job}?card={CARD}").json(), {"ok": True, "deleted": False})
 
     def test_delete_reports_failure_instead_of_success_when_the_file_stays(self):
         self.keep = True
         job = self._ask()
         self._wait(job)
-        with patch.object(Path, "unlink", side_effect=PermissionError):
+        with patch.object(os, "unlink", side_effect=PermissionError):
             r = self.c.delete(f"/card/ask/{job}?card={CARD}")
         self.assertEqual(r.status_code, 500)
         self.assertNotIn("deleted", r.json())
@@ -481,25 +481,25 @@ class MarkSentFailure(RecoveryBase):
 
     def test_failed_sent_write_invalidates_the_stale_queued_marker(self):
         self.jobs.create(J1, card="c1")
-        real = os.replace
+        real = os.rename
 
         def failing(src, dst, *a, **k):
             if str(dst).endswith(f"{J1}.json"):
                 raise OSError("disk full")
             return real(src, dst, *a, **k)
 
-        self.addCleanup(setattr, os, "replace", real)
-        os.replace = failing
+        self.addCleanup(setattr, os, "rename", real)
+        os.rename = failing
         self.assertTrue(self.jobs.mark_sent(J1))
-        os.replace = real
+        os.rename = real
         self.assertEqual(self.files(), [], "the stale queued marker is gone")
         self.boot()
         self.assertIsNone(self.jobs.get(J1), "unknown, never not_submitted with resubmit_safe")
 
     def test_unrecordable_request_must_not_reach_the_model(self):
         self.jobs.create(J1, card="c1")
-        self.journal.write = lambda job, rec: False
-        self.journal.delete = lambda job: False
+        self.journal.write = lambda job, rec, **kw: False
+        self.journal.delete = lambda job, **kw: False
         self.assertFalse(self.jobs.mark_sent(J1))
 
     def test_no_journal_still_allows_the_send(self):
@@ -512,10 +512,9 @@ class UnavailableStorage(RecoveryBase):
     """Round-3 review: storage that cannot be examined is unknown, never an empty directory."""
 
     def lose_directory(self):
-        def broken():
-            raise OSError("storage unavailable")
-
-        self.journal._directory = broken
+        """The storage itself stops answering (a directory nobody can open), not just the resolver."""
+        self.addCleanup(os.chmod, self.dir, 0o700)
+        os.chmod(self.dir, 0)
 
     def test_model_is_not_called_when_the_queued_marker_cannot_be_checked_or_removed(self):
         self.jobs.create(J1, card="c1")
@@ -529,6 +528,7 @@ class UnavailableStorage(RecoveryBase):
         with self.assertRaises(jobs.DiscardFailed):
             self.jobs.discard(J1)
         self.assertIsNotNone(self.jobs.get(J1))  # still there, and so is the file
+        os.chmod(self.dir, 0o700)
         self.assertEqual(self.files(), [f"{J1}.json"])
 
     def test_a_job_that_was_never_journaled_is_verifiably_absent_without_a_location(self):
