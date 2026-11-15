@@ -55,7 +55,8 @@ class Containment(Base):
         old.write_text("{}")
         os.utime(old, (1, 1))
         self.dir.symlink_to(target, target_is_directory=True)
-        self.jobs.create(J1, card="c1")
+        with self.assertRaises(jobs.ScopeUnavailable):
+            self.jobs.create(J1, card="c1")
         self.jobs.housekeeping()
         self.assertEqual(sorted(p.name for p in target.iterdir()), [f"{J3}.json"], "nothing added, nothing deleted")
         self.assertGreater(self.journal.failures, 0)
@@ -67,7 +68,8 @@ class Containment(Base):
         link.symlink_to(real, target_is_directory=True)
         journal = jobs.AskJournal(lambda: link / "ask", lambda: False, self.clock)
         table = jobs.AskJobs(self.clock, journal)
-        table.create(J1, card="c1")
+        with self.assertRaises(jobs.ScopeUnavailable):
+            table.create(J1, card="c1")
         self.assertEqual(list(real.rglob("*")), [])
 
     def test_one_profile_cannot_recover_a_job_through_a_symlinked_profile_directory(self):
