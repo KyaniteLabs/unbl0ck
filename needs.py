@@ -776,19 +776,24 @@ def _fit_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
         hidden = dict(list(hidden.items())[-keep:])
     return hidden
 
-_ORDER_LOCK = threading.Lock()
-_last_order = 0
+ORDER_FILE = "dismissal-order.json"
 
 
-def _dismissal_order() -> int:
-    """A number that grows with each dismissal this process commits (milliseconds, never repeated
-    or lowered by a clock that stands still or steps back). Taken while the state lock is held,
-    so it follows the order the server committed dismissals in, which the client cannot see from
-    the order of its clicks or of the responses."""
-    global _last_order
-    with _ORDER_LOCK:
-        _last_order = max(int(time.time() * 1000), _last_order + 1)
-        return _last_order
+def _dismissal_order(home: Path | None) -> int:
+    """A number that grows with each dismissal any process commits (milliseconds, never repeated
+    or lowered by a clock that stands still or steps back). The last one is kept in ORDER_FILE
+    and taken under the state lock, so it follows the order dismissals were committed in, which
+    the client cannot see from the order of its clicks or of the responses."""
+    out: dict[str, int] = {}
+
+    def bump(data: dict[str, Any]) -> dict[str, Any]:
+        last = data.get("last")
+        last = last if isinstance(last, int) and not isinstance(last, bool) else 0
+        out["order"] = max(int(time.time() * 1000), last + 1)
+        return {"last": out["order"]}
+
+    _update_state(home, data_dir(home) / ORDER_FILE, bump)
+    return out["order"]
 
 
 class StaleHide(RuntimeError):
@@ -837,7 +842,7 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
             hidden.pop(item_id, None)
             out["token"] = uuid.uuid4().hex
             hidden[item_id] = f"{version}\x1f{out['token']}"
-            out["order"] = _dismissal_order()
+            out["order"] = _dismissal_order(home)
             return _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
 
         _update_state(home, _hidden_path(home), mutate, entry_ok=_hidden_entry_ok)
@@ -904,8 +909,8 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
                     f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before undoing Done"
                 )
         def undo_done() -> None:
-            rec.pop("done_at", None)
-            rec.pop("done_token", None)
+            for key in _DONE_FIELDS:
+                rec.pop(key, None)
             _write_json(f, rec)
 
         def undo_hidden() -> None:
@@ -1786,21 +1791,30 @@ def _digest(*texts: Any) -> str:
 
 
 def _comments_sig(conn: Any, kanban_db: Any, task_id: str) -> str:
-    """"count:newest id:digest of the comment bodies": it changes when a comment is added and when an
-    existing one is rewritten, so advice or a summary written from the old text is not shown for the
-    card as it is now."""
+    """"count:newest id:digest" of a card's comments: it changes when a comment is added and when
+    one that a model call can see (the newest CARD_CONTEXT_COMMENTS, each up to
+    ASK_CARD_CONTEXT_LIMIT characters) is rewritten, so advice or a summary written from the old
+    text is not shown for the card as it is now. The bounds are applied by the query."""
     try:
+        count, newest = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,)
+        ).fetchone()
         rows = conn.execute(
-            "SELECT id, author, body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)
+            "SELECT id, author, LENGTH(body), SUBSTR(body, 1, ?) FROM task_comments WHERE task_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT ?",
+            (ASK_CARD_CONTEXT_LIMIT, task_id, CARD_CONTEXT_COMMENTS),
         ).fetchall()
-        comments = [(r[0], r[1], r[2]) for r in rows]
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments = [
-            (getattr(c, "id", 0) or 0, getattr(c, "author", ""), getattr(c, "body", ""))
-            for c in kanban_db.list_comments(conn, task_id)
+        comments, count = _newest_rows(
+            conn, kanban_db, "task_comments", "Comment", "list_comments", task_id, CARD_CONTEXT_COMMENTS
+        )
+        newest = max((getattr(c, "id", 0) or 0 for c in comments), default=0)
+        rows = [
+            (getattr(c, "id", 0) or 0, getattr(c, "author", ""), len(body), body[:ASK_CARD_CONTEXT_LIMIT])
+            for c in reversed(comments)
+            for body in (str(getattr(c, "body", "") or ""),)
         ]
-    newest = max((c[0] or 0 for c in comments), default=0)
-    return f"{len(comments)}:{newest}:{_digest(*(part for c in comments for part in c))}"
+    return f"{count}:{newest}:{_digest(*(part for r in rows for part in r))}"
 
 
 def kanban_items(
@@ -2104,7 +2118,6 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # sits at the end of a turn, so a longer message is read from its end.
 CHAT_READ_CHARS = 100_000
 CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_CHARS characters
-CHAT_VERSION_BYTES = 16 * 1024 * 1024  # most bytes of one message hashed into its version
 
 
 def _text_digest(length: Any, text: str) -> str:
@@ -2133,32 +2146,45 @@ def _drop_cut_prefix(text: str) -> str:
 
 
 def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, over: bool) -> str:
-    """Names the whole message: the retained text alone cannot, when only its end was read, so a
-    cut message is hashed from the database in blocks (up to CHAT_VERSION_BYTES)."""
+    """Names the whole message: the retained text alone cannot, when only its end was read, so
+    a cut message is hashed from the database in full, streamed in 1 MiB blocks."""
     if not over:
         return f"{mid}:{_text_digest(length, text)}"
     digest = hashlib.sha256(f"{length}\0".encode())
-    step = 1 << 20
-    pos = 1
-    while pos <= min(length, CHAT_VERSION_BYTES):
-        block = conn.execute(
-            "SELECT SUBSTR(CAST(content AS BLOB), ?, ?) FROM messages WHERE id=?", (pos, step, mid)
-        ).fetchone()
-        digest.update(bytes(block[0] or b""))
-        pos += step
+    rowid = conn.execute("SELECT rowid FROM messages WHERE id=?", (mid,)).fetchone()[0]
+    with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
+        for block in iter(lambda: blob.read(1 << 20), b""):
+            digest.update(block)
     digest.update(text.encode("utf-8", "replace"))
     return f"{mid}:{digest.hexdigest()[:12]}"
 
 
+def _other_fd_on(fd: int, st: os.stat_result) -> bool | None:
+    """Whether a descriptor other than *fd* is open on the file *st* describes, or None where
+    descriptors cannot be listed (Windows, whose open descriptor already keeps the path from
+    being replaced)."""
+    try:
+        names = os.listdir("/dev/fd")
+    except OSError:
+        return None
+    for name in names:
+        try:
+            if int(name) != fd and os.path.samestat(os.fstat(int(name)), st):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
 def _open_chat_db(db: Path) -> sqlite3.Connection:
-    """Open *db* read-only, only if it is the regular file it was when the search began. The
-    check is made on the path itself (no link is followed) before and after the open, so a link
-    put in its place between the listing and the open is refused, not read."""
-    fd, _ = _pinned_open(db, os.O_RDONLY)
+    """Open *db* read-only, only if it is the regular file it was when the search began. SQLite
+    opens the path again, so the open is accepted only when the path still names the pinned
+    file and a descriptor besides the pin (SQLite's) is open on that same file."""
+    fd, st = _pinned_open(db, os.O_RDONLY)
     try:
         conn = sqlite3.connect(Path(os.path.abspath(db)).as_uri() + "?mode=ro", uri=True, timeout=2)
         try:
-            if not _names_open_file(fd, db):
+            if not _names_open_file(fd, db) or _other_fd_on(fd, st) is False:
                 raise UnsafeStateFile("state.db changed while it was opened", "changed")
         except BaseException:
             conn.close()
@@ -2178,11 +2204,14 @@ def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
 BACKFILL_FILE = "chat-backfill.json"
 
 
-def _backfill_floor(home: Path | None, since: float, *, record: bool, errors: list[str] | None) -> float:
+def _backfill_floor(
+    home: Path | None, since: float, *, record: bool, errors: list[str] | None
+) -> tuple[float, frozenset[str]]:
     """The start of the first window any queue build read (``{"floor": time}``, written once
-    under the state lock), or *since* before one exists. Nothing here is chat text. A floor
-    that cannot be read or saved counts as a day ago, so a widened window never passes for
-    an ordinary one."""
+    under the state lock), or *since* before one exists, plus the chat ids an older store
+    listed as backfill (``ids``), which stay flagged. Nothing here is chat text. A floor that
+    cannot be read or saved counts as a day ago, so a widened window never passes for an
+    ordinary one."""
     try:
         if record:
             data = _update_state(
@@ -2193,9 +2222,11 @@ def _backfill_floor(home: Path | None, since: float, *, record: bool, errors: li
     except (OSError, RuntimeError) as exc:
         if errors is not None:
             errors.append(f"chat: the backfill floor could not be read or saved ({type(exc).__name__})")
-        return time.time() - 86400
+        return time.time() - 86400, frozenset()
     floor = _finite(data.get("floor", since))
-    return floor if floor is not None else time.time() - 86400
+    ids = data.get("ids")
+    kept = frozenset(i for i in ids if isinstance(i, str)) if isinstance(ids, list) else frozenset()
+    return (floor if floor is not None else time.time() - 86400), kept
 
 
 def _mark_backfill(
@@ -2208,15 +2239,13 @@ def _mark_backfill(
 ) -> None:
     """Flag chats that only a widened window reached (``backfilled``), so nothing is sent to a
     model for them automatically: a chat older than the default window or than the first
-    window any queue build read. Both edges only move forward in time relative to a chat, so
-    the flag stays with it and a later refresh cannot turn it back into an ordinary ask. Only
-    ``record`` (the queue build) saves the floor."""
-    edge = max(
-        _backfill_floor(home, since, record=record, errors=errors),
-        time.time() - CHAT_WINDOW_DAYS * 86400,
-    )
+    window any queue build read, or one an older store listed. Both edges only move forward in
+    time relative to a chat, so the flag stays with it and a later refresh cannot turn it back
+    into an ordinary ask. Only ``record`` (the queue build) saves the floor."""
+    floor, listed = _backfill_floor(home, since, record=record, errors=errors)
+    edge = max(floor, time.time() - CHAT_WINDOW_DAYS * 86400)
     for it in items:
-        if (it.get("since") or 0) < edge:
+        if (it.get("since") or 0) < edge or it.get("id") in listed:
             it["backfilled"] = True
 
 
@@ -3267,6 +3296,23 @@ def _done_token(rec: dict[str, Any]) -> str:
     return token if isinstance(token, str) and token else repr(rec.get("done_at"))
 
 
+def _done_order(rec: dict[str, Any]) -> int:
+    """The commit order of one Done; a Done written before orders existed falls back to its time."""
+    order = rec.get("done_order")
+    if isinstance(order, bool) or not isinstance(order, int):
+        return int((_done_at(rec) or 0) * 1000)
+    return order
+
+
+_DONE_FIELDS = ("done_at", "done_token", "done_order")
+
+
+def _done_marks(rec: dict[str, Any]) -> dict[str, Any]:
+    """Everything that names one Done (time, token, order), pinned so that rewriting the record
+    or its ``done_at`` keeps the same dismissal with the same token and rank."""
+    return {"done_at": rec.get("done_at"), "done_token": _done_token(rec), "done_order": _done_order(rec)}
+
+
 def _done_at(rec: dict[str, Any]) -> float | None:
     """The Done time, or None when there is none or it is not a real finite time (a boolean is
     an int to Python, and NaN or infinity never compare as expired)."""
@@ -3366,7 +3412,7 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
         if done_at > now:
             # The clock stepped back since this Done: keep the record and restart its window.
             try:
-                rec["done_token"] = _done_token(rec)
+                rec.update(_done_marks(rec))
                 rec["done_at"] = now
                 _write_json(f, rec)
             except OSError:
@@ -3609,9 +3655,7 @@ def file_outside(
                     f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before filing another"
                 )
         if stays_done:
-            rec["done_at"] = old["done_at"]
-            if "done_token" in old:
-                rec["done_token"] = old["done_token"]
+            rec.update(_done_marks(old))
         _write_json(d / f"{record_id}.json", rec)
         return {
             "ok": True,
@@ -4133,17 +4177,24 @@ def _folder_outside_item(
     }
 
 
-def _stat_hidden(hidden: dict[str, Any], f: Path, st: os.stat_result) -> bool:
+def _stat_hidden(
+    hidden: dict[str, Any], f: Path, st: os.stat_result, attempts: list[int] | None = None
+) -> bool:
     """Whether a folder file is still dismissed at its current mtime, size and content.
 
     Time and size alone repeat after an in-place edit with a restored timestamp, so they only
     pick the candidates: a dismissal holds only when the stored content digest matches the same
     bounded read that makes the file's version. A version stored without a digest, a file that
-    cannot be read or one that differs is not dismissed."""
+    cannot be read or one that differs is not dismissed. The read uses one of *attempts* (the
+    caller's read budget); with none left the file is not dismissed."""
     stored = hidden.get("outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest())
     key = f"{st.st_mtime_ns}:{st.st_size}:"
     if not isinstance(stored, str) or not stored.startswith(key):
         return False
+    if attempts is not None:
+        if attempts[0] <= 0:
+            return False
+        attempts[0] -= 1
     try:
         fd, now = _pinned_open(f, os.O_RDONLY)
         with os.fdopen(fd, "rb") as fh:
@@ -4160,13 +4211,15 @@ def _scan_outside_folder(
     recursive: bool,
     errors: list[str],
     hidden: dict[str, Any] | None = None,
+    attempts: list[int] | None = None,
 ) -> tuple[list[tuple[Path, os.stat_result]], list[tuple[Path, os.stat_result]]]:
     """``(waiting, dismissed)`` eligible regular files under *root*, never following symlinks.
 
     The entry budget is spent on files that still wait (and on everything that is not a
     file): files already dismissed at their current version are the progress made through a
     large folder, so they cost time but not budget, and finishing a page always reaches the
-    next one. The time budget covers every step, including the last directory opened."""
+    next one. The time budget covers every step, including the last directory opened. Each
+    file read to confirm a dismissal uses one of *attempts*."""
     waiting: list[tuple[Path, os.stat_result]] = []
     dismissed: list[tuple[Path, os.stat_result]] = []
     stack: list[tuple[Path, int]] = [(root, 0)]
@@ -4222,7 +4275,7 @@ def _scan_outside_folder(
                             elif recursive:
                                 too_deep = True
                         elif f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
-                            if _stat_hidden(hidden, f, st):
+                            if _stat_hidden(hidden, f, st, attempts):
                                 dismissed.append((f, st))
                             elif charge():
                                 waiting.append((f, st))
@@ -4418,7 +4471,7 @@ def outside_items(
             if root in seen:
                 continue
             seen.add(root)
-            waiting, dismissed = _scan_outside_folder(root, recursive, errors, hidden)
+            waiting, dismissed = _scan_outside_folder(root, recursive, errors, hidden, attempts)
             # A file under two overlapping roots is listed once, where it is shown first.
             waiting = [pair for pair in waiting if pair[0] not in claimed]
             dismissed = [pair for pair in dismissed if pair[0] not in claimed]
@@ -4447,7 +4500,7 @@ def outside_items(
                 if with_hidden:
                     dismissed.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
                     read_hidden, hidden_rest = _read_folder_window(
-                        dismissed, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors
+                        dismissed, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors, attempts
                     )
                 hidden_omitted.update(f for f, _ in hidden_rest)
             for item in shown + read_hidden:
@@ -4551,15 +4604,13 @@ def done_outside(
             if not _is_done(rec):
                 rec["done_at"] = time.time()
                 rec["done_token"] = uuid.uuid4().hex
-                rec["done_order"] = _dismissal_order()
+                rec["done_order"] = _dismissal_order(home)
                 _write_json(f, rec)
                 # The Done is committed. Enforcing the keep limit is best effort: a failure there
                 # is reported in the reply, never as a failed Done the client could not undo.
                 cleanup_failed += _purge_logged(d)
             token = _done_token(rec)
-        order = rec.get("done_order")
-        if isinstance(order, bool) or not isinstance(order, int):
-            order = int((_done_at(rec) or 0) * 1000)  # a Done written before orders existed
+        order = _done_order(rec)
         reply = {
             "ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS,
             "token": token, "order": order,
@@ -5051,69 +5102,93 @@ def _unblock_task_at_version(
         return True
 
 
+def _event_logs(payload: Any, author: Any, body: Any) -> bool:
+    """Whether a ``commented`` event's payload can record this comment: same author, and a
+    length the stored (stripped) body fits in. A payload without them matches any comment."""
+    payload = payload if isinstance(payload, dict) else {}
+    who, size = payload.get("author"), payload.get("len")
+    return (not isinstance(who, str) or _same_author(who.strip(), author)) and (
+        not isinstance(size, int) or len(str(body or "")) <= size
+    )
+
+
+def _after_block(
+    comments: Iterable[tuple[Any, Any, Any, Any]], events: Iterable[tuple[int, Any]], cut: int, block_id: int
+) -> list[tuple[str, str]]:
+    """Walk ``(id, author, body, created_at)`` comments and ``(id, payload)`` commented events,
+    both newest first, pairing each event with the next comment it can record. A paired comment
+    counts when its event is later than the block, and the walk ends at the first that is not;
+    a comment no event records counts when its time is at or after *cut*."""
+    out: list[tuple[str, str]] = []
+    pending = iter(events)
+    event = next(pending, None)
+    for _, author, body, created_at in comments:
+        if event is not None and _event_logs(event[1], author, body):
+            if event[0] <= block_id:
+                break
+            out.append((author, body))
+            event = next(pending, None)
+        elif (_num(created_at) or 0) >= cut:
+            out.append((author, body))
+    return out[::-1]
+
+
 def _comments_since_block(
     conn: Any, kanban_db: Any, task_id: str, since: int, block_id: int | None
 ) -> list[tuple[str, str]]:
     """``(author, body)`` of the comments made since the current block began, oldest first.
 
-    With the block's event id a comment is placed by its ``commented`` event when every comment
-    has one (event ids are ordered, clocks are not); when some comment has none, its time
-    decides as well, a comment counting when strictly later than the block. Without the id, a
-    comment counts when it is at or after the block's second. Older blocks' comments never count."""
-    strict = block_id is not None
-    cut = (since or 0) + 1 if strict else (since or 0)
-    try:
-        by_event_only = False
-        if strict:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
-            ).fetchone()[0]
-            logged = conn.execute(
-                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
-                (task_id,),
-            ).fetchone()[0]
-            by_event_only = logged >= total
-        rows = {
-            r[0]: (r[1], r[2])
-            for r in (
-                []
-                if by_event_only
-                else conn.execute(
-                    "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-                    (task_id, cut),
-                ).fetchall()
-            )
-        }
-        if strict:
-            n = conn.execute(
-                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
-                (task_id, block_id),
-            ).fetchone()[0]
-            if n:
+    With the block's event id a comment is placed by the ``commented`` event that records it
+    (event ids are ordered, clocks are not; see :func:`_after_block`); a comment no event records
+    counts when strictly later than the block. Without the id, a comment counts when it is at or
+    after the block's second. Older blocks' comments never count."""
+    if block_id is None:
+        try:
+            return [
+                (r[0], r[1])
                 for r in conn.execute(
-                    "SELECT id, author, body FROM task_comments WHERE task_id = ? "
-                    "ORDER BY id DESC LIMIT ?",
-                    (task_id, n),
-                ).fetchall():
-                    rows[r[0]] = (r[1], r[2])
-    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments = list(kanban_db.list_comments(conn, task_id))
-        keyed = [(getattr(c, "id", None) or i, c) for i, c in enumerate(comments, 1)]
-        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
-        by_event_only = strict and (
-            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
+                    "SELECT author, body FROM task_comments WHERE task_id = ? AND created_at >= ? ORDER BY id",
+                    (task_id, since or 0),
+                ).fetchall()
+            ]
+        except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+            return [(c.author, c.body) for c in kanban_db.list_comments(conn, task_id) if c.created_at >= (since or 0)]
+    cut = (since or 0) + 1
+    try:
+        comments = conn.execute(
+            "SELECT id, author, body, created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+            (task_id,),
         )
-        rows = {} if by_event_only else {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
-        if strict:
-            n = sum(
-                1
-                for e in all_events
-                if getattr(e, "kind", None) == "commented"
-                and int(getattr(e, "id", 0) or 0) > block_id
+        events = (
+            (r[0], _json_payload(r[1]))
+            for r in conn.execute(
+                "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'commented' ORDER BY id DESC",
+                (task_id,),
             )
-            for k, c in keyed[len(keyed) - n :] if n else []:
-                rows[k] = (c.author, c.body)
-    return [rows[k] for k in sorted(rows)]
+        )
+        return _after_block(comments, events, cut, block_id)
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        listed = list(kanban_db.list_comments(conn, task_id))
+        keyed = sorted(
+            ((getattr(c, "id", None) or i, c) for i, c in enumerate(listed, 1)), key=lambda kc: kc[0], reverse=True
+        )
+        logged = sorted(
+            (
+                (int(getattr(e, "id", 0) or 0), getattr(e, "payload", None))
+                for e in kanban_db.list_events(conn, task_id)
+                if getattr(e, "kind", None) == "commented"
+            ),
+            key=lambda e: e[0],
+            reverse=True,
+        )
+        return _after_block(((k, c.author, c.body, c.created_at) for k, c in keyed), logged, cut, block_id)
+
+
+def _json_payload(raw: Any) -> Any:
+    try:
+        return _json_loads_safe(raw) if isinstance(raw, (str, bytes)) else raw
+    except ValueError:
+        return None
 
 
 def answer_card(
