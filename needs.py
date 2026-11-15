@@ -2737,12 +2737,14 @@ def _profile_of(home: Path) -> str:
 
 WAIT_TAIL_CHARS = 2000
 WAIT_FAULT_LIMIT = 50
+WAIT_LOST_LIMIT = 1000
 # (home, request id) -> (what failed, the record to write). The hooks run in the agent; when a
 # write or removal fails there, polling in the same process retries it and says so until it works.
 _WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
-# Request ids dropped because the list was full, per home: never retried, so reported until
-# the prompt settles. Ids only, never the prompt.
-_WAIT_FAULTS_LOST: dict[str, set[str]] = {}
+# Faults pushed out of the full list: (home, id) -> what failed. Clears are still retried. Past
+# WAIT_LOST_LIMIT the oldest are only counted, for WAIT_MAX_AGE, when any record of theirs is stale.
+_WAIT_FAULTS_LOST: dict[tuple[str, str], str] = {}
+_WAIT_FAULTS_DROPPED: dict[str, tuple[int, float]] = {}
 # Hooks and polls in one process settle a prompt one at a time: a retry in flight must not
 # recreate a record that a clear has just removed.
 _WAIT_FAULT_LOCK = threading.RLock()
@@ -2759,18 +2761,11 @@ def _journal_fault(home: Path, rid: str, what: str | None) -> None:
     try:
         with _state_lock(home):
             data = _read_json(_fault_path(home))
-            if what is None and rid not in data:
-                return
             if what is not None:
                 pid = os.getpid()
-                data[rid] = {
-                    "what": what,
-                    "pid": pid,
-                    "proc_start": _proc_start(pid),
-                    "since": int(time.time()),
-                }
-            else:
-                data.pop(rid, None)
+                data[rid] = {"what": what, "pid": pid, "proc_start": _proc_start(pid), "since": int(time.time())}
+            elif data.pop(rid, None) is None:
+                return
             if data:
                 _write_json(_fault_path(home), data, ordered=True)
             else:
@@ -2779,37 +2774,33 @@ def _journal_fault(home: Path, rid: str, what: str | None) -> None:
         log.warning("unbl0ck: could not note a live-prompt fault: %s", type(exc).__name__)
 
 
-def _remember_wait_fault(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
-    """A dropped fault keeps its journal entry, so other processes still see it under its owner."""
-    with _WAIT_FAULT_LOCK:
-        _WAIT_FAULTS.pop((str(home), rid), None)
-        _WAIT_FAULTS[(str(home), rid)] = (what, rec)
-        while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
-            h, r = next(iter(_WAIT_FAULTS))
-            _WAIT_FAULTS.pop((h, r))
-            _WAIT_FAULTS_LOST.setdefault(h, set()).add(r)
-        _journal_fault(home, rid, what)
-
-
 def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
     """Write or remove one prompt's record and settle its fault under the fault lock, so this
     cleanup can never remove a newer fault for the same prompt. Raises if the write fails."""
     with _WAIT_FAULT_LOCK:
-        had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
-        lost = _WAIT_FAULTS_LOST.get(str(home), set())
-        had_fault |= rid in lost
-        lost.discard(rid)
+        key = (str(home), rid)
+        had_fault = (_WAIT_FAULTS.pop(key, None), _WAIT_FAULTS_LOST.pop(key, None)) != (None, None)
         try:
-            path = _waits_dir(home) / f"{rid}.json"
-            if what == "record":
-                _write_json(path, rec)
-            else:
-                _unlink_wait(path)
+            _apply_wait(home, rid, what, rec)
         except Exception:
-            _remember_wait_fault(home, rid, what, rec)
+            _WAIT_FAULTS[key] = (what, rec)
+            while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
+                old = next(iter(_WAIT_FAULTS))
+                _WAIT_FAULTS_LOST[old] = _WAIT_FAULTS.pop(old)[0]  # keeps its journal entry
+            while len(_WAIT_FAULTS_LOST) > WAIT_LOST_LIMIT:
+                h, r = next(iter(_WAIT_FAULTS_LOST))
+                del _WAIT_FAULTS_LOST[(h, r)]
+                _WAIT_FAULTS_DROPPED[h] = (_WAIT_FAULTS_DROPPED.get(h, (0, 0.0))[0] + 1, time.time())
+                _journal_fault(Path(h), r, None)
+            _journal_fault(home, rid, what)
             raise
         if had_fault:
             _journal_fault(home, rid, None)
+
+
+def _apply_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
+    path = _waits_dir(home) / f"{rid}.json"
+    _write_json(path, rec) if what == "record" else _unlink_wait(path)
 
 
 def _unlink_wait(path: Path) -> None:
@@ -2840,24 +2831,24 @@ def _other_process_faults(home: Path, errors: list[str]) -> None:
 def _reconcile_waits(home: Path, errors: list[str]) -> None:
     """Retry hook writes/removals that failed; what still fails is a reported source error."""
     _other_process_faults(home, errors)
-    lost = len(_WAIT_FAULTS_LOST.get(str(home), ()))
-    if lost:
-        errors.append(f"prompt: {lost} live prompts could not be recorded or cleared and are no longer retried")
     with _WAIT_FAULT_LOCK:
-        for (h, rid), (what, rec) in list(_WAIT_FAULTS.items()):
-            if h != str(home) or _WAIT_FAULTS.get((h, rid)) != (what, rec):
+        clears = [(k, ("clear", None)) for k, w in _WAIT_FAULTS_LOST.items() if w == "clear"]
+        for (h, rid), (what, rec) in clears + list(_WAIT_FAULTS.items()):
+            if h != str(home):
                 continue
             try:
-                path = _waits_dir(home) / f"{rid}.json"
-                if what == "record" and rec is not None:
-                    _write_json(path, rec)
-                else:
-                    _unlink_wait(path)
+                _apply_wait(home, rid, what, rec)
                 _WAIT_FAULTS.pop((h, rid), None)
+                _WAIT_FAULTS_LOST.pop((h, rid), None)
                 _journal_fault(home, rid, None)
             except Exception as exc:  # noqa: BLE001
-                verb = "record" if what == "record" else "clear"
-                errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
+                if (h, rid) not in _WAIT_FAULTS_LOST:  # those are counted below, not listed
+                    verb = "record" if what == "record" else "clear"
+                    errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
+        dropped, last = _WAIT_FAULTS_DROPPED.get(str(home), (0, 0.0))
+        lost = sum(k[0] == str(home) for k in _WAIT_FAULTS_LOST) + (dropped if time.time() - last < WAIT_MAX_AGE else 0)
+        if lost:
+            errors.append(f"prompt: {lost} live prompts could not be recorded or cleared; past the newest {WAIT_FAULT_LIMIT} faults a record is no longer retried")
 
 
 def record_wait(home: Path | None = None, **payload: Any) -> None:
