@@ -121,6 +121,64 @@ const it={...item,id:'kanban:default:dl1',version:'1'};
 """)
 
 
+class StrongerTests(NodeCase):
+    def test_a_terminal_reply_that_settles_after_the_limit_is_refused(self):
+        """R5-desk-020: the first response or a poll that answers after 150 s is refused, with no other guard to hit first."""
+        self.run_views(r"""
+let now=1e12;Date.now=()=>now;
+const realSet=global.setTimeout;global.setTimeout=fn=>realSet(fn,0);
+async function run(id,rest){
+ state=[];const it={...item,id:'kanban:default:'+id,version:'1'};
+ mount({rest},it);await find(mount({rest},it),'TL;DR').onClick();
+ return store.readAskSession(it.id);
+}
+(async()=>{
+ const t0=now;
+ let s=await run('tl1',async url=>{if(url==='/card/ask'){now=t0+151000;return{ok:true,reply:'late first'}}return{}});
+ assert.ok(!s.msgs.some(m=>m.content==='late first'),'a late first response is not accepted');
+ assert.match(s.error,/over 150 s/);
+ const t1=now;
+ s=await run('tl2',async url=>{
+  if(url==='/card/ask')return{ok:true,pending:true,job:'j'};
+  if(url.startsWith('/card/ask/')){now=t1+151000;return{ok:true,reply:'late poll'}}
+  return{}});
+ assert.ok(!s.msgs.some(m=>m.content==='late poll'),'a late terminal poll is not accepted');
+ assert.match(s.error,/over 150 s/);
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_not_for_me_keeps_the_token_the_server_returned(self):
+        """R5-desk-021: Undo of a Kanban "Not for me" carries the hide token from the response, not a local value."""
+        self.run_views(r"""
+const ctx={rest:async url=>url==='/hide'?{token:'tok-from-server',order:7}:{}};
+const it={...item,id:'kanban:default:nf1',version:'4'};
+(async()=>{
+ undo=[];
+ await find(mount(ctx,it),'Not for me').onClick();
+ assert.equal(undo.length,1,JSON.stringify(undo));
+ assert.equal(undo[0].token,'tok-from-server');
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_unmounting_while_an_ask_runs_stops_the_card_observer(self):
+        """R5-desk-022: the card's 500 ms observer is cleared on unmount while the request is still pending."""
+        self.run_views(r"""
+const ctx={rest:url=>url==='/card/ask'?new Promise(()=>{}):Promise.resolve({})};
+const it={...item,id:'kanban:default:um1',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ find(mount(ctx,it),'TL;DR').onClick();
+ await new Promise(r=>setTimeout(r,5));
+ mount(ctx,it);                                   // remounted while the request runs: the observer starts
+ const observers=()=>timers.filter(t=>t.on&&t.ms===500);
+ assert.equal(observers().length,1,'the observer runs while the ask is pending');
+ assert.ok(store.readAskSession(it.id).running,'the request is still pending');
+ cleanups.forEach(c=>typeof c==='function'&&c());cleanups=[];   // unmount
+ assert.equal(observers().length,0,'an unmounted card must not keep its observer running');
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
 class FullTextOffer(NodeCase):
     def test_password_prompts_and_pairing_requests_offer_no_full_text(self):
         """R5-desk-026: the guide says password prompts never offer Full text and pairing requests show neither."""
