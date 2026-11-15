@@ -294,7 +294,7 @@ def outside_text(id: str = "", version: str = ""):
 @router.get("/source/text")
 def source_text(id: str = "", version: str = ""):
     n = _needs()
-    if not id or len(id) > MAX_ID or len(version) > MAX_ID:
+    if not id or len(id) > MAX_ID or len(version) > MAX_ID or _CONTROL.search(id + version):
         raise HTTPException(status_code=400, detail="invalid item reference")
     try:
         return n.source_text(id, version)
