@@ -79,7 +79,7 @@ class ChatVersion(unittest.TestCase):
         versions = []
         for text in (body, edited):
             conn.execute("INSERT OR REPLACE INTO messages VALUES(7, ?)", (text,))
-            versions.append(needs._chat_version(conn, 7, len(text), tail, True))
+            versions.append(needs._chat_version(conn, 7, len(text), tail, True, [needs.CHAT_HASH_BYTES]))
         self.assertNotEqual(versions[0], versions[1])
 
 
