@@ -243,11 +243,13 @@ const src = fs.readFileSync(process.argv[1], 'utf8');
 const views = src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
 const noop = () => {};
 const node = (type, props) => ({type, props});
-let state = [], cursor = 0, effects = [], deps = [];
+let state = [], cursor = 0, effectCursor = 0, effects = [], hooks = [];
 const env = {
   jsx: node, jsxs: node,
   useState: init => { const i = cursor++; if (!(i in state)) state[i] = init; return [state[i], v => { state[i] = typeof v === 'function' ? v(state[i]) : v; }]; },
-  useEffect: (fn, d) => { const i = effects.length; const prev = deps[i]; if (!prev || !d || d.some((x, k) => x !== prev[k])) { effects.push([i, fn, d]); } deps[i] = d; },
+  // One slot per useEffect call site (by call order), like React: an effect is due when its
+  // dependencies differ from the ones it last ran with, and its cleanup runs first.
+  useEffect: (fn, d) => { const i = effectCursor++; const prev = hooks[i]; if (!prev || !d || d.some((x, k) => x !== prev.deps[k])) { effects.push([i, fn, d]); } },
   useRef: () => ({}), platformLabel: x => x, LOCAL_PLATFORMS: [], KEEP_BLOCKED: /keep blocked/i,
   button: props => node('button', props), openBoard: noop, ago: () => '', ageClass: () => '', pad: String,
   sfx: {play: noop}, petEmit: noop, host: {notify: noop, notifyError: e => {throw e}},
@@ -261,13 +263,24 @@ function text(n) { return all(n).filter(x => typeof x === 'string').join(''); }
 const FULL = 'FIRST sentence.\n\nmiddle é ✓\nLAST?';
 const requests = [];
 let mode = 'ok';
-const ctx = {rest: async url => { requests.push(url); if (mode === 'fail') throw new Error('offline'); return {text: FULL, truncated: mode === 'cut'}; }};
-function render(item) { cursor = 0; effects = []; return Item({ctx, item, n: 1, refresh: async () => {}, askEnabled: false}); }
-async function flush() { const run = effects.splice(0); for (const [, fn] of run) fn(); await new Promise(r => setImmediate(r)); }
+const held = [];
+const ctx = {rest: async url => {
+  requests.push(url);
+  if (mode === 'held') return new Promise((resolve, reject) => held.push({url, resolve, reject}));
+  if (mode === 'fail') throw new Error('offline');
+  return {text: FULL, truncated: mode === 'cut'};
+}};
+function render(item) { cursor = 0; effectCursor = 0; effects = []; return Item({ctx, item, n: 1, refresh: async () => {}, askEnabled: false}); }
+async function flush() {
+  const run = effects.splice(0);
+  for (const [i, fn, d] of run) { hooks[i]?.cleanup?.(); const cleanup = fn(); hooks[i] = {deps: d, cleanup}; }
+  await new Promise(r => setImmediate(r));
+}
+const settle = () => new Promise(r => setImmediate(r));
 function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.className === 'ub-full').props.onClick(); }
 (async () => {
   for (const [source, id] of [['chat', 'chat:p:s1'], ['prompt', 'prompt:0123456789abcdef']]) {
-    state = []; deps = []; requests.length = 0; mode = 'ok';
+    state = []; hooks = []; requests.length = 0; mode = 'ok';
     const item = {id, version: '9', source, title: 't', ask: '…tail of it', ask_truncated: true, since: 1, profile: 'p', platform: 'cli'};
     let tree = render(item);
     assert.ok(text(tree).includes('last 480 characters'), 'excerpt must be labelled while closed');
@@ -282,7 +295,7 @@ function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.cl
     assert.ok(!text(tree).includes('FIRST sentence.'), 'old version text must not be shown for a new version');
   }
   // failure and retry
-  state = []; deps = []; requests.length = 0; mode = 'fail';
+  state = []; hooks = []; requests.length = 0; mode = 'fail';
   const item = {id: 'chat:p:s1', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
   let tree = render(item); openFull(tree); tree = render(item); await flush(); tree = render(item);
   assert.ok(text(tree).includes('Full text could not load: offline'));
@@ -292,17 +305,37 @@ function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.cl
   mode = 'ok'; retry.props.onClick(); tree = render(item); await flush(); tree = render(item);
   assert.ok(text(tree).includes('FIRST sentence.'));
   // a message over the limit keeps a visible warning after the load succeeds
-  state = []; deps = []; requests.length = 0; mode = 'cut';
+  state = []; hooks = []; requests.length = 0; mode = 'cut';
   const long = {id: 'chat:p:s3', version: '1', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
   tree = render(long); openFull(tree); tree = render(long); await flush(); tree = render(long);
   assert.ok(text(tree).includes('FIRST sentence.'));
   assert.ok(text(tree).includes('longer than 20,000 characters'), 'limit warning must show');
   assert.ok(text(tree).includes('original chat'));
-  state = []; deps = []; mode = 'ok';
+  state = []; hooks = []; mode = 'ok';
   tree = render(long); openFull(tree); tree = render(long); await flush(); tree = render(long);
   assert.ok(!text(tree).includes('longer than 20,000 characters'), 'no warning when complete');
+  // 01-097: an older response arriving after a newer request must not overwrite it
+  state = []; hooks = []; requests.length = 0; held.length = 0; mode = 'held';
+  const v9 = {id: 'chat:p:s9', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
+  const v10 = {...v9, version: '10'};
+  tree = render(v9); openFull(tree); tree = render(v9); await flush();
+  tree = render(v10); await flush();
+  assert.equal(held.length, 2, 'one request per version');
+  held[1].resolve({text: 'NEWER TEXT', truncated: false}); await settle(); tree = render(v10);
+  assert.ok(text(tree).includes('NEWER TEXT'), 'newest response shown');
+  held[0].resolve({text: 'OLDER TEXT', truncated: false}); await settle(); tree = render(v10);
+  assert.ok(text(tree).includes('NEWER TEXT') && !text(tree).includes('OLDER TEXT'), 'a late older response must be ignored');
+  // a late older failure must not show an error over the newer text
+  state = []; hooks = []; held.length = 0;
+  tree = render(v9); openFull(tree); tree = render(v9); await flush();
+  tree = render(v10); await flush();
+  held[1].resolve({text: 'NEWER TEXT', truncated: false}); await settle();
+  held[0].reject(new Error('stale failure')); await settle(); tree = render(v10);
+  assert.ok(!text(tree).includes('stale failure'), 'a late older failure must be ignored');
+  assert.ok(text(tree).includes('NEWER TEXT'));
   // an untruncated chat never fetches
-  state = []; deps = []; requests.length = 0;
+  mode = 'ok';
+  state = []; hooks = []; requests.length = 0;
   const short = {id: 'chat:p:s2', version: '1', source: 'chat', title: 't', ask: 'short?', since: 1};
   tree = render(short); openFull(tree); tree = render(short); await flush();
   assert.equal(requests.length, 0);
