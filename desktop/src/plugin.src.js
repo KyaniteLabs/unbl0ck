@@ -990,7 +990,8 @@ function withinDeadline(t0, step) {
     timer = setInterval(() => { if (late()) reject(tooSlow()) }, Math.max(1, ASK_DEADLINE_MS - (Date.now() - t0)))
     timer?.unref?.()
   })
-  return Promise.race([step(), limit]).then(
+  // A step that throws synchronously rejects here, so the timer below is always cleared.
+  return Promise.race([new Promise(resolve => resolve(step())), limit]).then(
     r => { clearInterval(timer); if (late()) throw tooSlow(); return r },
     e => { clearInterval(timer); throw e }
   )

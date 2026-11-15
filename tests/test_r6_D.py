@@ -35,6 +35,24 @@ class NodeCase(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class Desktop(NodeCase):
+    def test_a_step_that_throws_synchronously_rejects_and_clears_the_deadline_timer(self):
+        """R6-023: withinDeadline turns a synchronous throw into a rejection and leaves no interval behind."""
+        self.run_views(r"""
+const live=new Set();let id=0;
+global.setInterval=()=>{live.add(++id);return id};
+global.clearInterval=i=>{live.delete(i)};
+const withinDeadline=new Function('env',`with(env){${views};return withinDeadline}`)(env);
+let p;
+try{p=withinDeadline(Date.now(),()=>{throw new Error('failure')})}
+catch(e){assert.fail('the throw escaped synchronously: '+e.message)}
+p.then(()=>assert.fail('resolved'),e=>{
+ assert.equal(e.message,'failure');
+ assert.equal(live.size,0,'the deadline interval is still running');
+}).catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
 class AcceptanceDates(unittest.TestCase):
     def test_an_impossible_recorded_time_or_release_date_is_refused(self):
         """R6-024: a date-shaped but impossible time or release date does not pass as acceptance evidence."""
