@@ -7,6 +7,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from conftest import ask_gen
 
 from test_outside import OutsideFixture, needs, plugin
 
@@ -318,9 +319,9 @@ class AskAdmission(unittest.TestCase):
 
         self.enabled = True
         job = self.api.uuid.uuid4().hex
-        self.api._ASK_JOBS.create(job)
+        gen = self.api._ASK_JOBS.create(job)
         self.enabled = False
-        self.api._run_ask(job, self.api._loaded_ctx(), [{"role": "user", "content": "q"}])
+        self.api._run_ask(job, gen, self.api._loaded_ctx(), [{"role": "user", "content": "q"}])
         self.assertEqual(self.llm_calls, [])
         self.assertEqual(self.api._ASK_JOBS.get(job)["status"], self.api.jobs.AskState.ERROR)
 
@@ -574,8 +575,8 @@ class JobTables(unittest.TestCase):
         table = jobs.AskJobs()
         table.create("a")
         table.create("b")
-        table.finish("a", "A")
-        table.finish("b", "B")
+        table.finish("a", "A", gen=ask_gen(table, "a"))
+        table.finish("b", "B", gen=ask_gen(table, "b"))
         self.assertIsNone(table.get("a"), "an evicted answer is gone, not recoverable")
         self.assertEqual(table.get("b")["reply"], "B")
 

@@ -1,6 +1,8 @@
 """Round-4 regression tests for the Ask restart journal (issue #35, PR #58).
 
-Every test here was written from a review reproducer and seen to fail before its fix."""
+Every test here was written from a review reproducer and seen to fail before its fix, except
+the ones marked "negative control": those pin the unchanged behaviour next to a fix and pass on
+the old code by design."""
 
 import contextvars
 import enum
@@ -16,6 +18,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from conftest import ask_gen, checks_see_a_regular_file
 
 import test_ask_job_recovery as rec
 
@@ -72,7 +75,7 @@ class Containment(Base):
         personal = Path(self.tmp.name) / "ask" / "personal"
         a = jobs.AskJobs(self.clock, jobs.AskJournal(lambda: work, lambda: True, self.clock))
         a.create(J1, card="c1")
-        a.finish(J1, "WORK ONLY", "p", "m")
+        a.finish(J1, "WORK ONLY", "p", "m", gen=ask_gen(a, J1))
         personal.symlink_to(work, target_is_directory=True)
         b = jobs.AskJobs(self.clock, jobs.AskJournal(lambda: personal, lambda: True, self.clock))
         st = b.get(J1)
@@ -84,10 +87,13 @@ class Containment(Base):
         self.jobs.create(J1, card="c1")
         self.assertEqual(stat.S_IMODE(os.stat(self.dir).st_mode), 0o700)
 
-    def test_an_existing_loose_record_is_replaced_by_an_owner_only_one(self):
+    def test_an_existing_loose_record_is_tightened_to_owner_only_when_read(self):
+        """Replacing a record already installs an owner-only file, so only reading one that was left
+        world-readable (by an older build or a restore) shows whether it is tightened."""
         self.jobs.create(J1, card="c1")
         os.chmod(self.dir / f"{J1}.json", 0o644)
-        self.jobs.mark_sent(J1)
+        self.boot()
+        self.jobs.get(J1)
         self.assertEqual(stat.S_IMODE(os.stat(self.dir / f"{J1}.json").st_mode), 0o600)
 
     def test_a_group_writable_record_is_not_trusted(self):
@@ -109,35 +115,39 @@ class TempFiles(Base):
 
 
 class ReadSafety(Base):
-    def test_a_path_swapped_for_a_symlink_after_the_size_check_is_not_followed(self):
+    def test_a_path_swapped_for_a_symlink_after_the_type_check_is_not_followed(self):
+        """Every check of the record still sees the regular file it was; only the open finds the link."""
         self.jobs.create(J1, card="c1")
-        big = Path(self.tmp.name) / "big.json"
-        big.write_text(json.dumps({"v": 1, "job": J1, "state": "done", "started": self.clock(), "card": "c1",
-                                   "reply": "STOLEN", "pad": "x" * (jobs.AskJournal.MAX_RECORD_BYTES + 10)}))
+        stolen = Path(self.tmp.name) / "stolen.json"
+        stolen.write_text(json.dumps({"v": 1, "job": J1, "state": "done", "started": self.clock(), "card": "c1",
+                                      "reply": "STOLEN"}))
         path = self.dir / f"{J1}.json"
-        real = os.lstat
-        swapped = []
-
-        def lstat(p, *a, **k):
-            out = real(p, *a, **k)
-            if str(p).endswith(f"{J1}.json") and not swapped:
-                swapped.append(1)
-                path.unlink()
-                path.symlink_to(big)
-            return out
-
-        with patch.object(os, "lstat", lstat):
-            self.boot()
+        regular = Path(self.tmp.name) / "regular"
+        regular.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(stolen)
+        self.boot()
+        with checks_see_a_regular_file({f"{J1}.json"}, regular):
             st = self.jobs.get(J1)
         self.assertNotIn("STOLEN", json.dumps(st, default=str))
 
     def test_a_fifo_in_place_of_a_record_does_not_block_a_poll(self):
+        """The FIFO appears after the type check, so only a non-blocking open of what is there helps."""
         self.dir.mkdir()
         os.mkfifo(self.dir / f"{J1}.json")
+        regular = Path(self.tmp.name) / "regular"
+        regular.write_text("{}")
         out = []
-        t = threading.Thread(target=lambda: out.append(self.jobs.get(J1)), daemon=True)
+
+        def poll():
+            with checks_see_a_regular_file({f"{J1}.json"}, regular):
+                out.append(self.jobs.get(J1))
+
+        t = threading.Thread(target=poll, daemon=True)
         t.start()
         t.join(5)
+        if t.is_alive():  # release the blocked reader so the test process can exit
+            os.close(os.open(self.dir / f"{J1}.json", os.O_WRONLY | os.O_NONBLOCK))
         self.assertFalse(t.is_alive(), "the read must not block on a FIFO")
         self.assertEqual(jobs.ASK_WIRE[out[0]["status"]], "unknown")
 
@@ -187,8 +197,8 @@ class Size(Base):
 
     def test_an_oversized_reply_is_stored_as_unkept_not_as_an_unreadable_record(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
-        self.jobs.finish(J1, "x" * 300000, "p", "m")
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
+        self.jobs.finish(J1, "x" * 300000, "p", "m", gen=ask_gen(self.jobs, J1))
         self.assertLessEqual(os.path.getsize(self.dir / f"{J1}.json"), jobs.AskJournal.MAX_RECORD_BYTES)
         self.boot()
         st = self.jobs.get(J1)
@@ -203,7 +213,7 @@ class Size(Base):
         self.addCleanup(setattr, jobs.AskJobs, "MAX_SETTLED", old)
         for i in range(5):
             self.jobs.create(hexid(i), card="c")
-            self.assertTrue(self.jobs.finish(hexid(i), "ok", Kind.A, object()))
+            self.assertTrue(self.jobs.finish(hexid(i), "ok", Kind.A, object(), gen=ask_gen(self.jobs, hexid(i))))
         self.assertEqual(len(self.jobs), 2, "retention still enforced")
         self.assertEqual([p for p in self.dir.iterdir() if p.name.endswith(".tmp")], [])
 
@@ -268,11 +278,17 @@ class UnverifiedAbsence(Base):
         (journal or self.journal)._directory = broken
 
     def test_a_restarted_table_does_not_call_an_unreadable_directory_empty(self):
+        """A settings fault is not always an OSError: whatever the resolver raises, the job is not
+        called absent and the delete is refused cleanly, never a crash."""
         self.keep = True
         self.jobs.create(J1, card="c1")
-        self.jobs.finish(J1, "ANSWER", "p", "m")
+        self.jobs.finish(J1, "ANSWER", "p", "m", gen=ask_gen(self.jobs, J1))
         self.boot()
-        self.lose_directory()
+
+        def broken():
+            raise RuntimeError("profile settings unreadable")
+
+        self.journal._directory = broken
         self.assertFalse(self.journal.verified_absent(J1))
         with self.assertRaises(jobs.DiscardFailed):
             self.jobs.discard(J1)
@@ -280,7 +296,7 @@ class UnverifiedAbsence(Base):
 
     def test_unavailable_storage_reads_as_unknown_not_as_an_expired_job(self):
         self.jobs.create(J1, card="c1")
-        self.jobs.mark_sent(J1)
+        self.jobs.mark_sent(J1, gen=ask_gen(self.jobs, J1))
         self.boot()
         self.lose_directory()
         st = self.jobs.get(J1)
@@ -299,6 +315,8 @@ class WorkerOwnership(Base):
         self.assertEqual(jobs.ASK_WIRE[st["status"]], "pending")
 
     def test_a_marker_whose_owner_is_gone_is_not_submitted(self):
+        """Negative control for the live-owner test above: a dead owner leaves the old answer
+        (not submitted) in place, so this passes on code that ignores ownership, by design."""
         a = self.other()
         a._journal.pid = dead_pid()
         a.create(J1, card="c1")
@@ -311,12 +329,12 @@ class SettledAcrossRestart(Base):
     def test_the_settled_bound_holds_for_records_recovered_after_a_restart(self):
         for i in range(jobs.AskJobs.MAX_SETTLED):
             self.jobs.create(hexid(i), card="c")
-            self.jobs.finish(hexid(i), "A", "p", "m")
+            self.jobs.finish(hexid(i), "A", "p", "m", gen=ask_gen(self.jobs, hexid(i)))
             self.clock.t += 1
         self.boot()
         for i in range(jobs.AskJobs.MAX_SETTLED, 2 * jobs.AskJobs.MAX_SETTLED):
             self.jobs.create(hexid(i), card="c")
-            self.jobs.finish(hexid(i), "B", "p", "m")
+            self.jobs.finish(hexid(i), "B", "p", "m", gen=ask_gen(self.jobs, hexid(i)))
             self.clock.t += 1
         self.assertLessEqual(len(self.files()), jobs.AskJobs.MAX_SETTLED)
         self.assertIsNone(self.jobs.get(hexid(0)), "the oldest answers went, in completion order")
@@ -332,7 +350,7 @@ class DeleteResurrection(Base):
         a.create(J1, card="c1")
         b = self.other()
         self.assertTrue(b.discard(J1))
-        a.finish(J1, "LATE ANSWER", "p", "m")
+        a.finish(J1, "LATE ANSWER", "p", "m", gen=ask_gen(a, J1))
         self.assertIsNone(self.other().get(J1), "the deleted answer must not come back")
         self.assertNotIn(f"{J1}.json", self.files())
         self.assertIsNone(a.get(J1), "and the owner stops serving it")
@@ -350,6 +368,7 @@ class CleanupRetry(Base):
         with patch.object(os, "listdir", side_effect=boom), patch.object(os, "scandir", side_effect=boom):
             self.boot()
             self.jobs.start_background(3600)
+            self.jobs.housekeeping()  # a request adopts its directory; the timer is armed while it may hold files
             with self.jobs._lock:
                 self.jobs._timer.cancel()
                 self.jobs._timer = None
@@ -369,8 +388,8 @@ class ProfileScope(Base):
         table.create(J1, card="c1")
 
         def worker():  # a pool thread: it starts with a fresh context, so who.get() is "home"
-            table.mark_sent(J1)
-            table.finish(J1, "WORK", "p", "m")
+            table.mark_sent(J1, gen=ask_gen(table, J1))
+            table.finish(J1, "WORK", "p", "m", gen=ask_gen(table, J1))
 
         t = threading.Thread(target=worker)
         t.start()
@@ -383,7 +402,7 @@ class ProfileScope(Base):
         dirs = {"a": Path(self.tmp.name) / "a", "b": Path(self.tmp.name) / "b"}
         table = jobs.AskJobs(self.clock, jobs.AskJournal(lambda: dirs[who.get()], lambda: True, self.clock))
         table.create(J1, card="c1")
-        table.finish(J1, "A ANSWER", "p", "m")
+        table.finish(J1, "A ANSWER", "p", "m", gen=ask_gen(table, J1))
         who.set("b")
         self.assertIsNone(table.get(J1))
         self.assertIsNone(table.card(J1))
@@ -397,14 +416,18 @@ class ProfileScope(Base):
         self.addCleanup(setattr, jobs.AskJobs, "MAX_SETTLED", old)
         self.boot()
         self.jobs.create(J1, card="c")
-        self.jobs.finish(J1, "A", "p", "m")
-        real = self.journal.delete
-        self.journal.delete = lambda job, *a, **k: False if job == J1 else real(job, *a, **k)
-        with patch.object(self.journal, "verified_absent", return_value=False):
+        self.jobs.finish(J1, "A", "p", "m", gen=ask_gen(self.jobs, J1))
+        real = os.unlink
+
+        def unlink(name, *a, **k):
+            if str(name) == f"{J1}.json":
+                raise PermissionError("refused")
+            return real(name, *a, **k)
+
+        with patch.object(os, "unlink", unlink):
             self.jobs.create(J2, card="c")
-            self.jobs.finish(J2, "B", "p", "m")
+            self.jobs.finish(J2, "B", "p", "m", gen=ask_gen(self.jobs, J2))
             self.assertIsNone(self.jobs.get(J1), "the settled limit is not bypassed by a failed delete")
-        self.journal.delete = real
         self.jobs.housekeeping()
         self.assertNotIn(f"{J1}.json", self.files(), "and the delete is retried")
 
