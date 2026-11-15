@@ -50,7 +50,8 @@ class BlufJobs:
     RETRY_S = 600      # the first retry waits this long; each later one waits twice as long
     MAX_ATTEMPTS = 3   # after this many failures a card version is not summarized again
     STUCK_S = 3600     # a pending job this old never reported back (the model call times out at 90 s)
-    PRUNE_OVER = 500   # table size at which settled entries are dropped
+    PRUNE_OVER = 500   # table size at which stuck pending jobs are dropped
+    HARD_CAP = 5000    # table size never exceeded: the oldest entries (failures included) go first
 
     def __init__(self, clock: Optional[Callable[[], float]] = None):
         self._clock = clock or (lambda: time.time())
@@ -112,8 +113,17 @@ class BlufJobs:
         """Drop entries that no longer hold anything back: cooled-down failures and stuck jobs."""
         if len(self._jobs) <= self.PRUNE_OVER:
             return
-        for k in [k for k in list(self._jobs) if self.can_start(k)]:
+        # A failure that cooled down still carries its attempt count; dropping it would let a
+        # card version that keeps failing restart from zero, so only stuck pending jobs go first.
+        now = self._clock()
+        for k in [k for k, st in self._jobs.items()
+                  if st["state"] is BlufState.PENDING and now - st["at"] >= self.STUCK_S]:
             self._jobs.pop(k, None)
+        # Hard cap: past HARD_CAP the oldest entries are evicted so memory stays bounded.
+        extra = len(self._jobs) - self.HARD_CAP
+        if extra > 0:
+            for k in sorted(self._jobs, key=lambda k: self._jobs[k]["at"])[:extra]:
+                self._jobs.pop(k, None)
 
     def __len__(self) -> int:
         return len(self._jobs)

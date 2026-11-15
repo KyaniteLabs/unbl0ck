@@ -872,6 +872,15 @@ function CardDetail({ data, loading, error }) {
 // Session memory only: source faults and route remounts must not discard a typed answer.
 // Keep the original version so recovering a changed question cannot authorize a stale reply.
 const ANSWER_DRAFT_TTL = 30 * 60 * 1000
+const ASK_MAX_CHARS = 20000       // the server's per-message limit; longer text is refused before it is stored
+const ASK_DEADLINE_MS = 150000    // one ask (initial request plus polling) never waits longer than this
+// One id per ask, kept across Retry, so a lost response cannot start a second model call.
+const newAskRequestId = () => {
+  const bytes = new Uint8Array(16)
+  if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(bytes)
+  else for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256)
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')
+}
 const answerDrafts = new Map()
 function readAnswerDraft(id) {
   const cutoff = Date.now() - ANSWER_DRAFT_TTL
@@ -911,6 +920,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const [askBusy, setAskBusy] = useState(false)
   const [askError, setAskError] = useState('')
   const [askJob, setAskJob] = useState(null)
+  const [askReq, setAskReq] = useState(null)
   const askEnd = useRef(null)
   const isKanban = item.source === 'kanban'
   const isPrompt = item.source === 'prompt'
@@ -980,10 +990,13 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     if (next && !askMsgs.length && !askBusy) askSend(false, TLDR_ASK)
   }
 
-  const run = async (fn, okFor, cue = 'ok') => {
+  // onOk runs the moment the request succeeded, before the queue refresh: a slow or hung
+  // refresh must not delay Undo or draft clearing, which only depend on the request result.
+  const run = async (fn, okFor, cue = 'ok', onOk = null) => {
     setBusy(true)
     try {
       const r = await fn()
+      if (onOk) onOk(r)
       sfx.play(cue)
       if (okFor) {
         petEmit('joy')
@@ -1017,11 +1030,12 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
         ? `Answered ${item.task_id} (triage)`
         : r && r.released
           ? `Answered and unblocked ${item.task_id}`
-          : `Answered ${item.task_id} (kept blocked)`)
+          : `Answered ${item.task_id} (kept blocked)`),
+      'ok',
+      // A source fault can remount this card and accept a newer draft while this
+      // request is in flight. Its late completion owns only the submitted record.
+      r => { if (r && answerDrafts.get(item.id) === submittedDraft) updateAnswer('', item.version) }
     )
-    // A source fault can remount this card and accept a newer draft while this
-    // request is in flight. Its late completion owns only the submitted record.
-    if (result && answerDrafts.get(item.id) === submittedDraft) updateAnswer('', item.version)
     return result
   }
   const sendPrimary = () => send(!triage)
@@ -1036,18 +1050,27 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
       r => (r && r.released ? `Unblocked ${item.task_id}` : `Could not unblock ${item.task_id}`)
     )
   const hide = async () => {
-    const r = await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
-    if (r) $undo.set({ id: item.id, title: item.title, at: Date.now() })
+    await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn',
+      r => { if (r) $undo.set({ id: item.id, title: item.title, at: Date.now() }) })
   }
   const outsideDone = async () => {
-    const r = await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null)
-    if (r?.hidden) $undo.set({ id: item.id, title: item.title, at: Date.now() })
+    await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'ok',
+      r => { if (r?.hidden) $undo.set({ id: item.id, title: item.title, at: Date.now() }) })
   }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
   const outsideBody = outsideText?.__version === item.version ? outsideText.text : item.ask
-  const excerptNote = hasFull && !isOutside && outsideText?.__version !== item.version
-    ? jsx('div', { className: 'ub-hint', role: 'note', children: 'Showing only the last 480 characters. Open Full text to read the whole message.' })
+  // The note says so whenever the text on screen is the excerpt: before Full text is opened,
+  // after it is closed again, and while a different version is cached.
+  const showingFull = open && outsideText?.__version === item.version
+  const cutNote = String(item.ask || '').startsWith('…')
+  const excerptNote = hasFull && !isOutside && !showingFull
+    ? jsx('div', {
+        className: 'ub-hint', role: 'note',
+        children: cutNote
+          ? 'Showing only the last 480 characters. Open Full text to read the whole message.'
+          : 'Showing a one-line version. Open Full text to see the original line breaks and spacing.'
+      })
     : null
   const fullTextStatus = open && hasFull
     ? outsideTextLoading
@@ -1063,29 +1086,53 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const askSend = async (retry = false, preset = '') => {
     const q = preset || askInput.trim()
     if (askBusy || (!retry && !q)) return
+    // The server refuses a longer message with 422. Refuse it here first, so it never enters
+    // the saved history (where every later question would resend it and fail the same way).
+    if (!retry && Array.from(q).length > ASK_MAX_CHARS) {
+      setAskError(`That message is ${Array.from(q).length} characters long; the limit is ${ASK_MAX_CHARS}. Shorten it and send again.`)
+      return
+    }
     const next = askStale
       ? [{ role: 'user', content: retry ? TLDR_ASK : q }]
       : retry ? askMsgs : [...askMsgs, { role: 'user', content: q }]
     if (!next.length || next[next.length - 1].role !== 'user') return
+    const before = { msgs: askMsgs, version: askVersion }
+    // One id per ask, reused by Retry, so a lost response never starts a second model call.
+    const reqId = retry && !askStale && askReq?.version === item.version ? askReq.id : newAskRequestId()
+    setAskReq({ id: reqId, version: item.version })
     setAskMsgs(next)
     setAskVersion(item.version)
     if (!retry && !preset) setAskInput('')
     setAskBusy(true)
     setAskError('')
+    let admitted = false
     try {
+      // The model can outlast the desktop's 30 s request limit: poll the background job. The
+      // 150 s limit covers the initial request, every sleep and every poll, and is checked after
+      // each response, terminal ones included.
+      const t0 = Date.now()
+      const over = () => Date.now() - t0 > ASK_DEADLINE_MS
+      const tooSlow = () => new Error('The model took too long (over 150 s)')
       // Keep displayed history intact while respecting the API's 50-message transport
       // limit. The server applies the configured model history window within that bound.
       let r = retry && !askStale && askJob?.version === item.version
         ? { pending: true, job: askJob.id }
-        : await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next.slice(-50) } })
-      const t0 = Date.now()   // the model can outlast the desktop's 30 s request limit: poll the background job
+        : await ctx.rest('/card/ask', {
+            method: 'POST',
+            body: { id: item.id, messages: next.slice(-50), version: item.version, request_id: reqId }
+          })
+      admitted = true
       while (r && r.pending && r.job) {
         setAskJob({ id: r.job, version: item.version })
-        if (Date.now() - t0 > 150000) throw new Error('The model took too long (over 150 s)')
-        await new Promise(res => setTimeout(res, 1500))
+        const left = ASK_DEADLINE_MS - (Date.now() - t0)
+        if (left <= 0) throw tooSlow()
+        await new Promise(res => setTimeout(res, Math.min(1500, left)))
         r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true')
+        if (over() && !(r && r.pending && r.job)) { setAskJob(null); setAskReq(null); throw tooSlow() }
       }
+      if (over()) { setAskJob(null); setAskReq(null); throw tooSlow() }
       setAskJob(null)
+      setAskReq(null)
       if (r?.ok === false) throw new Error(String(r.detail || 'The model could not answer'))
       const reply = String(r?.reply || '').trim()
       if (!reply) throw new Error('The model returned an empty answer')
@@ -1094,9 +1141,19 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     } catch (e) {
       sfx.play('err')
       const msg = String(e?.message || e)
-      if (/unknown or expired ask job/.test(msg)) setAskJob(null)
+      const unknownJob = /unknown or expired ask job/.test(msg)
+      if (unknownJob) { setAskJob(null); setAskReq(null) }
+      const status = Number(e?.status ?? e?.response?.status ?? (/\b(4\d\d)\b/.exec(msg) || [])[1])
+      if (!admitted && status >= 400 && status < 500 && status !== 408 && status !== 429) {
+        // The server refused the request outright: nothing was stored, so the refused message must
+        // not stay in the history (it would be resent and refused again) and the text is restored.
+        setAskMsgs(before.msgs)
+        setAskVersion(before.version)
+        setAskReq(null)
+        if (!retry && !preset) setAskInput(q)
+      }
       // An unknown job means the gateway restarted mid-answer: the work is gone, not slow.
-      setAskError(/unknown or expired ask job/.test(msg) ? 'The gateway restarted while the model was answering. Retry to ask again.' : msg)
+      setAskError(unknownJob ? 'The gateway restarted while the model was answering. Retry to ask again.' : msg)
     } finally {
       setAskBusy(false)
     }
@@ -1421,6 +1478,8 @@ function Page({ ctx, refresh }) {
   const kanbanAsks = kanban.filter(i => i.tier !== 'stuck' && i.tier !== 'answered')
   const kanbanStuck = kanban.filter(i => i.tier === 'stuck')
   const kanbanAnswered = kanban.filter(i => i.tier === 'answered')
+  // Stuck and answered cards are listed but are not asks; they still mean the queue is not empty.
+  const held = q.items.filter(i => i.tier === 'stuck' || i.tier === 'answered').length
   const chats = q.items.filter(i => i.source === 'chat')
   const outside = q.items.filter(i => i.source === 'outside')
   const prompts = q.items.filter(i => i.source === 'prompt')
@@ -1497,7 +1556,9 @@ function Page({ ctx, refresh }) {
                                 ? 'A source failed to load; the list may be incomplete.'
                                 : askCount(q)
                                 ? 'Everything that is waiting on your word.'
-                                : 'Nothing is blocked on you.',
+                                : held
+                                  ? 'No asks, but stuck or answered cards are listed.'
+                                  : 'Nothing is blocked on you.',
                           jsx('i', { className: 'ub-cursor' })
                         ]
                       })
@@ -1553,7 +1614,7 @@ function Page({ ctx, refresh }) {
           ...group('KANBAN.ANSWERED', kanbanAnswered, true),
           ...group('OUTSIDE.HERMES', outside),
           ...group('CHATS', chats),
-          !q.loading && !askCount(q) && !q.fault && !(q.errors || []).length
+          !q.loading && !askCount(q) && !held && !q.fault && !(q.errors || []).length
             ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, outside item, chat, prompt or pairing request is waiting on you.' })] })
             : null
         ]
