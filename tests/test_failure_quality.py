@@ -37,7 +37,7 @@ class SourceFailures(OutsideFixture):
         path.write_text("{bad")
         assert any(e.startswith("state:") for e in outside_needs.build_queue()["errors"])
         with pytest.raises(RuntimeError, match="could not read"):
-            outside_needs.unhide("outside:filed:" + "b" * 32, self.home)
+            outside_needs.unhide("chat:p:s", self.home)
         assert path.read_text() == "{bad"
 
     def test_corrupt_filed_item_is_reported_without_hiding_healthy_items(self):

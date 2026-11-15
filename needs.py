@@ -373,7 +373,21 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
 
 
 def unhide(item_id: str, home: Path | None = None) -> bool:
-    """Undo "Not for me". Returns whether the item was hidden."""
+    """Undo "Not for me" or a local Done. Returns whether anything was restored."""
+    filed = _FILED_ID.fullmatch(str(item_id))
+    if filed:
+        with _state_lock(home):
+            d = _outside_dir(home)
+            _purge_done(d)
+            f = d / (filed.group(1) + ".json")
+            if f.is_symlink() or not f.is_file():
+                return False
+            rec = _read_json(f)
+            if not _is_done(rec):
+                return False
+            rec.pop("done_at")
+            _write_json(f, rec)
+            return True
     with _state_lock(home):
         hidden = load_hidden(home, strict=True)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
@@ -1868,6 +1882,11 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
 _OUTSIDE_KINDS = ("draft", "notes", "approval", "other")
 _OUTSIDE_LIMIT = 200
 _OUTSIDE_READ_LIMIT = 256 * 1024
+# Done on an agent-filed item keeps the record (marked done_at) so Undo can restore it. The
+# text stays on disk only for this long and for at most this many done records; then it is
+# deleted. Nothing is kept for folder items beyond the existing hidden-version list.
+OUTSIDE_UNDO_SECONDS = 900
+_OUTSIDE_DONE_KEEP = 25
 _FILED_ID = re.compile(r"outside:filed:([a-f0-9]{32})\Z")
 _FOLDER_ID = re.compile(r"outside:folder:[a-f0-9]{64}\Z")
 
@@ -1890,6 +1909,35 @@ def _outside_field(
         marker = "\n[truncated]"
         return value[: limit - len(marker)] + marker
     return value[:limit]
+
+
+def _is_done(rec: dict[str, Any]) -> bool:
+    return isinstance(rec.get("done_at"), (int, float))
+
+
+def _purge_done(d: Path, now: float | None = None) -> int:
+    """Delete done records past the undo window and the oldest beyond the keep limit.
+
+    Call with the state lock held. Returns how many records were deleted."""
+    now = time.time() if now is None else now
+    done: list[tuple[float, Path]] = []
+    removed = 0
+    for f in d.glob("*.json"):
+        if f.is_symlink():
+            continue
+        rec = _read_json(f)
+        if not _is_done(rec):
+            continue
+        if now - rec["done_at"] > OUTSIDE_UNDO_SECONDS or rec["done_at"] > now + 60:
+            f.unlink(missing_ok=True)
+            removed += 1
+        else:
+            done.append((rec["done_at"], f))
+    done.sort()
+    for _, f in done[: max(0, len(done) - _OUTSIDE_DONE_KEEP)]:
+        f.unlink(missing_ok=True)
+        removed += 1
+    return removed
 
 
 def file_outside(
@@ -1926,6 +1974,7 @@ def file_outside(
             raise ValueError("resolve requires either id or dedupe_key")
     with _state_lock(home):
         d = _outside_dir(home)
+        _purge_done(d)
         files = list(d.glob("*.json"))
         match = None
         if action == "resolve" and item_id:
@@ -1945,6 +1994,11 @@ def file_outside(
             match.unlink()
             return {"ok": True, "resolved": True, "id": f"outside:filed:{match.stem}"}
         if match is None and len(files) >= _OUTSIDE_LIMIT:
+            # Done records waiting out their undo window do not count against the cap.
+            active = sum(1 for f in files if not f.is_symlink() and not _is_done(_read_json(f)))
+        else:
+            active = 0
+        if match is None and active >= _OUTSIDE_LIMIT:
             raise ValueError(
                 "Outside queue is full (200 filed items); resolve an item before filing another"
             )
@@ -1963,6 +2017,10 @@ def file_outside(
             "tier": "normal",
             "since": old.get("since") or time.time(),
         }
+        # Re-filing identical content does not undo a local Done; a changed claim is new
+        # work for the human and resurfaces.
+        if _is_done(old) and old.get("version") == version:
+            rec["done_at"] = old["done_at"]
         _write_json(d / f"{record_id}.json", rec)
         return {"ok": True, "id": item_id, "version": version}
 
@@ -2045,11 +2103,15 @@ def outside_items(
     """Our filed records plus bounded, non-recursive reads of explicitly watched folders."""
     errors = errors if errors is not None else []
     items = []
+    done_seen = False
     for f in _outside_dir(home).glob("*.json"):
         if f.is_symlink():
             continue
         before = len(errors)
         rec = _read_json(f, errors=errors, source="outside")
+        if _is_done(rec):
+            done_seen = True  # locally Done, waiting out its undo window; not in the queue
+            continue
         if (
             rec.get("id") == f"outside:filed:{f.stem}"
             and _FILED_ID.fullmatch(rec["id"])
@@ -2062,6 +2124,12 @@ def outside_items(
             items.append(rec)
         elif len(errors) == before:
             errors.append(f"outside: {f.name}: invalid filed record")
+    if done_seen:
+        try:
+            with _state_lock(home):
+                _purge_done(_outside_dir(home))
+        except (OSError, TimeoutError, RuntimeError):
+            pass  # cleanup retries on the next poll or the next Done
     raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
     seen: set[Path] = set()
     for name in str(raw).split(","):
@@ -2115,11 +2183,19 @@ def outside_items(
 def done_outside(
     item_id: str, version: str, home: Path | None = None
 ) -> dict[str, Any]:
-    """Done only deletes our own record; folder items are hidden at the version read."""
+    """Local Done: clears the card from UNBL0CK and nothing else.
+
+    Both kinds are reversible. A filed record is kept, marked done, for OUTSIDE_UNDO_SECONDS;
+    a folder item is hidden at the version read. Neither sends, files or completes anything
+    in the original app, and neither touches a source file. The agent's own ``resolve``
+    action is the permanent deletion.
+    """
     match = _FILED_ID.fullmatch(item_id)
     if match:
         with _state_lock(home):
-            f = _outside_dir(home) / (match.group(1) + ".json")
+            d = _outside_dir(home)
+            _purge_done(d)
+            f = d / (match.group(1) + ".json")
             rec = _read_json(f)
             if not rec or f.is_symlink():
                 raise LookupError("Filed outside item no longer exists")
@@ -2127,12 +2203,15 @@ def done_outside(
                 raise RuntimeError(
                     "Outside item changed; refresh before marking it Done"
                 )
-            f.unlink()
-        return {"ok": True, "deleted": True}
+            if not _is_done(rec):
+                rec["done_at"] = time.time()
+                _write_json(f, rec)
+                _purge_done(d)  # enforce the keep limit now that this one counts
+        return {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS}
     if not _FOLDER_ID.fullmatch(item_id):
         raise ValueError("id must identify an outside item")
     hide(item_id, version, home)
-    return {"ok": True, "hidden": True}
+    return {"ok": True, "hidden": True, "local_only": True}
 
 
 # --- the queue -----------------------------------------------------------------------------

@@ -474,14 +474,14 @@ class OutsideAPI(OutsideFixture):
         self.client = TestClient(app)
         self.addCleanup(self.client.close)
 
-    def test_done_deletes_filed_record(self):
+    def test_done_hides_filed_record_without_deleting_it(self):
         result = self.file()
         (it,) = needs.build_queue()["items"]
         reply = self.client.post(
             "/outside/done", json={"id": it["id"], "version": it["version"]}
         )
         self.assertEqual(reply.status_code, 200)
-        self.assertFalse(self.record(result).exists())
+        self.assertTrue(self.record(result).exists())  # kept for Undo; see test_outside_done_undo
         self.assertEqual(needs.build_queue()["count"], 0)
 
     def test_queue_sends_only_an_excerpt_and_full_text_is_fetched_lazily(self):

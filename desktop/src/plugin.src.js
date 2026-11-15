@@ -23,8 +23,9 @@ function oldestAskSince(items) {
     .filter(i => i.tier !== 'stuck' && i.tier !== 'answered')
     .reduce((m, i) => (i.since && (!m || i.since < m) ? i.since : m), 0)
 }
-const $undo = atom(null)   // the last "Not for me": { id, title } while it can be undone
+const $undo = atom([])   // recent local dismissals, newest first: [{ id, title, at, kind, failed }]
 const UNDO_MS = 12000
+const UNDO_KEEP = 5
 // An answer that says to keep the card blocked, sent with the unblocking button.
 const KEEP_BLOCKED = /\b(keep|leave|stay|remain)s?\b[^.]{0,24}\bblocked\b|\b(do not|don't|dont|never)\s+(unblock|release)/i
 // What the TL;DR button asks (the /bro rule: bottom line first, plain words, no jargon).
@@ -872,6 +873,13 @@ function CardDetail({ data, loading, error }) {
 // Session memory only: source faults and route remounts must not discard a typed answer.
 // Keep the original version so recovering a changed question cannot authorize a stale reply.
 const ANSWER_DRAFT_TTL = 30 * 60 * 1000
+// Local dismissals the human can still undo, newest first, bounded. A second dismissal
+// no longer replaces the first. The server keeps a filed record only for a short period,
+// so an entry can outlive its record; Undo then says so instead of pretending.
+function undoPush(entry) {
+  const rest = ($undo.get?.() || []).filter(u => u.id !== entry.id)
+  $undo.set([entry, ...rest].slice(0, 5))
+}
 const answerDrafts = new Map()
 function readAnswerDraft(id) {
   const cutoff = Date.now() - ANSWER_DRAFT_TTL
@@ -1037,11 +1045,11 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     )
   const hide = async () => {
     const r = await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
-    if (r) $undo.set({ id: item.id, title: item.title, at: Date.now() })
+    if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden' })
   }
   const outsideDone = async () => {
     const r = await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null)
-    if (r?.hidden) $undo.set({ id: item.id, title: item.title, at: Date.now() })
+    if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done' })
   }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
@@ -1238,7 +1246,10 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
         jsxs('div', { className: 'ub-btns', children: [
           button({ kind: 'primary', disabled: busy, onClick: outsideDone, children: item.origin === 'folder' ? 'Done — hides until the file changes' : 'Done' }),
           button({ kind: 'ghost', disabled: busy, onClick: hide, children: 'Not for me' })
-        ] })
+        ] }),
+        jsx('div', { className: 'ub-hint', role: 'note', children: item.origin === 'folder'
+          ? 'Done only hides this card until the file changes. The file is not changed, moved or deleted. You can Undo.'
+          : 'Done only clears this card here. It does not send, file or finish anything in the original app, and you can Undo for a few minutes.' })
       ].filter(Boolean)
     : [
         opensHere ? null : jsx('div', { className: 'ub-hint', role: 'note', children: `Reply in ${platformName || 'the chat'}. It leaves this list once you answer.` }),
@@ -1382,26 +1393,37 @@ function Page({ ctx, refresh }) {
   const [source, setSource] = useState('all')
   useEffect(() => { if (Date.now() - (q.at || 0) > 10000) refresh() }, [])   // opening the page shows fresh data
   const fx = useValue($fxOn)
-  const undo = useValue($undo)
+  const undoList = useValue($undo) || []
   const [undoBusy, setUndoBusy] = useState(false)
+  const [ended, setEnded] = useState([])
   useEffect(() => {
-    if (!undo || undoBusy) return
-    const t = setTimeout(() => $undo.set(null), Math.max(0, UNDO_MS - (Date.now() - undo.at)))
+    if (!undoList.length || undoBusy) return
+    const next = Math.min(...undoList.map(u => u.at + UNDO_MS))
+    const t = setTimeout(() => {
+      const now = Date.now()
+      const gone = ($undo.get() || []).filter(u => u.at + UNDO_MS <= now)
+      if (!gone.length) return
+      $undo.set(($undo.get() || []).filter(u => u.at + UNDO_MS > now))
+      setEnded(gone.map(u => u.title))   // announced politely; the action stays recorded in the host's history
+    }, Math.max(0, next - Date.now()))
     return () => clearTimeout(t)
-  }, [undo, undoBusy])
-  const undoHide = async () => {
-    const u = undo
+  }, [undoList, undoBusy])
+  const undoHide = async (u) => {
     if (!u || undoBusy) return
     setUndoBusy(true)
+    const drop = () => $undo.set(($undo.get() || []).filter(x => x.id !== u.id))
     try {
-      await ctx.rest('/unhide', { method: 'POST', body: { id: u.id } })
-      if ($undo.get()?.at === u.at) $undo.set(null)
-      sfx.play('move')
+      const r = await ctx.rest('/unhide', { method: 'POST', body: { id: u.id } })
+      drop()
+      if (r && r.restored === false) {
+        host.notify({ kind: 'info', message: `Nothing to restore for "${u.title}": it changed or its undo period ended.` })
+      } else {
+        sfx.play('move')
+      }
       await refresh()
     } catch (e) {
-      // Keep a failed restoration available for another full retry window. A different
-      // hide action may have replaced this one while the request was pending.
-      if ($undo.get()?.at === u.at) $undo.set({ ...u, at: Date.now() })
+      // Keep a failed restoration for another full retry window, marked so it reads as retryable.
+      $undo.set(($undo.get() || []).map(x => (x.id === u.id ? { ...u, at: Date.now(), failed: true } : x)))
       host.notifyError(e, 'UNBL0CK: could not undo')
     } finally {
       setUndoBusy(false)
@@ -1535,16 +1557,29 @@ function Page({ ctx, refresh }) {
           ] }),
           filtered ? jsx('div', { className: 'ub-filter-status', role: 'status', children: `${visible.length} of ${q.items.length} cards shown · search uses titles and previews` }) : null,
           filtered && !visible.length && !q.loading ? jsx('div', { className: 'ub-clear', children: jsx('span', { children: 'No cards match these filters. Clear filters to see the queue.' }) }) : null,
-          undo
+          ended.length
             ? jsxs('div', {
                 className: 'ub-undo',
                 role: 'status',
                 children: [
-                  jsxs('span', { children: [jsx('b', { children: 'HIDDEN \\\\ ' }), undo.title] }),
-                  button({ kind: 'ghost', disabled: undoBusy, onClick: undoHide, children: 'Undo' })
+                  jsx('span', { children: `Undo window ended: ${ended.join(', ')}. Find it again under its source if it is still waiting.` }),
+                  button({ kind: 'ghost', onClick: () => setEnded([]), children: 'Dismiss' })
                 ]
-              }, undo.at)
+              })
             : null,
+          ...undoList.map(u =>
+            jsxs('div', {
+              className: 'ub-undo',
+              role: 'status',
+              children: [
+                jsxs('span', { children: [
+                  jsx('b', { children: (u.kind === 'done' ? 'DONE (LOCAL ONLY)' : 'HIDDEN') + ' \\\\ ' }),
+                  u.title,
+                  u.failed ? ' · could not restore, try again' : ''
+                ] }),
+                button({ kind: 'ghost', disabled: undoBusy, onClick: () => undoHide(u), children: 'Undo' })
+              ]
+            }, u.id)),
           kanban.length ? jsx('div', { className: 'ub-hazard' }) : null,
           ...group('LIVE.PROMPTS', prompts),
           ...group('ACCESS.REQUESTS', pairing),

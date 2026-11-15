@@ -50,13 +50,13 @@ const fs = require('fs'), assert = require('node:assert/strict');
 const src = fs.readFileSync(process.argv[1], 'utf8');
 const views = src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
 const node = (type, props, key) => ({type, props, key}), noop = () => {};
-let state = [], cursor = 0, undo;
+let state = [], cursor = 0, undo = [];
 const env = {
   jsx: node, jsxs: node, useState: init => { const i = cursor++; if (!(i in state)) state[i] = init; return [state[i], v => { state[i] = typeof v === 'function' ? v(state[i]) : v; }]; },
   useEffect: noop, useRef: () => ({}), platformLabel: x => x, LOCAL_PLATFORMS: [], KEEP_BLOCKED: /keep blocked/i,
   button: props => node('button', props), openBoard: noop, ago: () => '', ageClass: () => '', pad: String,
   sfx: {play: noop}, petEmit: noop, host: {notify: noop, notifyError: e => {throw e}},
-  $undo: {set: v => {undo = v}}, $queue: 'queue', $fxOn: 'fx', UNDO_MS: 12000, askCount: q => q.count,
+  $undo: {get: () => undo, set: v => {undo = v}}, $queue: 'queue', $fxOn: 'fx', UNDO_MS: 12000, askCount: q => q.count,
   Field: noop, Watermark: noop, Banner: noop, Pet: noop, Ticker: noop, FxToggle: noop, SfxToggle: noop,
   grainUrl: () => '', oldestAskSince: () => 0, reducedMotion: () => true,
 };
@@ -85,7 +85,7 @@ state = []; cursor = 0;
 const folder = Item({ctx,item:draft,n:1,refresh,askEnabled:false});
 (async () => {
   await all(folder).find(n => n?.type === 'button' && n.props.children === 'Done — hides until the file changes').props.onClick();
-  assert.equal(undo.id,draft.id);
+  assert.equal(undo[0].id,draft.id);assert.equal(undo[0].kind,'done');
   state = []; cursor = 0;
   const card = Item({ctx,item:kanban,n:1,refresh,askEnabled:false});
   assert.ok(all(card).some(n => n?.type === 'button' && n.props.children === '+ FULL TEXT'),'unsummarized cards need a keyboard control');

@@ -55,8 +55,8 @@ control and are not a standalone public API.
 | `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502 |
 | `GET /card/ask/{job}?poll=true` | Same job, with terminal model failures encoded as `{ok:false,detail}` for the client |
 | `POST /kanban/answer` | Versioned native comment and optional release; stale version 409 with no comment or release; empty version 400; unversioned comment-only answers still work for older callers (response `versioned:false`, `Warning: 299` header) unless `require_answer_version` is on (428, nothing written); the response reports the block `version` applied; settings uncertainty prevents writes |
-| `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID. Identifiers (and `board`/`task_id` on `/card`, `/kanban/answer`, `/outside/done`) are limited to 300 characters with no control characters (400); a malformed or non-Kanban `id`, or one that disagrees with `board`/`task_id`, is rejected instead of retargeted |
-| `POST /outside/done` | Delete a filed record or hide a folder item version |
+| `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID (also restores a filed record marked done; `restored:false` when nothing was restorable). Identifiers (and `board`/`task_id` on `/card`, `/kanban/answer`, `/outside/done`) are limited to 300 characters with no control characters (400); a malformed or non-Kanban `id`, or one that disagrees with `board`/`task_id`, is rejected instead of retargeted |
+| `POST /outside/done` | Local, reversible Done: mark a filed record done (kept up to 15 minutes, at most 25) or hide a folder item version; `local_only:true`; nothing is sent or completed externally |
 | `GET /pack`, `POST /pack` | Read pack representation, or explicitly write it |
 
 POST Answer/Ask models bound card identifiers to 300 characters, answers/message text

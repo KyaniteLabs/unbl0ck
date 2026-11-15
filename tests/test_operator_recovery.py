@@ -9,7 +9,7 @@ const fs = require('fs'), assert = require('node:assert/strict');
 const src = fs.readFileSync(process.argv[1], 'utf8');
 const views = src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
 const node = (type, props, key) => ({type,props,key}), noop=()=>{};
-let state=[],cursor=0,undo={id:'outside:1',title:'Draft',at:Date.now()}, refreshes=0, failures=0;
+let state=[],cursor=0,undo=[{id:'outside:1',title:'Draft',at:Date.now(),kind:'done'}], refreshes=0, failures=0;
 const env={
  jsx:node,jsxs:node,useState:init=>{const i=cursor++,current=state;if(!(i in current))current[i]=init;return[current[i],v=>{current[i]=typeof v==='function'?v(current[i]):v}]},
  useEffect:noop,useRef:()=>({}),platformLabel:x=>x,LOCAL_PLATFORMS:[],KEEP_BLOCKED:/keep blocked/i,
@@ -44,9 +44,9 @@ const render=()=>{cursor=0;return Page({ctx,refresh})};
  assert.equal(find(render(),'Undo').disabled,true);
  await find(render(),'Undo').onClick();assert.equal(calls,1);
  reject(new Error('temporary outage'));await first;
- assert.ok(undo,'failed restoration must preserve retry');
+ assert.equal(undo.length,1,'failed restoration must preserve retry');assert.equal(undo[0].failed,true);
  assert.equal(find(render(),'Undo').disabled,false);
- await find(render(),'Undo').onClick();assert.equal(undo,null);assert.equal(calls,2);
+ await find(render(),'Undo').onClick();assert.equal(undo.length,0);assert.equal(calls,2);
  assert.equal(failures,1);assert.equal(refreshes,1);
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)

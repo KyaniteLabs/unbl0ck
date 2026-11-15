@@ -12,12 +12,18 @@ An empty incomplete queue does not mean everything is clear.
 | Chat | Open a local session, or read where to reply on a gateway platform | Reply in the original chat. UNBL0CK does not send a message on your behalf. |
 | Live prompt | Read the platform and prompt | Answer where the agent paused. Resolved, expired and dead-process prompts disappear. |
 | Pairing request | Read the admin approval command or open Pairing | Approve through native Hermes. Expired requests disappear. The requester’s pairing code is never exposed. |
-| Outside Hermes | Read **Act in**, then finish in the original app | **Done** deletes an agent-filed record. Folder **Done** hides that file version; it does not edit, move or delete the source file. |
+| Outside Hermes | Read **Act in**, then finish in the original app | **Done** is local and reversible for both kinds: it clears the card from UNBL0CK and nothing else. It never sends mail or completes the task in the original app. A filed record is kept, marked done, for 15 minutes so Undo works, then deleted. Folder **Done** hides that file version; it does not edit, move or delete the source file. |
 
 **Not for me** hides the current item version. A source change makes it eligible again.
-**Undo** lasts 12 seconds, pauses expiry while restoration is pending, and renews its
-12-second window after a failed restoration request. Folder Done also offers Undo; deletion of an agent-filed record
-does not. A later hide action replaces the single Undo slot.
+**Undo** history keeps the five most recent local dismissals (Not for me and Done), newest
+first, each with its own Undo button. An entry lasts 12 seconds, pauses expiry while
+restoration is pending, and renews its window after a failed restoration request, marked
+"could not restore, try again". When an entry expires the page announces
+"Undo window ended". If the item changed or its record is already gone, Undo says nothing
+was restored. A filed record is kept on disk for 15 minutes after Done (at most 25 such
+records), then deleted; the agent's own `resolve` action removes a record permanently and
+is the only action that means the work is finished. Re-filing identical content keeps a
+Done item hidden; changed content brings it back.
 
 Search and source filtering use already loaded text. They preserve mounted answer
 boxes and conversations and do not change the total queue count. **Clear filters**
