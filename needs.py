@@ -2602,7 +2602,11 @@ def outside_items(
                         item = _folder_outside_item(f, root, st, dfd)
                         if item is not None:
                             items.append(item)
-                    except (OSError, ValueError) as exc:
+                        else:
+                            errors.append(
+                                f"outside: {f.name}: changed while it was read or is no longer a plain file; retry"
+                            )
+                    except Exception as exc:  # one hostile file must not hide the rest of the folder
                         errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
         except (OSError, ValueError, RuntimeError) as exc:
             errors.append(f"outside: {name.strip()}: {type(exc).__name__}: {exc}")
@@ -2667,7 +2671,10 @@ def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
                     )
                     if not stat.S_ISREG(st.st_mode) or f.resolve().parent != root:
                         raise LookupError("outside item is no longer available")
-                    item = _folder_outside_item(f, root, st, dfd)
+                    try:
+                        item = _folder_outside_item(f, root, st, dfd)
+                    except RecursionError as exc:
+                        raise SourceUnavailable("outside file could not be parsed: too deeply nested") from exc
                     if item is None:
                         raise SourceUnavailable("outside file changed while it was read; retry")
                     return item
