@@ -83,18 +83,31 @@ def _loaded_ctx():
     """
     target = (PLUGIN_DIR / "__init__.py").resolve()
     for module in list(sys.modules.values()):
-        filename = getattr(module, "__file__", None)
+        filename = _safe_attr(module, "__file__")
         if not filename:
             continue
         try:
             if Path(filename).resolve() != target:
                 continue
-        except OSError:
+        except (OSError, TypeError, ValueError):
             continue
-        ctx = getattr(module, "_PLUGIN_CTX", None)
+        ctx = _safe_attr(module, "_PLUGIN_CTX")
         if ctx is not None:
             return ctx
     return None
+
+
+def _safe_attr(obj: Any, name: str) -> Any:
+    """``getattr`` that treats any failure to resolve the name as absent. A lazily resolved
+    attribute of a host object can raise ImportError, not only AttributeError."""
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _has_llm(ctx: Any) -> bool:
+    return ctx is not None and _safe_attr(ctx, "llm") is not None
 
 
 router = APIRouter()
@@ -224,7 +237,7 @@ def queue():
             if (not it.get("bluf") and it.get("source") not in getattr(n, "NO_BLUF_SOURCES", ())
                     and not it.get("backfilled")   # older than the default window: no automatic model call
                     and it.get("tier") not in ("stuck", "answered")):   # not asks: no model call each
-                if ctx is not None and hasattr(ctx, "llm"):
+                if _has_llm(ctx):
                     _queue_bluf(n, ctx, it)
                 else:
                     it["bluf_status"] = "unavailable"
@@ -383,7 +396,7 @@ def card_ask(body: CardAsk):
         raise HTTPException(status_code=403, detail="Ask is disabled in UNBL0CK settings")
     board, task_id = _checked_card_ref(body.id, body.board, body.task_id)
     ctx = _loaded_ctx()
-    if ctx is None or not hasattr(ctx, "llm"):
+    if not _has_llm(ctx):
         raise HTTPException(
             status_code=503,
             detail="Ask is unavailable: the plugin host LLM is not reachable",

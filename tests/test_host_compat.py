@@ -23,18 +23,60 @@ else:
     HERMES = True
 
 
+HOST_ROOTS = ("hermes_cli", "hermes_constants", "gateway")
+
+
+def source_files():
+    """Every shipped Python file that can reach into Hermes (tests are not shipped)."""
+    files = [ROOT / n for n in ("needs.py", "jobs.py", "recovery.py", "adapter_contract.py", "__init__.py")]
+    files += [ROOT / "dashboard" / "plugin_api.py"]
+    files += sorted((ROOT / "scripts").glob("*.py"))
+    return [f for f in files if f.exists() and f.name != "host_compat.py"]
+
+
 def used_names():
-    """Every hermes_cli / hermes_constants name the source reaches for, read from the source."""
-    found = {}
-    alias = {"kanban_db": "hermes_cli.kanban_db", "kbc": "hermes_cli.kanban_db_connect", "kb": "hermes_cli.kanban_db_boards"}
-    for rel in ("needs.py", "dashboard/plugin_api.py"):
-        text = (ROOT / rel).read_text()
-        for var, module in alias.items():
-            for name in re.findall(rf"\b{var}\.([A-Za-z_]\w*)", text):
-                found.setdefault(module, set()).add(name)
-    found["hermes_cli.config"] = {"load_config_readonly"}
-    found["hermes_constants"] = {"get_hermes_home"}
+    """Every Hermes name the shipped source reaches for, read from the syntax tree.
+
+    Only executable imports and attribute accesses count: a name in a comment or docstring is not
+    a dependency. ``from hermes_cli import kanban_db`` makes ``kanban_db.x`` an access to
+    ``hermes_cli.kanban_db.x``; ``from gateway.pairing import PairingStore`` is the name
+    ``PairingStore``. The one method taken from a returned object, ``list_pending``, is recorded
+    as ``PairingStore.list_pending``.
+    """
+    import ast
+
+    found: dict[str, set[str]] = {}
+    for path in source_files():
+        tree = ast.parse(path.read_text())
+        alias: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] in HOST_ROOTS:
+                for a in node.names:
+                    if node.module == "hermes_cli":
+                        alias[a.asname or a.name] = f"hermes_cli.{a.name}"
+                    else:
+                        found.setdefault(node.module, set()).add(a.name)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in alias:
+                found.setdefault(alias[node.value.id], set()).add(node.attr)
+            if isinstance(node, ast.Attribute) and node.attr == "list_pending":
+                found.setdefault("gateway.pairing", set()).add("PairingStore.list_pending")
     return found
+
+
+def full_module(drop=()):
+    """A stand-in module holding every listed name (dotted names become nested attributes)."""
+    ns = types.SimpleNamespace()
+    for names in needs.HOST_API.values():
+        for name in names:
+            if name in drop:
+                continue
+            head, _, tail = name.partition(".")
+            if tail:
+                setattr(ns, head, types.SimpleNamespace(**{tail: 1}))
+            else:
+                setattr(ns, head, 1)
+    return ns
 
 
 class TheTableIsTheCode(unittest.TestCase):
@@ -47,16 +89,15 @@ class TheTableIsTheCode(unittest.TestCase):
         privates = {n for names in needs.HOST_API.values() for n in names if n.startswith("_")}
         self.assertEqual(
             privates,
-            {"_append_event", "_landing_status_after_parents", "_normalize_board_slug",
-             "_reclaim_dangling_run", "_resume_status_from_events"},
+            {"_append_event", "_landing_status_after_parents", "_reclaim_dangling_run",
+             "_resume_status_from_events", "_mutate_subscriptions", "_subscriptions_path"},
         )
-        self.assertEqual(needs.host_compat(lambda m: types.SimpleNamespace(**{
-            n: 1 for names in needs.HOST_API.values() for n in names}))["private_checked"], len(privates))
+        self.assertEqual(needs.host_compat(lambda m: full_module())["private_checked"], len(privates))
 
 
 class Report(unittest.TestCase):
     def full(self):
-        return types.SimpleNamespace(**{n: 1 for names in needs.HOST_API.values() for n in names})
+        return full_module()
 
     def test_a_complete_host_is_ok(self):
         r = needs.host_compat(lambda m: self.full())
@@ -136,7 +177,7 @@ class Script(unittest.TestCase):
         rec = json.loads(out.stdout)
         self.assertEqual(
             set(rec),
-            {"recorded_at", "plugin_version", "hermes_version", "python", "os", "state_lock", "interfaces"},
+            {"recorded_at", "plugin_version", "hermes_version", "hermes_release_date", "python", "os", "state_lock", "interfaces"},
         )
         self.assertRegex(rec["recorded_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual(rec["plugin_version"], re.search(r'^version:\s*"([^"]+)"', (ROOT / "plugin.yaml").read_text(), re.M).group(1))

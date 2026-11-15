@@ -4428,20 +4428,39 @@ def done_outside(
 # Every name UNBL0CK takes from Hermes that is not a documented plugin API. A Hermes upgrade can
 # remove or rename any of them; host_compat() reports which are present so the failure names the
 # cause ("this Hermes lacks X") instead of an AttributeError deep in a card read. Names starting
-# with an underscore are private to Hermes and the most upgrade-sensitive. A test keeps this
-# table equal to what the code actually uses.
+# with an underscore are private to Hermes and the most upgrade-sensitive. A test reads the syntax
+# tree of every shipped file and keeps this table equal to what the code actually imports and
+# calls (a name in a comment is not a dependency). A dotted entry is a method of a class in the
+# same module. ``Comment``, ``Attachment`` and ``list_attachments`` are reached by name only on a
+# schema-drift fallback path, so they are not required. The installer script's webhook helpers
+# are listed because that script needs them on the same host.
 HOST_API = {
     "hermes_cli.kanban_db": (
-        "Event", "add_comment", "board_exists", "get_task", "latest_run", "list_attachments",
+        "Event", "add_comment", "board_exists", "get_task", "latest_run",
         "list_comments", "list_events", "list_tasks", "task_graph_context", "write_txn",
-        "_append_event", "_landing_status_after_parents", "_normalize_board_slug",
+        "_append_event", "_landing_status_after_parents",
         "_reclaim_dangling_run", "_resume_status_from_events",
     ),
     "hermes_cli.kanban_db_connect": ("connect",),
     "hermes_cli.kanban_db_boards": ("list_boards",),
     "hermes_cli.config": ("load_config_readonly",),
+    "hermes_cli.profiles": ("profile_exists",),
+    "hermes_cli.webhook": ("_mutate_subscriptions", "_subscriptions_path"),
     "hermes_constants": ("get_hermes_home",),
+    "gateway.pairing": ("PairingStore", "PairingStore.list_pending"),
 }
+
+
+def _host_has(mod: Any, dotted: str) -> bool:
+    """Whether *dotted* resolves on *mod*. A module may resolve an attribute lazily and fail doing
+    it (an ImportError for a dependency it needs); that name is not usable, so it is missing."""
+    obj = mod
+    for part in dotted.split("."):
+        try:
+            obj = getattr(obj, part)
+        except Exception:  # noqa: BLE001 - any resolution fault means the name is not usable
+            return False
+    return True
 
 
 def host_compat(import_module: Callable[[str], Any] | None = None) -> dict[str, Any]:
@@ -4462,7 +4481,7 @@ def host_compat(import_module: Callable[[str], Any] | None = None) -> dict[str, 
             continue
         for name in names:
             checked += 1
-            if not hasattr(mod, name):
+            if not _host_has(mod, name):
                 missing.append(f"{module}.{name}")
     return {
         "ok": not missing,
@@ -4613,11 +4632,19 @@ def build_queue(
     outside_retained: dict[str, str] = {}  # Done records waiting out Undo: not shown, still known
     # One broken source must not hide the other; one broken board must not hide the
     # rest of Kanban (kanban_items records ``kanban[board]: …`` itself).
+    kanban_failed = False
     try:
         items.extend(kanban_items(errors=errors))
+        # kanban_items records a failing board itself and returns normally.
+        kanban_failed = any(e.startswith("kanban[") for e in errors)
     except Exception as exc:  # noqa: BLE001
+        kanban_failed = True
         errors.append(f"kanban: {type(exc).__name__}: {exc}")
-        note = host_compat_note()
+    if kanban_failed:
+        try:
+            note = host_compat_note()
+        except Exception:  # noqa: BLE001 - the diagnostic must never hide the other sources
+            note = ""
         if note:
             errors.append(note)
     chat_coverage: dict[str, Any] | None = {}

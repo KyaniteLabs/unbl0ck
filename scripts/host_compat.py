@@ -36,13 +36,35 @@ def _plugin_version() -> str:
     return match.group(1).strip() if match else "unknown"
 
 
-def _hermes_version() -> str:
-    for dist in ("hermes-agent", "hermes_agent", "hermes"):
-        try:
-            return metadata.version(dist)
-        except metadata.PackageNotFoundError:
-            continue
-    return "unknown"
+_PLACEHOLDERS = {"", "0.0.0", "0", "unknown", "none"}
+
+
+def _hermes_identity() -> dict:
+    """The Hermes release this process runs, from the runtime's own provenance.
+
+    ``hermes_cli.__version__`` and ``__release_date__`` identify the checkout that is imported.
+    Distribution metadata is only a fallback, and its placeholder ``0.0.0`` is never recorded
+    as a version, because every revision of an editable install carries it.
+    """
+    version = date = ""
+    try:
+        import hermes_cli  # type: ignore
+
+        version = str(getattr(hermes_cli, "__version__", "") or "")
+        date = str(getattr(hermes_cli, "__release_date__", "") or "")
+    except Exception:  # noqa: BLE001 - an unimportable Hermes has no runtime identity
+        pass
+    if version.strip().lower() in _PLACEHOLDERS:
+        version = ""
+        for dist in ("hermes-agent", "hermes_agent", "hermes"):
+            try:
+                found = metadata.version(dist)
+            except metadata.PackageNotFoundError:
+                continue
+            if found.strip().lower() not in _PLACEHOLDERS:
+                version = found
+                break
+    return {"hermes_version": version or "unknown", "hermes_release_date": date or "unknown"}
 
 
 def record() -> dict:
@@ -51,7 +73,7 @@ def record() -> dict:
     return {
         "recorded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "plugin_version": _plugin_version(),
-        "hermes_version": _hermes_version(),
+        **_hermes_identity(),
         "python": platform.python_version(),
         "os": f"{platform.system()} {platform.release()} {platform.machine()}",
         "state_lock": needs.state_lock_mode(),
