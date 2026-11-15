@@ -52,7 +52,7 @@ def test_ub2_credential_and_home_path_shapes_never_reach_ctx_llm_complete():
         ],
         bluf_messages=needs.bluf_messages,
         parse_bluf=needs.parse_bluf,
-        save_bluf=lambda *a: None,
+        save_bluf=lambda *a, **kw: None,
     )
     item = {
         "id": "kanban:b:t",

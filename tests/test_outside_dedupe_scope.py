@@ -235,6 +235,38 @@ class DedupeScope(OutsideFixture):
         fresh = self.call("work", dedupe_key="k", body="three")
         self.assertNotEqual(fresh["id"], a["id"])
 
+    # Class sweep: resolve cleans its own dismissal marker; a long key is refused, not cut.
+
+    def test_resolve_drops_the_not_for_me_marker_of_the_resolved_record(self):
+        a = self.call("work", dedupe_key="k")
+        needs.hide(a["id"], a["version"], self.home)
+        self.assertIn(a["id"], needs.load_hidden(self.home))
+        self.assertTrue(self.call("work", action="resolve", id=a["id"])["resolved"])
+        self.assertNotIn(a["id"], needs.load_hidden(self.home))
+
+    def test_resolve_leaves_other_dismissals_alone(self):
+        a = self.call("work", dedupe_key="k")
+        needs.hide(a["id"], a["version"], self.home)
+        needs.hide("outside:folder:" + "a" * 64, "v", self.home)
+        self.call("work", action="resolve", id=a["id"])
+        self.assertEqual(list(needs.load_hidden(self.home)), ["outside:folder:" + "a" * 64])
+
+    def test_resolve_with_a_corrupt_hidden_file_still_resolves_and_keeps_the_file(self):
+        a = self.call("work", dedupe_key="k")
+        path = needs._hidden_path(self.home)
+        path.write_text("{not json")
+        self.assertTrue(self.call("work", action="resolve", id=a["id"])["resolved"])
+        self.assertEqual(path.read_text(), "{not json")
+
+    def test_two_long_keys_that_share_a_prefix_are_refused_not_merged(self):
+        prefix = "k" * 120
+        first = self.call("work", dedupe_key=prefix)
+        self.assertTrue(first["ok"])
+        second = self.call("work", dedupe_key=prefix + "-other", title="Other")
+        self.assertFalse(second["ok"])
+        self.assertIn("120", second["error"])
+        self.assertEqual([r["title"] for r in self.records()], ["T"])
+
 
 if __name__ == "__main__":
     unittest.main()

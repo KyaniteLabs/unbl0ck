@@ -1696,7 +1696,13 @@ export default {
     let lastErr = ''
     let inflight = null
     let disposed = false
-    const refresh = () => (inflight ||= load().finally(() => { inflight = null }))
+    // One load at a time. A refresh asked for while a load is running (after an answer or a Done)
+    // waits for it and then reads again: the running load may have read the queue before the change.
+    let rerun = null
+    const refresh = () => {
+      if (!inflight) return (inflight = load().finally(() => { inflight = null }))
+      return (rerun ||= inflight.then(() => { rerun = null; return refresh() }))
+    }
     const load = async () => {
       if (disposed) return
       clearTimeout(follow)

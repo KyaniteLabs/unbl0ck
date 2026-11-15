@@ -71,6 +71,7 @@ class BlufJobs:
     MAX_ATTEMPTS = 3   # after this many failures a card version is not summarized again
     STUCK_S = 3600     # a pending job this old never reported back (the model call times out at 90 s)
     PRUNE_OVER = 500   # table size at which settled entries are dropped
+    MAX_ENTRIES = 2000  # hard bound: past it the oldest failed entries go, even ones out of retries
 
     def __init__(self, clock: Optional[Callable[[], float]] = None):
         self._clock = clock or (lambda: time.time())
@@ -134,6 +135,13 @@ class BlufJobs:
             return
         for k in [k for k in list(self._jobs) if self.can_start(k)]:
             self._jobs.pop(k, None)
+        # A version out of retries never "can start", so the pass above keeps it for ever. Bound
+        # the table anyway: the oldest failures go first, pending jobs never.
+        over = len(self._jobs) - (self.MAX_ENTRIES - 1)
+        if over > 0:
+            failed = sorted((v["at"], k) for k, v in self._jobs.items() if v["state"] is BlufState.FAILED)
+            for _, k in failed[:over]:
+                self._jobs.pop(k, None)
 
     def __len__(self) -> int:
         return len(self._jobs)
@@ -172,6 +180,7 @@ class AskJournal:
     counts them and Ask itself never breaks because of the journal."""
 
     MAX_FILES = 256
+    MAX_RECORD_BYTES = 262144  # a record holds one reply of at most a few thousand tokens
 
     def __init__(
         self,
@@ -304,8 +313,8 @@ class AskJournal:
         except OSError:
             self.failures += 1
             return {"corrupt": True}
-        if not stat.S_ISREG(st.st_mode):
-            return {"corrupt": True}
+        if not stat.S_ISREG(st.st_mode) or st.st_size > self.MAX_RECORD_BYTES:
+            return {"corrupt": True}  # never read a file that cannot be a record into memory
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -543,8 +552,9 @@ class AskJobs:
                 raise KeyError(job)
             if st["status"] not in ASK_SETTLED:
                 raise IllegalTransition(f"ask job {job} is still {st['status'].value}")
-            if self._journal:
-                self._journal.delete(job)
+            if self._journal and not self._journal.delete(job) and not self._journal.verified_absent(job):
+                # The saved reply is still on disk and would be recovered as this very job.
+                raise DiscardFailed(f"the saved record for ask job {job} could not be deleted")
             return self._jobs.pop(job)
 
     def _expire(self) -> None:
