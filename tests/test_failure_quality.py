@@ -354,7 +354,7 @@ def test_worker_completion_or_failure_returns_model_capacity(fail):
 def test_ask_overload_and_failed_submission_are_explicit_and_recoverable():
     from fastapi import HTTPException
     api = api_module()
-    api._needs = lambda: types.SimpleNamespace(ask_enabled=lambda: True, card_context=lambda *a: {}, build_ask_messages=lambda *a: [])
+    api._needs = lambda: types.SimpleNamespace(ask_enabled=lambda: True, card_context=lambda *a: {}, build_ask_messages=lambda *a: [], ask_journal_dir=lambda: None)
     api._checked_card_ref = lambda *a: ("default", "t")
     api._loaded_ctx = lambda: types.SimpleNamespace(llm=object())
     submitted = []
@@ -367,7 +367,7 @@ def test_ask_overload_and_failed_submission_are_explicit_and_recoverable():
     assert exc.value.status_code == 429
     assert len(submitted) == 4
     api = api_module()
-    api._needs = lambda: types.SimpleNamespace(ask_enabled=lambda: True, card_context=lambda *a: {}, build_ask_messages=lambda *a: [])
+    api._needs = lambda: types.SimpleNamespace(ask_enabled=lambda: True, card_context=lambda *a: {}, build_ask_messages=lambda *a: [], ask_journal_dir=lambda: None)
     api._checked_card_ref = lambda *a: ("default", "t")
     api._loaded_ctx = lambda: types.SimpleNamespace(llm=object())
     api._ASK_POOL = types.SimpleNamespace(submit=lambda *args: (_ for _ in ()).throw(RuntimeError("closed")))

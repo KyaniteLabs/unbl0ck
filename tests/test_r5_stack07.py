@@ -1,0 +1,259 @@
+"""Round-5 regression tests for the Ask restart journal (issue #35).
+
+Each test reproduces a round-5 review finding with real files and real threads, and was seen to
+fail against the code before its fix. Siblings are loaded by file path so the tests also run
+under a shadowing ``tests`` package."""
+
+import contextvars
+import importlib.util
+import json
+import os
+import sys
+import threading
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+_HERE = Path(__file__).resolve().parent
+
+
+def _sibling(name):
+    spec = importlib.util.spec_from_file_location(f"ub_r5s07_{name}", _HERE / f"{name}.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+rec = _sibling("test_ask_job_recovery")
+jobs = rec.jobs
+J1, J2, J3, CARD, ROOT = rec.J1, rec.J2, rec.J3, rec.CARD, rec.ROOT
+
+
+def hexid(i: int) -> str:
+    return f"{i:032x}"
+
+
+class Profiles(rec.RecoveryBase):
+    """Two profile directories chosen by a context variable, like the real request context."""
+
+    def setUp(self):
+        super().setUp()
+        self.who = contextvars.ContextVar(f"who_{id(self)}", default="home")
+        self.persist = contextvars.ContextVar(f"persist_{id(self)}", default=True)
+        self.dirs = {"home": Path(self.tmp.name) / "p" / "home", "work": Path(self.tmp.name) / "p" / "work"}
+        self.unresolved = False
+
+    def resolve(self):
+        if self.unresolved:
+            raise PermissionError("profile cannot be resolved")
+        return self.dirs[self.who.get()]
+
+    def table(self):
+        journal = jobs.AskJournal(self.resolve, lambda: self.persist.get(), self.clock)
+        return jobs.AskJobs(self.clock, journal)
+
+
+class ScopeFailsClosed(Profiles):
+    """R5-jobs-001 (class F)."""
+
+    def test_an_unresolvable_profile_is_served_nothing_from_memory(self):
+        table = self.table()
+        self.who.set("work")
+        table.create(J1, card="c1")
+        table.finish(J1, "WORK PRIVATE ANSWER", "p", "m")
+        for broken in ("raise", "none"):
+            with self.subTest(resolver=broken):
+                self.unresolved = broken == "raise"
+                if broken == "none":
+                    table._journal._directory = lambda: None
+                st = table.get(J1)
+                self.assertNotIn("WORK PRIVATE ANSWER", json.dumps(st, default=str))
+                self.assertIsNone(table.card(J1) if broken == "none" else None)
+
+    def test_a_job_cannot_be_created_while_its_profile_is_unresolvable(self):
+        table = self.table()
+        self.unresolved = True
+        with self.assertRaises(jobs.JournalUnavailable):
+            table.create(J1, card="c1")
+        self.unresolved = False
+        self.assertEqual(len(table), 0)
+
+
+class PersistenceFollowsTheJobsProfile(Profiles):
+    """R5-jobs-002 (class F)."""
+
+    def test_a_worker_context_does_not_override_the_profiles_persistence_setting(self):
+        table = self.table()
+        self.who.set("work")
+        self.persist.set(False)  # the work profile does not keep replies
+        ticket = table.create(J1, card="c1")
+
+        def worker():  # a pool thread: a fresh context, where the default profile keeps replies
+            table.mark_sent(ticket)
+            table.finish(ticket, "WORK ANSWER", "p", "m")
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(10)
+        text = (self.dirs["work"] / f"{J1}.json").read_text()
+        self.assertNotIn("WORK ANSWER", text)
+        self.assertEqual(json.loads(text)["state"], "done")
+
+
+class StaleWorker(Profiles):
+    """R5-jobs-003 (class A)."""
+
+    def test_a_deleted_jobs_worker_cannot_complete_a_replacement_with_the_same_id(self):
+        table = self.table()
+        old = table.create(J1, card="old-card") or J1  # older tables returned no ticket
+        table.discard(J1)
+        table.create(J1, card="new-card")
+        self.assertFalse(table.finish(old, "OLD PRIVATE ANSWER", "p", "m"))
+        st = table.get(J1)
+        self.assertEqual(jobs.ASK_WIRE[st["status"]], "pending")
+        self.assertNotIn("OLD PRIVATE ANSWER", json.dumps(st, default=str))
+        self.assertEqual(st["card"], "new-card")
+
+
+class RecoveredDirectoriesStayTracked(Profiles):
+    """R5-jobs-008 (class F)."""
+
+    def test_cleanup_in_the_default_profile_still_visits_a_recovered_work_profile(self):
+        first = self.table()
+        self.who.set("work")
+        first.create(J1, card="c1")
+        first.finish(J1, "WORK ANSWER", "p", "m")
+        restarted = self.table()
+        self.assertEqual(restarted.get(J1)["reply"], "WORK ANSWER")  # recovered during a work request
+        self.who.set("home")  # the timer thread runs in the default profile
+        self.clock.t += jobs.AskJobs.TTL_S + 5
+        restarted.housekeeping()
+        self.assertEqual(list(self.dirs["work"].glob("*.json")), [], "the work reply expires although nobody asks")
+
+    def test_leftover_temp_files_are_still_cleaned_after_the_last_job_leaves_memory(self):
+        table = self.table()
+        self.who.set("work")
+        ticket = table.create(J1, card="c1")
+        table.finish(ticket, "A", "p", "m")
+        table.consume(J1)
+        stray = self.dirs["work"] / ".stray.tmp"
+        stray.write_text("x")
+        os.utime(stray, (1, 1))
+        self.who.set("home")
+        self.clock.t += jobs.AskJobs.TTL_S + 5
+        table.housekeeping()
+        self.assertFalse(stray.exists())
+        self.assertTrue(table._more() is False)
+
+
+class IdsPerProfile(Profiles):
+    """R5-jobs-012 (class F)."""
+
+    def test_the_same_job_id_can_be_created_in_two_profiles(self):
+        table = self.table()
+        self.who.set("home")
+        table.create(J1, card="home-card")
+        table.finish(J1, "HOME", "p", "m")
+        self.who.set("work")
+        self.assertIsNone(table.get(J1))
+        ticket = table.create(J1, card="work-card")  # must not raise IllegalTransition
+        table.finish(ticket, "WORK", "p", "m")
+        self.assertEqual(table.get(J1)["reply"], "WORK")
+        self.who.set("home")
+        self.assertEqual(table.get(J1)["reply"], "HOME")
+        self.assertEqual(table.get(J1)["card"], "home-card")
+
+
+try:
+    import fastapi
+    from fastapi.testclient import TestClient
+except Exception:  # noqa: BLE001
+    fastapi = None
+    TestClient = None
+import tempfile
+import time
+import types
+
+
+@unittest.skipIf(fastapi is None, "fastapi not installed")
+class ApiBase(unittest.TestCase):
+    keep = True
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "ask"
+        spec = importlib.util.spec_from_file_location("ub_api_r5s07", ROOT / "dashboard/plugin_api.py")
+        self.api = importlib.util.module_from_spec(spec)
+        sys.modules["ub_api_r5s07"] = self.api
+        spec.loader.exec_module(self.api)
+        self.addCleanup(self.api._ASK_JOBS.stop_background)
+        self.dir_fn = lambda: self.dir
+        self.card = ("factory", "t_1")
+        self.llm = lambda m, **kw: types.SimpleNamespace(text="Pick A", provider="p", model="m")
+        needs = types.SimpleNamespace(
+            ask_enabled=lambda: True,
+            card_context=lambda b, t: {"id": t},
+            build_ask_messages=lambda c, h: list(h),
+            ask_journal_dir=lambda: self.dir_fn(),
+            ask_persist_replies=lambda: self.keep,
+        )
+        self.api._needs = lambda: needs
+        self.api._checked_card_ref = lambda i, b, t: self.card
+        self.api._loaded_ctx = lambda: types.SimpleNamespace(llm=types.SimpleNamespace(complete=lambda m, **kw: self.llm(m, **kw)))
+        self.api._ASK_JOBS = self.api.jobs.AskJobs(journal=self.api.jobs.AskJournal(lambda: self.api._ask_journal_dir(), lambda: self.keep))
+        app = fastapi.FastAPI()
+        app.include_router(self.api.router)
+        self.c = TestClient(app)
+
+    def post(self, request_id=None):
+        body = {"id": "x", "messages": [{"role": "user", "content": "q"}]}
+        if request_id:
+            body["request_id"] = request_id
+        return self.c.post("/card/ask", json=body)
+
+    def settle(self, job):
+        for _ in range(100):
+            p = self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").json()
+            if not p.get("pending"):
+                return p
+            time.sleep(0.05)
+        self.fail("ask did not settle")
+
+
+class ApiScope(ApiBase):
+    def test_a_request_whose_profile_cannot_be_resolved_is_refused_not_served(self):
+        def broken():
+            raise PermissionError("no state")
+
+        self.dir_fn = broken
+        r = self.post()
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(len(self.api._ASK_JOBS), 0)
+
+    def test_a_worker_for_a_deleted_job_cannot_answer_its_replacement(self):
+        release = threading.Event()
+        started = threading.Event()
+        answers = ["OLD PRIVATE ANSWER", "NEW ANSWER"]
+
+        def slow(m, **kw):
+            started.set()
+            release.wait(10)
+            return types.SimpleNamespace(text=answers.pop(0), provider="p", model="m")
+
+        self.llm = slow
+        rid = "d" * 32
+        self.assertEqual(self.post(rid).status_code, 200)
+        self.assertTrue(started.wait(10))
+        self.assertTrue(self.c.delete(f"/card/ask/{rid}?card={CARD}").json()["deleted"])
+        self.card = ("factory", "t_2")  # the replacement is a different card's request with the same id
+        self.assertEqual(self.post(rid).status_code, 200)
+        release.set()
+        time.sleep(0.5)
+        p = self.c.get(f"/card/ask/{rid}?poll=true&card=kanban:factory:t_2").json()
+        self.assertNotIn("OLD PRIVATE ANSWER", json.dumps(p))
+
+
+if __name__ == "__main__":
+    unittest.main()

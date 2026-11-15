@@ -408,16 +408,20 @@ def card_ask(body: CardAsk):
         job = body.request_id or uuid.uuid4().hex
         try:
             # The canonical card identity from the validated board/task pair, never the optional raw id.
-            _ASK_JOBS.create(job, card=f"kanban:{board}:{task_id}")
+            ticket = _ASK_JOBS.create(job, card=f"kanban:{board}:{task_id}")
         except jobs.IllegalTransition:
             return {"ok": True, "pending": True, "job": job}   # a concurrent twin got there first
+        except jobs.JournalUnavailable:
+            raise HTTPException(status_code=503, detail="Ask cannot tell which profile this request belongs to right now. Retry in a moment.")
         try:
-            _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, job, ctx, messages)
+            # The worker completes the job through its ticket, never by id alone: a job deleted
+            # and re-created under the same id is a different job.
+            _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, ticket, ctx, messages)
             submitted = True
         except Exception as exc:
-            _ASK_JOBS.fail(job, "could not start Ask")
+            _ASK_JOBS.fail(ticket, "could not start Ask")
             try:
-                _ASK_JOBS.consume(job)
+                _ASK_JOBS.consume(ticket)
             except jobs.DiscardFailed:
                 pass  # the settled record expires on its own; the caller still gets the 503 below
             log.warning("unbl0ck: could not submit Ask: %s", type(exc).__name__)
