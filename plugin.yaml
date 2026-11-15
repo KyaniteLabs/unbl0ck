@@ -53,7 +53,11 @@ config_schema:
     type: bool
     default: false
     description: "Refuse Kanban answers that omit the queue item version (HTTP 428). Off keeps older clients working; their answers are accepted against the current block and flagged with a Warning header. Desktop always sends the version."
+  outside_recursive:
+    type: bool
+    default: false
+    description: "Also read .eml/.md/.txt files in nested folders under each watched folder, read-only. Bounded to 3 levels, 5,000 directory entries and 2 seconds per folder; symlinks, dotfolders and anything resolving outside the watched folder are skipped. Off reads direct files only."
   outside_dirs:
     type: str
     default: ""
-    description: "Comma-separated absolute folders (~ expanded) to watch read-only for .eml drafts and .md/.txt notes. Empty means off. Direct regular files only; up to 200 newest files per folder, 256 KiB per file. Fallback: UNBL0CK_OUTSIDE_DIRS."
+    description: "Comma-separated absolute folders (~ expanded) to watch read-only for .eml drafts and .md/.txt notes. Empty means off. Regular files only (nested folders only when outside_recursive is on); newest 200 waiting files per folder, 256 KiB per file. Fallback: UNBL0CK_OUTSIDE_DIRS."

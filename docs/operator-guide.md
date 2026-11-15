@@ -82,21 +82,28 @@ the card open while collecting an answer, or start a fresh question when returni
 
 ## Outside-source limits
 
-Watched folders read only direct regular `.eml`, `.md` and `.txt` files. They skip
-subfolders, symlinks and dotfiles, select the newest 200 eligible files per folder,
-and read at most 256 KiB per file. The queue reports omitted older files, and cards
-mark truncated exports. Full text remains within this read limit; use the original
-app for the complete document.
+Watched folders read regular `.eml`, `.md` and `.txt` files. They skip symlinks and
+dotfiles, show the newest 200 waiting files per folder (ties break on path, so the
+order is stable), and read at most 256 KiB per file. By default only the folder's
+direct files count. Set `outside_recursive` to true to also read nested folders, up
+to 3 levels deep, 5,000 directory entries and 2 seconds per folder per poll; symlinked
+folders and files are never followed, and a path that resolves outside the watched
+folder is rejected. Hitting any scan bound is reported in the queue errors.
+Cards mark truncated exports. Full text remains within the read limit; use the
+original app for the complete document.
 
-Folder Done does not advance through older exports: hidden files still occupy the
-newest 200 selection. Archive completed exports yourself when you want older files
-to enter that window. UNBL0CK never automatically moves those files.
+Files you mark Done or Not for me no longer use up the 200 window, so finishing a
+page brings the next older files into view. When more are waiting, the queue says how
+many ("N older files are waiting") until you work through them. UNBL0CK never moves,
+renames or deletes source files; a hidden file that changes comes back.
 
 Mail uses the plain body selected by MIME structure. Attachments, filename-bearing
 inline subtrees, attached messages and non-root related resources do not replace it.
 HTML-only mail shows an explicit no-plain-body notice; HTML is never rendered.
 
-Agent-filed records are capped at 200. A `dedupe_key` identifies an item across the
+Agent-filed records waiting for you are capped at 200; at the cap the queue says how
+many are waiting, new filings are refused with that count (nothing is dropped,
+and existing items can still be updated), and finishing one makes room. A `dedupe_key` identifies an item across the
 installation's profiles, so callers needing separate records must namespace their
 keys. The tool's record proves what was filed, not whether the external app changed.
 

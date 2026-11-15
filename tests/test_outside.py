@@ -351,14 +351,14 @@ class Outside(OutsideFixture):
             any(e.startswith("outside:") for e in needs.build_queue()["errors"])
         )
         self.watch()
-        iterdir = Path.iterdir
+        scandir = os.scandir
 
         def unreadable(path):
-            if path == self.folder:
+            if Path(path) == self.folder:
                 raise PermissionError("denied")
-            return iterdir(path)
+            return scandir(path)
 
-        with patch.object(Path, "iterdir", unreadable):
+        with patch.object(os, "scandir", unreadable):
             q = needs.build_queue()
         self.assertEqual(q["count"], 1)
         self.assertTrue(any(e.startswith("outside:") for e in q["errors"]))

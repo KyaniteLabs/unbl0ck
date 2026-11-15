@@ -140,6 +140,12 @@ def bluf_enabled(settings: dict[str, Any] | None = None) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def outside_recursive(settings: dict[str, Any] | None = None) -> bool:
+    """Whether watched folders also read nested folders (``outside_recursive``, off by default)."""
+    raw = (settings if settings is not None else _settings()).get("outside_recursive", False)
+    return raw if isinstance(raw, bool) else str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def answer_version_required(settings: dict[str, Any] | None = None) -> bool:
     """Whether Kanban answers must carry the queue version (``require_answer_version``)."""
     raw = (settings if settings is not None else _settings()).get(
@@ -1882,6 +1888,12 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
 _OUTSIDE_KINDS = ("draft", "notes", "approval", "other")
 _OUTSIDE_LIMIT = 200
 _OUTSIDE_READ_LIMIT = 256 * 1024
+# Recursive intake (outside_recursive) is bounded three ways: nesting depth, directory
+# entries examined per watched folder, and wall-clock time. Hitting any bound is reported.
+OUTSIDE_MAX_DEPTH = 3
+OUTSIDE_SCAN_ENTRIES = 5000
+OUTSIDE_SCAN_SECONDS = 2.0
+_OUTSIDE_EXTS = (".eml", ".md", ".txt")
 # Done on an agent-filed item keeps the record (marked done_at) so Undo can restore it. The
 # text stays on disk only for this long and for at most this many done records; then it is
 # deleted. Nothing is kept for folder items beyond the existing hidden-version list.
@@ -2000,7 +2012,8 @@ def file_outside(
             active = 0
         if match is None and active >= _OUTSIDE_LIMIT:
             raise ValueError(
-                "Outside queue is full (200 filed items); resolve an item before filing another"
+                f"Outside queue is full ({active} filed items waiting, limit {_OUTSIDE_LIMIT}); "
+                "nothing was filed. Resolve an item or ask the human to finish one, then file again"
             )
         old = _read_json(match) if match else {}
         record_id = match.stem if match else uuid.uuid4().hex
@@ -2030,8 +2043,11 @@ def _folder_outside_item(
 ) -> dict[str, Any] | None:
     # Recheck containment at read time. O_NOFOLLOW and fstat also reject a leaf swapped for
     # a symlink, FIFO or device after the directory scan; never block on a special file.
-    if f.is_symlink() or f.resolve().parent != root:
+    if f.is_symlink():
         return None
+    real = f.resolve()
+    if real.name != f.name or (real.parent != root and root not in real.parents):
+        return None  # escaped the watched folder (a swapped directory or symlink)
     fd = os.open(
         f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     )
@@ -2093,8 +2109,50 @@ def _folder_outside_item(
         "since": st.st_mtime,
         "act_where": where,
         "ref": str(f),
-        "path": f.name,
+        "path": f.relative_to(root).as_posix() if f.parent != root else f.name,
     }
+
+
+def _scan_outside_folder(
+    root: Path, recursive: bool, errors: list[str]
+) -> list[tuple[Path, os.stat_result]]:
+    """Eligible regular files under *root*, never following symlinks, within the scan bounds."""
+    out: list[tuple[Path, os.stat_result]] = []
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    examined = 0
+    deadline = time.monotonic() + OUTSIDE_SCAN_SECONDS
+    stopped = ""
+    while stack and not stopped:
+        d, depth = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError as exc:
+            errors.append(f"outside: {d.name}: {type(exc).__name__}: {exc}")
+            continue
+        for entry in sorted(entries, key=lambda e: e.name):
+            examined += 1
+            if examined > OUTSIDE_SCAN_ENTRIES:
+                stopped = f"examined {OUTSIDE_SCAN_ENTRIES} entries"
+                break
+            if time.monotonic() > deadline:
+                stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
+                break
+            if entry.name.startswith("."):
+                continue
+            f = d / entry.name
+            try:
+                st = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(st.st_mode):
+                    if recursive and depth < OUTSIDE_MAX_DEPTH:
+                        stack.append((f, depth + 1))
+                    continue
+                if f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
+                    out.append((f, st))
+            except OSError as exc:
+                errors.append(f"outside: {entry.name}: {type(exc).__name__}: {exc}")
+    if stopped:
+        errors.append(f"outside: {root.name}: scan {stopped}; some files may not be listed")
+    return out
 
 
 def outside_items(
@@ -2124,6 +2182,12 @@ def outside_items(
             items.append(rec)
         elif len(errors) == before:
             errors.append(f"outside: {f.name}: invalid filed record")
+    filed_waiting = len(items)
+    if filed_waiting >= _OUTSIDE_LIMIT:
+        errors.append(
+            f"outside: {filed_waiting} agent-filed items are waiting (limit {_OUTSIDE_LIMIT}); "
+            "agents cannot file more until you finish some"
+        )
     if done_seen:
         try:
             with _state_lock(home):
@@ -2131,6 +2195,8 @@ def outside_items(
         except (OSError, TimeoutError, RuntimeError):
             pass  # cleanup retries on the next poll or the next Done
     raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
+    recursive = outside_recursive()
+    hidden = load_hidden(home, errors=errors) if str(raw).strip() else {}
     seen: set[Path] = set()
     for name in str(raw).split(","):
         if not name.strip():
@@ -2143,23 +2209,25 @@ def outside_items(
             if root in seen:
                 continue
             seen.add(root)
-            candidates = []
-            for f in root.iterdir():
-                if f.name.startswith(".") or f.suffix.lower() not in (
-                    ".eml",
-                    ".md",
-                    ".txt",
-                ):
-                    continue
-                try:
-                    st = f.lstat()
-                    if stat.S_ISREG(st.st_mode) and f.resolve().parent == root:
-                        candidates.append((f, st))
-                except OSError as exc:
-                    errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
-            candidates.sort(key=lambda pair: (-pair[1].st_mtime_ns, pair[0].name))
+            candidates = [
+                pair
+                for pair in _scan_outside_folder(root, recursive, errors)
+                if visibility(
+                    hidden,
+                    "outside:folder:" + hashlib.sha256(str(pair[0]).encode()).hexdigest(),
+                    f"{pair[1].st_mtime_ns}:{pair[1].st_size}",
+                )
+                is not Visibility.HIDDEN
+            ]
+            # Files already marked Done at their current version do not use up the window, so
+            # finishing a page always exposes the next one. Ties break on path, so order is stable.
+            candidates.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
             if len(candidates) > _OUTSIDE_LIMIT:
-                errors.append(f"outside: {root.name}: folder limit {_OUTSIDE_LIMIT} of {len(candidates)} files; only the newest are shown")
+                errors.append(
+                    f"outside: {root.name}: folder limit, showing the newest {_OUTSIDE_LIMIT}; "
+                    f"{len(candidates) - _OUTSIDE_LIMIT} older files are waiting. "
+                    "Finish or hide items to bring them into view"
+                )
             for f, st in candidates[:_OUTSIDE_LIMIT]:
                 try:
                     item = _folder_outside_item(f, root, st)
