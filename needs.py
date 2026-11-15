@@ -328,9 +328,30 @@ def _state_lock(home: Path | None):
         _STATE_LOCK.release()
 
 
+# No state file is legitimately larger; a bigger one is damage or abuse, refused before it is read.
+MAX_STATE_BYTES = 16 * 1024 * 1024
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # absent on Windows
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+def _read_plain_text(p: Path) -> str:
+    """Read a small regular file without following a link or blocking on a FIFO or device."""
+    fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        if st.st_size > MAX_STATE_BYTES:
+            raise OSError("too large to be a state file")
+        with os.fdopen(fd, "r", closefd=False) as fh:
+            return fh.read(MAX_STATE_BYTES + 1)
+    finally:
+        os.close(fd)
+
+
 def _read_json(p: Path, *, errors: list[str] | None = None, source: str = "state", strict: bool = False) -> dict[str, Any]:
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(_read_plain_text(p))
         if not isinstance(data, dict):
             raise ValueError("expected a JSON object")
     except FileNotFoundError:
@@ -350,8 +371,11 @@ def _read_json(p: Path, *, errors: list[str] | None = None, source: str = "state
 def _write_json(p: Path, data: dict[str, Any], *, ordered: bool = False) -> None:
     """Atomic JSON write. ``ordered`` keeps insertion order (stores that evict the oldest entry)."""
     tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    # A leftover or planted file at this name is removed, never written through: O_EXCL and
+    # O_NOFOLLOW make a link there fail instead of clobbering its target.
+    tmp.unlink(missing_ok=True)
     fd = os.open(
-        tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+        tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600
     )  # waits hold prompt text
     try:
         with os.fdopen(fd, "w") as fh:
@@ -3085,9 +3109,15 @@ def answer_card(
                         True  # another actor released it; do not claim it was ours
                     )
             if release_failed:
-                _set_pending_release(item_id, current_version, home)
+                try:
+                    _set_pending_release(item_id, current_version, home)
+                except Exception as exc:  # noqa: BLE001 - the unblock failure is what the caller must see
+                    log.warning("unbl0ck: could not record the retry marker: %s", type(exc).__name__)
                 raise UnblockFailed(task_id, comment_id)
-            _set_pending_release(item_id, None, home)
+            try:
+                _set_pending_release(item_id, None, home)
+            except Exception as exc:  # noqa: BLE001 - the card is released; a stale marker is not a failure
+                log.warning("unbl0ck: could not clear the retry marker: %s", type(exc).__name__)
     return {
         "ok": True,
         "comment_id": comment_id,
