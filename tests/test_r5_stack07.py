@@ -529,5 +529,29 @@ class ApiScope(ApiBase):
         self.assertNotIn("OLD PRIVATE ANSWER", json.dumps(p))
 
 
+_LEAKED = []
+
+
+@unittest.skipIf(fastapi is None, "fastapi not installed")
+class LoadingTheApiLeavesNoTimerBehind(unittest.TestCase):
+    """R5-api-003 (class M): a test that loads the API and never stops its timer must not leak it.
+
+    The two tests run in order: the first loads the module like the other test files do and
+    deliberately leaves the timer to the shared teardown; the second looks at what is left."""
+
+    def test_a_load_that_never_stops_the_timer(self):
+        spec = importlib.util.spec_from_file_location("ub_api_r5s07_leak", ROOT / "dashboard/plugin_api.py")
+        api = importlib.util.module_from_spec(spec)
+        sys.modules["ub_api_r5s07_leak"] = api
+        spec.loader.exec_module(api)
+        _LEAKED.append(api._ASK_JOBS)
+        self.assertIsNotNone(api._ASK_JOBS._timer, "the import arms the timer")
+
+    def test_the_timer_is_gone_after_that_test(self):
+        self.assertTrue(_LEAKED, "the previous test must have run first")
+        self.assertIsNone(_LEAKED[0]._timer)
+        self.assertIsNone(_LEAKED[0]._bg_every)
+
+
 if __name__ == "__main__":
     unittest.main()
