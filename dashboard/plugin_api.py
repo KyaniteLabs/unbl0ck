@@ -278,10 +278,15 @@ def card(id: str = "", board: str = "", task_id: str = ""):
 def outside_text(id: str = "", version: str = ""):
     if len(id) > MAX_ID or not id.startswith("outside:") or len(version) > MAX_ID:
         raise HTTPException(status_code=400, detail="invalid outside item reference")
-    items = _needs().outside_items()
-    item = next((candidate for candidate in items if candidate.get("id") == id), None)
-    if item is None:
-        raise HTTPException(status_code=404, detail="outside item is no longer available")
+    n = _needs()
+    try:
+        item = n.outside_lookup(id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except n.SourceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     if item.get("version") != version:
         raise HTTPException(status_code=409, detail="outside item changed; refresh the queue")
     return {"id": id, "version": version, "text": item.get("text") or "(No text supplied.)"}
@@ -455,14 +460,17 @@ def hide(body: Hide):
 
 @router.post("/outside/done")
 def outside_done(body: Hide):
+    n = _needs()
     try:
-        return _needs().done_outside(body.id, body.version)
+        return n.done_outside(body.id, body.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except TimeoutError:
         raise HTTPException(status_code=409, detail="busy, retry")
+    except n.SourceUnavailable as exc:   # before RuntimeError: it is a RuntimeError subclass
+        raise HTTPException(status_code=503, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 

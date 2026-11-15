@@ -529,7 +529,7 @@ class BlufTest(unittest.TestCase):
     def test_outside_full_text_route_returns_only_the_requested_current_version(self):
         api = self.load_api_without_fastapi()
         item = {"id": "outside:folder:abc", "version": "3:10", "text": "Full body"}
-        api._needs = lambda: types.SimpleNamespace(outside_items=lambda: [item])
+        api._needs = lambda: types.SimpleNamespace(outside_lookup=lambda i: item)
         self.assertEqual(
             api.outside_text(item["id"], item["version"])["text"], "Full body"
         )

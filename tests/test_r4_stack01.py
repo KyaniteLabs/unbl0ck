@@ -385,5 +385,141 @@ def real_needs():
     return needs
 
 
+class OutsideLookups(OutsideFixture):
+    def setUp(self):
+        super().setUp()
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        self.api = load_api("outside")
+        self.api._needs = lambda: needs
+        app = FastAPI()
+        app.include_router(self.api.router)
+        self.client = TestClient(app)
+
+    def folder_item(self, name="a.txt", text="body"):
+        self.watch()
+        (self.folder / name).write_text(text)
+        return next(i for i in needs.outside_items() if i["path"] == name)
+
+    def test_full_text_of_a_file_below_the_poll_window_is_still_served(self):
+        """01-006: a file that is not among the newest 200 can still be opened and marked Done."""
+        import os
+
+        self.watch()
+        old = self.folder / "old.txt"
+        old.write_text("the oldest note")
+        os.utime(old, (1_000, 1_000))
+        for i in range(210):
+            (self.folder / f"n{i:03d}.txt").write_text(f"note {i}")
+        ids = {i["path"] for i in needs.outside_items()}
+        self.assertNotIn("old.txt", ids)
+        item_id = "outside:folder:" + __import__("hashlib").sha256(str(old.resolve()).encode()).hexdigest()
+        version = f"{old.stat().st_mtime_ns}:{old.stat().st_size}"
+        got = self.client.get("/outside/text", params={"id": item_id, "version": version})
+        self.assertEqual(got.status_code, 200, got.text)
+        self.assertEqual(got.json()["text"], "the oldest note")
+
+    def test_a_missing_item_is_404_but_an_unreadable_one_is_503(self):
+        """01-006/01-007: absence and failure to read are different answers."""
+        item = self.folder_item()
+        self.assertEqual(self.client.get("/outside/text", params={"id": item["id"], "version": item["version"]}).status_code, 200)
+        gone = "outside:folder:" + "0" * 64
+        self.assertEqual(self.client.get("/outside/text", params={"id": gone, "version": "1"}).status_code, 404)
+        with patch.object(Path, "iterdir", side_effect=PermissionError("denied")):
+            r = self.client.get("/outside/text", params={"id": item["id"], "version": item["version"]})
+        self.assertEqual(r.status_code, 503, r.text)
+
+    def test_a_corrupt_filed_record_is_503_on_text_and_done(self):
+        result = self.file()
+        self.record(result).write_text("{not json")
+        text = self.client.get("/outside/text", params={"id": result["id"], "version": "x"})
+        self.assertEqual(text.status_code, 503, text.text)
+        done = self.client.post("/outside/done", json={"id": result["id"], "version": "x"})
+        self.assertEqual(done.status_code, 503, done.text)
+        self.assertTrue(self.record(result).exists())   # never deleted on a failed read
+
+    def test_a_filed_item_that_is_gone_stays_404(self):
+        result = self.file()
+        self.record(result).unlink()
+        self.assertEqual(self.client.get("/outside/text", params={"id": result["id"], "version": "x"}).status_code, 404)
+        self.assertEqual(self.client.post("/outside/done", json={"id": result["id"], "version": "x"}).status_code, 404)
+
+
+class ShortMultilineText(OutsideFixture):
+    def test_short_text_with_line_breaks_offers_full_text(self):
+        """01-012: the one-line excerpt loses line breaks even when short, so the original must be reachable."""
+        self.assertTrue(needs._is_excerpted("Line one\nLine two\n\n  - item"))
+        self.assertTrue(needs._is_excerpted("a\r\nb"))
+        self.assertFalse(needs._is_excerpted("One plain line."))
+        self.assertFalse(needs._is_excerpted("  trailing newline stripped\n"))
+        self.assertTrue(needs._is_excerpted("x" * 481))
+
+    def test_desktop_note_matches_what_was_changed(self):
+        src = (ROOT / "desktop/src/plugin.src.js").read_text(encoding="utf-8")
+        self.assertIn("one-line version", src)
+        self.assertIn("last 480 characters", src)
+
+
+ITEM_PRELUDE = r"""
+const fs = require('fs'), assert = require('node:assert/strict');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const views = src.slice(src.indexOf('const ANSWER_DRAFT_TTL'), src.indexOf('function Chip('));
+const noop = () => {};
+const node = (type, props) => ({type, props});
+let state = [], cursor = 0, effects = [], deps = [], undoSet = [];
+const env = {
+  jsx: node, jsxs: node,
+  useState: init => { const i = cursor++; if (!(i in state)) state[i] = init; return [state[i], v => { state[i] = typeof v === 'function' ? v(state[i]) : v; }]; },
+  useEffect: (fn, d) => { const i = effects.length; const prev = deps[i]; if (!prev || !d || d.some((x, k) => x !== prev[k])) { effects.push([i, fn, d]); } deps[i] = d; },
+  useRef: () => ({}), platformLabel: x => x, LOCAL_PLATFORMS: [], KEEP_BLOCKED: /keep blocked/i,
+  button: props => node('button', props), openBoard: noop, ago: () => '', ageClass: () => '', pad: String,
+  sfx: {play: noop}, petEmit: noop, host: {notify: noop, notifyError: e => {throw e}},
+  $undo: {set: v => { undoSet.push(v) }}, $queue: 'queue', $fxOn: 'fx', UNDO_MS: 12000, askCount: q => q.count,
+  Field: noop, Watermark: noop, Banner: noop, Pet: noop, Ticker: noop, FxToggle: noop, SfxToggle: noop,
+  grainUrl: () => '', oldestAskSince: () => 0,
+};
+const {Item} = new Function('env', `with(env) { ${views}; return {Item}; }`)(env);
+function all(n) { if (n == null) return []; if (Array.isArray(n)) return n.flatMap(all); if (typeof n !== 'object') return [n]; return [n, ...all(n.props?.children)]; }
+function text(n) { return all(n).filter(x => typeof x === 'string').join(''); }
+async function flush() { const run = effects.splice(0); for (const [, fn] of run) fn(); await new Promise(r => setImmediate(r)); }
+function fullButton(tree) { return all(tree).find(x => x?.type === 'button' && x.props.className === 'ub-full'); }
+"""
+
+
+class DesktopExcerptLabel(unittest.TestCase):
+    def check(self, body):
+        for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
+            with self.subTest(path=path.name):
+                result = subprocess.run(
+                    ["node", "-e", ITEM_PRELUDE + body, str(path)], capture_output=True, text=True, check=False
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_excerpt_is_labelled_whenever_it_is_what_is_shown(self):
+        """01-013 and 01-012: closing Full text again must bring the label back, and a short
+        multi-line message says it was flattened rather than claiming it was cut."""
+        self.check(r"""
+const ctx = {rest: async () => ({text: 'FIRST\nSECOND', truncated: false})};
+function render(item) { cursor = 0; effects = []; return Item({ctx, item, n: 1, refresh: async () => {}, askEnabled: false}); }
+(async () => {
+  const item = {id: 'chat:p:s1', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
+  let tree = render(item);
+  assert.ok(text(tree).includes('last 480 characters'));
+  fullButton(tree).props.onClick(); tree = render(item); await flush(); tree = render(item);
+  assert.ok(text(tree).includes('FIRST'));
+  assert.ok(!text(tree).includes('last 480 characters'));
+  fullButton(tree).props.onClick(); tree = render(item);
+  assert.ok(!text(tree).includes('FIRST'), 'closed again shows the excerpt');
+  assert.ok(text(tree).includes('last 480 characters'), 'the excerpt label must come back when Full text is closed');
+  state = []; deps = [];
+  const short = {id: 'chat:p:s2', version: '1', source: 'chat', title: 't', ask: 'a b c', ask_truncated: true, since: 1};
+  tree = render(short);
+  assert.ok(text(tree).includes('one-line version'), 'a flattened short message is described as a one-line version');
+  assert.ok(!text(tree).includes('last 480 characters'));
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
+
 if __name__ == "__main__":
     unittest.main()

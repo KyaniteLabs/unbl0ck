@@ -981,8 +981,10 @@ FULL_TEXT_LIMIT = 20_000  # most characters one on-demand full-text read returns
 
 
 def _is_excerpted(text: str, n: int = EXCERPT_CHARS) -> bool:
-    """True when ``_excerpt`` would drop part of *text*."""
-    return len(re.sub(r"\s+", " ", (text or "")).strip()) > n
+    """True when ``_excerpt`` would change *text*: cut it, or flatten its line breaks and spacing."""
+    original = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    collapsed = re.sub(r"\s+", " ", original)
+    return len(collapsed) > n or collapsed != original
 
 
 def _full_text(text: str) -> tuple[str, bool]:
@@ -2104,6 +2106,63 @@ def outside_items(
     return items
 
 
+def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
+    """One current outside item by id, read directly rather than from the newest-200 poll window.
+
+    Raises ``ValueError`` for a malformed id, ``LookupError`` only when the item is confirmed
+    absent, and ``SourceUnavailable`` when it could not be read or its absence cannot be proved
+    (an unreadable folder, a corrupt record, a file that changed mid-read)."""
+    match = _FILED_ID.fullmatch(item_id or "")
+    if match:
+        f = _outside_dir(home) / (match.group(1) + ".json")
+        if f.is_symlink():
+            raise SourceUnavailable("filed outside record is not a regular file")
+        try:
+            rec = _read_json(f, strict=True)
+        except RuntimeError as exc:
+            raise SourceUnavailable(str(exc)) from exc
+        if not rec:
+            raise LookupError("outside item is no longer available")
+        if rec.get("id") != item_id or rec.get("origin") != "filed" or not isinstance(rec.get("text"), str):
+            raise SourceUnavailable("filed outside record is invalid; repair it")
+        return rec
+    if not _FOLDER_ID.fullmatch(item_id or ""):
+        raise ValueError("id must identify an outside item")
+    raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
+    unreadable: list[str] = []
+    seen: set[Path] = set()
+    for name in str(raw).split(","):
+        if not name.strip():
+            continue
+        try:
+            root = Path(name.strip()).expanduser()
+            if not root.is_absolute():
+                raise ValueError("outside_dirs requires absolute paths")
+            root = root.resolve()
+            if root in seen:
+                continue
+            seen.add(root)
+            for f in root.iterdir():
+                if f.name.startswith(".") or f.suffix.lower() not in (".eml", ".md", ".txt"):
+                    continue
+                if "outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest() != item_id:
+                    continue
+                st = f.lstat()
+                if not stat.S_ISREG(st.st_mode) or f.resolve().parent != root:
+                    raise LookupError("outside item is no longer available")
+                item = _folder_outside_item(f, root, st)
+                if item is None:
+                    raise SourceUnavailable("outside file changed while it was read; retry")
+                return item
+        except (LookupError, SourceUnavailable):
+            raise
+        except (OSError, ValueError, RuntimeError) as exc:
+            unreadable.append(f"{name.strip()}: {type(exc).__name__}")
+    if unreadable:
+        raise SourceUnavailable("a watched folder could not be read: " + "; ".join(unreadable))
+    raise LookupError("outside item is no longer available")
+
+
 def done_outside(
     item_id: str, version: str, home: Path | None = None
 ) -> dict[str, Any]:
@@ -2112,8 +2171,13 @@ def done_outside(
     if match:
         with _state_lock(home):
             f = _outside_dir(home) / (match.group(1) + ".json")
-            rec = _read_json(f)
-            if not rec or f.is_symlink():
+            if f.is_symlink():
+                raise SourceUnavailable("filed outside record is not a regular file")
+            try:
+                rec = _read_json(f, strict=True)   # a corrupt record is a failure, not "gone"
+            except RuntimeError as exc:
+                raise SourceUnavailable(str(exc)) from exc
+            if not rec:
                 raise LookupError("Filed outside item no longer exists")
             if rec.get("version") != version:
                 raise RuntimeError(

@@ -1047,8 +1047,17 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
   const outsideBody = outsideText?.__version === item.version ? outsideText.text : item.ask
-  const excerptNote = hasFull && !isOutside && outsideText?.__version !== item.version
-    ? jsx('div', { className: 'ub-hint', role: 'note', children: 'Showing only the last 480 characters. Open Full text to read the whole message.' })
+  // The note says so whenever the text on screen is the excerpt: before Full text is opened,
+  // after it is closed again, and while a different version is cached.
+  const showingFull = open && outsideText?.__version === item.version
+  const cutNote = String(item.ask || '').startsWith('…')
+  const excerptNote = hasFull && !isOutside && !showingFull
+    ? jsx('div', {
+        className: 'ub-hint', role: 'note',
+        children: cutNote
+          ? 'Showing only the last 480 characters. Open Full text to read the whole message.'
+          : 'Showing a one-line version. Open Full text to see the original line breaks and spacing.'
+      })
     : null
   const fullTextStatus = open && hasFull
     ? outsideTextLoading
