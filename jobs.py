@@ -35,6 +35,8 @@ Ask job, one per question::
         unreadable, oversized, foreign, symlinked or implausible file -> UNKNOWN
         storage that cannot be checked -> UNKNOWN (never "absent")
     The plugin never resubmits a recovered job on its own.
+    Without fcntl (no lock other processes honour) nothing is written: a restart reads such a
+    job as unknown, and the journal never claims a lock it does not hold.
 
     consume is refused while PENDING; finish/fail are refused unless PENDING (a late
     worker for an expired job is a no-op, never a resurrection).
@@ -186,6 +188,20 @@ ASK_WIRE = {
 }
 
 
+class JournalConflict(Exception):
+    """A guarded write found another worker's record where it expected its own (or none)."""
+
+
+def _finite(x: Any) -> bool:
+    """A real, finite number (not a bool). An integer too large for a float is not finite here."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:
+        return False
+
+
 def _reject_constant(name: str) -> Any:
     raise ValueError(f"non-finite number {name} is not valid in a record")
 
@@ -224,18 +240,23 @@ class AskJournal:
         self.pid = os.getpid()
         self.inst = secrets.token_hex(8)  # one per journal object: a restart in the same process is still a new owner
         self._written: set[str] = set()  # jobs whose marker reached disk at some point
-        self.protect: Callable[[str], bool] = lambda job: False  # set by AskJobs: live jobs are never evicted
+        self.protect: Callable[[str, Optional[Path]], bool] = lambda job, d=None: False  # set by AskJobs: live jobs are never evicted
 
     # --- locating and opening the directory -------------------------------------------------
 
-    def where(self) -> Optional[Path]:
-        """The directory the resolver names right now, or None (no journal, or it cannot be resolved)."""
+    def resolve(self) -> tuple[bool, Optional[Path]]:
+        """(resolved, directory). A resolver that fails is (False, None): not the same thing as
+        "no journal configured" (True, None), which callers must never confuse."""
         try:
             d = self._directory()
         except Exception:  # noqa: BLE001 - an unresolvable profile is "no location", never a crash
             self.failures += 1
-            return None
-        return None if d is None else Path(d)
+            return False, None
+        return True, None if d is None else Path(d)
+
+    def where(self) -> Optional[Path]:
+        """The directory the resolver names right now, or None (no journal, or it cannot be resolved)."""
+        return self.resolve()[1]
 
     def _acquire(self, create: bool, d: Optional[Path]) -> tuple[Optional[int], str]:
         """(directory fd, status). status is ok | none (no journal configured) | missing (nothing
@@ -250,7 +271,8 @@ class AskJournal:
             return None, "none"
         d = Path(d)
         nofollow = getattr(os, "O_NOFOLLOW", 0)
-        fd = None
+        dirflag = getattr(os, "O_DIRECTORY", 0)
+        fd = pfd = None
         try:
             if create:
                 try:
@@ -261,35 +283,49 @@ class AskJournal:
                     if not stat.S_ISDIR(parent_kind):  # a link here would send the new directory elsewhere
                         self.failures += 1
                         return None, "unavailable"
-                try:
-                    os.mkdir(d, 0o700)
-                except FileExistsError:
-                    pass
             for p in (d.parent, d):  # a link in either place is never followed
-                if not stat.S_ISDIR(os.lstat(p).st_mode):
+                try:
+                    kind = os.lstat(p).st_mode
+                except FileNotFoundError:
+                    if create and p == d:
+                        break  # created below, relative to the parent descriptor
+                    raise
+                if not stat.S_ISDIR(kind):
                     self.failures += 1
                     return None, "unavailable"
-            fd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow)
-            seen, again = os.fstat(fd), os.lstat(d)
+            # The parent is opened once and checked against its own entry; the journal directory is
+            # then opened relative to that descriptor, so a parent swapped for a link after the
+            # checks cannot send the open (or any later write) to another directory.
+            pfd = os.open(d.parent, os.O_RDONLY | dirflag | nofollow)
+            pseen, pagain = os.fstat(pfd), os.lstat(d.parent)
+            if (pseen.st_ino, pseen.st_dev) != (pagain.st_ino, pagain.st_dev):
+                raise PermissionError("the parent directory changed")
+            if create:
+                try:
+                    os.mkdir(d.name, 0o700, dir_fd=pfd)
+                except FileExistsError:
+                    pass
+            fd = os.open(d.name, os.O_RDONLY | dirflag | nofollow, dir_fd=pfd)
+            seen, again = os.fstat(fd), os.stat(d.name, dir_fd=pfd, follow_symlinks=False)
             if (seen.st_ino, seen.st_dev) != (again.st_ino, again.st_dev) or seen.st_uid != os.geteuid():
                 raise PermissionError("not our directory")
             if seen.st_mode & 0o077:
                 os.fchmod(fd, 0o700)
-            return fd, "ok"
+            out, fd = fd, None
+            return out, "ok"
         except FileNotFoundError:
-            if fd is not None:
-                os.close(fd)
             return None, "missing"
         except NotADirectoryError:
-            if fd is not None:
-                os.close(fd)
             self.failures += 1
             return None, "missing"  # a path component is a file: nothing can be stored there
         except OSError:
-            if fd is not None:
-                os.close(fd)
             self.failures += 1
             return None, "unavailable"
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if pfd is not None:
+                os.close(pfd)
 
     @contextlib.contextmanager
     def _session(self, create: bool = False, d: Optional[Path] = None):
@@ -301,16 +337,18 @@ class AskJournal:
                 os.close(fd)
 
     @contextlib.contextmanager
-    def _locked(self, fd: int):
-        """Hold the directory lock; yields False (fail closed) when it cannot be taken in time."""
+    def _locked(self, fd: int, wait: Optional[float] = None):
+        """Hold the directory lock; yields False (fail closed) when it cannot be taken in time.
+
+        ``wait`` caps how long to wait (0 tries once). Without ``fcntl`` there is no lock that
+        other processes honour, so the lock is never "taken": nothing is persisted rather than
+        letting two writers both claim the last slot."""
         lfd = None
         got = False
         try:
             lfd = os.open(".lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=fd)
-            if fcntl is None:
-                got = True
-            else:
-                deadline = time.monotonic() + self.LOCK_WAIT_S
+            if fcntl is not None:
+                deadline = time.monotonic() + (self.LOCK_WAIT_S if wait is None else wait)
                 while True:
                     try:
                         fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -352,8 +390,8 @@ class AskJournal:
             return False
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
+        except (ProcessLookupError, OverflowError, ValueError):
+            return False  # no such process (or not a process id at all)
         except PermissionError:
             return True
         except OSError:
@@ -373,6 +411,9 @@ class AskJournal:
             st = os.fstat(rfd)
             if not stat.S_ISREG(st.st_mode) or st.st_size > self.MAX_RECORD_BYTES or st.st_uid != os.geteuid():
                 return {"corrupt": True}  # a link, FIFO, other owner or too big: never read into memory
+            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if (entry.st_ino, entry.st_dev) != (st.st_ino, st.st_dev):
+                return {"corrupt": True}  # the entry is a link (or was swapped): not the file that was opened
             if st.st_mode & 0o022:
                 return {"corrupt": True}  # somebody else could have written it
             if st.st_mode & 0o044:
@@ -409,7 +450,7 @@ class AskJournal:
         if "card" not in data or not isinstance(data["card"], (str, type(None))):
             return False
         started = data.get("started")
-        if isinstance(started, bool) or not isinstance(started, (int, float)) or not math.isfinite(started):
+        if not _finite(started):
             return False
         return started <= self._clock() + self.FUTURE_SLACK_S
 
@@ -540,6 +581,29 @@ class AskJournal:
             raise ValueError("record too large")
         return body
 
+    def _installed(self, fd: int, name: str, body: bytes) -> bool:
+        """True when the file now at ``name`` is a regular file holding exactly ``body``."""
+        try:
+            rfd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0), dir_fd=fd)
+        except OSError:
+            return False
+        try:
+            st = os.fstat(rfd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size != len(body):
+                return False
+            chunks, total = [], 0
+            while total <= len(body):
+                part = os.read(rfd, 65536)
+                if not part:
+                    break
+                total += len(part)
+                chunks.append(part)
+            return b"".join(chunks) == body
+        except OSError:
+            return False
+        finally:
+            os.close(rfd)
+
     def _publish(self, fd: int, job: str, body: bytes) -> bool:
         tmp = f".{job}.{secrets.token_hex(6)}.tmp"
         try:
@@ -557,6 +621,16 @@ class AskJournal:
             finally:
                 os.close(tfd)
             os.rename(tmp, f"{job}.json", src_dir_fd=fd, dst_dir_fd=fd)
+            if not self._installed(fd, f"{job}.json", body):
+                # Something else took the temporary file's place before the rename: what is
+                # installed is not what was meant to be published, so it must not stand.
+                self.failures += 1
+                try:
+                    os.unlink(f"{job}.json", dir_fd=fd)
+                except OSError:
+                    pass
+                self._written.discard(job)
+                return False
         except OSError:
             self.failures += 1
             try:
@@ -572,8 +646,23 @@ class AskJournal:
             return False
         return True
 
-    def write(self, job: str, rec: dict[str, Any], d: Optional[Path] = None) -> bool:
+    def _expectation_met(self, expect: Any, cur: Optional[dict[str, Any]]) -> bool:
+        if expect == "absent":
+            return cur is None
+        # A tuple of states this process may move the record on from: its own record in one of
+        # them, or nothing usable. Another worker's valid record is never overwritten.
+        if cur is None or cur.get("corrupt") or cur.get("unavailable"):
+            return True
+        owner = cur.get("owner")
+        return isinstance(owner, dict) and owner.get("inst") == self.inst and cur.get("state") in expect
+
+    def write(self, job: str, rec: dict[str, Any], d: Optional[Path] = None, expect: Any = None) -> bool:
         """True when the record is on disk and synced. False when it is not (or no journal is available).
+
+        ``expect`` makes the write a compare-and-set under the directory lock: ``"absent"`` claims
+        the id (nothing may be stored under it), a tuple of states moves this process's own record
+        on from one of them. A record that is not as expected raises ``JournalConflict``, so two
+        workers that both looked and found nothing cannot both take the same request.
 
         A new file first evicts the oldest evictable ones (``protect`` names jobs alive in
         memory), under the directory lock, so the directory never exceeds MAX_FILES however many
@@ -591,34 +680,41 @@ class AskJournal:
             with self._locked(fd) as got:
                 if not got or self._exists(fd, f"{job}.gone"):
                     return False
-                if not self._exists(fd, f"{job}.json") and not self._make_room(fd, self.protect):
+                if expect is not None and not self._expectation_met(expect, self._read_fd(fd, f"{job}.json", job)):
+                    raise JournalConflict(job)
+                if not self._exists(fd, f"{job}.json") and not self._make_room(fd, lambda stem: self.protect(stem, d)):
                     return False
                 return self._publish(fd, job, body)
 
-    def _touch(self, fd: int, name: str) -> None:
+    def _touch(self, fd: int, name: str) -> bool:
         try:
             os.close(os.open(name, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=fd))
         except OSError:
             self.failures += 1
+            return False
+        return True
 
-    def delete(self, job: str, d: Optional[Path] = None, tombstone: bool = False) -> bool:
+    def delete(self, job: str, d: Optional[Path] = None, tombstone: bool = False, wait: Optional[float] = None) -> bool:
         """True when a record was removed. With ``tombstone``, a job another running worker still
-        owns is also marked deleted, so that worker's later write is refused instead of
-        resurrecting the answer."""
+        owns (queued, sent or already settled, which that worker may still serve from memory) is
+        also marked deleted, so that worker's later write is refused and its next read drops the
+        answer. When the mark cannot be made nothing is deleted and False is returned: a deletion
+        the owner can undo must not be reported as done."""
         if not self._valid(job):
             return False
         with self._session(False, d) as (fd, _status):
             if fd is None:
                 return False
-            with self._locked(fd) as got:
+            with self._locked(fd, wait) as got:
                 if not got:
                     return False
                 name = f"{job}.json"
                 if tombstone:
                     rec = self._read_fd(fd, name, job)
-                    if (isinstance(rec, dict) and rec.get("state") in ("queued", "sent")
+                    if (isinstance(rec, dict) and rec.get("state") in self.STATES
                             and not rec.get("corrupt") and self.owner_live(rec)):
-                        self._touch(fd, f"{job}.gone")
+                        if not self._touch(fd, f"{job}.gone"):
+                            return False
                 try:
                     os.unlink(name, dir_fd=fd)
                 except FileNotFoundError:
@@ -646,14 +742,15 @@ class AskJournal:
                 self.failures += 1
                 return True
 
-    def prune(self, ttl: float, keep: Callable[[str], bool] = lambda job: False, d: Optional[Path] = None) -> int:
+    def prune(self, ttl: float, keep: Callable[[str], bool] = lambda job: False, d: Optional[Path] = None,
+              wait: Optional[float] = None) -> int:
         """Delete expired and unreadable files, then the oldest beyond MAX_FILES.
 
         ``keep(job)`` protects jobs that are alive in memory. Returns how many were removed."""
         with self._session(False, d) as (fd, _status):
             if fd is None:
                 return 0
-            with self._locked(fd) as got:
+            with self._locked(fd, wait) as got:
                 return self._prune_locked(fd, ttl, keep) if got else 0
 
     def _prune_locked(self, fd: int, ttl: float, keep: Callable[[str], bool]) -> int:
@@ -708,9 +805,14 @@ class AskJournal:
                 self.failures += 1
         return removed
 
-    def enforce_settled(self, limit: int, keep: Callable[[str], bool], d: Optional[Path] = None) -> int:
+    def enforce_settled(self, limit: int, keep: Callable[[str], bool], d: Optional[Path] = None,
+                        on_fail: Optional[Callable[[str, float], None]] = None, wait: Optional[float] = None) -> int:
         """Keep at most ``limit`` settled (done or error) records on disk, oldest settled first,
-        whoever wrote them: answers recovered after a restart count against the same bound."""
+        whoever wrote them: answers recovered after a restart count against the same bound.
+
+        Records ``keep`` protects are skipped and the next oldest goes instead, so a protected
+        record never stops the bound from being enforced. A record that cannot be deleted is
+        reported to ``on_fail(job, started)`` (the caller must stop serving it) and counts as gone."""
         with self._session(False, d) as (fd, _status):
             if fd is None:
                 return 0
@@ -724,95 +826,175 @@ class AskJournal:
                     rec = self._read_fd(fd, name, stem) if self._valid(stem) else None
                     if rec and not rec.get("corrupt") and rec.get("state") in ("done", "error"):
                         at = rec.get("settled_at")
-                        settled.append((at if isinstance(at, (int, float)) and math.isfinite(at) else rec["started"], stem))
+                        settled.append((at if _finite(at) else rec["started"], stem, rec["started"]))
             except OSError:
                 self.failures += 1
                 return 0
         settled.sort()
-        removed = 0
-        for _, stem in settled[: max(0, len(settled) - limit)]:
-            if not keep(stem) and self.delete(stem, d=d):
+        removed, excess = 0, len(settled) - limit
+        for _, stem, started in settled:
+            if excess <= 0:
+                break
+            if keep(stem):
+                continue
+            if self.delete(stem, d=d, wait=wait):
                 removed += 1
+                excess -= 1
+            elif on_fail is not None:
+                on_fail(stem, started)
+                excess -= 1
         return removed
 
 
-class AskJobs:
-    """``{job: {"status", "started", ...}}``. Every write goes through one named transition.
+class JournalUnavailable(RuntimeError):
+    """The journal location cannot be resolved right now, so a job cannot be scoped to a profile."""
 
-    Each job remembers the journal directory it was created under (``dir``). Later calls from a
-    worker thread, which carries no request context, still write to that directory; and a job is
-    never shown to a request that resolves a different directory (another profile)."""
+
+class AskTicket(str):
+    """A job id bound to the directory (profile) and generation it was created under.
+
+    ``create`` returns one. A worker that completes the job through it can never touch a later
+    job that reuses the same id after this one was deleted or expired."""
+
+    dir: Optional[Path]
+    gen: int
+
+    def __new__(cls, job: str, dir: Optional[Path] = None, gen: int = 0):
+        obj = super().__new__(cls, job)
+        obj.dir = dir
+        obj.gen = gen
+        return obj
+
+
+_PRIVATE = ("gen", "keep")
+
+
+def _public(st: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in st.items() if k not in _PRIVATE}
+
+
+class AskJobs:
+    """``{(directory, job): {"status", "started", ...}}``. Every write goes through one named transition.
+
+    A job lives under the journal directory (profile) it was created under, and the same id may
+    exist in two profiles. A caller sees only jobs of the directory it resolves right now: when
+    that cannot be resolved nothing in memory is served (it is reported unavailable, never as a
+    match). Later calls from a worker thread, which carries no request context, use the
+    ``AskTicket`` that ``create`` returned (or, for a plain id, the one table entry that has it)."""
 
     TTL_S = 900
     MAX_SETTLED = 128
     PRUNE_EVERY_S = 30  # journal housekeeping cadence; polls are every 1.5 s
-    MAX_UNDELETED = 1024
+    MAX_UNDELETED = 1024  # past this, entries already beyond their retention are forgotten; live ones never are
+    MAX_KNOWN_DIRS = 256
+    HOUSEKEEPING_BUDGET_S = 2.0  # total time one cleanup pass may spend waiting on journal locks
 
     def __init__(self, clock: Optional[Callable[[], float]] = None, journal: Optional[AskJournal] = None):
         self._clock = clock or (lambda: time.time())
         self._lock = threading.Lock()
-        self._jobs: dict[str, dict[str, Any]] = {}
+        self._jobs: dict[tuple[Optional[Path], str], dict[str, Any]] = {}
+        self._gen = 0
         self._journal = journal
         if journal is not None:
-            journal.protect = lambda j: j in self._jobs
-        self._undeleted: dict[str, Optional[Path]] = {}  # records that could not be deleted: treated as gone, retried
+            journal.protect = lambda j, d=None: (d, j) in self._jobs
+        # Records that could not be deleted: treated as gone, retried. Value: the job's start time.
+        self._undeleted: dict[tuple[Optional[Path], str], float] = {}
+        # Directories this table has served or written, so cleanup keeps visiting them after
+        # their last in-memory job is gone (recovered answers and leftover temporary files).
+        self._known: dict[Path, None] = {}
         self._last_prune = float("-inf")
+        self._deadline = float("inf")  # monotonic time by which the current pass stops waiting on locks
         self._bg_every: Optional[float] = None
         self._timer: Optional[threading.Timer] = None
 
-    def _visible(self, job: str) -> Optional[dict[str, Any]]:
-        """The in-memory entry, unless it belongs to a different directory (profile) than the caller's."""
-        st = self._jobs.get(job)
-        if st is None:
-            return None
-        if self._journal is not None and st.get("dir") is not None:
-            here = self._journal.where()
-            if here is not None and here != st["dir"]:
-                return None
-        return st
+    # --- scope ------------------------------------------------------------------------------
 
-    def _gone_elsewhere(self, job: str, st: dict[str, Any]) -> bool:
+    def _scope(self) -> tuple[bool, Optional[Path]]:
+        """(resolved, directory) for the caller right now. Unresolved is never the same scope as anything."""
+        if self._journal is None:
+            return True, None
+        return self._journal.resolve()
+
+    def _note_dir(self, d: Optional[Path]) -> None:
+        if d is None:
+            return
+        self._known.pop(d, None)
+        self._known[d] = None
+        while len(self._known) > self.MAX_KNOWN_DIRS:
+            self._known.pop(next(iter(self._known)))
+
+    def _entry(self, job: str) -> tuple[Optional[tuple[Optional[Path], str]], Optional[dict[str, Any]]]:
+        """The in-memory entry this caller may act on. A ticket names its own directory and generation."""
+        if isinstance(job, AskTicket):
+            key = (job.dir, str(job))
+            st = self._jobs.get(key)
+            return (key, st) if st is not None and st.get("gen") == job.gen else (None, None)
+        ok, here = self._scope()
+        if ok:
+            key = (here, str(job))
+            st = self._jobs.get(key)
+            if st is not None:
+                return key, st
+        return None, None
+
+    def _worker_entry(self, job: str) -> tuple[Optional[tuple[Optional[Path], str]], Optional[dict[str, Any]]]:
+        """For a worker thread: its ticket, else the caller's own entry, else the only entry with this id."""
+        key, st = self._entry(job)
+        if st is not None or isinstance(job, AskTicket):
+            return key, st
+        found = [(k, v) for k, v in self._jobs.items() if k[1] == job]
+        return found[0] if len(found) == 1 else (None, None)
+
+    def _gone_elsewhere(self, key: tuple[Optional[Path], str], st: dict[str, Any]) -> bool:
         """Another worker deleted this job (tombstone): drop it here so it is not served or resurrected."""
-        if self._journal is not None and st.get("dir") is not None and self._journal.tombstoned(job, d=st["dir"]):
-            self._jobs.pop(job, None)
+        if self._journal is not None and key[0] is not None and self._journal.tombstoned(key[1], d=key[0]):
+            self._jobs.pop(key, None)
             return True
         return False
+
+    # --- reading ----------------------------------------------------------------------------
 
     def get(self, job: str) -> Optional[dict[str, Any]]:
         with self._lock:
             self._expire()
-            if job in self._undeleted:
-                return None  # deleted or expired; only the removal of its file is still pending
-            st = self._visible(job)
-            if st is not None:
-                if self._gone_elsewhere(job, st):
-                    return None
-                return dict(st)
-            return self._recover(job)
+            ok, here = self._scope()
+            if ok:
+                key = (here, job)
+                if key in self._undeleted:
+                    return None  # deleted or expired; only the removal of its file is still pending
+                st = self._jobs.get(key)
+                if st is not None:
+                    if self._gone_elsewhere(key, st):
+                        return None
+                    return _public(st)
+            return self._recover(job, here if ok else None)
 
     def card(self, job: str) -> Optional[str]:
         """The card id a job was created for, when known (memory first, then the journal)."""
         with self._lock:
-            if job in self._undeleted:
+            ok, here = self._scope()
+            if ok and (here, job) in self._undeleted:
                 return None
-            st = self._visible(job)
-            if st is not None:
-                return st.get("card")
-            rec = self._journal.read(job) if self._journal else None
+            if ok:
+                st = self._jobs.get((here, job))
+                if st is not None:
+                    return st.get("card")
+            rec = self._journal.read(job, d=here if ok else None) if self._journal else None
             return rec.get("card") if rec and not rec.get("corrupt") and not rec.get("unavailable") else None
 
-    def _recover(self, job: str) -> Optional[dict[str, Any]]:
+    def _recover(self, job: str, here: Optional[Path]) -> Optional[dict[str, Any]]:
         """A job absent from memory: read what the journal says survived a restart."""
-        rec = self._journal.read(job) if self._journal else None
+        rec = self._journal.read(job, d=here) if self._journal else None
         if rec is None:
             return None
         if rec.get("unavailable"):
             return {"started": self._clock(), "recovered": True, "card": None, "unavailable": True,
                     "status": AskState.UNKNOWN, "ok": False,
                     "detail": "the saved state for this request cannot be read right now, so its outcome is unknown"}
+        self._note_dir(here)
         started = rec.get("started") if isinstance(rec.get("started"), (int, float)) else self._clock()
         if self._clock() - started > self.TTL_S:
-            self._drop_record(job, None)  # past retention: gone, like an expired in-memory job
+            self._drop_record(job, here, started)  # past retention: gone, like an expired in-memory job
             return None
         base = {"started": started, "recovered": True, "card": rec.get("card")}
         if rec.get("corrupt"):
@@ -841,19 +1023,42 @@ class AskJobs:
                     "detail": "the model finished before the restart, but answers are not kept on disk; ask again to get a new one"}
         return {**base, "status": AskState.UNKNOWN, "ok": False, "detail": "the saved record for this request is unreadable, so its outcome is unknown"}
 
-    def create(self, job: str, card: Optional[str] = None) -> None:
-        """absent -> PENDING (after expiring old jobs)."""
+    # --- transitions ------------------------------------------------------------------------
+
+    def create(self, job: str, card: Optional[str] = None) -> AskTicket:
+        """absent -> PENDING (after expiring old jobs). Returns the ticket the worker completes it with.
+
+        Raises JournalUnavailable when the journal location cannot be resolved: a job without a
+        known profile could be shown to another one."""
         with self._lock:
             self._expire()
-            if job in self._jobs:
+            ok, where = self._scope()
+            if not ok:
+                raise JournalUnavailable("the Ask journal location cannot be resolved")
+            key = (where, job)
+            if key in self._jobs:
                 raise IllegalTransition(f"ask job {job} already exists")
             now = self._clock()
-            where = self._journal.where() if self._journal else None
-            self._jobs[job] = {"status": AskState.PENDING, "started": now, "card": card, "dir": where}
+            # The profile's persistence setting is read here, in the request's own context: the
+            # worker thread that settles the job resolves the default profile instead.
+            keep = self._journal.keeps_replies() if self._journal else False
+            if self._journal and where is not None:
+                # Claim the id on disk first, atomically: another worker that also found nothing
+                # under it must not go on to send the same request a second time. A record this
+                # table already treats as deleted (its removal is only pending) may be replaced.
+                try:
+                    self._journal.write(job, {"state": "queued", "started": now, "card": card}, d=where,
+                                        expect=None if key in self._undeleted else "absent")
+                except JournalConflict:
+                    raise IllegalTransition(f"ask job {job} already exists") from None
+                self._undeleted.pop(key, None)
+                self._note_dir(where)
+            self._gen += 1
+            self._jobs[key] = {"status": AskState.PENDING, "started": now, "card": card, "dir": where,
+                               "gen": self._gen, "keep": keep}
             if self._journal:
-                if where is not None:
-                    self._journal.write(job, {"state": "queued", "started": now, "card": card}, d=where)
                 self._arm()
+            return AskTicket(job, where, self._gen)
 
     def mark_sent(self, job: str) -> bool:
         """Record, durably, that the model call is about to start (before it starts).
@@ -863,22 +1068,27 @@ class AskJobs:
         claim that nothing was sent and offer a safe resubmit although the model may have run.
         It is also False when another worker has deleted the job meanwhile."""
         with self._lock:
-            st = self._jobs.get(job)
+            key, st = self._worker_entry(job)
             if st is None or st["status"] is not AskState.PENDING:
                 return False
             st["sent"] = True
             where = st.get("dir")
             if not self._journal or where is None:
                 return True
-            if self._journal.write(job, {"state": "sent", "started": st["started"], "card": st.get("card"),
-                                         "sent_at": self._clock()}, d=where):
-                return True
-            if self._gone_elsewhere(job, st):
+            try:
+                if self._journal.write(key[1], {"state": "sent", "started": st["started"], "card": st.get("card"),
+                                                "sent_at": self._clock()}, d=where, expect=("queued",)):
+                    return True
+            except JournalConflict:
+                # Another worker owns this request now: it is theirs to send, not ours.
+                self._jobs.pop(key, None)
+                return False
+            if self._gone_elsewhere(key, st):
                 return False
             # Could not record it. A stale "queued" marker would turn into a false not_submitted,
             # so remove it: an unknown job is reported as unknown, never as safe to resend.
-            self._journal.delete(job, d=where)
-            return self._journal.verified_absent(job, owned=True, d=where)
+            self._journal.delete(key[1], d=where)
+            return self._journal.verified_absent(key[1], owned=True, d=where)
 
     def discard(self, job: str) -> bool:
         """Delete a job and its journal file at the caller's request, whatever its state.
@@ -886,15 +1096,16 @@ class AskJobs:
         Raises DiscardFailed, leaving the job in place, when the saved record cannot be removed:
         dropping only the memory entry would let the next GET recover the saved answer."""
         with self._lock:
-            st = self._visible(job)
+            key, st = self._entry(job)
             where = st.get("dir") if st is not None else None
             gone = False
             if self._journal:
-                gone = self._journal.delete(job, d=where, tombstone=True)
-                if not gone and not self._journal.verified_absent(job, owned=st is not None, d=where):
+                gone = self._journal.delete(str(job), d=where, tombstone=True)
+                if not gone and not self._journal.verified_absent(str(job), owned=st is not None, d=where):
                     raise DiscardFailed(f"the saved record for ask job {job} could not be deleted")
-            self._undeleted.pop(job, None)
-            return (st is not None and self._jobs.pop(job, None) is not None) or gone
+            ok, here = self._scope()
+            self._undeleted.pop((where if st is not None else (here if ok else None), str(job)), None)
+            return (st is not None and self._jobs.pop(key, None) is not None) or gone
 
     def finish(self, job: str, reply: str, provider: Any = None, model: Any = None) -> bool:
         """PENDING -> DONE. False when the job expired meanwhile (a late worker is a no-op)."""
@@ -908,89 +1119,112 @@ class AskJobs:
     def _settle(self, job: str, out: dict[str, Any]) -> bool:
         with self._lock:
             self._expire()
-            st = self._jobs.get(job)
+            key, st = self._worker_entry(job)
             if st is None:
                 return False
             if st["status"] is not AskState.PENDING:
                 raise IllegalTransition(f"ask job {job} is already {st['status'].value}")
-            if self._gone_elsewhere(job, st):
+            if self._gone_elsewhere(key, st):
                 return False  # deleted by a client while this worker was running: never resurrect it
-            where = st.get("dir")
+            where, jid = st.get("dir"), key[1]
             # One new record, swapped in whole: a poller never sees a status without its reply.
             # Dict order must follow completion, not creation: a slow pending job can
             # otherwise evict itself immediately when newer jobs have already settled.
-            self._jobs.pop(job)
-            self._jobs[job] = {"started": st["started"], "card": st.get("card"), "dir": where, **out}
+            self._jobs.pop(key)
+            self._jobs[key] = {"started": st["started"], "card": st.get("card"), "dir": where,
+                               "gen": st["gen"], "keep": st["keep"], **out}
             if self._journal and where is not None:
                 done = out["status"] is AskState.DONE
-                wrote = self._journal.write(job, {
-                    "state": "done" if done else "error",
-                    "started": st["started"], "card": st.get("card"), "settled_at": self._clock(),
-                    "provider": out.get("provider"), "model": out.get("model"),
-                    "detail": None if done else out.get("detail"),
-                    **({"reply": out["reply"]} if done and self._journal.keeps_replies() else {}),
-                }, d=where)
-                if not wrote and self._journal.tombstoned(job, d=where):
-                    self._jobs.pop(job, None)
+                try:
+                    wrote = self._journal.write(jid, {
+                        "state": "done" if done else "error",
+                        "started": st["started"], "card": st.get("card"), "settled_at": self._clock(),
+                        "provider": out.get("provider"), "model": out.get("model"),
+                        "detail": None if done else out.get("detail"),
+                        **({"reply": out["reply"]} if done and st["keep"] else {}),
+                    }, d=where, expect=("queued", "sent"))
+                except JournalConflict:
+                    self._jobs.pop(key, None)  # another worker's record: never answer over it
+                    return False
+                if not wrote and self._journal.tombstoned(jid, d=where):
+                    self._jobs.pop(key, None)
                     return False
             settled = [k for k, v in self._jobs.items() if v["status"] in ASK_SETTLED]
-            for key in settled[:-self.MAX_SETTLED]:
-                evicted = self._jobs.pop(key, None)
-                self._drop_record(key, evicted.get("dir") if evicted else None)
+            for k in settled[:-self.MAX_SETTLED]:
+                evicted = self._jobs.pop(k, None)
+                self._drop_record(k[1], k[0], evicted["started"] if evicted else None)
             if self._journal and where is not None:
                 # Answers recovered from an earlier run are not in memory but still count against the bound.
-                self._journal.enforce_settled(self.MAX_SETTLED, keep=lambda j: j in self._jobs, d=where)
+                self._journal.enforce_settled(self.MAX_SETTLED, keep=lambda j: (where, j) in self._jobs, d=where,
+                                              on_fail=lambda j, started: self._drop_record(j, where, started),
+                                              wait=self._wait())
             return True
 
     def consume(self, job: str) -> dict[str, Any]:
         """DONE | ERROR -> absent, returning the settled record."""
         with self._lock:
             self._expire()
-            st = self._visible(job)
+            key, st = self._entry(job)
             if st is None:
                 raise KeyError(job)
             if st["status"] not in ASK_SETTLED:
                 raise IllegalTransition(f"ask job {job} is still {st['status'].value}")
             where = st.get("dir")
-            if (self._journal and where is not None and not self._journal.delete(job, d=where)
-                    and not self._journal.verified_absent(job, owned=True, d=where)):
+            if (self._journal and where is not None and not self._journal.delete(key[1], d=where)
+                    and not self._journal.verified_absent(key[1], owned=True, d=where)):
                 # The saved reply is still on disk and would be recovered as this very job.
                 raise DiscardFailed(f"the saved record for ask job {job} could not be deleted")
-            return self._jobs.pop(job)
+            return _public(self._jobs.pop(key))
 
-    def _drop_record(self, job: str, where: Optional[Path]) -> None:
+    # --- retention --------------------------------------------------------------------------
+
+    def _drop_record(self, job: str, where: Optional[Path], started: Optional[float] = None) -> None:
         """Remove a job's file. When it cannot be removed the job is still treated as gone (never
         served) and the removal is retried by housekeeping, so a failed delete cannot bypass a limit."""
         if not self._journal or where is None:
             return
-        if self._journal.delete(job, d=where) or self._journal.verified_absent(job, owned=True, d=where):
-            self._undeleted.pop(job, None)
+        if self._journal.delete(job, d=where, wait=self._wait()) or self._journal.verified_absent(job, owned=True, d=where):
+            self._undeleted.pop((where, job), None)
             return
-        self._undeleted[job] = where
-        while len(self._undeleted) > self.MAX_UNDELETED:
-            self._undeleted.pop(next(iter(self._undeleted)))  # the TTL prune removes the file regardless
+        self._undeleted[(where, job)] = started if started is not None else self._clock()
+        if len(self._undeleted) > self.MAX_UNDELETED:
+            self._forget_lapsed()
+
+    def _wait(self) -> float:
+        """How long the next journal lock may be waited for: what is left of this pass's budget."""
+        return max(0.0, min(self._journal.LOCK_WAIT_S if self._journal else 0.0, self._deadline - time.monotonic()))
+
+    def _forget_lapsed(self) -> None:
+        """Forget undeleted records past their retention: reading one drops it as expired anyway.
+        A record still inside its retention is never forgotten, or its evicted answer would be served again."""
+        cutoff = self._clock() - self.TTL_S
+        for k in [k for k, started in self._undeleted.items() if started < cutoff]:
+            self._undeleted.pop(k, None)
 
     def _retry_undeleted(self) -> None:
-        for job, where in list(self._undeleted.items()):
-            self._drop_record(job, where)
+        for (where, job), started in list(self._undeleted.items()):
+            self._drop_record(job, where, started)
+        self._forget_lapsed()
 
-    def _journal_dirs(self) -> list[Optional[Path]]:
-        dirs: list[Optional[Path]] = [None]  # None: whatever the resolver names for this caller
-        for st in self._jobs.values():
-            if st.get("dir") is not None and st["dir"] not in dirs:
-                dirs.append(st["dir"])
+    def _journal_dirs(self) -> list[Path]:
+        dirs: list[Path] = []
+        ok, here = self._scope()
+        for d in [here if ok else None, *[k[0] for k in self._jobs], *[k[0] for k in self._undeleted], *self._known]:
+            if d is not None and d not in dirs:
+                dirs.append(d)
         return dirs
 
     def _expire(self) -> None:
+        self._deadline = time.monotonic() + self.HOUSEKEEPING_BUDGET_S
         cutoff = self._clock() - self.TTL_S
         for k in [k for k, v in list(self._jobs.items()) if v["started"] < cutoff]:
             gone = self._jobs.pop(k, None)
-            self._drop_record(k, gone.get("dir") if gone else None)
+            self._drop_record(k[1], k[0], gone["started"] if gone else None)
         now = self._clock()
         if self._journal and now - self._last_prune >= self.PRUNE_EVERY_S:
             self._last_prune = now
             for d in self._journal_dirs():
-                self._journal.prune(self.TTL_S, keep=lambda j: j in self._jobs, d=d)
+                self._journal.prune(self.TTL_S, keep=lambda j, d=d: (d, j) in self._jobs, d=d, wait=self._wait())
             self._retry_undeleted()
 
     def housekeeping(self) -> None:
@@ -1009,6 +1243,14 @@ class AskJobs:
             self._bg_every = every_s
             self._arm()
 
+    def stop_background(self) -> None:
+        """Cancel the housekeeping timer and do not re-arm it (shutdown, and tests that load the API)."""
+        with self._lock:
+            self._bg_every = None
+            timer, self._timer = self._timer, None
+        if timer is not None:
+            timer.cancel()
+
     def _arm(self) -> None:
         every = getattr(self, "_bg_every", None)
         if every is None or getattr(self, "_timer", None) is not None:
@@ -1017,6 +1259,20 @@ class AskJobs:
         t.daemon = True
         self._timer = t
         t.start()
+
+    def _more(self) -> bool:
+        """True while anything may remain to expire: jobs, undeleted records, or files in a known directory."""
+        if self._jobs or self._undeleted:
+            return True
+        if not self._journal:
+            return False
+        more = False
+        for d in self._journal_dirs():
+            if self._journal.has_files(d):
+                more = True
+            else:
+                self._known.pop(d, None)  # nothing left there: stop visiting it
+        return more
 
     def _tick(self) -> None:
         failed = False
@@ -1028,7 +1284,7 @@ class AskJobs:
             with self._lock:
                 self._timer = None
                 try:
-                    more = bool(self._jobs or self._undeleted or (self._journal and self._journal.has_files()))
+                    more = self._more()
                 except Exception:  # noqa: BLE001
                     more = True
                 if more or failed:

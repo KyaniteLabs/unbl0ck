@@ -94,9 +94,12 @@ authorization: it is not a gap and will not be added. **Not yet** is a real gap.
 <!-- capability-matrix:end -->
 
 - **Context** is the Context panel for Kanban and the Full text view for chats, live prompts
-  and outside items. Chats and live prompts show Full text only when the card holds a
-  shortened tail; password prompts never offer Full text, and pairing requests show neither
-  (the code and the person's platform id are never shown).
+  and outside items. The **+ Full text** button is on every card without a summary: it
+  expands or collapses the text already on the card. Only chats and live prompts that hold a
+  shortened tail, and outside items, load the whole record from the source; short chats,
+  password prompts and pairing requests never fetch anything. Password prompts are never
+  expanded to a larger record, and a pairing request never shows its code or the person's
+  platform id.
 - **Model help** is the interactive TL;DR: it sends card text to your configured provider
   only on an explicit click, and only for Kanban. It is separate from the one-line summary,
   which is on by default and is sent automatically in the background when the queue is
@@ -144,7 +147,7 @@ the result expired) and offers a fresh attempt. The client polls for up to 150 s
 and checked after every response, including a finished answer. Each Ask carries a random
 request ID that Retry reuses, so a lost response cannot start a second model call, and it
 carries the card version, so a changed card is refused instead of answered from old context.
-A follow-up over 20,000 characters, or one the server refuses, is not kept in the conversation.
+A follow-up over 20,000 characters, or one the server refuses outright (a client error other than busy or timeout), is not kept in the conversation. After a busy (429) or timeout answer it stays, so Retry can send it again.
 
 
 After a gateway restart the plugin never sends a request again by itself. Each Ask job
@@ -177,15 +180,16 @@ returning to the page restores the conversation without asking the model again; 
 request still running when you left is followed to its result. A reload or app restart
 clears this memory, and nothing is written to disk, so there is nothing to delete. Conversations
 are kept for each backend connection separately: the same card id on another backend or
-profile never shows or resends them, and closing a connection removes its conversations.
+profile never shows or resends them, and closing a connection removes its conversations, its queue and its Undo list. A card and the page itself are remounted per connection, so an answer being typed or advice for the same card id never carries over to another backend.
 One conversation keeps at most 100 messages and 200,000 characters; older messages are
 dropped, and the card says so. A conversation that expires while its card stays open
 leaves the screen too. If a request's conversation is evicted or expires while the model
 is still answering, the card reports that it was dropped from session memory and offers
 Retry; the late answer is not shown. The recovered conversation stays bound to the card it
-was asked about: if the block version or the title, question, owner or comments changed,
-it is marked as out of date and its suggestion cannot be used as an answer until you ask
-again. A late response from an older request
+was asked about: if the block version or the title, question, owner, description or comments
+(including a comment rewritten in place) changed, it is marked as out of date and its suggestion
+cannot be used as an answer until you ask again. A Retry after leaving and returning to the
+page reuses the request's id, so a response lost in transit never starts a second model call. A late response from an older request
 never replaces a newer one.
 
 ## Recover from a fault

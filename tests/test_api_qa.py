@@ -44,10 +44,11 @@ class ApiQA(unittest.TestCase):
         def hide(i, v):
             if not i or len(i) > 300:
                 raise ValueError("bad id")
+            return "tok", 1
 
         self.needs = types.SimpleNamespace(
             NO_BLUF_SOURCES=real.NO_BLUF_SOURCES,
-            hide=hide,
+            hide_ordered=hide,
             StaleAnswer=real.StaleAnswer,
             VersionRequired=real.VersionRequired,
             normalize_board_slug=real.normalize_board_slug,

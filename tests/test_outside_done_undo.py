@@ -270,8 +270,8 @@ class UndoTokens(OutsideFixture):
     def test_old_not_for_me_undo_cannot_remove_a_newer_hide(self):
         self.file(dedupe_key="a")
         (it,) = self.queue()
-        old = needs.hide(it["id"], "v-old")
-        new = needs.hide(it["id"], it["version"])  # dismissed again at the current version
+        old = needs.hide(it["id"], it["version"])
+        new = needs.hide(it["id"], it["version"])  # dismissed again at the same version
         self.assertFalse(needs.unhide(it["id"], token=old))
         self.assertEqual(self.queue(), [])
         self.assertTrue(needs.unhide(it["id"], token=new))
