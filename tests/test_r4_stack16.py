@@ -206,7 +206,9 @@ class CorruptStoreMutationUnderTheLock(unittest.TestCase):
             entered.append(1)
             return real(home)
 
-        with patch.object(needs, "_state_lock", spy):
+        # The card lookup before the lock is a queue read with its own lock; this test counts
+        # only the mutation's lock.
+        with patch.object(needs, "_state_lock", spy), patch.object(needs, "_current_version", lambda *a: None):
             with self.assertRaises(RuntimeError):
                 needs.hide("a", "1", self.home)
         self.assertEqual(entered, [1], "the corrupt store must be met inside the lock")

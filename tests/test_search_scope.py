@@ -223,7 +223,10 @@ class SearchBudget(RealReaders):
     def test_a_hidden_chat_that_changed_is_searched_again(self):
         self.chats(["Should I merge change 0 now?"])
         (it,) = needs.chat_items(self.home)
-        needs.hide(it["id"], "an-older-version", self.home)
+        # A dismissal of an older version (hide itself now refuses one, so it is written as
+        # an older tab's hide would have left it).
+        with patch.object(needs, "_current_version", lambda *a: None):
+            needs.hide(it["id"], "an-older-version", self.home)
         self.assertEqual(len(needs.search_text("change")["matches"]), 1)
         needs.hide(it["id"], it["version"], self.home)
         self.assertEqual(needs.search_text("change")["matches"], [])
@@ -387,9 +390,9 @@ class DesktopSearchPreservesState(unittest.TestCase):
 
     def test_cards_stay_mounted_by_id_so_their_state_survives_a_search(self):
         s = (ROOT / "desktop/src/plugin.src.js").read_text()
-        # Every list renders Item with the item id as its key, and the full-text result never
+        # Every list renders Item keyed by its scope and item id, and the full-text result never
         # replaces the list: it only adds a summary line and marks matches.
-        self.assertGreaterEqual(s.count("}, item.id))"), 2)
+        self.assertGreaterEqual(s.count("}, askKey(scope, item.id)))"), 2)
         self.assertNotIn("setItems(fullHits", s)
         self.assertNotIn("items={fullHits", s)
 
