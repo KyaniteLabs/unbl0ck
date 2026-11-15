@@ -46,6 +46,15 @@ class CutComments(unittest.TestCase):
                 self.assertIn("truncated", row[2])
 
 
+class Signature(unittest.TestCase):
+    def test_the_signature_moves_when_a_comment_date_does(self):
+        """R8-013: every field of the shared comment view, created_at included, is in the signature."""
+        conn = comments_table("same text")
+        before = needs._comments_sig(conn, None, "t")
+        conn.execute("UPDATE task_comments SET created_at = 2")
+        self.assertNotEqual(needs._comments_sig(conn, None, "t"), before)
+
+
 class BoundedTextReads(unittest.TestCase):
     def run_child(self, home, call):
         done = subprocess.run(

@@ -1817,9 +1817,9 @@ def _digest(*texts: Any) -> str:
 
 def _comments_sig(conn: Any, kanban_db: Any, task_id: str) -> str:
     """"count:newest id:digest" of a card's comments: it changes when a comment is added and when
-    the bounded read every model call and Desktop are given (:func:`_newest_comments`) changes."""
+    anything in the bounded view every model call and Desktop are given (:func:`_newest_comments`) does."""
     rows, count = _newest_comments(conn, kanban_db, task_id, CARD_CONTEXT_COMMENTS)
-    return f"{count}:{max((r[0] or 0 for r in rows), default=0)}:{_digest(*(p for r in rows for p in r[:3]))}"
+    return f"{count}:{max((r[0] or 0 for r in rows), default=0)}:{_digest(*(p for r in rows for p in r))}"
 
 
 def _newest_comments(conn: Any, kanban_db: Any, task_id: str, limit: int) -> tuple[list[tuple[Any, ...]], int]:
