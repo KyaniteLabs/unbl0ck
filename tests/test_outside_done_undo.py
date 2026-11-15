@@ -43,6 +43,18 @@ class DoneUndo(OutsideFixture):
         self.assertFalse(needs.unhide("outside:filed:" + "0" * 32))
         self.assertTrue(self.record(result).exists())
 
+    def test_undo_clears_done_and_not_for_me_together(self):
+        result = self.file(dedupe_key="a")
+        (it,) = self.queue()
+        self.done(it)
+        needs.hide(it["id"], it["version"])
+        self.assertEqual(self.queue(), [])
+        self.assertTrue(needs.unhide(it["id"]))
+        self.assertEqual([i["id"] for i in self.queue()], [it["id"]])
+        self.assertNotIn(it["id"], needs.load_hidden())
+        self.assertNotIn("done_at", json.loads(self.record(result).read_text()))
+        self.assertFalse(needs.unhide(it["id"]))
+
     def test_not_for_me_on_a_filed_item_is_undoable_through_unhide(self):
         result = self.file(dedupe_key="a")
         (it,) = self.queue()
