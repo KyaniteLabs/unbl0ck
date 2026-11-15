@@ -3304,67 +3304,426 @@ def file_outside(
 _HTML_VOID = frozenset("area base br col embed hr img input link meta param source track wbr".split())
 _HTML_DROP = frozenset(
     "head script style title noscript template iframe frame frameset object embed applet svg math canvas "
-    "audio video select textarea".split()
+    "audio video select".split()
+)
+_HTML_FOREIGN = frozenset(("svg", "math"))  # a self-closing tag really is empty only here
+_HTML_HEAD_OK = frozenset(
+    "title meta link style script base noscript template basefont bgsound command".split()
 )
 _HTML_BLOCK = frozenset(
     "p div section article header footer main nav aside blockquote pre table tr ul ol dl dt dd h1 h2 h3 h4 h5 h6 "
     "form fieldset figure figcaption address hr center".split()
 )
-_HTML_HIDDEN_STYLE = re.compile(
-    r"display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0\s*(?:;|$)|"
-    r"(?:font-size|max-height|max-width|width|height)\s*:\s*0(?:px|pt|em|rem|%)?\s*(?:;|!|$)",
-    re.I,
+# A start tag of these closes an open <p> (HTML's optional end tag for p).
+_HTML_CLOSES_P = frozenset(
+    "address article aside blockquote center details dialog dir div dl fieldset figcaption figure footer "
+    "form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre section table ul li dd dt".split()
 )
-_HTML_MAX_OPEN = 2000  # nesting tracked inside a hidden element; deeper ends the readable text
+_HTML_SCOPE = frozenset("table td th caption html button object marquee applet template".split())
+_HTML_MAX_OPEN = 1000  # open elements tracked; deeper nesting ends the readable text, and is reported
+
+
+class _HtmlStop(Exception):
+    """Raised inside the converter to end it early; the result is reported as incomplete."""
+
+
+_CSS_COMMENT = re.compile(r"/\*.*?(?:\*/|\Z)", re.S)
+_CSS_ZERO = re.compile(r"^[+-]?(?:0+(?:\.0*)?|\.0+)(?:[a-z]+|%)?$")
+_CSS_ABS_LENGTH = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:px|pt|pc|cm|mm|in|q|rem|vw|vh|vmin|vmax)$")
+_CSS_FONT_KEYWORDS = frozenset(
+    "xx-small x-small small medium large x-large xx-large xxx-large math".split()
+)
+_CSS_IMPORTANT = re.compile(r"\s*!\s*important\s*$")
+_CSS_COMPOUND = re.compile(r"^(?P<tag>[a-zA-Z][a-zA-Z0-9-]*|\*)?(?P<rest>(?:[.#][A-Za-z_][\w-]*)*)$")
+_CSS_PART = re.compile(r"([.#])([A-Za-z_][\w-]*)")
+_CSS_SKIP_BLOCKS = ("@font-face", "@keyframes", "@-webkit-keyframes", "@page", "@counter-style", "@property")
+_CSS_HIDING = frozenset(
+    "display visibility opacity font-size width height max-width max-height overflow overflow-x overflow-y".split()
+)
+_CSS_HIDINGISH = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|opacity\s*:\s*0|font-size\s*:\s*0|overflow", re.I
+)
+_CSS_MAX_RULES = 2000
+_CSS_MAX_SELECTOR = 4  # compounds in a selector this converter evaluates
+_CSS_BIG_INT = re.compile(
+    r"&#(?:[0-9]{100,}|0*[1-9][0-9]{7,}|[xX](?:[0-9a-fA-F]{100,}|0*[1-9a-fA-F][0-9a-fA-F]{6,}));?"
+)
+
+
+def _css_declarations(block: str) -> dict[str, tuple[str, bool]]:
+    """``{property: (value, important)}`` from one declaration block. Property names are matched
+    whole (``min-width`` is never ``width``) and custom properties (``--x``) are not properties."""
+    out: dict[str, tuple[str, bool]] = {}
+    for piece in _CSS_COMMENT.sub("", block).split(";"):
+        name, sep, value = piece.partition(":")
+        name = name.strip().lower()
+        if not sep or not name or name.startswith("--"):
+            continue
+        value = value.strip().lower()
+        important = bool(_CSS_IMPORTANT.search(value))
+        value = _CSS_IMPORTANT.sub("", value).strip()
+        if name in out and out[name][1] and not important:
+            continue
+        out[name] = (value, important)
+    return out
+
+
+def _css_zero(value: str) -> bool:
+    return bool(_CSS_ZERO.match(value))
+
+
+def _css_clips(decls: dict[str, str]) -> bool:
+    return any(decls.get(p, "visible") in ("hidden", "clip", "scroll", "auto") for p in ("overflow", "overflow-x", "overflow-y"))
+
+
+def _css_hides(decls: dict[str, str]) -> bool:
+    """Whether declarations hide an element's whole subtree whatever its descendants say."""
+    if decls.get("display") == "none":
+        return True
+    if "opacity" in decls and _css_zero(decls["opacity"]):
+        return True
+    if _css_clips(decls):
+        return any(_css_zero(decls[p]) for p in ("width", "height", "max-width", "max-height") if p in decls)
+    return False
+
+
+def _css_can_hide(decls: dict[str, tuple[str, bool]]) -> bool:
+    plain = {k: v[0] for k, v in decls.items()}
+    return (
+        _css_hides(plain)
+        or plain.get("visibility") in ("hidden", "collapse")
+        or ("font-size" in plain and _css_zero(plain["font-size"]))
+    )
+
+
+class _CssRule:
+    __slots__ = ("chain", "spec", "order", "decls")
+
+    def __init__(self, chain, spec, order, decls):
+        self.chain, self.spec, self.order, self.decls = chain, spec, order, decls
+
+
+def _css_selector(text: str):
+    """``[(combinator, tag, classes, id)]`` for a selector of tags, classes, ids and the
+    descendant and child combinators, or None when it uses anything else."""
+    text = text.strip()
+    if not text or len(text) > 200 or "\\" in text:
+        return None
+    tokens = re.split(r"\s*(>)\s*|\s+", text)
+    chain, comb = [], " "
+    for tok in tokens:
+        if tok is None or tok == "":
+            continue
+        if tok == ">":
+            comb = ">"
+            continue
+        m = _CSS_COMPOUND.match(tok)
+        if not m:
+            return None
+        tag = (m.group("tag") or "*").lower()
+        classes, ident = [], ""
+        for kind, name in _CSS_PART.findall(m.group("rest")):
+            if kind == ".":
+                classes.append(name)
+            else:
+                ident = name
+        chain.append((comb, tag, tuple(classes), ident))
+        comb = " "
+    return chain if chain and len(chain) <= _CSS_MAX_SELECTOR else None
+
+
+def _css_parse(css: str, conditional: bool, rules: list, state: dict) -> None:
+    """Collect evaluable rules into *rules*; set ``state['uncertain']`` when a rule that could
+    hide text is one this converter cannot evaluate (media queries, attribute or pseudo selectors)."""
+    css = _CSS_COMMENT.sub("", css)
+    pos, n = 0, len(css)
+    while pos < n:
+        brace, semi = css.find("{", pos), css.find(";", pos)
+        stripped = css[pos:].lstrip()
+        if stripped.startswith("@") and semi != -1 and (brace == -1 or semi < brace):
+            pos = semi + 1  # @import, @charset: statements without a block
+            continue
+        if brace == -1:
+            break
+        prelude = css[pos:brace].strip()
+        depth, end = 1, brace + 1
+        while end < n and depth:
+            depth += {"{": 1, "}": -1}.get(css[end], 0)
+            end += 1
+        body = css[brace + 1 : end - 1 if depth == 0 else end]
+        pos = end
+        if prelude.startswith("@"):
+            if prelude.lower().startswith(_CSS_SKIP_BLOCKS):
+                continue
+            _css_parse(body, True, rules, state)
+            continue
+        if "{" in body:  # nested rules: not evaluated
+            if _CSS_HIDINGISH.search(body):
+                state["uncertain"] = True
+            continue
+        decls = _css_declarations(body)
+        decls = {k: v for k, v in decls.items() if k in _CSS_HIDING}
+        if not decls:
+            continue
+        can_hide = _css_can_hide(decls)
+        for sel in prelude.split(","):
+            chain = None if conditional else _css_selector(sel)
+            if chain is None:
+                if can_hide:
+                    state["uncertain"] = True
+                continue
+            if len(rules) >= _CSS_MAX_RULES:
+                state["uncertain"] = True
+                return
+            ids = sum(1 for c in chain if c[3])
+            classes = sum(len(c[2]) for c in chain)
+            tags = sum(1 for c in chain if c[1] != "*")
+            rules.append(_CssRule(chain, (ids, classes, tags), len(rules), decls))
+
+
+class _StyleCollector(html.parser.HTMLParser):
+    """First pass: the text of every <style> element, whatever the element sits inside."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.blocks: list[tuple[str, bool]] = []
+        self._open: list[str] | None = None
+        self._size = 0
+        self.capped = False  # a stylesheet was longer than is read: its rules are not all known
+        self._conditional = False
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag == "style":
+            a = {k: (v or "") for k, v in attrs}
+            media = a.get("media", "").strip().lower()
+            self._conditional = media not in ("", "all", "screen")
+            self._open, self._size = [], 0
+
+    handle_startendtag = handle_starttag
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "style" and self._open is not None:
+            self.blocks.append(("".join(self._open), self._conditional))
+            self._open = None
+
+    def handle_data(self, data: str) -> None:
+        if self._open is not None:
+            room = 200_000 - self._size
+            if len(data) > room:
+                self.capped = True
+            if room > 0:
+                self._open.append(data[:room])
+                self._size += min(len(data), room)
+
+
+class _Frame:
+    __slots__ = ("tag", "classes", "ident", "gone", "vis_hidden", "font_zero", "own")
+
+    def __init__(self, tag, classes, ident, gone, vis_hidden, font_zero, own):
+        self.tag, self.classes, self.ident = tag, classes, ident
+        self.gone, self.vis_hidden, self.font_zero, self.own = gone, vis_hidden, font_zero, own
 
 
 class _InertText(html.parser.HTMLParser):
     """HTML to plain text without interpreting any of it: nothing is fetched, no attribute value
     is kept (links, image sources and alt text never reach the output), and script, style, frames,
-    forms of embedding and visually hidden elements contribute no text."""
+    embedding and visually hidden elements contribute no text. Hiding follows the CSS cascade for
+    the properties it evaluates (see the operator guide); a descendant that overrides an inherited
+    one (``visibility``, ``font-size``) is read, while ``display:none``, zero opacity and a clipped
+    zero-size box hide the whole subtree."""
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, rules: list[_CssRule] | None = None) -> None:
         super().__init__(convert_charrefs=True)
         self.out: list[str] = []
         self.size = 0
         self.limit = limit
-        self.hidden: list[str] = []  # open elements inside a dropped or hidden region
+        self.stack: list[_Frame] = []
+        self.open_count: collections.Counter[str] = collections.Counter()
+        self._head: tuple[int, _Frame] | None = None
+        self.by_tag: dict[str, list[_CssRule]] = {}
+        self.by_class: dict[str, list[_CssRule]] = {}
+        self.by_id: dict[str, list[_CssRule]] = {}
+        for r in rules or ():
+            last = r.chain[-1]
+            if last[3]:
+                self.by_id.setdefault(last[3], []).append(r)
+            elif last[2]:
+                self.by_class.setdefault(last[2][0], []).append(r)
+            else:
+                self.by_tag.setdefault(last[1], []).append(r)
+
+    @property
+    def hidden(self) -> bool:
+        """The markup ended inside an element that still hides text."""
+        return any(f.own for f in self.stack if f.tag != "head")
 
     def _emit(self, text: str) -> None:
         if self.size < self.limit:
             self.out.append(text)
             self.size += len(text)
 
+    def _visible(self) -> bool:
+        if not self.stack:
+            return True
+        top = self.stack[-1]
+        return not (top.gone or top.vis_hidden or top.font_zero)
+
+    # -- cascade ---------------------------------------------------------------------------
+    def _matches(self, rule: _CssRule, tag: str, classes: tuple, ident: str) -> bool:
+        comb, rtag, rclasses, rid = rule.chain[-1]
+        if rtag != "*" and rtag != tag:
+            return False
+        if rid and rid != ident:
+            return False
+        if any(c not in classes for c in rclasses):
+            return False
+        idx = len(self.stack) - 1  # the candidate element is not on the stack yet
+        # walk the chain right to left: each earlier compound sits above the later one
+        want = rule.chain
+        pos = len(want) - 1
+        while pos > 0:
+            link = want[pos][0]  # combinator between want[pos-1] and want[pos]
+            _, ptag, pclasses, pid = want[pos - 1]
+            if link == ">":
+                if idx < 0 or not self._frame_is(self.stack[idx], ptag, pclasses, pid):
+                    return False
+                idx -= 1
+            else:
+                while idx >= 0 and not self._frame_is(self.stack[idx], ptag, pclasses, pid):
+                    idx -= 1
+                if idx < 0:
+                    return False
+                idx -= 1
+            pos -= 1
+        return True
+
+    @staticmethod
+    def _frame_is(f: _Frame, tag: str, classes: tuple, ident: str) -> bool:
+        return (tag == "*" or tag == f.tag) and (not ident or ident == f.ident) and all(c in f.classes for c in classes)
+
+    def _computed(self, tag: str, classes: tuple, ident: str, style: str) -> dict[str, str]:
+        found: dict[int, _CssRule] = {}
+        for rule in itertools.chain(
+            self.by_tag.get(tag, ()),
+            self.by_tag.get("*", ()),
+            (r for c in classes for r in self.by_class.get(c, ())),
+            self.by_id.get(ident, ()) if ident else (),
+        ):
+            if rule.order not in found and self._matches(rule, tag, classes, ident):
+                found[rule.order] = rule
+        layers: list[tuple[int, int, tuple, int, str, str]] = []
+        for rule in found.values():
+            for name, (value, important) in rule.decls.items():
+                layers.append((int(important), 0, rule.spec, rule.order, name, value))
+        for name, (value, important) in _css_declarations(style).items():
+            if name in _CSS_HIDING:
+                layers.append((int(important), 1, (0, 0, 0), 0, name, value))
+        layers.sort(key=lambda t: t[:4])
+        return {name: value for *_k, name, value in layers}
+
+    # -- tree ------------------------------------------------------------------------------
+    def _close_to(self, tag: str, boundary: frozenset[str] = frozenset()) -> bool:
+        """Pop elements up to and including the nearest open *tag*, unless a boundary comes first."""
+        if not self.open_count[tag]:
+            return False
+        for i in range(len(self.stack) - 1, -1, -1):
+            t = self.stack[i].tag
+            if t == tag:
+                for f in self.stack[i:]:
+                    self.open_count[f.tag] -= 1
+                del self.stack[i:]
+                return True
+            if t in boundary:
+                return False
+        return False
+
+    def _implied_ends(self, tag: str) -> None:
+        h = self._head
+        if (
+            h is not None
+            and tag not in _HTML_HEAD_OK
+            and tag != "head"
+            and len(self.stack) > h[0]
+            and self.stack[h[0]] is h[1]
+        ):
+            self._close_to("head")  # the omitted </head>
+        if tag in _HTML_CLOSES_P:
+            self._close_to("p", _HTML_SCOPE)
+        if tag == "li":
+            self._close_to("li", frozenset(("ul", "ol", "table", "td", "th")))
+        elif tag in ("dt", "dd"):
+            for t in ("dt", "dd"):
+                self._close_to(t, frozenset(("dl", "table", "td", "th")))
+        elif tag in ("td", "th"):
+            for t in ("td", "th"):
+                self._close_to(t, frozenset(("tr", "table")))
+        elif tag in ("tr", "tbody", "thead", "tfoot"):
+            for t in ("td", "th", "tr"):
+                self._close_to(t, frozenset(("table",)))
+
     def handle_starttag(self, tag: str, attrs: list) -> None:
-        if self.hidden:
-            if tag not in _HTML_VOID and len(self.hidden) < _HTML_MAX_OPEN:
-                self.hidden.append(tag)
-            return
+        self._implied_ends(tag)
         a = {k: (v or "") for k, v in attrs}
-        if tag in _HTML_DROP or "hidden" in a or _HTML_HIDDEN_STYLE.search(a.get("style", "")):
-            if tag not in _HTML_VOID:
-                self.hidden.append(tag)
+        classes = tuple(a.get("class", "").split())
+        ident = a.get("id", "")
+        parent = self.stack[-1] if self.stack else None
+        gone = parent.gone if parent else False
+        vis_hidden = parent.vis_hidden if parent else False
+        font_zero = parent.font_zero if parent else False
+        own = False
+        if not gone:
+            c = self._computed(tag, classes, ident, a.get("style", ""))
+            if tag in _HTML_DROP or "hidden" in a or _css_hides(c):
+                gone = own = True
+            else:
+                vis = c.get("visibility")
+                if vis in ("hidden", "collapse"):
+                    vis_hidden = own = True
+                elif vis == "visible":
+                    vis_hidden = False
+                fs = c.get("font-size")
+                if fs is not None:
+                    if _css_zero(fs):
+                        font_zero = own = True
+                    elif _CSS_ABS_LENGTH.match(fs) or fs in _CSS_FONT_KEYWORDS:
+                        font_zero = False
+        if tag in _HTML_VOID:
+            if not (gone or vis_hidden or font_zero) and tag == "br":
+                self._emit("\n")
             return
-        if tag == "br":
-            self._emit("\n")
-        elif tag == "li":
+        if len(self.stack) >= _HTML_MAX_OPEN:
+            raise _HtmlStop
+        frame = _Frame(tag, classes, ident, gone, vis_hidden, font_zero, own)
+        if tag == "head":
+            self._head = (len(self.stack), frame)
+        self.stack.append(frame)
+        self.open_count[tag] += 1
+        if gone or vis_hidden or font_zero:
+            return
+        if tag == "li":
             self._emit("\n- ")
         elif tag in _HTML_BLOCK:
             self._emit("\n")
 
+    def handle_startendtag(self, tag: str, attrs: list) -> None:
+        # A trailing slash empties only void and foreign elements; anywhere else HTML ignores it.
+        self.handle_starttag(tag, attrs)
+        if tag in _HTML_FOREIGN and self.stack and self.stack[-1].tag == tag:
+            self.open_count[tag] -= 1
+            self.stack.pop()
+
     def handle_endtag(self, tag: str) -> None:
-        if self.hidden:
-            if tag in self.hidden:
-                while self.hidden and self.hidden.pop() != tag:
-                    pass
+        was_visible = self._visible()
+        if not self._close_to(tag):
             return
-        if tag in _HTML_BLOCK:
-            self._emit("\n")
-        elif tag in ("td", "th"):
-            self._emit(" ")
+        if was_visible:
+            if tag in _HTML_BLOCK:
+                self._emit("\n")
+            elif tag in ("td", "th"):
+                self._emit(" ")
 
     def handle_data(self, data: str) -> None:
-        if not self.hidden:
+        if self._visible():
             self._emit(data)
 
 
@@ -3373,27 +3732,58 @@ def html_to_text(markup: str, limit: int) -> str:
     return _html_convert(markup, limit)[0]
 
 
-def _html_convert(markup: str, limit: int) -> tuple[str, bool]:
-    """Inert text, and whether the markup ended inside a hidden or never-closed element, so
-    that whatever followed it was left out."""
-    parser = _InertText(limit)
+def _html_convert(markup: str, limit: int) -> tuple[str, list[str]]:
+    """Inert text, and a note for each way the result is incomplete: text left out because it sat
+    in an element that is hidden or never closed, markup the reader could not finish, or styles
+    that could not be evaluated."""
+    markup = _CSS_BIG_INT.sub("�", markup.replace("\x00", ""))
+    notes: list[str] = []
+    state: dict[str, bool] = {"uncertain": False}
+    rules: list[_CssRule] = []
     try:
-        # The trailing tag flushes text the parser holds back; an unterminated comment or style
-        # block swallows it, which is the safe outcome for hostile input.
-        parser.feed(markup.replace("\x00", "") + "\n<p></p>")
-    except Exception:  # noqa: BLE001 - hostile or broken markup: keep what was read so far
-        pass
+        sc = _StyleCollector()
+        sc.feed(markup + "\n<p></p>")
+        for css, conditional in sc.blocks:
+            _css_parse(css, conditional, rules, state)
+        if sc.capped:
+            state["uncertain"] = True
+    except Exception:  # noqa: BLE001 - styles are an aid; the markup pass reports what it cannot read
+        state["uncertain"] = True
+    parser = _InertText(limit, rules)
+    incomplete = False
+    try:
+        # The trailing tag flushes text the parser holds back. What it cannot flush (an unterminated
+        # comment, tag or quoted attribute) stays in rawdata and is reported, never shown.
+        parser.feed(markup + "\n<p></p>")
+        if parser.rawdata.strip():
+            incomplete = True
+    except _HtmlStop:
+        incomplete = True
+    except Exception:  # noqa: BLE001 - hostile or broken markup: keep what was read, and say so
+        incomplete = True
     text = "".join(parser.out)
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in text.split("\n")]
     cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()[:limit]
-    return cleaned, bool(parser.hidden)
+    if parser.hidden:
+        notes.append(_HTML_SWALLOWED)
+    if incomplete:
+        notes.append(_HTML_INCOMPLETE)
+    if state["uncertain"]:
+        notes.append(_HTML_STYLE_NOTE)
+    return cleaned, notes
 
 
 _HTML_NOTE = "(Converted from HTML; formatting, images and links are not shown.)\n\n"
 _NO_BODY = "(No readable text body; this message has only attachments or parts that are not read.)"
 _HTML_SWALLOWED = (
     "(Part of this HTML body is not shown: it sits inside an element that is hidden or never closed.)"
+)
+_HTML_INCOMPLETE = (
+    "(Part of this HTML body is not shown: it is nested too deeply, is malformed or could not be read.)"
+)
+_HTML_STYLE_NOTE = (
+    "(Some styles in this HTML body were not evaluated, so text they hide may appear here.)"
 )
 # Headers a mail client writes when it saves an unsent message, and headers a receiving server adds.
 _DRAFT_MARKERS = (("x-unsent", lambda v: v.strip() == "1"), ("x-mozilla-draft-info", lambda v: True),
@@ -3410,21 +3800,27 @@ def _decode_part(part: Any) -> str:
         return payload.decode("utf-8", errors="replace")
 
 
+def _has_visible_text(text: str) -> bool:
+    """Whether *text* shows anything: whitespace, control and format characters (zero-width
+    spaces, byte-order marks, NULs, soft hyphens) alone are not a message."""
+    return any(not ch.isspace() and unicodedata.category(ch) not in ("Cc", "Cf", "Zs", "Zl", "Zp") for ch in text)
+
+
 def _eml_body(msg: Any) -> str:
     """The readable body: text/plain when it says anything, else inert text from text/html.
     Parts with a filename were already marked as attachments and are never used."""
     plain = msg.get_body(preferencelist=("plain",))
     if plain is not None:
         text = _decode_part(plain)
-        if text.strip():
+        if _has_visible_text(text):
             return text
     html_part = msg.get_body(preferencelist=("html",))
     if html_part is not None:
-        text, swallowed = _html_convert(_decode_part(html_part), _OUTSIDE_READ_LIMIT)
+        text, notes = _html_convert(_decode_part(html_part), _OUTSIDE_READ_LIMIT)
         if text:
-            return _HTML_NOTE + text + (f"\n\n{_HTML_SWALLOWED}" if swallowed else "")
-        if swallowed:
-            return _HTML_SWALLOWED
+            return _HTML_NOTE + text + "".join(f"\n\n{n}" for n in notes)
+        if notes:
+            return "\n\n".join(notes)
     return _NO_BODY
 
 

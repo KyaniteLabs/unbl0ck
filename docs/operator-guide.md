@@ -308,17 +308,35 @@ the newest 200 per folder and says how many more it left out.
 
 Mail uses the plain body selected by MIME structure. Attachments, filename-bearing
 inline subtrees, attached messages and non-root related resources do not replace it.
-When the message has no plain text, its HTML body is turned into inert text: nothing is
-rendered or fetched, scripts, styles, frames, embedded objects and visually hidden
-elements contribute nothing, and links, image sources and alt text are dropped, so a
-tracking address never reaches the card, a summary or the model. The card starts with
-"Converted from HTML"; tables and lists are flattened. A message with no readable body
-says so instead of showing an empty card.
+When the message has no plain text (or its plain part holds only whitespace, zero-width or
+control characters), its HTML body is turned into inert text: nothing is rendered or
+fetched, and scripts, styles, frames, embedded objects, `select` lists and hidden
+elements contribute nothing. Link addresses, image sources and alt text are dropped as
+attribute values; an address printed as text in the message (a link whose visible text is
+its own URL) is ordinary text and stays, so a tracking address shown that way reaches the
+card, search, a summary and the model. Text in a `textarea` is shown; `input` values are
+not. The card starts with "Converted from HTML"; tables and lists are flattened. A message
+with no readable body says so instead of showing an empty card.
+
+Hidden text is decided from the element's own `hidden` attribute, its inline `style` and
+the message's `<style>` rules, read properly (whole property names, comments and
+`!important` understood; `min-width` is not `width`; custom properties are ignored).
+`display:none`, zero `opacity` and a zero width or height with clipped overflow remove the
+whole element; `visibility:hidden` and `font-size:0` apply to what is inside unless an
+inner element sets them back. Stylesheet rules with tag, class, id, descendant and child
+selectors are applied; media queries and attribute, pseudo-class or sibling selectors are
+not evaluated, and when one of those could hide text the card says "styles ... were not
+evaluated" and may show text such a rule hides. External stylesheets are never fetched,
+and positioning, colour or text-indent tricks are not evaluated. When part of the body
+could not be shown (an element that is hidden or never closed, markup nested too deeply,
+an unterminated comment, tag or quoted value, a reader failure) the card says so instead
+of presenting the rest as complete.
 
 **What kind of card an `.eml` becomes** comes from its own headers: a message marked
 unsent by its mail client (`X-Unsent`, Thunderbird or Apple Mail draft markers) is a
-**draft**; one carrying `Received`, `Return-Path` or `Delivered-To` is an ordinary
-message and is never called a draft. Mail with neither uses `outside_eml_kind` (`draft` by
+**draft**, and that unsent marker wins even when the file also carries received-mail
+headers. Otherwise one carrying `Received`, `Return-Path` or `Delivered-To` is an ordinary
+message and is not called a draft. Mail with neither uses `outside_eml_kind` (`draft` by
 default; `notes`, `approval` or `other`). It only changes the label and where the card
 says to act; headers can be forged, and the label never makes the text trusted.
 

@@ -64,7 +64,7 @@ config_schema:
   outside_eml_kind:
     type: str
     default: draft
-    description: "What a watched-folder .eml is called when its own headers do not say: draft (default), notes, approval or other. A message marked unsent by its mail client is always a draft, and one with received-mail headers is never called a draft. Only changes the label; the text is read the same way."
+    description: "What a watched-folder .eml is called when its own headers do not say: draft (default), notes, approval or other. A message marked unsent by its mail client is always a draft, even with received-mail headers; otherwise one with received-mail headers is not called a draft. Only changes the label; the text is read the same way."
   chat_window_days:
     type: int
     default: 14
