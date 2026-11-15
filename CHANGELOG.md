@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **CI type-checks the shipped code (#71).** A `typecheck` job runs mypy 1.18.2 and fails on any error not in `.github/mypy-baseline.txt`. The baseline holds the 69 errors present when the job was added; each was read and is a value checked elsewhere that mypy cannot see, not a defect.
 - **CI checks that a fix's new tests need the fix (#71).** On a pull request, each commit whose subject starts with `fix` has its newly added tests run against the parent commit's code; a test that passes there guards nothing, and the job fails. `.github/scripts/new_tests_bite.py` runs the same check locally.
 - **Every state-folder listing reads at most 1,000 entries and says when it stops (#70).** Live prompts, pairing requests and profile folders used an unbounded listing, so a folder full of files made each poll read every record. They now share the bounded listing the filed outside records already used, and a cut listing adds a `listing_cut` notice so the queue does not claim to be complete.
 - **Ask sends a fixed list of card fields (#71).** It used to send a redacted copy of the whole card, so any new field Hermes added reached the model unless a rule removed it. Ask now builds its payload from named fields only; event payloads, attachments, the graph and the workspace path are never sent, and a field that holds a container where Hermes stores text is sent as `[not text]`. JSON found inside text again loses its own workspace path.
