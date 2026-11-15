@@ -85,22 +85,44 @@ class DedupeScope(OutsideFixture):
         shared = self.call("home", dedupe_key="k", dedupe_scope="global", title="Shared")
         self.assertEqual(shared["id"], old["id"])
 
-    def test_caller_without_a_profile_defaults_to_global_and_resolves_unambiguously(self):
+    def test_caller_without_a_profile_kwarg_uses_the_runtime_profile_not_global(self):
         a = self.call(None, dedupe_key="k")
-        self.assertEqual(a["dedupe_scope"], "global")
+        self.assertEqual(a["dedupe_scope"], "profile")
+        self.assertEqual(self.records()[0]["profile"], "default")
         self.assertEqual(self.call(None, dedupe_key="k", title="Again")["id"], a["id"])
+        other = self.call("work", dedupe_key="k")
+        self.assertNotEqual(other["id"], a["id"])
         self.assertTrue(self.call(None, action="resolve", dedupe_key="k")["resolved"])
-        # a key matching several profiles' items is ambiguous for a caller with no profile
-        self.call("work", dedupe_key="k")
-        self.call("home", dedupe_key="k")
-        out = self.call(None, action="resolve", dedupe_key="k")
-        self.assertFalse(out["ok"])
-        self.assertIn("different profiles", out["error"])
-        self.assertEqual(len(self.records()), 2)
+        self.assertEqual([r["profile"] for r in self.records()], ["work"])
+
+    def test_native_dispatch_kwargs_without_profile_keep_two_profiles_apart(self):
+        # Hermes passes task_id, session_id and user_task, never `profile`. The runtime
+        # profile comes from the process' Hermes home, the way record_wait() resolves it.
+        native = {"task_id": "t", "session_id": "s", "user_task": "do it"}
+        args = {"kind": "draft", "title": "T", "body": "B", "act_where": "Mail", "dedupe_key": "k"}
+        ids = {}
+        for profile in ("work", "home"):
+            ph = self.home / "profiles" / profile
+            ph.mkdir(parents=True)
+            with patch.dict("os.environ", {"HERMES_HOME": str(ph)}):
+                out = json.loads(self.tools["unbl0ck_file"][2]({**args, "title": profile}, **native))
+            self.assertTrue(out["ok"], out)
+            ids[profile] = out["id"]
+        self.assertNotEqual(ids["work"], ids["home"])
+        self.assertEqual({(r["profile"], r["title"]) for r in self.records()}, {("work", "work"), ("home", "home")})
+        ph = self.home / "profiles" / "work"
+        with patch.dict("os.environ", {"HERMES_HOME": str(ph)}):
+            out = json.loads(self.tools["unbl0ck_file"][2]({"action": "resolve", "dedupe_key": "k"}, **native))
+        self.assertTrue(out["resolved"])
+        self.assertEqual([r["profile"] for r in self.records()], ["home"])
+        # an explicit dedupe_scope of profile now validates without a profile kwarg
+        with patch.dict("os.environ", {"HERMES_HOME": str(ph)}):
+            ok = json.loads(self.tools["unbl0ck_file"][2]({**args, "dedupe_scope": "profile"}, **native))
+        self.assertTrue(ok["ok"], ok)
 
     def test_scope_validation(self):
         self.assertFalse(self.call("work", dedupe_key="k", dedupe_scope="everyone")["ok"])
-        self.assertFalse(self.call(None, dedupe_key="k", dedupe_scope="profile")["ok"])
+        self.assertTrue(self.call(None, dedupe_key="k", dedupe_scope="profile")["ok"])  # runtime profile is known
 
     def test_resolve_by_id_is_unambiguous_across_profiles(self):
         a = self.call("work", dedupe_key="k")
