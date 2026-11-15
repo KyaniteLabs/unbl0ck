@@ -361,6 +361,19 @@ def visibility(hidden: dict[str, Any], item_id: str, version: str) -> Visibility
 
 
 _HIDDEN_KEEP = 1000
+# Folder Done records are the paging progress through a watched-folder backlog. A scan reads at
+# most OUTSIDE_SCAN_ENTRIES files per folder, so finishing that many must not evict the earliest
+# completions (they would outrank the files still waiting). They keep their own, larger bound.
+_HIDDEN_FOLDER_KEEP = 5000
+
+
+def _trim_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
+    """Oldest-first eviction, separately for folder Done records and every other dismissal."""
+    folder = [k for k in hidden if k.startswith("outside:folder:")]
+    other = [k for k in hidden if not k.startswith("outside:folder:")]
+    drop = set(folder[:-_HIDDEN_FOLDER_KEEP] if len(folder) > _HIDDEN_FOLDER_KEEP else [])
+    drop |= set(other[:-_HIDDEN_KEEP] if len(other) > _HIDDEN_KEEP else [])
+    return {k: v for k, v in hidden.items() if k not in drop} if drop else hidden
 
 
 def hide(item_id: str, version: str, home: Path | None = None) -> None:
@@ -371,10 +384,7 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
         hidden = load_hidden(home, strict=True)
         hidden.pop(item_id, None)
         hidden[item_id] = version
-        if (
-            len(hidden) > _HIDDEN_KEEP
-        ):  # oldest hides first out; the store never grows unbounded
-            hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
+        hidden = _trim_hidden(hidden)  # oldest first out; the store never grows unbounded
         _write_json(_hidden_path(home), hidden)
 
 
@@ -2238,7 +2248,7 @@ def outside_items(
     recursive = outside_recursive()
     hidden = load_hidden(home, errors=errors) if str(raw).strip() else {}
     seen: set[Path] = set()
-    collected: set[Path] = set()  # a file under two overlapping roots is listed once
+    claimed: set[Path] = set()  # a file under two overlapping roots is listed once, where it is shown
     for name in str(raw).split(","):
         if not name.strip():
             continue
@@ -2253,9 +2263,8 @@ def outside_items(
             candidates = []
             hidden_pairs = []
             for pair in _scan_outside_folder(root, recursive, errors):
-                if pair[0] in collected:
+                if pair[0] in claimed:
                     continue
-                collected.add(pair[0])
                 state = visibility(
                     hidden,
                     "outside:folder:" + hashlib.sha256(str(pair[0]).encode()).hexdigest(),
@@ -2282,6 +2291,7 @@ def outside_items(
                     item = _folder_outside_item(f, root, st)
                     if item is not None:
                         items.append(item)
+                        claimed.add(f)
                 except (OSError, ValueError) as exc:
                     errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
         except (OSError, ValueError, RuntimeError) as exc:

@@ -72,7 +72,7 @@ as private. Settings and source files remain owned by their original application
 
 | State | Lifetime and ownership |
 | --- | --- |
-| `hidden.json` | Version-specific hides, capped at 1,000; shared by local operator surfaces |
+| `hidden.json` | Version-specific hides, capped at 1,000, plus watched-folder Done records capped separately at 5,000 (the per-folder scan bound) so paging progress is not evicted; shared by local operator surfaces |
 | `pending-release.json` | Recovery state for comments whose release remains unfinished |
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; shared across profiles |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
