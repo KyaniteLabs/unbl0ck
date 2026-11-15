@@ -571,18 +571,19 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
     if not item_id or len(item_id) > 300 or len(version) > 300 or "\x1f" in version:
         raise ValueError("item id and version must be short strings")
     # An older tab's "Not for me" must not replace a newer dismissal. The queue lookup takes the
-    # state lock, so it runs outside it; the stored value is therefore re-read under the lock
-    # and a dismissal that changed in between is judged again, never overwritten blind.
-    current: str | None = None
-    looked_up = False
+    # state lock, so it runs outside it. Every dismissal is judged against the card's current
+    # version, whether or not an earlier dismissal exists: a hide for an older version hid
+    # nothing the operator saw. The stored value is re-read under the lock, and a dismissal for
+    # another version that appeared since the lookup is judged again, never overwritten blind.
+    judged: str | None = None
     while True:
+        current = _current_version(item_id, home)
+        if current is not None and current != version:
+            raise StaleHide("the card changed since this view; refresh before hiding it")
         with _state_lock(home):
             hidden = _load_hidden_raw(home, strict=True)
             existing = _split_hidden(hidden.get(item_id))[0] if item_id in hidden else None
-            if existing and existing != version and looked_up:
-                if current is not None and current != version:
-                    raise StaleHide("the card changed since this view; refresh before hiding it")
-            if not existing or existing == version or looked_up:
+            if not existing or existing == version or existing == judged:
                 hidden.pop(item_id, None)
                 token = uuid.uuid4().hex
                 hidden[item_id] = f"{version}\x1f{token}"
@@ -590,8 +591,7 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
                 order = _dismissal_order()
                 _write_json(_hidden_path(home), hidden, ordered=True)
                 return token, order
-        current = _current_version(item_id, home)
-        looked_up = True
+            judged = existing
 
 
 def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:

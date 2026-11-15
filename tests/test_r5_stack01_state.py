@@ -37,10 +37,10 @@ class AStaleDismissalIsJudgedUnderTheLock(Home):
             with real_lock(home):
                 yield
 
-        queue = {"items": [{"id": "kanban:b:t", "version": "2"}]}
-        with patch.object(needs, "_state_lock", racing), patch.object(
-            needs, "build_queue", lambda *a, **kw: queue
-        ):
+        def queue(*a, **kw):  # the card is at version 1 until the other tab has hidden version 2
+            return {"items": [{"id": "kanban:b:t", "version": "2" if state["raced"] else "1"}]}
+
+        with patch.object(needs, "_state_lock", racing), patch.object(needs, "build_queue", queue):
             with self.assertRaises(needs.StaleHide):
                 needs.hide("kanban:b:t", "1", self.home)
         self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "2"})
