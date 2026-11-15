@@ -6077,14 +6077,12 @@ def _ask_redact_bare_credential_values(text: str) -> str:
     return _ASK_BARE_CREDENTIAL_VALUE.sub(replace, text)
 
 
+# An explicit key (``? key`` then ``: value``) arrives as one folded line, so ``\s*`` spans it.
 _ASK_YAML_FIELD = re.compile(
-    r"^(?P<indent>[ \t]*)(?P<dash>-\s*)?(?P<quote>[\"']?)"
+    r"^(?P<indent>[ \t]*)(?P<dash>-\s*)?(?P<explicit>\?[ \t]*)?(?P<quote>[\"']?)"
     r"(?P<key>[A-Za-z0-9_.-]+)(?P=quote)\s*:\s*(?P<value>[^\r\n]*)"
 )
-_ASK_YAML_EXPLICIT_FIELD = re.compile(
-    rf"(?im)^(?P<indent>[ \t]*)\?[ \t]*(?P<key>{_ASK_CREDENTIAL_NAME})[ \t]*"
-    r"\r?\n(?P=indent):[ \t]*(?P<value>[^\r\n]*)"
-)
+_ASK_YAML_EXPLICIT_KEY = re.compile(r"([ \t]*(?:-[ \t]+)?)\?[ \t]*[^\r\n]*\r?\n\Z")
 _ASK_YAML_BLOCK = re.compile(
     r"^(?P<style>[|>](?:[+-][1-9]?|[1-9][+-]?)?)(?P<tail>[ \t]*(?:#.*)?)$"
 )
@@ -6165,17 +6163,13 @@ def _ask_flow_secret_values(text: str) -> str:
 
 
 def _ask_redact_yaml(text: str) -> str:
-    text = _ask_flow_secret_values(text)
-
-    def explicit_field(match: re.Match[str]) -> str:
-        key = match.group("key")
-        value = match.group("value")
-        if not _ask_is_secret_key(key, value):
-            return match.group(0)
-        return f"{match.group('indent')}? {key}\n{match.group('indent')}: [redacted]"
-
-    text = _ASK_YAML_EXPLICIT_FIELD.sub(explicit_field, text)
-    lines = text.splitlines(keepends=True)
+    lines: list[str] = []
+    for line in _ask_flow_secret_values(text).splitlines(keepends=True):
+        key = _ASK_YAML_EXPLICIT_KEY.match(lines[-1]) if lines else None
+        if key and not line[: key.end(1)].strip() and line[key.end(1) :].startswith(":"):
+            lines[-1] += line
+        else:
+            lines.append(line)
     fields = [_ask_yaml_field(line) for line in lines]
     paired_values: dict[int, str] = {}
     for index, field in enumerate(fields):
@@ -6215,97 +6209,48 @@ def _ask_redact_yaml(text: str) -> str:
             out.append(lines[index])
             index += 1
             continue
-        key = field.group("key")
-        raw_value = field.group("value")
+        key, raw_value = field.group("key"), field.group("value")
         paired_name = paired_values.get(index)
+        secret_name = key if paired_name is None else paired_name
         direct_secret = _ask_names_credential(key)
-        if direct_secret and raw_value.lstrip().startswith(('"', "'")):
+        if (
+            not (direct_secret or paired_name is not None)
+            or (direct_secret and not field.group("explicit") and raw_value.lstrip().startswith(('"', "'")))
+            or (
+                paired_name is None
+                and _ask_secret_word(key) in {"auth", "authentication", "authorization", "oauth", "cookie"}
+                and _ask_auth_value_is_prose(raw_value)
+            )
+        ):
             out.append(lines[index])
             index += 1
             continue
         scalar = _ASK_YAML_BLOCK.fullmatch(raw_value.strip())
-        collection = raw_value.strip() == "" and (
-            direct_secret or paired_name is not None
-        )
-        scalar_end = index + 1
-        scalar_value = ""
+        collection = raw_value.strip() == ""
+        end, scalar_value = index + 1, ""
         if scalar or collection:
             explicit = re.search(r"[1-9]", scalar.group("style")) if scalar else None
-            explicit_indent = (
-                _ask_yaml_indent(field) + int(explicit.group()) if explicit else None
-            )
-            scalar_end, scalar_value = _ask_yaml_scalar_end(
-                lines, index, _ask_yaml_indent(field), explicit_indent
-            )
-            collection = collection and scalar_end > index + 1
-        if (
-            field.group("quote")
-            and paired_name is None
-            and not scalar
-            and not collection
+            explicit_indent = _ask_yaml_indent(field) + int(explicit.group()) if explicit else None
+            end, scalar_value = _ask_yaml_scalar_end(lines, index, _ask_yaml_indent(field), explicit_indent)
+            collection = collection and end > index + 1
+        if (field.group("quote") and paired_name is None and not scalar and not collection) or not (
+            _ask_is_secret_key(secret_name, scalar_value if scalar or collection else raw_value)
         ):
-            out.append(lines[index])
-            index += 1
+            out.extend(lines[index:end])
+            index = end
             continue
-        if not direct_secret and paired_name is None:
-            out.append(lines[index])
-            index += 1
-            continue
-        secret_name = paired_name if paired_name is not None else key
-        secret_word = _ask_secret_word(secret_name)
-        if (
-            paired_name is None
-            and secret_word
-            in {"auth", "authentication", "authorization", "oauth", "cookie"}
-            and _ask_auth_value_is_prose(raw_value)
-        ):
-            out.append(lines[index])
-            index += 1
-            continue
-        if not _ask_is_secret_key(
-            secret_name, scalar_value if scalar or collection else raw_value
-        ):
-            out.extend(lines[index:scalar_end])
-            index = scalar_end
-            continue
-        container_start = len(raw_value) - len(raw_value.lstrip())
-        if (
-            scalar is None
-            and not collection
-            and raw_value[container_start : container_start + 1] in {"[", "{"}
-        ):
-            container_end = _ask_json_container_end(raw_value, container_start)
-            if container_end is None:
-                scalar_end, _ = _ask_yaml_scalar_end(
-                    lines, index, _ask_yaml_indent(field)
-                )
-                container_end = len(raw_value)
-                if scalar_end > index + 1:
-                    line_without_newline = lines[index].rstrip("\r\n")
-                    newline = lines[index][len(line_without_newline) :]
-                    before_value = line_without_newline[: field.start("value")]
-                    out.append(f"{before_value}[redacted]{newline}")
-                    index = scalar_end
-                    continue
-            line_without_newline = lines[index].rstrip("\r\n")
-            newline = lines[index][len(line_without_newline) :]
-            before_value = line_without_newline[: field.start("value")]
-            tail = raw_value[container_end:]
-            if re.match(r"\s*,\s*[\"']?[A-Za-z0-9_.-]+[\"']?\s*:", tail):
-                tail = ""
-            out.append(f"{before_value}[redacted]{tail}{newline}")
-            index += 1
-            continue
-        line_without_newline = lines[index].rstrip("\r\n")
-        newline = lines[index][len(line_without_newline) :]
-        before_value = line_without_newline[: field.start("value")]
-        if scalar or collection:
-            tail = scalar.group("tail") if scalar else ""
-            out.append(f"{before_value}[redacted]{tail}{newline}")
-            index = scalar_end
-            continue
-        out.append(f"{before_value}[redacted]{newline}")
-        index += 1
+        body = lines[index].rstrip("\r\n")
+        head, newline = body[: field.start("value")], lines[index][len(body) :]
+        tail = scalar.group("tail") if scalar else ""
+        start = len(raw_value) - len(raw_value.lstrip())
+        if not scalar and not collection and raw_value[start : start + 1] in {"[", "{"}:
+            close = _ask_json_container_end(raw_value, start)
+            if close is None:  # an unclosed container may continue on the lines below
+                end, _ = _ask_yaml_scalar_end(lines, index, _ask_yaml_indent(field))
+            elif not re.match(r"\s*,\s*[\"']?[A-Za-z0-9_.-]+[\"']?\s*:", raw_value[close:]):
+                tail = raw_value[close:]
+        out.append(f"{head}[redacted]{tail}{newline}")
+        index = end
     return "".join(out)
 
 
