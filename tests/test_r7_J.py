@@ -39,15 +39,10 @@ class Admission(unittest.TestCase):
                 raise OSError("I/O error")
             return real(src, dst, *a, **k)
 
-        sent = 0
         with patch.object(os, "rename", failing):
-            for w in workers:
-                try:
-                    gen = w.create(J1, card="c1")
-                except jobs.ScopeUnavailable:
-                    continue
-                sent += w.mark_sent(J1, gen=gen)
-        self.assertLessEqual(sent, 1, "the same job reached the model twice")
+            for w in workers:  # R8-014: admission itself refuses; a failing sent marker must not mask it
+                with self.assertRaises(jobs.ScopeUnavailable, msg="a job whose claim failed was admitted"):
+                    w.create(J1, card="c1")
 
 
 if __name__ == "__main__":

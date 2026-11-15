@@ -671,9 +671,7 @@ def _hidden_entry_ok(value: Any) -> bool:
     return value is None or isinstance(value, str)
 
 
-# A hide stores ``version`` plus a per-dismissal token (``version \x1f token``), so an Undo can
-# name this dismissal and not just the content version two dismissals share. Entries written
-# before tokens existed hold the bare version, which stays their token.
+# A hide stores ``version \x1f token`` so an Undo names this dismissal; a pre-token bare version is its own token.
 _HIDDEN_TOKEN = re.compile(r"(.*)\x1f([0-9a-f]{32})\Z", re.S)
 
 
@@ -781,31 +779,33 @@ ORDER_FILE = "dismissal-order.json"
 
 
 def _dismissal_order(home: Path | None) -> int:
-    """A number that grows with each dismissal any process commits (milliseconds, never repeated
-    or lowered by a clock that stands still or steps back). The last one is kept in ORDER_FILE
-    and taken under the state lock, so it follows the order dismissals were committed in, which
-    the client cannot see from the order of its clicks or of the responses. A missing counter
-    restarts above every stored order; a malformed one refuses the dismissal."""
+    """A new dismissal's commit order: milliseconds above ORDER_FILE's last, under the state lock. A lost
+    counter restarts above every stored order; an order that is malformed or overflows a token refuses."""
     out: dict[str, int] = {}
 
     def bump(data: dict[str, Any]) -> dict[str, Any]:
         out["order"] = max(int(time.time() * 1000), (data["last"] if "last" in data else _orders_issued(home)) + 1)
+        if not _order_ok(out["order"]):
+            raise RuntimeError(f"{ORDER_FILE} has passed the largest order a dismissal token holds")
         return {"last": out["order"]}
 
-    _update_state(home, data_dir(home) / ORDER_FILE, bump, entry_ok=lambda v: type(v) is int and v >= 0)
+    _update_state(home, data_dir(home) / ORDER_FILE, bump, entry_ok=_order_ok)
     return out["order"]
 
 
+def _order_ok(value: Any) -> bool:  # fits the 13 hex digits a hide token starts with
+    return type(value) is int and 0 <= value < 16**13
+
+
 def _orders_issued(home: Path | None) -> int:
-    """The highest order a stored dismissal carries (a hidden token's 13-hex prefix, a Done's
-    done_order). Raises when a record cannot be read or the filed listing is cut."""
+    """The highest stored order (hide token prefixes, Done orders); raises when one cannot be read."""
     tokens = (_split_hidden(v)[1] for v in _load_hidden_raw(home, strict=True).values())
     d, errors = _outside_dir(home, create=False), []
     files, cut = _filed_files(d) if d.is_dir() else ([], False)
-    recs = [_read_json(f, errors=errors) for f in files]
-    if cut or errors:
+    orders = [r["done_order"] for r in (_read_json(f, errors=errors) for f in files) if "done_order" in r]
+    if cut or errors or not all(map(_order_ok, orders)):
         raise RuntimeError(f"{ORDER_FILE} is missing and the stored orders could not all be read; restore it")
-    return max([int(t[:13], 16) for t in tokens if t] + [_done_order(r) for r in recs if "done_order" in r], default=0)
+    return max([int(t[:13], 16) for t in tokens if t] + orders, default=0)
 
 
 class StaleHide(RuntimeError):
@@ -834,11 +834,8 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
     item_id, version = str(item_id or ""), str(version or "")
     if not item_id or len(item_id) > 300 or len(version) > 300 or "\x1f" in version:
         raise ValueError("item id and version must be short strings")
-    # An older tab's "Not for me" must not replace a newer dismissal. The queue lookup takes the
-    # state lock, so it runs outside it. Every dismissal is judged against the card's current
-    # version, whether or not an earlier dismissal exists: a hide for an older version hid
-    # nothing the operator saw. The stored value is re-read under the lock, and a dismissal for
-    # another version that appeared since the lookup is judged again, never overwritten blind.
+    # Every hide is judged against the card's current version (looked up outside the state lock);
+    # a dismissal for another version that appears before the write is judged again, never overwritten.
     judged: str | None = None
     while True:
         current = _current_version(item_id, home)
@@ -852,7 +849,7 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
                 out["existing"] = existing
                 return None
             hidden.pop(item_id, None)
-            out["order"] = _dismissal_order(home)  # the token starts with it, so a lost counter can restart above it
+            out["order"] = _dismissal_order(home)  # the token starts with it (13 hex, see _order_ok)
             out["token"] = f"{out['order']:013x}{uuid.uuid4().hex[:19]}"
             hidden[item_id] = f"{version}\x1f{out['token']}"
             return _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
@@ -2680,9 +2677,7 @@ _WAIT_KINDS = {
     "sudo": "needs your admin password",
 }
 _SAFE_ID = re.compile(r"^[0-9a-f]{8,64}$")
-WAIT_MAX_AGE = (
-    86400  # no human prompt legitimately stays open a day; a missed resolve hook does
-)
+WAIT_MAX_AGE = 86400  # no human prompt legitimately stays open a day; a missed resolve hook does
 
 
 def _num(value: Any) -> float:
@@ -2760,8 +2755,7 @@ WAIT_LOST_LIMIT = 1000
 # (home, request id) -> (what failed, the record to write). The hooks run in the agent; when a
 # write or removal fails there, polling in the same process retries it and says so until it works.
 _WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
-# Faults pushed out of the full list: (home, id) -> what failed. Clears are still retried. Past
-# WAIT_LOST_LIMIT the oldest are only counted, for WAIT_MAX_AGE, when any record of theirs is stale.
+# Faults pushed out of the full list: (home, id) -> what failed; clears are still retried.
 _WAIT_FAULTS_LOST: dict[tuple[str, str], str] = {}
 _WAIT_FAULTS_DROPPED: dict[str, tuple[int, float]] = {}
 # Hooks and polls in one process settle a prompt one at a time: a retry in flight must not
@@ -2774,9 +2768,8 @@ def _fault_path(home: Path) -> Path:
 
 
 def _journal_fault(home: Path, rid: str, what: str | None) -> None:
-    """Best effort: tell other processes that this one holds a prompt it could not record or
-    clear. It holds only the request id, what failed and this process's identity, never the
-    prompt, and it is removed when the fault is settled. ``what=None`` removes *rid*."""
+    """Best effort: tell other processes this one holds a prompt it could not record or clear
+    (id, what failed and this process, never the prompt). ``what=None`` removes *rid*."""
     try:
         with _state_lock(home):
             data = _read_json(_fault_path(home))
@@ -2809,12 +2802,19 @@ def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) ->
             while len(_WAIT_FAULTS_LOST) > WAIT_LOST_LIMIT:
                 h, r = next(iter(_WAIT_FAULTS_LOST))
                 del _WAIT_FAULTS_LOST[(h, r)]
-                _WAIT_FAULTS_DROPPED[h] = (_WAIT_FAULTS_DROPPED.get(h, (0, 0.0))[0] + 1, time.time())
+                _WAIT_FAULTS_DROPPED[h] = (_dropped(h) + 1, time.time())
                 _journal_fault(Path(h), r, None)
             _journal_fault(home, rid, what)
             raise
         if had_fault:
             _journal_fault(home, rid, None)
+
+
+def _dropped(home: str) -> int:
+    """Faults *home* dropped past WAIT_LOST_LIMIT; a home whose latest drop is past WAIT_MAX_AGE is forgotten."""
+    for h in [h for h, (_, t) in _WAIT_FAULTS_DROPPED.items() if time.time() - t >= WAIT_MAX_AGE]:
+        del _WAIT_FAULTS_DROPPED[h]
+    return _WAIT_FAULTS_DROPPED.get(home, (0, 0.0))[0]
 
 
 def _apply_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
@@ -2867,8 +2867,7 @@ def _reconcile_waits(home: Path, errors: list[str]) -> None:
                 if (h, rid) not in _WAIT_FAULTS_LOST:  # those are counted below, not listed
                     verb = "record" if what == "record" else "clear"
                     errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
-        dropped, last = _WAIT_FAULTS_DROPPED.get(str(home), (0, 0.0))
-        lost = sum(k[0] == str(home) for k in _WAIT_FAULTS_LOST) + (dropped if time.time() - last < WAIT_MAX_AGE else 0)
+        lost = sum(k[0] == str(home) for k in _WAIT_FAULTS_LOST) + _dropped(str(home))
         if lost:
             errors.append(f"prompt: {lost} live prompts could not be recorded or cleared; past the newest {WAIT_FAULT_LIMIT} faults a record is no longer retried")
 
@@ -3322,8 +3321,8 @@ _DONE_FIELDS = ("done_at", "done_token", "done_order")
 
 def _done_marks(rec: dict[str, Any]) -> dict[str, Any]:
     """Everything that names one Done (time, token, order), pinned so that rewriting the record
-    or its ``done_at`` keeps the same dismissal with the same token and rank."""
-    return {"done_at": rec.get("done_at"), "done_token": _done_token(rec), "done_order": _done_order(rec)}
+    or its ``done_at`` keeps the same dismissal with the same token and rank (a malformed order stays, to refuse)."""
+    return {"done_at": rec.get("done_at"), "done_token": _done_token(rec), "done_order": rec.get("done_order", _done_order(rec))}
 
 
 def _done_at(rec: dict[str, Any]) -> float | None:
