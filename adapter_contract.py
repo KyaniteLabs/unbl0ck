@@ -89,6 +89,7 @@ class Local:
     acted_revision: str | None = None  # the revision the human dismissed or answered
     pending_edit: bool = False  # the human has an unsent change in flight
     held: bool = False  # access failed; possibly stale. Held keeps the open or done state underneath
+    held_by: str | None = None  # why: LEFT_VIEW (needs an event for the item), anything else is an access failure
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,7 @@ class Action:
     seq: int | None = None  # the watermark this action moves the item to
     revision: str | None = None
     evidence: str | None = None  # for completion actions
+    reason: str | None = None  # for ``hold``: LEFT_VIEW, or None for an access failure
 
 
 @dataclass
@@ -166,7 +168,7 @@ def reconcile(local: Mapping[Key, Local], batch: ChangeBatch, accounts: Iterable
         plan.omitted = None
         plan.stop_reason = "error"
         return plan  # an unknown status is a failure, never a success
-    winners: dict[Key, ExternalItem] = {}
+    events: dict[Key, list[ExternalItem]] = {}
     rejected = 0
     for item in batch.items:
         if (item.provider, item.account) not in scope:
@@ -177,16 +179,19 @@ def reconcile(local: Mapping[Key, Local], batch: ChangeBatch, accounts: Iterable
             plan.actions.append(Action("reject_item", item.key, "seq must be a non-negative integer"))
             rejected += 1
             continue
-        prev = winners.get(item.key)
-        if prev is None or item.seq > prev.seq:
-            winners[item.key] = item
-        elif item.seq == prev.seq and (item.revision != prev.revision or item.state != prev.state):
-            plan.actions.append(Action("seq_collision", item.key, "same seq, different content; the first was kept"))
-    for item in winners.values():  # one event per item: the newest wins, so a batch folds into one state
-        plan.actions.extend(_one(item, local.get(item.key)))
+        events.setdefault(item.key, []).append(item)
+    after: dict[Key, Local | None] = {}
+    for key, evs in events.items():  # an item's events run in seq order against the state the earlier ones left
+        cur = local.get(key)
+        for item in _fold(evs, cur):
+            acts = _one(item, cur)
+            plan.actions.extend(acts)
+            cur = apply({key: cur} if cur is not None else {}, Plan(actions=acts)).get(key)
+        after[key] = cur
     if batch.complete and not rejected:
-        for k, v in local.items():  # a successful full read proves access: unmentioned held items are current
-            if (k[0], k[1]) in scope and k not in winners and (v.held or v.state == "held") and v.state != "gone":
+        for k, v in local.items():  # a successful full read proves access: access holds are released
+            v = after.get(k, v) or v
+            if (k[0], k[1]) in scope and (v.held or v.state == "held") and v.state != "gone" and v.held_by != LEFT_VIEW:
                 plan.actions.append(Action("release_hold", k, "reads work again"))
     plan.complete = batch.complete and not rejected
     if not plan.complete:
@@ -196,6 +201,25 @@ def reconcile(local: Mapping[Key, Local], batch: ChangeBatch, accounts: Iterable
         plan.stop_reason = "; ".join(reasons)
     plan.cursor = batch.cursor if not rejected else None  # a batch with rejected items is not accepted
     return plan
+
+
+def _fold(events: list[ExternalItem], cur: Local | None) -> list[ExternalItem]:
+    """The events of one item in one batch, in ``seq`` order, folded without changing the outcome.
+    With no card yet only the newest ``seq`` matters (a deletion after an addition is not an
+    addition). Otherwise a run of events that leave the item in the same state folds into its
+    newest, but an event that changes state (a reopen between two completions) is never skipped,
+    and events sharing a ``seq`` are all kept so they are judged exactly as across batches."""
+    ordered = sorted(events, key=lambda e: e.seq)
+    if cur is None:
+        return [e for e in ordered if e.seq == ordered[-1].seq]
+    out: list[ExternalItem] = []
+    for e in ordered:
+        last = out[-1] if out else None
+        if last is not None and last.seq < e.seq and (last.state, last.confidence) == (e.state, e.confidence):
+            out[-1] = e
+        else:
+            out.append(e)
+    return out
 
 
 def _scope(accounts: Iterable[tuple[str, str]], batch: ChangeBatch) -> set[tuple[str, str]]:
@@ -217,11 +241,10 @@ def _view(cur: Local) -> tuple[str, str | None, bool]:
 def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
     k, s, r = item.key, item.seq, item.revision
     if item.state not in ITEM_STATES:
-        # Neither open work nor a deletion: report it and change nothing but the watermark.
+        # Neither open work nor a deletion: report it and change nothing, not even the watermark.
         if cur is not None and s < cur.seq:
             return [Action("ignore_stale", k)]
-        return [Action("unknown_state", k, "the provider reported a state this contract does not know; nothing changed",
-                       seq=s if cur is not None else None)]
+        return [Action("unknown_state", k, "the provider reported a state this contract does not know; nothing changed")]
     guessed = item.confidence != CONFIRMED
     ev = HEURISTIC if guessed else VERIFIED
     if cur is None:
@@ -229,12 +252,18 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
             return [Action("tombstone", k, "deleted at the provider; the sequence is kept", seq=s, revision=r)]
         if item.state == DONE:
             return [Action("track_done", k, "already done at the provider; no card", seq=s, revision=r, evidence=ev)]
-        return [] if item.state == LEFT_VIEW else [Action("add", k, seq=s, revision=r)]
+        if item.state == LEFT_VIEW:  # not listed, never held: only the watermark is kept
+            return [Action("tombstone", k, "no longer listed where it was read; the sequence is kept", seq=s, revision=r)]
+        return [Action("add", k, seq=s, revision=r)]
     if s < cur.seq:
         return [Action("ignore_stale", k)]
     if s == cur.seq and r != cur.revision:
         return [Action("seq_collision", k, "same seq, different revision; the stored one was kept")]
     state, cur_ev, held = _view(cur)
+    if s == cur.seq and r == cur.revision and cur.state != "gone" and (
+        item.state == DELETED or (item.state == DONE and state == OPEN)
+    ):
+        return [Action("seq_collision", k, "same seq and revision, different state; the stored one was kept")]
     out: list[Action] = [Action("release_hold", k)] if held and item.state != LEFT_VIEW else []
     edit = cur.pending_edit
     conflict = Action("conflict", k, "changed at the provider while a local edit is unsent; nothing was written")
@@ -252,9 +281,10 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
             out.append(conflict)
         return out + [Action("remove", k, "deleted at the provider", seq=s, revision=r)]
     if item.state == LEFT_VIEW:
-        if held:
+        if held and cur.held_by == LEFT_VIEW:
             return [Action("advance", k, seq=s, revision=r)] if s > cur.seq else []
-        return [Action("hold", k, "no longer listed where it was read; existence is not confirmed", seq=s, revision=r)]
+        return [Action("hold", k, "no longer listed where it was read; existence is not confirmed", seq=s, revision=r,
+                       reason=LEFT_VIEW)]
     if item.state == DONE:
         if state == DONE and _RANK.get(cur_ev, 0) >= _RANK[ev]:
             if r != cur.revision:
@@ -298,21 +328,22 @@ def apply(local: Mapping[Key, Local], plan: Plan) -> dict[Key, Local]:
         if cur is None:
             continue
         if a.op == "hold":
-            cur = replace(cur, held=True)
+            cur = replace(cur, held=True, held_by=a.reason)
         elif a.op == "release_hold":
-            cur = replace(cur, held=False, state=(DONE if cur.evidence else OPEN) if cur.state == "held" else cur.state)
+            cur = replace(cur, held=False, held_by=None,
+                          state=(DONE if cur.evidence else OPEN) if cur.state == "held" else cur.state)
         elif a.op in ("complete_verified", "complete_unconfirmed", "verify_done"):
             cur = replace(cur, state=DONE, evidence=a.evidence)
         elif a.op in ("contradicted", "reopen", "restore"):
             cur = replace(cur, state=OPEN, evidence=None)
         elif a.op == "remove":
-            cur = replace(cur, state="gone", held=False, evidence=None, pending_edit=False)
+            cur = replace(cur, state="gone", held=False, held_by=None, evidence=None, pending_edit=False)
         elif a.op == "resurface":
             cur = replace(cur, acted_revision=None)
         if a.seq is not None and a.seq > cur.seq:
             cur = replace(cur, seq=a.seq)
         if a.revision is not None and a.op in ("update", "restore", "complete_verified", "complete_unconfirmed", "reopen",
-                                               "contradicted", "remove", "advance"):
+                                               "contradicted", "remove", "advance", "hold"):
             cur = replace(cur, revision=a.revision)
         out[a.key] = cur
     return out
