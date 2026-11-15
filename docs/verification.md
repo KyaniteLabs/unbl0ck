@@ -94,6 +94,34 @@ and relay paths are unchanged by this correction; their earlier execution eviden
 reused, not represented as a new rendered run. The
 397-test run above is historical evidence and does not cover this later correction.
 
+## Acceptance matrix
+
+Reproducible record of what was checked, on which host, and what was not. Fill one row per
+run; leave a row "not run" until someone runs it on the real host. Source CI, packaged-host
+runs, provider runs, Security acceptance, publishing and deployment are separate receipts: a
+missing live run is a missing receipt, not a source defect.
+
+To record a host, run `python scripts/host_compat.py` with the Python that runs Hermes. It
+prints one JSON record (UTC time, plugin and Hermes versions, OS, state-lock mode and the
+Hermes interface names it needs, with any missing) and exits 1 if an interface is missing. It
+reads no settings, chats, cards or credentials.
+
+Interfaces taken from Hermes that are not documented plugin APIs are listed in
+`needs.HOST_API` (five of them are private `kanban_db` helpers) and a test keeps that list
+equal to what the source uses. If an upgrade removes one, the queue adds a single
+`host: this Hermes lacks N of the M interfaces UNBL0CK uses (...)` line to its errors instead
+of failing deep in a card read.
+
+| Receipt | Host and OS | Plugin / Hermes revision | Recorded at (UTC) | Result |
+| --- | --- | --- | --- | --- |
+| Source tests and interface check (`pytest`, `scripts/host_compat.py`) | Linux, CI-style venv | plugin 0.5.1 / Hermes source checkout in the test venv | recorded per PR | passes; all interfaces present |
+| Packaged Desktop, full operator and recovery flows | not run | not recorded | not recorded | not run |
+| Real permitted export fixtures (mail, notes) | not run | not recorded | not recorded | not run |
+| Configured model and chat providers | not run | not recorded | not recorded | not run |
+| Clean install, upgrade, isolated rollback | not run | not recorded | not recorded | not run |
+| Windows cross-process state lock | not run | not recorded | not recorded | not run |
+| Independent Security acceptance for the exact head | not run | not recorded | not recorded | not run |
+
 ## Acceptance still requiring live evidence
 
 The rendered harness exercises host SDK contracts, not a complete packaged Electron

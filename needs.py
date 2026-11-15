@@ -2806,6 +2806,67 @@ def done_outside(
 
 # Every value an item's "source" can hold, in queue order (a new source must be added here,
 # and the tests fail until every consumer handles it).
+# --- host compatibility (issue #44) ---------------------------------------------------------
+# Every name UNBL0CK takes from Hermes that is not a documented plugin API. A Hermes upgrade can
+# remove or rename any of them; host_compat() reports which are present so the failure names the
+# cause ("this Hermes lacks X") instead of an AttributeError deep in a card read. Names starting
+# with an underscore are private to Hermes and the most upgrade-sensitive. A test keeps this
+# table equal to what the code actually uses.
+HOST_API = {
+    "hermes_cli.kanban_db": (
+        "Event", "add_comment", "board_exists", "get_task", "latest_run", "list_attachments",
+        "list_comments", "list_events", "list_tasks", "task_graph_context", "write_txn",
+        "_append_event", "_landing_status_after_parents", "_normalize_board_slug",
+        "_reclaim_dangling_run", "_resume_status_from_events",
+    ),
+    "hermes_cli.kanban_db_connect": ("connect",),
+    "hermes_cli.kanban_db_boards": ("list_boards",),
+    "hermes_cli.config": ("load_config_readonly",),
+    "hermes_constants": ("get_hermes_home",),
+}
+
+
+def host_compat(import_module: Callable[[str], Any] | None = None) -> dict[str, Any]:
+    """Which Hermes names UNBL0CK depends on are present right now. Names and counts only."""
+    import importlib
+
+    load = import_module or importlib.import_module
+    missing: list[str] = []
+    modules_missing: list[str] = []
+    checked = 0
+    for module, names in HOST_API.items():
+        try:
+            mod = load(module)
+        except Exception:  # noqa: BLE001 - any import fault means the module is not usable
+            modules_missing.append(module)
+            missing.extend(f"{module}.{n}" for n in names)
+            checked += len(names)
+            continue
+        for name in names:
+            checked += 1
+            if not hasattr(mod, name):
+                missing.append(f"{module}.{name}")
+    return {
+        "ok": not missing,
+        "checked": checked,
+        "missing": missing,
+        "modules_missing": modules_missing,
+        "private_checked": sum(1 for names in HOST_API.values() for n in names if n.startswith("_")),
+    }
+
+
+def host_compat_note(report: dict[str, Any] | None = None) -> str:
+    """One fixed sentence for the queue's errors when the host does not match, else empty."""
+    r = report if report is not None else host_compat()
+    if r["ok"]:
+        return ""
+    return (
+        f"host: this Hermes lacks {len(r['missing'])} of the {r['checked']} interfaces UNBL0CK uses "
+        f"({', '.join(r['missing'][:6])}{', ...' if len(r['missing']) > 6 else ''}); "
+        "update UNBL0CK or use a Hermes release it supports. Kanban cards may be missing until then"
+    )
+
+
 SOURCES = ("prompt", "pairing", "kanban", "outside", "chat")
 SOURCE_ORDER = {s: i for i, s in enumerate(SOURCES)}
 # Sources whose text is already one plain line; a model summary would only add latency and cost.
@@ -2933,6 +2994,9 @@ def build_queue(
         items.extend(kanban_items(errors=errors))
     except Exception as exc:  # noqa: BLE001
         errors.append(f"kanban: {type(exc).__name__}: {exc}")
+        note = host_compat_note()
+        if note:
+            errors.append(note)
     chat_coverage: dict[str, Any] | None = {}
     try:
         items.extend(chat_items(home, errors=errors, coverage=chat_coverage))
