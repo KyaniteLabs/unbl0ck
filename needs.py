@@ -199,6 +199,10 @@ def ask_journal_dir(home: Path | None = None) -> Path:
 CHAT_WINDOW_DAYS = 14
 CHAT_WINDOW_MAX_DAYS = 90  # the most a configured backfill may reach
 CHAT_SESSION_CAP = 500  # sessions read per profile in one queue build; the rest are counted, not read
+# SQLite work one profile's chat read may spend (virtual-machine steps, about a second or two): the
+# session cap bounds rows returned, this bounds the work behind them, so a table without the
+# indexes Hermes creates fails the source visibly instead of stalling the refresh.
+CHAT_QUERY_OPS = 30_000_000
 CHAT_TITLES = ("Bot Chat",)
 
 _PATTERN_CACHE: dict[str, dict[str, re.Pattern[str]]] = {}
@@ -1891,6 +1895,7 @@ def chat_items(
     full_limit: int | None = None,
     visible: Callable[[str, str], bool] | None = None,
     only: tuple[str, str] | None = None,
+    unread_profiles: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
     last visible turn is the bot asking you something you have not answered. ``only`` =
@@ -1898,7 +1903,9 @@ def chat_items(
 
     ``coverage`` (when given) is filled with counts only: the window actually read, sessions
     checked and left unread past ``CHAT_SESSION_CAP``, and chats skipped by the group-name and
-    owner rules, so an empty result is never mistaken for an exhaustive one."""
+    owner rules, so an empty result is never mistaken for an exhaustive one. ``unread_profiles``
+    (when given) receives the profiles that left sessions unread, so the caller keeps the cached
+    summaries of chats it did not look at."""
     home = home or hermes_home()
     items: list[dict[str, Any]] = []
     settings, settings_error = _settings_state()
@@ -1932,8 +1939,29 @@ def chat_items(
             if errors is not None:
                 errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
             continue
+        budget = {"ops": 0, "hit": False}
+
+        def spend() -> int:
+            budget["ops"] += 1000
+            if budget["ops"] > CHAT_QUERY_OPS:
+                budget["hit"] = True
+                return 1  # abort the running statement
+            return 0
+
+        def failed(exc: sqlite3.Error) -> None:
+            if errors is not None:
+                why = (
+                    "read budget exceeded; its chats were not fully read"
+                    if budget["hit"]
+                    else f"{type(exc).__name__}: {exc}"
+                )
+                errors.append(f"chat[{profile}]: {why}")
+
         with closing(conn):
+            conn.isolation_level = None  # explicit transaction: one snapshot for every read below
+            conn.set_progress_handler(spend, 1000)
             try:
+                conn.execute("BEGIN")
                 cols = _columns(conn, "sessions")
                 if not cols:
                     continue  # a profile that never chatted has no sessions table yet
@@ -1951,8 +1979,11 @@ def chat_items(
                     args += CHAT_TITLES
                 if "parent_session_id" in cols:
                     # A compressed chat continues in a child session; only the newest link counts.
+                    # One pass over the table (an uncorrelated list of parents), not a scan of
+                    # every session per session.
                     where.append(
-                        "NOT EXISTS (SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id"
+                        "s.id NOT IN (SELECT c.parent_session_id FROM sessions c "
+                        "WHERE c.parent_session_id IS NOT NULL"
                         + (
                             f" AND COALESCE(c.source,'') NOT IN ({','.join('?' * len(CHAT_MACHINE_SOURCES))})"
                             if "source" in cols
@@ -1962,8 +1993,22 @@ def chat_items(
                     )
                     if "source" in cols:
                         args += CHAT_MACHINE_SOURCES
+                mcols = _columns(conn, "messages")
+                from_sql = "sessions s"
                 if "last_activity_at" in cols and "started_at" in cols:
-                    where.append("COALESCE(s.last_activity_at, s.started_at, 0) >= ?")
+                    activity = "COALESCE(s.last_activity_at, s.started_at, 0)"
+                elif "timestamp" in mcols:
+                    # No session activity columns (an older schema): the newest message says
+                    # how recent a chat is, so expired chats neither fill the scan cap nor count.
+                    from_sql += (
+                        " LEFT JOIN (SELECT session_id AS sid, MAX(timestamp) AS ts "
+                        "FROM messages GROUP BY session_id) a ON a.sid = s.id"
+                    )
+                    activity = "COALESCE(a.ts, 0)"
+                else:
+                    activity = ""
+                if activity:
+                    where.append(f"{activity} >= ?")
                     args.append(since)
                 if only:
                     where.append("s.id = ?")
@@ -1972,25 +2017,21 @@ def chat_items(
                     f"s.{c}" if c in cols else "NULL"
                     for c in ("source", "chat_type", "user_id", "display_name")
                 )
-                mcols = _columns(conn, "messages")
                 where_sql = " AND ".join(where) or "1"
-                order = (
-                    "COALESCE(s.last_activity_at, s.started_at, 0) DESC"
-                    if "last_activity_at" in cols and "started_at" in cols
-                    else "s.rowid DESC"
-                )
+                order = f"{activity} DESC, s.rowid DESC" if activity else "s.rowid DESC"
                 sessions = conn.execute(
-                    f"SELECT s.id, s.title, {pick} FROM sessions s WHERE {where_sql} "
+                    f"SELECT s.id, s.title, {pick} FROM {from_sql} WHERE {where_sql} "
                     f"ORDER BY {order} LIMIT {int(CHAT_SESSION_CAP)}",
                     args,
                 ).fetchall()
-                total = conn.execute(f"SELECT COUNT(*) FROM sessions s WHERE {where_sql}", args).fetchone()[0]
+                total = conn.execute(f"SELECT COUNT(*) FROM {from_sql} WHERE {where_sql}", args).fetchone()[0]
                 cov["sessions_checked"] += len(sessions)
                 cov["sessions_omitted"] += max(0, int(total) - len(sessions))
+                if int(total) > len(sessions) and unread_profiles is not None:
+                    unread_profiles.add(profile)
                 cov["profiles"] += 1
             except sqlite3.Error as exc:
-                if errors is not None:
-                    errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
+                failed(exc)
                 continue
             # Only the columns this profile's schema has: an old schema must not fail per session.
             last_sql = (
@@ -2022,8 +2063,7 @@ def chat_items(
                 try:
                     row = conn.execute(last_sql, (-CHAT_READ_CHARS, sid)).fetchone()
                 except sqlite3.Error as exc:
-                    if errors is not None:
-                        errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
+                    failed(exc)
                     break  # same schema for every session: say it once
                 if not row:
                     continue
@@ -3765,8 +3805,11 @@ def build_queue(
     except Exception as exc:  # noqa: BLE001
         errors.append(f"kanban: {type(exc).__name__}: {exc}")
     chat_coverage: dict[str, Any] | None = {}
+    unread_profiles: set[str] = set()
     try:
-        items.extend(chat_items(home, errors=errors, coverage=chat_coverage))
+        items.extend(
+            chat_items(home, errors=errors, coverage=chat_coverage, unread_profiles=unread_profiles)
+        )
     except Exception as exc:  # noqa: BLE001
         chat_coverage = None  # a failed source is not "covered"
         errors.append(f"chat: {type(exc).__name__}: {exc}")
@@ -3801,6 +3844,8 @@ def build_queue(
         for source in ("kanban", "chat", "prompt", "pairing")
         if source in failed_sources
     )
+    # A chat the scan cap left unread was not observed: its cached summary stays for when it is.
+    preserve_prefixes += tuple(f"chat:{p}:" for p in sorted(unread_profiles))
     if outside_source_failed:
         preserve_prefixes += ("outside:",)
     else:
@@ -3881,6 +3926,20 @@ def not_covered_notes(chat_coverage: dict[str, Any] | None) -> list[str]:
     elif chat_coverage.get("sessions_omitted"):
         notes.insert(0, f"{chat_coverage['sessions_omitted']} older chat sessions were not read (scan limit {CHAT_SESSION_CAP} per profile).")
     return notes
+
+
+def coverage_gaps(queue: dict[str, Any]) -> list[str]:
+    """Fixed sentences for what the queue did not read, so a surface never says "nothing is
+    blocked" over a list that left chats unread. Counts only, no card text."""
+    cov = ((queue or {}).get("coverage") or {}).get("chat")
+    try:
+        omitted = int((cov or {}).get("sessions_omitted") or 0)
+    except (TypeError, ValueError):
+        omitted = 0
+    gaps = []
+    if omitted > 0:
+        gaps.append(f"{omitted} older chat session(s) were not read (scan limit {CHAT_SESSION_CAP} per profile).")
+    return gaps
 
 
 class UnblockFailed(RuntimeError):

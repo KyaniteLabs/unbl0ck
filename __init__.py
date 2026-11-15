@@ -24,18 +24,25 @@ def _other_work(q: dict) -> list[str]:
     return parts
 
 
+def _gaps(n, q) -> list:
+    """Fixed sentences on chat sessions the queue did not read (empty when it read them all)."""
+    fn = getattr(n, "coverage_gaps", None)
+    return list(fn(q)) if callable(fn) else []
+
+
 def _summary(limit: int = 12) -> str:
     n = _needs()
     q = n.build_queue()
     c = lambda value, size=200: n._clean(value, size)  # noqa: E731  (display sanitizer)
     other = _other_work(q)
-    if not q["count"] and not q["errors"]:
+    gaps = _gaps(n, q)
+    if not q["count"] and not q["errors"] and not gaps:
         if other:
             return f"Nothing is waiting on you, but {' and '.join(other)} card(s) need a look. Open /unblock in Desktop."
         return "Nothing is blocked on you."
     asks = [it for it in q["items"] if it.get("tier") not in ("stuck", "answered")]
     lines = [f"{q['count']} thing(s) waiting on you:" if q["count"]
-             else "No asks detected; the queue is incomplete." if q["errors"]
+             else "No asks detected; the queue is incomplete." if q["errors"] or gaps
              else "No asks, but listed cards are stuck or answered:"]
     limit = max(0, int(limit))
     for it in asks[:limit]:
@@ -55,6 +62,8 @@ def _summary(limit: int = 12) -> str:
         # Also when the ask list is empty because a source failed: stuck and answered
         # cards are still omitted from the lines above, so the counts have to be said.
         lines.append(f"Not listed here: {', '.join(other)}. Open /unblock in Desktop.")
+    for gap in gaps:
+        lines.append(f"(not complete: {gap})")
     for err in q["errors"]:
         lines.append(f"(source error: {c(err, 300)})")
     return "\n".join(lines)
@@ -67,15 +76,17 @@ LOCAL_SURFACES = frozenset({"cli", "tui", "desktop", "local"})
 
 
 def _count_only() -> str:
-    q = _needs().build_queue()
+    n = _needs()
+    q = n.build_queue()
     other = _other_work(q)
-    if not q["count"] and not q["errors"] and not other:
+    gaps = _gaps(n, q)
+    if not q["count"] and not q["errors"] and not other and not gaps:
         return "Nothing is blocked on you."
     lead = f"{q['count']} thing(s) waiting on you. " if q["count"] else ""
     if other:
         # Counts of other cards only: remote senders never see a title, a reason or an id.
         lead += f"Also {' and '.join(other)} card(s). " if q["count"] else f"No new asks, but {' and '.join(other)} card(s) need a look. "
-    if q["errors"]:
+    if q["errors"] or gaps:
         lead += "The queue is incomplete. "
     return (lead + "Open UNBL0CK in Hermes Desktop or run "
             "hermes unbl0ck on the machine to see them.")

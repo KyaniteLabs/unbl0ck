@@ -1854,7 +1854,10 @@ function Page({ ctx, refresh, scope = '' }) {
           ...group('KANBAN.ANSWERED', kanbanAnswered, true),
           ...group('OUTSIDE.HERMES', outside),
           ...group('CHATS', chats),
-          !q.loading && !askCount(q) && !held && !q.fault && !(q.errors || []).length
+          !q.loading && !askCount(q) && !held && !q.fault && !(q.errors || []).length && omittedChats(q) > 0
+            ? jsxs('div', { className: 'ub-clear', role: 'status', children: [jsx('b', { children: '● NOT ALL CLEAR' }), jsx('span', { children: `No ask was found, but ${omittedChats(q)} older chat session(s) were not read (scan limit reached).` })] })
+            : null,
+          !q.loading && !askCount(q) && !held && !q.fault && !(q.errors || []).length && !omittedChats(q)
             ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, outside item, chat, prompt or pairing request is waiting on you.' })] })
             : null,
           !q.loading ? coverageNote(q) : null
@@ -1867,13 +1870,18 @@ function Page({ ctx, refresh, scope = '' }) {
 
 // What an empty or short list does not prove: the chat window actually read and the fixed
 // coverage sentences from the server. Text only; counts and sentences, never card content.
+function omittedChats(q) {
+  const n = Number(q && q.coverage && q.coverage.chat && q.coverage.chat.sessions_omitted)
+  return Number.isFinite(n) && n > 0 ? n : 0
+}
+
 function coverageNote(q) {
   const c = q && q.coverage
   if (!c) return null
   const days = c.chat && !c.chat.failed && c.chat.window_days
   const notes = Array.isArray(c.not_covered) ? c.not_covered.filter(x => typeof x === 'string') : []
   if (!days && !notes.length) return null
-  return jsxs('details', { className: 'ub-coverage', children: [
+  return jsxs('details', { className: 'ub-coverage', open: omittedChats(q) > 0, children: [
     jsx('summary', { children: (days ? `Chats checked: last ${days} days. ` : '') + 'What this list does not cover' }),
     ...notes.map(line => jsx('p', { key: line, children: line }))
   ] })
@@ -1882,7 +1890,7 @@ function coverageNote(q) {
 function Chip() {
   const q = useValue($queue)
   const count = askCount(q)
-  const incomplete = !!q.fault || !!q.errors?.length
+  const incomplete = !!q.fault || !!q.errors?.length || Number(q.coverage?.chat?.sessions_omitted) > 0
   if (!count && !incomplete) return null
   return jsx('button', {
     type: 'button',

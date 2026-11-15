@@ -5,6 +5,8 @@ profile.yaml. Every test that builds the queue isolates HERMES_KANBAN_HOME."""
 import os
 import sqlite3
 import threading
+import time
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -247,3 +249,321 @@ class ProfileYamlRead(HomeCase):
 
     def test_a_plain_small_file_is_still_read(self):
         self.assertEqual(needs._bot_name(self.home, "work"), "Small")
+
+
+DAY = 86400
+
+
+def legacy_db(path: Path, rows):
+    """The oldest supported schema: no session activity columns, Bot Mode chats told apart by title.
+    rows: (session id, last message age in days, text) in creation order."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path)
+    db.executescript(
+        "CREATE TABLE sessions(id TEXT, title TEXT, archived INT);"
+        "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,"
+        " timestamp REAL, display_kind TEXT, active INT);"
+    )
+    now = time.time()
+    for sid, age, text in rows:
+        db.execute("INSERT INTO sessions VALUES(?, 'Bot Chat', 0)", (sid,))
+        db.execute(
+            "INSERT INTO messages(session_id, role, content, timestamp, active) VALUES(?, 'assistant', ?, ?, 1)",
+            (sid, text, now - age * DAY),
+        )
+    db.commit()
+    db.close()
+
+
+class LegacyWindow(QueueCase):
+    def test_the_first_created_session_with_a_current_ask_is_examined(self):
+        """11-006 (class D, budget applied before the window): rowid order spent the cap on expired chats."""
+        rows = [("current", 1, ASK)] + [(f"old{i}", 100, ASK) for i in range(needs.CHAT_SESSION_CAP + 5)]
+        legacy_db(self.home / "profiles" / "work" / "state.db", rows)
+        cov: dict = {}
+        ids = [i["session_id"] for i in needs.chat_items(self.home, coverage=cov)]
+        self.assertEqual(ids, ["current"])
+        self.assertEqual(cov["sessions_omitted"], 0)
+        self.assertEqual(cov["sessions_checked"], 1)
+
+    def test_newest_message_decides_the_order_when_the_cap_bites(self):
+        rows = [(f"s{i}", 10 - i * 0.001, ASK) for i in range(8)]
+        legacy_db(self.home / "profiles" / "work" / "state.db", rows)
+        with patch.object(needs, "CHAT_SESSION_CAP", 3):
+            cov: dict = {}
+            ids = sorted(i["session_id"] for i in needs.chat_items(self.home, coverage=cov))
+        self.assertEqual(ids, ["s5", "s6", "s7"])
+        self.assertEqual(cov["sessions_omitted"], 5)
+
+    def test_equal_activity_is_ordered_newest_created_first(self):
+        chat_db(
+            self.home / "state.db",
+            [(f"s{i}", "cli", "u", ASK, "dm") for i in range(6)],
+        )
+        db = sqlite3.connect(self.home / "state.db")
+        db.execute("UPDATE sessions SET last_activity_at = 1000000000.0 + 0, started_at = 1000000000.0")
+        db.execute("UPDATE sessions SET last_activity_at = ?", (time.time() - 30,))
+        db.commit()
+        db.close()
+        with patch.object(needs, "CHAT_SESSION_CAP", 2):
+            ids = sorted(i["session_id"] for i in needs.chat_items(self.home))
+        self.assertEqual(ids, ["s4", "s5"])
+
+
+class CountingConnection(sqlite3.Connection):
+    """Counts the virtual-machine steps a connection spends, whatever progress handler the code
+    under test installs on top."""
+
+    made: list = []
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.ops = 0
+        type(self).made.append(self)
+        self.set_progress_handler(None, 1000)
+
+    def set_progress_handler(self, handler, n):
+        def counted():
+            self.ops += n
+            return handler() if handler else 0
+
+        super().set_progress_handler(counted, n)
+
+
+class ReadBudget(QueueCase):
+    def _sessions_without_a_parent_index(self, n):
+        db = sqlite3.connect(self.home / "state.db")
+        db.executescript(
+            "CREATE TABLE sessions(id TEXT, title TEXT, source TEXT, chat_type TEXT, parent_session_id TEXT,"
+            " started_at REAL, last_activity_at REAL, user_id TEXT, display_name TEXT);"
+            "CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,"
+            " timestamp REAL, display_kind TEXT, active INT);"
+        )
+        now = time.time()
+        for i in range(n):
+            db.execute(
+                "INSERT INTO sessions VALUES(?, '', 'cli', 'dm', ?, ?, ?, 'u', 'n')",
+                (f"s{i}", f"s{i - 1}" if i % 2 else None, now - 100 - i, now - 50 - i),
+            )
+            db.execute(
+                "INSERT INTO messages(session_id, role, content, timestamp, active) VALUES(?, 'assistant', ?, ?, 1)",
+                (f"s{i}", ASK, now - 50 - i),
+            )
+        db.commit()
+        db.close()
+
+    def _counted(self, fn):
+        CountingConnection.made.clear()
+        real = needs.sqlite3.connect
+
+        def connect(*a, **k):
+            return real(*a, factory=CountingConnection, **k)
+
+        with patch.object(needs.sqlite3, "connect", connect):
+            fn()
+        return sum(c.ops for c in CountingConnection.made)
+
+    def test_a_small_cap_bounds_the_database_work_not_only_the_rows(self):
+        """01-054 (class D): the continuation check scanned the table once per session, twice."""
+        self._sessions_without_a_parent_index(800)
+        with patch.object(needs, "CHAT_SESSION_CAP", 1):
+            ops = self._counted(lambda: needs.chat_items(self.home))
+        self.assertLess(ops, 200_000, ops)
+
+    def test_work_past_the_budget_is_a_failed_source_not_a_clean_read(self):
+        self._sessions_without_a_parent_index(300)
+        errors: list[str] = []
+        cov: dict = {}
+        with patch.object(needs, "CHAT_QUERY_OPS", 3000):
+            items = needs.chat_items(self.home, errors=errors, coverage=cov)
+        self.assertTrue(any("read budget exceeded" in e for e in errors), errors)
+        self.assertEqual(items, [])
+
+    def test_the_budget_applies_to_the_per_session_reads_too(self):
+        self._sessions_without_a_parent_index(300)
+        errors: list[str] = []
+        with patch.object(needs, "CHAT_QUERY_OPS", 60_000):
+            needs.chat_items(self.home, errors=errors)
+        self.assertTrue(any("read budget exceeded" in e for e in errors), errors)
+
+    def test_a_continuation_chain_still_lists_only_its_newest_link(self):
+        chat_db(self.home / "state.db", [("a", "cli", "u", ASK, "dm"), ("b", "cli", "u", ASK, "dm")])
+        db = sqlite3.connect(self.home / "state.db")
+        db.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")
+        db.execute("UPDATE sessions SET parent_session_id = 'a' WHERE id = 'b'")
+        db.commit()
+        db.close()
+        self.assertEqual([i["session_id"] for i in needs.chat_items(self.home)], ["b"])
+
+
+class ReadSnapshot(QueueCase):
+    def test_the_omitted_count_comes_from_the_same_snapshot_as_the_sessions_read(self):
+        """01-053 (class A, stale snapshot): a delete between the two reads hid an unread session."""
+        path = self.home / "state.db"
+        chat_db(path, [(f"s{i:03d}", "cli", "u", ASK, "dm") for i in range(5)])
+        writer = sqlite3.connect(path)
+        self.addCleanup(writer.close)
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("UPDATE sessions SET last_activity_at = ? + rowid", (time.time() - 3600,))
+        writer.commit()
+        real = needs.sqlite3.connect
+        deleted = []
+
+        def connect(*a, **k):
+            conn = real(*a, **k)
+
+            def trace(statement):
+                if "COUNT(" in statement and not deleted:
+                    deleted.append(1)
+                    writer.execute("DELETE FROM sessions WHERE id = 's004'")  # the newest, already read
+                    writer.commit()
+
+            conn.set_trace_callback(trace)
+            return conn
+
+        cov: dict = {}
+        with patch.object(needs, "CHAT_SESSION_CAP", 4), patch.object(needs.sqlite3, "connect", connect):
+            needs.chat_items(self.home, coverage=cov)
+        self.assertEqual(deleted, [1])
+        self.assertEqual(cov["sessions_checked"], 4)
+        self.assertEqual(cov["sessions_omitted"], 1)
+
+
+class UnreadChatSummaries(QueueCase):
+    def _many(self, n):
+        chat_db(
+            self.home / "profiles" / "work" / "state.db",
+            [(f"s{i:03d}", "cli", "u", ASK, "dm") for i in range(n)],
+        )
+        db = sqlite3.connect(self.home / "profiles" / "work" / "state.db")
+        db.execute("UPDATE sessions SET last_activity_at = ? + rowid", (time.time() - 3600,))
+        db.commit()
+        db.close()
+
+    def test_a_summary_for_a_chat_past_the_scan_limit_is_kept(self):
+        """01-086 (class H, prune unobserved state): omission must not delete the cached summary."""
+        self._many(3)
+        item = next(i for i in needs.build_queue(self.home)["items"] if i["session_id"] == "s000")
+        needs.save_bluf(item["id"], item["version"], "Say yes", "why", self.home)
+        with patch.object(needs, "CHAT_SESSION_CAP", 2):
+            queue = needs.build_queue(self.home)
+        self.assertEqual(queue["coverage"]["chat"]["sessions_omitted"], 1)
+        self.assertNotIn(item["id"], [i["id"] for i in queue["items"]])
+        self.assertIn(item["id"], needs.load_blufs(self.home))
+        back = next(i for i in needs.build_queue(self.home)["items"] if i["id"] == item["id"])
+        self.assertEqual(back["bluf"], "Say yes")
+
+    def test_a_summary_for_a_chat_that_was_read_and_answered_is_still_pruned(self):
+        self._many(3)
+        needs.save_bluf("chat:work:gone", "1:abc", "Old", "why", self.home)
+        with patch.object(needs, "CHAT_SESSION_CAP", 2):
+            needs.build_queue(self.home)
+        # the omitted profile keeps every chat summary it has; the stale one is dropped only
+        # once the profile is read in full
+        self.assertIn("chat:work:gone", needs.load_blufs(self.home))
+        needs.build_queue(self.home)
+        self.assertNotIn("chat:work:gone", needs.load_blufs(self.home))
+
+
+class OmissionIsNeverAllClear(QueueCase):
+    """01-020 (class E, false-complete coverage): a queue that left chat sessions unread must not
+    be reported as empty by any surface."""
+
+    def _queue_with_omission(self):
+        chat_db(
+            self.home / "state.db",
+            [(f"s{i}", "cli", "u", "thanks", "dm") for i in range(3)] + [("old", "cli", "u", ASK, "dm")],
+        )
+        db = sqlite3.connect(self.home / "state.db")
+        db.execute("UPDATE sessions SET last_activity_at = ? WHERE id = 'old'", (time.time() - 3600 * 5,))
+        db.execute("UPDATE sessions SET last_activity_at = ? WHERE id != 'old'", (time.time() - 60,))
+        db.commit()
+        db.close()
+        patcher = patch.object(needs, "CHAT_SESSION_CAP", 3)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _surfaces(self):
+        import test_outside
+
+        plugin = test_outside.plugin
+        real = needs.build_queue
+        with patch.object(plugin, "_needs", lambda: needs), patch.object(
+            needs, "build_queue", lambda *a, **k: real(self.home)
+        ):
+            return plugin.slash_unbl0ck(platform="cli"), plugin.slash_unbl0ck(platform="telegram")
+
+    def test_coverage_gaps_names_unread_sessions_and_is_silent_when_complete(self):
+        self._queue_with_omission()
+        q = needs.build_queue(self.home)
+        self.assertEqual(q["items"], [])
+        gaps = needs.coverage_gaps(q)
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("1 older chat session", gaps[0])
+        self.assertEqual(needs.coverage_gaps({"coverage": {"chat": {"sessions_omitted": 0}}}), [])
+        self.assertEqual(needs.coverage_gaps({}), [])
+        self.assertEqual(needs.coverage_gaps({"coverage": {"chat": {"sessions_omitted": "x"}}}), [])
+
+    def test_the_cli_and_slash_summaries_do_not_say_nothing_is_blocked(self):
+        self._queue_with_omission()
+        local, remote = self._surfaces()
+        for text in (local, remote):
+            self.assertNotIn("Nothing is blocked on you", text)
+            self.assertIn("incomplete", text)
+        self.assertIn("1 older chat session", local)
+
+    def test_a_complete_empty_queue_still_says_nothing_is_blocked(self):
+        chat_db(self.home / "state.db", [("a", "cli", "u", "thanks", "dm")])
+        local, remote = self._surfaces()
+        self.assertEqual(local, "Nothing is blocked on you.")
+        self.assertEqual(remote, "Nothing is blocked on you.")
+
+
+class DesktopOmission(unittest.TestCase):
+    def test_the_page_is_not_all_clear_and_opens_the_coverage_when_sessions_were_not_read(self):
+        from test_r4_stack01 import PRELUDE, run_views
+
+        body = r"""
+const ctx = {rest: async () => ({})}, refresh = async () => {};
+env.useValue = key => key === 'queue' ? q : false;
+function render(q0) { globalThis.q = q0; state = []; cursor = 0; return Page({ctx, refresh}); }
+const base = {items:[], count:0, counts:{asks:0,stuck:0,answered:0}, errors:[], at:Date.now()};
+const cov = n => ({chat:{window_days:14, sessions_omitted:n}, not_covered:['Detection phrases are English.']});
+let tree = render({...base, coverage: cov(7)});
+let page = text(tree);
+assert.ok(page.includes('NOT ALL CLEAR'), 'the page says it is not all clear');
+assert.ok(page.includes('7 older chat session'), 'the count is shown on the page, not only in details');
+assert.ok(!page.replace('NOT ALL CLEAR', '').includes('ALL CLEAR'), 'plain ALL CLEAR is gone');
+const det = all(tree).find(n => n && n.type === 'details');
+assert.ok(det && det.props.open === true, 'the coverage details are open');
+const whole = render({...base, coverage: cov(0)});
+page = text(whole);
+assert.ok(page.includes('● ALL CLEAR') && !page.includes('NOT ALL CLEAR'), 'a complete read stays all clear');
+const det0 = all(whole).find(n => n && n.type === 'details');
+assert.ok(det0 && !det0.props.open, 'details stay collapsed when nothing is omitted');
+"""
+        for name, code, err in run_views(PRELUDE + body):
+            with self.subTest(file=name):
+                self.assertEqual(code, 0, err)
+
+    def test_the_chip_reports_an_incomplete_queue_when_sessions_were_not_read(self):
+        from test_r4_stack01 import run_views
+
+        script = r"""
+const fs = require('fs'), assert = require('node:assert/strict');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const body = src.slice(src.indexOf('function Chip('), src.indexOf('export default'));
+let q = null;
+const env = {jsx: (t, p) => ({type: t, props: p}), useValue: () => q, askCount: x => x.count || 0,
+  host: {navigate() {}}, PATH: '/x', $queue: 'queue'};
+const {Chip} = new Function('env', `with(env){${body};return {Chip};}`)(env);
+q = {count: 0, errors: [], coverage: {chat: {sessions_omitted: 4}}};
+const chip = Chip();
+assert.ok(chip, 'a chip is shown');
+assert.ok(String(chip.props.children).includes('QUEUE INCOMPLETE'));
+q = {count: 0, errors: [], coverage: {chat: {sessions_omitted: 0}}};
+assert.equal(Chip(), null);
+"""
+        for name, code, err in run_views(script):
+            with self.subTest(file=name):
+                self.assertEqual(code, 0, err)
