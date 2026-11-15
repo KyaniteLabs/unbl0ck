@@ -885,14 +885,18 @@ const newAskRequestId = () => {
 // Local dismissals the human can still undo, newest first, bounded. A second dismissal
 // no longer replaces the first. The server keeps a filed record only for a short period,
 // so an entry can outlive its record; Undo then says so instead of pretending.
-// seq is taken when the human clicks, not when the response arrives: a late response for an older
-// dismissal of this item must not displace the entry (and Undo token) of a newer one.
+// `order` is the number the server gave the dismissal when it committed it. Neither the order of
+// the clicks nor the order the responses arrive in says which dismissal the server holds now, so
+// a late response for an older dismissal of this item must not displace the entry (and Undo
+// token) of a newer one, and the five kept are the five the server committed last.
+// seq is only a local identity for one entry; entries without an order fall back to their time.
 let undoSeq = 0
+const undoRank = u => (typeof u.order === 'number' ? u.order : u.at || 0)
 function undoPush(entry) {
   const list = $undo.get?.() || []
-  if (list.some(u => u.id === entry.id && (u.seq || 0) > (entry.seq || 0))) return
+  if (list.some(u => u.id === entry.id && undoRank(u) > undoRank(entry))) return
   const rest = list.filter(u => u.id !== entry.id)
-  $undo.set([entry, ...rest].slice(0, 5))
+  $undo.set([entry, ...rest].sort((a, b) => undoRank(b) - undoRank(a)).slice(0, 5))
 }
 const answerDrafts = new Map()
 function readAnswerDraft(id) {
@@ -900,9 +904,9 @@ function readAnswerDraft(id) {
   for (const [key, draft] of answerDrafts) if (draft.at < cutoff) answerDrafts.delete(key)
   return answerDrafts.get(id)
 }
-function rememberAnswerDraft(id, text, version) {
+function rememberAnswerDraft(id, text, version, ask) {
   answerDrafts.delete(id)
-  if (text.trim()) answerDrafts.set(id, { text, version, at: Date.now() })
+  if (text.trim()) answerDrafts.set(id, { text, version, ask, at: Date.now() })
   while (answerDrafts.size > 100) answerDrafts.delete(answerDrafts.keys().next().value)
 }
 
@@ -910,10 +914,14 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const savedDraft = readAnswerDraft(item.id)
   const [answer, setAnswer] = useState(savedDraft?.text || '')
   const [answerVersion, setAnswerVersion] = useState(savedDraft?.version ?? item.version)
-  const updateAnswer = (text, version) => {
-    rememberAnswerDraft(item.id, text, version)
+  // The question text the draft answers: an edit in place keeps the block version, so the text
+  // is part of what the draft is bound to.
+  const [answerAsk, setAnswerAsk] = useState(savedDraft?.ask ?? item.ask)
+  const updateAnswer = (text, version, ask = item.ask) => {
+    rememberAnswerDraft(item.id, text, version, ask)
     setAnswer(text)
     setAnswerVersion(version)
+    setAnswerAsk(ask)
   }
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState(false)
@@ -941,7 +949,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const isOutside = item.source === 'outside'
   // Chats and live prompts poll only a 480-character tail; the whole record is fetched on demand.
   const hasFull = isOutside || (item.ask_truncated === true && (item.source === 'chat' || item.source === 'prompt'))
-  const answerStale = isKanban && !!answer.trim() && answerVersion !== item.version
+  const answerStale = isKanban && !!answer.trim() && (answerVersion !== item.version || answerAsk !== item.ask)
   const askStale = askVersion !== item.version
   const platformName = platformLabel(item.platform)
   // Desktop can open its own sessions (and CLI/TUI ones, which share the store). A Telegram or
@@ -1065,12 +1073,12 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const hide = async () => {
     const seq = ++undoSeq
     await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn',
-      r => { if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: r.token, seq }) })
+      r => { if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: r.token, order: r.order, seq }) })
   }
   const outsideDone = async () => {
     const seq = ++undoSeq
     await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'ok',
-      r => { if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.token, seq }) })
+      r => { if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.token, order: r.order, seq }) })
   }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
@@ -1078,7 +1086,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   // The note says so whenever the text on screen is the excerpt: before Full text is opened,
   // after it is closed again, and while a different version is cached.
   const showingFull = open && outsideText?.__version === item.version
-  const cutNote = String(item.ask || '').startsWith('…')
+  const cutNote = item.ask_cut === true
   const excerptNote = hasFull && !isOutside && !showingFull
     ? jsx('div', {
         className: 'ub-hint', role: 'note',
@@ -1142,6 +1150,8 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
         const left = ASK_DEADLINE_MS - (Date.now() - t0)
         if (left <= 0) throw tooSlow()
         await new Promise(res => setTimeout(res, Math.min(1500, left)))
+        // The sleep can use up the last of the budget: no poll starts at or after the limit.
+        if (Date.now() - t0 >= ASK_DEADLINE_MS) throw tooSlow()
         r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true')
         if (over() && !(r && r.pending && r.job)) { setAskJob(null); setAskReq(null); throw tooSlow() }
       }
@@ -1267,7 +1277,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
           'aria-label': `Answer for ${item.task_id}`,
           onChange: e => {
             const text = e.target.value
-            updateAnswer(text, !answerStale || !text.trim() ? item.version : answerVersion)
+            updateAnswer(text, !answerStale || !text.trim() ? item.version : answerVersion, !answerStale || !text.trim() ? item.ask : answerAsk)
           },
           onKeyDown: e => {
             if (e.key === 'Enter' && !e.nativeEvent?.isComposing && (e.metaKey || e.ctrlKey) && ready) { e.preventDefault(); saysKeep ? send(false) : sendPrimary() }

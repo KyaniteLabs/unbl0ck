@@ -301,7 +301,7 @@ def test_visibility_write_failure_has_a_repairable_conflict_response():
     api = api_module()
     def failed(*args, **kwargs):
         raise RuntimeError("could not read hidden.json; repair the record before changing it")
-    api._needs = lambda: types.SimpleNamespace(hide=failed, unhide=failed)
+    api._needs = lambda: types.SimpleNamespace(hide_ordered=failed, unhide=failed)
     for operation in (lambda: api.hide(api.Hide(id="x", version="1")), lambda: api.unhide(api.Unhide(id="x"))):
         with pytest.raises(HTTPException) as exc:
             operation()
