@@ -716,5 +716,30 @@ const render = mount(ctx);
 """)
 
 
+class CoverageClaims(unittest.TestCase):
+    def test_no_session_cap_exists_so_an_older_ask_is_never_omitted(self):
+        """01-020 DISPUTED on this branch: chat discovery has no 500-session cap and reports no
+        sessions_omitted, so an older unanswered ask among 600 newer answered chats is still listed
+        and ALL CLEAR cannot hide an omission. A later branch that adds a cap owns that fix."""
+        import tempfile
+        from test_cover import home_with, needs as cover_needs, ASK
+        rows = [("old", "", "telegram", "dm", None, "assistant", ASK)]
+        rows += [(f"new{i}", "", "telegram", "dm", None, "user", "thanks") for i in range(600)]
+        with tempfile.TemporaryDirectory() as d:
+            ids = [i["session_id"] for i in cover_needs.chat_items(home_with(Path(d), rows))]
+        self.assertEqual(ids, ["old"])
+        self.assertNotIn("sessions_omitted", (ROOT / "needs.py").read_text())
+
+    def test_verification_doc_matches_the_folder_window_this_branch_implements(self):
+        """01-022 DISPUTED on this branch: only a newest-200 window with a disclosed omission note
+        exists here (no folder paging), so docs/verification.md saying paging was not adopted is
+        accurate. The branch that adds paging must change that sentence."""
+        doc = (ROOT / "docs/verification.md").read_text()
+        self.assertIn("Folder pagination", doc)
+        needs_src = (ROOT / "needs.py").read_text()
+        self.assertIn("only the newest are shown", needs_src)
+        self.assertNotIn("page_token", needs_src)
+
+
 if __name__ == "__main__":
     unittest.main()
