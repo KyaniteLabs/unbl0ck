@@ -642,15 +642,13 @@ class WidenedWindowIsBackfill(QueueCase):
         needs.chat_items(home)
         self.assertFalse((home / "plugin-data" / "unbl0ck" / needs.BACKFILL_FILE).exists())
 
-    def test_the_marks_hold_a_time_and_ids_only_and_are_bounded(self):
+    def test_the_marks_hold_one_time_only(self):
         home = self._home([("three", "cli", "dm", "u", 3, ASK)])
         self._queue(home, 1)
         self._queue(home, 7)
         data = json.loads((home / "plugin-data" / "unbl0ck" / needs.BACKFILL_FILE).read_text())
-        self.assertEqual(sorted(data), ["floor", "ids"])
-        self.assertEqual(data["ids"], ["chat:work:three"])
+        self.assertEqual(sorted(data), ["floor"])
         self.assertNotIn("Should I open", json.dumps(data))
-        self.assertLessEqual(needs.BACKFILL_IDS_MAX, 1000)
 
     def test_the_documented_promise_matches_the_behavior(self):
         root = Path(__file__).resolve().parents[1]

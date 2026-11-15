@@ -2253,42 +2253,20 @@ def _mark_backfill(
     since: float,
     *,
     record: bool,
-    complete: bool,
     errors: list[str] | None,
 ) -> None:
     """Flag chats that only a widened window reached (``backfilled``), so nothing is sent to a
-    model for them automatically. A chat is backfill when it is older than the default window or
-    older than anything an earlier read looked at; the flag then stays with it, so a later
-    refresh cannot turn it back into an ordinary ask. Only ``record`` (the queue build) saves."""
-    default_since = time.time() - CHAT_WINDOW_DAYS * 86400
-    floor, ids, readable = _backfill_state(home)
-    edge = floor if floor is not None else since
-    marked = dict.fromkeys(ids)
-    changed = False
+    model for them automatically: a chat older than the default window or than the first
+    window any queue build read. Both edges only move forward in time relative to a chat, so
+    the flag stays with it and a later refresh cannot turn it back into an ordinary ask. Only
+    ``record`` (the queue build) saves the floor."""
+    edge = max(
+        _backfill_floor(home, since, record=record, errors=errors),
+        time.time() - CHAT_WINDOW_DAYS * 86400,
+    )
     for it in items:
-        ts = it.get("since") or 0
-        if it["id"] not in marked and (ts < edge or not readable) and ts < time.time() - 86400:
-            marked[it["id"]] = None
-            changed = True
-        if ts < default_since or it["id"] in marked:
+        if (it.get("since") or 0) < edge:
             it["backfilled"] = True
-    if complete:  # a whole read: chats no longer listed need no flag
-        listed = {it["id"] for it in items}
-        kept = {i: None for i in marked if i in listed}
-        changed = changed or len(kept) != len(marked)
-        marked = kept
-    new_floor = min(edge, since)
-    if not record or not readable or (not changed and floor is not None and new_floor >= floor):
-        return
-    try:
-        _write_json(
-            data_dir(home) / BACKFILL_FILE,
-            {"floor": new_floor, "ids": list(marked)[-BACKFILL_IDS_MAX:]},
-            ordered=True,
-        )
-    except OSError as exc:
-        if errors is not None:
-            errors.append(f"chat: backfill marks could not be saved ({type(exc).__name__})")
 
 
 def chat_items(
@@ -2332,7 +2310,7 @@ def chat_items(
         """Whether a dismissal or a cached summary already exists under this profile's chat ids."""
         prefix = f"chat:{profile}:"
         try:
-            ids = list(load_hidden(home, create=False)) + list(load_blufs(home))
+            ids = list(load_hidden(home)) + list(load_blufs(home))
         except Exception:  # noqa: BLE001 - only a tie-break between aliases; the first one wins
             return False
         return any(str(i).startswith(prefix) for i in ids)
@@ -2598,19 +2576,11 @@ def _pending_file_damage(path: Path) -> bool:
     such a file as "no requests", so it cannot tell a damaged store from an empty one. The content
     is parsed and dropped here, never kept, logged or reported."""
     try:
-        fd = os.open(path, os.O_RDONLY | _NONBLOCK)
-        try:
-            st = os.fstat(fd)
-            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_STATE_BYTES:
-                return True
-            with os.fdopen(fd, "rb", closefd=False) as fh:
-                raw = fh.read(MAX_STATE_BYTES + 1)
-        finally:
-            os.close(fd)
-        return not isinstance(json.loads(raw.decode("utf-8-sig")), dict)
+        raw, _ = _read_plain_bytes_st(path)
+        return not isinstance(_json_loads_safe(raw.decode("utf-8-sig")), dict)
     except FileNotFoundError:
         return False
-    except (OSError, ValueError, RecursionError):  # too deeply nested is damage, not a crash
+    except (OSError, ValueError):
         return True
 
 
