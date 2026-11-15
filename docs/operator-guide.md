@@ -66,7 +66,7 @@ and status) and each difference below.
 <!-- surface-matrix:start -->
 | Surface | Visibility | Context | Action routing | Completion | Recovery | Intentional limits |
 |---|---|---|---|---|---|---|
-| Desktop | Every source and tier: asks, stuck, answered | Context panel, Full text, TL;DR on Kanban | Answer, release, open the session or board, Done, Not for me | The card leaves on the next poll; Undo for a few minutes | Drafts and Ask jobs survive remounts; per-source errors with retry | Only inside Hermes Desktop |
+| Desktop | Every source and tier: asks, stuck, answered | Context panel, Full text, TL;DR on Kanban | Answer, release, open the session or board, Done, Not for me | The card leaves on the next poll; Undo banner lasts 12 seconds | Drafts and Ask jobs survive remounts; per-source errors with retry | Only inside Hermes Desktop |
 | CLI and local slash | Asks only, 12 listed; says how many more and how many stuck or answered cards are not listed | One line per ask: where, title, summary or first 140 characters | Prints the native `hermes pairing approve` command; no inline action | Run it again | Source errors are printed; run it again | Local surfaces only (`cli`, `tui`, `desktop`, `local`) |
 | CLI --json | The raw queue, every tier | Full item fields | None | Run it again | Pairs with `--pack` | Machine owner only; contains private text |
 | Remote slash | Counts only: asks, plus counts of stuck and answered cards and whether the queue is incomplete | None: never a title, text, id, name or approval command | Says to open Desktop or run `hermes unbl0ck` on the machine | Ask again after acting there | "Incomplete" is stated as a count-level fact | Anyone admitted to a gateway can type it, so an unknown or missing platform counts as remote |
@@ -224,8 +224,11 @@ file two items and never update or resolve each other's. `global` shares the key
 profiles on purpose, so they update one record. A caller with no known profile defaults to
 `global`. Every filed item records its `profile` and `dedupe_scope`, and the tool's reply
 returns both. Records filed before scopes existed keep their keys: a profile adopts a legacy
-record its own profile filed (same id, version and any local Done, so nothing resurfaces),
-a `global` caller still updates it, and a different profile gets its own item. Resolving by
+record its own profile filed (same id, version and any local Done, so nothing resurfaces).
+A legacy record that stored no profile, because the tool call did not carry one, is adopted
+once by the next profile-scoped caller and then belongs to that profile. Several such records
+for one key fail the call instead of choosing one. A `global` caller still updates a legacy
+record, and a different profile gets its own item. Resolving by
 `id` is always unambiguous; resolving by key from a caller with no profile fails when the key
 matches items in several profiles. The tool's record proves what was filed, not whether the external app changed.
 

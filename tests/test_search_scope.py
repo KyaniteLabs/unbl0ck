@@ -5,8 +5,10 @@ import importlib.util
 import json
 import os
 import subprocess
+import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -146,6 +148,62 @@ class Bounds(Fixture):
             self.outside_items = [outside(1, "needle")]
             needs.search_text("needle")
             self.assertEqual(sorted(Path(d).rglob("*")), before)
+
+
+class RealReaders(unittest.TestCase):
+    """The chat and live-prompt readers cut text at the search limit and expand records on demand."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        for name, value in (("_settings", lambda: {"principal_name": "Ada"}), ("hermes_home", lambda: self.home),
+                            ("outside_items", lambda *a, **k: [])):
+            p = patch.object(needs, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def chats(self, contents):
+        db = sqlite3.connect(self.home / "state.db")
+        db.execute("CREATE TABLE sessions(id TEXT, title TEXT, source TEXT, chat_type TEXT, started_at REAL,"
+                   " last_activity_at REAL, user_id TEXT, display_name TEXT)")
+        db.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,"
+                   " timestamp REAL, display_kind TEXT, active INT)")
+        now = time.time()
+        for i, content in enumerate(contents):
+            db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)", (f"s{i}", "", "cli", "dm", now - 60, now - 30, "u", "n"))
+            db.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES(?, 'assistant', ?, ?)",
+                       (f"s{i}", content, now - 30))
+        db.commit()
+        db.close()
+
+    def test_chat_text_the_reader_cut_is_counted_as_cut_not_as_a_complete_miss(self):
+        self.chats(["x " * 12000 + "needle? Should I merge it now?"])
+        r = needs.search_text("needle")
+        self.assertEqual((r["matches"], r["items_cut"], r["partial"]), ([], 1, True))
+
+    def test_prompt_text_the_reader_cut_is_counted_as_cut(self):
+        needs.record_wait(self.home, request_id="0123456789abcdef", kind="clarify",
+                          prompt="y " * 15000 + "needle", platform="cli")
+        r = needs.search_text("needle")
+        self.assertEqual((r["matches"], r["items_cut"], r["partial"]), ([], 1, True))
+
+    def test_only_the_searched_window_is_expanded_and_the_rest_are_still_counted(self):
+        self.chats([f"Should I merge change {i} now?" for i in range(205)])
+        calls = []
+        real = needs._full_fields
+        with patch.object(needs, "_full_fields", lambda text: calls.append(1) or real(text)):
+            r = needs.search_text("change")
+        self.assertEqual(len(calls), needs.SEARCH_MAX_ITEMS)
+        self.assertEqual((r["searched"]["chat"], r["not_searched"]["chat"]), (200, 5))
+        self.assertEqual(len(r["matches"]), 200)
+        self.assertTrue(r["partial"])
+
+    def test_the_queue_itself_still_carries_every_item_without_full_text(self):
+        self.chats([f"Should I merge change {i} now?" for i in range(205)])
+        items = needs.chat_items(self.home)
+        self.assertEqual(len(items), 205)
+        self.assertTrue(all("text" not in i for i in items))
 
 
 @unittest.skipIf(FastAPI is None, "fastapi missing")

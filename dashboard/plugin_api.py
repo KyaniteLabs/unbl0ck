@@ -295,7 +295,7 @@ def outside_text(id: str = "", version: str = ""):
 @router.get("/source/text")
 def source_text(id: str = "", version: str = ""):
     n = _needs()
-    if not id or len(id) > MAX_ID or len(version) > MAX_ID:
+    if not id or len(id) > MAX_ID or len(version) > MAX_ID or _CONTROL.search(id + version):
         raise HTTPException(status_code=400, detail="invalid item reference")
     try:
         return n.source_text(id, version)
@@ -460,7 +460,11 @@ def card_ask_discard(job: str, card: str = ""):
     st = _ASK_JOBS.get(job)
     if st is not None and card and st.get("card") and st["card"] != card:
         raise HTTPException(status_code=404, detail="unknown or expired ask job")
-    return {"ok": True, "deleted": _ASK_JOBS.discard(job)}
+    try:
+        return {"ok": True, "deleted": _ASK_JOBS.discard(job)}
+    except jobs.DiscardFailed:
+        # The saved record is still there and the job is still readable: say so, never "deleted".
+        raise HTTPException(status_code=500, detail="the saved answer could not be deleted; it expires on its own within 15 minutes")
 
 
 UNVERSIONED_WARNING = (
@@ -535,13 +539,14 @@ def outside_done(body: Hide):
 
 class Unhide(BaseModel):
     id: str
+    token: str | None = None
 
 
 @router.post("/unhide")
 def unhide(body: Unhide):
-    _bounded(id=body.id)
+    _bounded(id=body.id, token=body.token or "")
     try:
-        return {"ok": True, "restored": _needs().unhide(body.id)}
+        return {"ok": True, "restored": _needs().unhide(body.id, token=body.token)}
     except TimeoutError:
         raise HTTPException(status_code=409, detail="busy, retry")
     except RuntimeError as exc:

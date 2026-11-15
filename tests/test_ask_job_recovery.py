@@ -11,6 +11,7 @@ import time
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).parents[1]
 
@@ -197,6 +198,39 @@ class RetentionAndDeletion(RecoveryBase):
         self.boot()
         self.assertTrue(self.jobs.discard(J1))
         self.assertIsNone(self.jobs.get(J1))
+
+    def test_discard_reports_failure_when_the_saved_record_cannot_be_deleted(self):
+        self.keep = True
+        self.jobs.create(J1, card="c1")
+        self.jobs.finish(J1, "secret answer")
+        with patch.object(Path, "unlink", side_effect=PermissionError):
+            with self.assertRaises(jobs.DiscardFailed):
+                self.jobs.discard(J1)
+        # Nothing was reported as deleted, and the job is still one consistent thing.
+        self.assertEqual(self.jobs.get(J1)["reply"], "secret answer")
+        self.assertEqual(self.files(), [f"{J1}.json"])
+        # Once the file can be removed, discard succeeds and nothing is left to recover.
+        self.assertTrue(self.jobs.discard(J1))
+        self.boot()
+        self.assertIsNone(self.jobs.get(J1))
+
+    def test_journal_never_exceeds_its_cap_across_simulated_boots(self):
+        counts = []
+        for boot in range(3):
+            self.boot()
+            for i in range(128):
+                self.clock.t += 0.001
+                self.jobs.create(f"{boot:08x}{i:024x}", card="c")
+            counts.append(len(self.files()))
+        self.assertEqual(counts, [128, 256, 256])
+
+    def test_a_new_job_never_evicts_a_live_one_from_the_journal(self):
+        self.journal.MAX_FILES = 2
+        self.jobs.create(J1, card="c")
+        self.jobs.create(J2, card="c")
+        self.jobs.create(J3, card="c")  # no room and nothing evictable: memory only
+        self.assertEqual(self.files(), [f"{J1}.json", f"{J2}.json"])
+        self.assertEqual(self.jobs.get(J3)["status"], jobs.AskState.PENDING)
 
 
 class Protection(RecoveryBase):
@@ -429,6 +463,17 @@ class AskApiRecovery(unittest.TestCase):
         self.assertEqual(self.c.get(f"/card/ask/{job}").status_code, 404)
         self.assertEqual(list(self.dir.glob("*.json")), [])
         self.assertEqual(self.c.delete(f"/card/ask/{job}").json(), {"ok": True, "deleted": False})
+
+    def test_delete_reports_failure_instead_of_success_when_the_file_stays(self):
+        self.keep = True
+        job = self._ask()
+        self._wait(job)
+        with patch.object(Path, "unlink", side_effect=PermissionError):
+            r = self.c.delete(f"/card/ask/{job}?card={CARD}")
+        self.assertEqual(r.status_code, 500)
+        self.assertNotIn("deleted", r.json())
+        self.assertEqual(self.c.get(f"/card/ask/{job}?poll=true&card={CARD}").json()["state"], "complete")
+        self.assertEqual(self.c.delete(f"/card/ask/{job}?card={CARD}").json(), {"ok": True, "deleted": True})
 
 
 class MarkSentFailure(RecoveryBase):
