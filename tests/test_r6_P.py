@@ -68,5 +68,20 @@ class ChatDatabaseOpen(unittest.TestCase):
                 conn.close()
 
 
+class ChatVersion(unittest.TestCase):
+    def test_an_edit_in_the_middle_of_a_huge_message_changes_its_version(self):
+        """R6-007: a cut message's version covers every byte, not only the first 16 MiB."""
+        tail = "Should I open the PR now?"
+        body = "a" * (17 << 20) + tail
+        edited = body[: (16 << 20) + 1000] + "b" + body[(16 << 20) + 1001 :]
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE messages(id INTEGER PRIMARY KEY, content TEXT)")
+        versions = []
+        for text in (body, edited):
+            conn.execute("INSERT OR REPLACE INTO messages VALUES(7, ?)", (text,))
+            versions.append(needs._chat_version(conn, 7, len(text), tail, True))
+        self.assertNotEqual(versions[0], versions[1])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2104,7 +2104,6 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # sits at the end of a turn, so a longer message is read from its end.
 CHAT_READ_CHARS = 100_000
 CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_CHARS characters
-CHAT_VERSION_BYTES = 16 * 1024 * 1024  # most bytes of one message hashed into its version
 
 
 def _text_digest(length: Any, text: str) -> str:
@@ -2133,19 +2132,15 @@ def _drop_cut_prefix(text: str) -> str:
 
 
 def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, over: bool) -> str:
-    """Names the whole message: the retained text alone cannot, when only its end was read, so a
-    cut message is hashed from the database in blocks (up to CHAT_VERSION_BYTES)."""
+    """Names the whole message: the retained text alone cannot, when only its end was read, so
+    a cut message is hashed from the database in full, streamed in 1 MiB blocks."""
     if not over:
         return f"{mid}:{_text_digest(length, text)}"
     digest = hashlib.sha256(f"{length}\0".encode())
-    step = 1 << 20
-    pos = 1
-    while pos <= min(length, CHAT_VERSION_BYTES):
-        block = conn.execute(
-            "SELECT SUBSTR(CAST(content AS BLOB), ?, ?) FROM messages WHERE id=?", (pos, step, mid)
-        ).fetchone()
-        digest.update(bytes(block[0] or b""))
-        pos += step
+    rowid = conn.execute("SELECT rowid FROM messages WHERE id=?", (mid,)).fetchone()[0]
+    with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
+        for block in iter(lambda: blob.read(1 << 20), b""):
+            digest.update(block)
     digest.update(text.encode("utf-8", "replace"))
     return f"{mid}:{digest.hexdigest()[:12]}"
 
