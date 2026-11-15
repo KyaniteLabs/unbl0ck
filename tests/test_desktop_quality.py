@@ -24,7 +24,7 @@ const env = {
   CSS:'', PATH:'/unblock', ROUTES_AREA:'route', SIDEBAR_NAV_AREA:'nav', STATUSBAR_AREAS:{right:'right'}, POLL_MS:45000,
   document:{createElement:()=>({dataset:{},remove:noop}),head:{appendChild:noop},addEventListener:noop,removeEventListener:noop},
   setTimeout:()=>{follows++;return 1},clearTimeout:noop,setInterval:()=>{intervals++;return 2},clearInterval:()=>{intervals--},
-  $queue:{get:()=>({}),set:()=>{writes++}},sfx:{close:noop,play:noop},petEmit:noop,
+  $queue:{get:()=>({}),set:()=>{writes++}},sfx:{close:noop,play:noop},petEmit:noop,askScopeSeq:0,endAskScope:noop,
 };
 const plugin = new Function('env', `with(env) { return (${src.slice(src.indexOf('export default ') + 'export default '.length)}); }`)(env);
 plugin.register({rest:()=>new Promise(r=>{resolve=r}),registerMany:noop,onDispose:f=>{dispose=f}});
@@ -43,7 +43,7 @@ const env = {
   CSS:'', PATH:'/unblock', ROUTES_AREA:'route', SIDEBAR_NAV_AREA:'nav', STATUSBAR_AREAS:{right:'right'}, POLL_MS:45000,
   document:{createElement:()=>({dataset:{},remove:noop}),head:{appendChild:noop},addEventListener:noop,removeEventListener:noop},
   setTimeout:()=>1,clearTimeout:noop,setInterval:()=>2,clearInterval:noop,
-  $queue:{get:()=>({}),set:v=>{writes.push(v)}},sfx:{close:noop,play:noop},petEmit:noop,
+  $queue:{get:()=>({}),set:v=>{writes.push(v)}},sfx:{close:noop,play:noop},petEmit:noop,askScopeSeq:0,endAskScope:noop,
   jsx:(type,props)=>({type,props}),Page:'Page',Chip:'Chip',
 };
 const plugin = new Function('env', `with(env) { return (${src.slice(src.indexOf('export default ') + 'export default '.length)}); }`)(env);

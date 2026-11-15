@@ -204,11 +204,11 @@ def test_bot_name_is_cached_until_the_file_changes(tmp_path, monkeypatch):
     f = _profile(tmp_path, "ada", "Ada")
     _profile(tmp_path, "bo", "Bo")
     reads = []
-    real = type(f).read_text
+    real = needs._read_plain_text_st
     monkeypatch.setattr(
-        type(f),
-        "read_text",
-        lambda self, *a, **k: (reads.append(self.parent.name), real(self, *a, **k))[1],
+        needs,
+        "_read_plain_text_st",
+        lambda path, *a, **k: (reads.append(path.parent.name), real(path, *a, **k))[1],
     )
 
     assert needs._bot_name(tmp_path, "ada") == "Ada"
