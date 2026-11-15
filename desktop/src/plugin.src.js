@@ -1130,12 +1130,17 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
         : await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next.slice(-50) } })
       const t0 = Date.now()   // the model can outlast the desktop's 30 s request limit: poll the background job
       while (r && r.pending && r.job) {
-        if (mine()) updateAskSession(item.id, { job: { id: r.job, version: item.version } })
+        // A superseded request (evicted session, newer question) stops polling at once and
+        // never records its job id, so Retry cannot follow it into a newer conversation.
+        if (!mine()) return
+        updateAskSession(item.id, { job: { id: r.job, version: item.version } })
         setAskJob({ id: r.job, version: item.version })
         if (Date.now() - t0 > 150000) throw new Error('The model took too long (over 150 s)')
         await new Promise(res => setTimeout(res, 1500))
+        if (!mine()) return
         r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true&card=' + encodeURIComponent(item.id))
       }
+      if (!mine()) return
       if (mine()) { updateAskSession(item.id, { job: null }); setAskJob(null) }
       // After a gateway restart the plugin never resends on its own. Say which of the five
       // outcomes this is; Retry then sends a new request only because the human chose it.

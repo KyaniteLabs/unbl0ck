@@ -98,6 +98,48 @@ class DedupeScope(OutsideFixture):
         self.assertIn("legacy", out["error"])
         self.assertEqual({r["title"] for r in self.records()}, {"One", "Two"})
 
+    # Written verbatim by the 0.6.0 implementation, which stored no profile for tool calls.
+    BASE_RECORD = {
+        "act_where": "Mail", "dedupe_key": "k", "id": "outside:filed:048e813bf75942aba82ac44877fcd4f0",
+        "kind": "draft", "origin": "filed", "profile": "", "ref": "", "session_id": "s", "since": 1794724659.8,
+        "source": "outside", "text": "B", "tier": "normal", "title": "T",
+        "version": "e73f46f6212b1ce53f308a7eb2cff945b890511d623bb5e86956635b769095f7",
+    }
+
+    def seed_base_record(self):
+        d = needs.data_dir(self.home) / "outside"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "048e813bf75942aba82ac44877fcd4f0.json").write_text(json.dumps(self.BASE_RECORD))
+        return self.BASE_RECORD["id"], self.BASE_RECORD["version"]
+
+    def test_ownerless_base_record_keeps_identity_and_done_state_on_an_unchanged_refile(self):
+        item_id, version = self.seed_base_record()
+        needs.done_outside(item_id, version)
+        again = self.call("work", dedupe_key="k", title="T", body="B", act_where="Mail")
+        self.assertEqual((again["id"], again["version"]), (item_id, version))
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(needs.build_queue()["items"], [])
+        later = self.call("work", dedupe_key="k", title="T", body="B", act_where="Mail")
+        self.assertEqual(later["version"], version)
+        self.assertEqual(self.records()[0]["profile"], "work")
+
+    def test_ownerless_base_record_keeps_not_for_me_and_resolves_by_key(self):
+        item_id, version = self.seed_base_record()
+        needs.hide(item_id, version)
+        self.call("work", dedupe_key="k", title="T", body="B", act_where="Mail")
+        self.assertEqual(needs.build_queue()["items"], [])
+        gone = self.call("work", action="resolve", dedupe_key="k")
+        self.assertTrue(gone["resolved"], gone)
+        self.assertEqual(self.records(), [])
+
+    def test_changed_content_on_an_ownerless_record_is_new_work(self):
+        item_id, version = self.seed_base_record()
+        needs.done_outside(item_id, version)
+        changed = self.call("work", dedupe_key="k", title="T", body="Different", act_where="Mail")
+        self.assertEqual(changed["id"], item_id)
+        self.assertNotEqual(changed["version"], version)
+        self.assertEqual(len(needs.build_queue()["items"]), 1)
+
     def test_legacy_record_is_adopted_by_its_own_profile_without_resurfacing(self):
         old = self.call("work", dedupe_key="k")
         path = self.record(old)
