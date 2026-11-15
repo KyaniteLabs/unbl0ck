@@ -342,9 +342,15 @@ selectors are applied; media queries and attribute, pseudo-class or sibling sele
 not evaluated, and when one of those could hide text the card says "styles ... were not
 evaluated" and may show text such a rule hides. External stylesheets are never fetched,
 and positioning, colour or text-indent tricks are not evaluated. When part of the body
-could not be shown (an element that is hidden or never closed, markup nested too deeply,
-an unterminated comment, tag or quoted value, a reader failure) the card says so instead
-of presenting the rest as complete.
+could not be shown (text inside an element that is hidden or never closed, markup nested
+too deeply, an unterminated comment, tag or quoted value, a reader failure) the card says
+so instead of presenting the rest as complete. Hidden text is reported even when the
+element closes: a closed `hidden` or `display:none` element that held text adds the notice
+(an empty one does not). A body that is longer than the card shows is cut and says so.
+Invalid declarations are discarded as CSS does, so they never override a valid one;
+`initial`, `revert` and `visible` restore an inherited `visibility` or `font-size`, while
+`inherit` and `unset` keep the parent's. Styles inside a `<template>` apply to nothing, and
+an omitted `</head>` or table-section end tag is understood.
 
 **What kind of card an `.eml` becomes** comes from its own headers: a message marked
 unsent by its mail client (`X-Unsent`, Thunderbird or Apple Mail draft markers) is a
