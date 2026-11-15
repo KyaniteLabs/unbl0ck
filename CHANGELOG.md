@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Full text shows the whole chat message or live prompt (#32).** Polling still carries a 480-character tail, now labelled; opening Full text reads the complete record (up to 20,000 characters) for that version via `GET /source/text`. Stale, missing and unreadable sources report errors with retry; password prompts are never expanded and nothing is sent to a model.
+
 ## 0.5.1 (2026-11-14)
 
 - **Interrupted Ask responses are recoverable.** Retry polling the same completed job without repeating model work. Completed-result retention is bounded and follows completion order, so a slow job is not immediately evicted by newer requests.

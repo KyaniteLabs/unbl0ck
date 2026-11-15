@@ -976,6 +976,26 @@ def _excerpt(text: str, n: int = 480) -> str:
     return text if len(text) <= n else "…" + text[-(n - 1) :]
 
 
+EXCERPT_CHARS = 480
+FULL_TEXT_LIMIT = 20_000  # most characters one on-demand full-text read returns
+
+
+def _is_excerpted(text: str, n: int = EXCERPT_CHARS) -> bool:
+    """True when ``_excerpt`` would drop part of *text*."""
+    return len(re.sub(r"\s+", " ", (text or "")).strip()) > n
+
+
+def _full_text(text: str) -> tuple[str, bool]:
+    """The permitted full text of one record: original newlines, bounded; second value is truncation."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return (text, False) if len(text) <= FULL_TEXT_LIMIT else (text[:FULL_TEXT_LIMIT], True)
+
+
+def _full_fields(text: str) -> dict[str, Any]:
+    full, cut = _full_text(text)
+    return {"text": full, "text_cut": cut}
+
+
 def _excerpt_head(text: str, n: int = 480) -> str:
     text = re.sub(r"\s+", " ", (text or "")).strip()
     return text if len(text) <= n else text[: n - 1] + "…"
@@ -1322,6 +1342,8 @@ def chat_items(
     home: Path | None = None,
     days: int = CHAT_WINDOW_DAYS,
     errors: list[str] | None = None,
+    *,
+    full: bool = False,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
     last visible turn is the bot asking you something you have not answered."""
@@ -1452,6 +1474,8 @@ def chat_items(
                         "chat_with": _chat_with(platform, display_name, me),
                         "title": f"{_bot_name(home, profile)} is asking you",
                         "ask": _excerpt(content),
+                        "ask_truncated": _is_excerpted(content),
+                        **(_full_fields(content) if full else {}),
                         "why": f"Last turn in this {where_} is a question for you",
                         "owner": profile,
                         "priority": 0,
@@ -1730,7 +1754,7 @@ def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitSt
 
 
 def wait_items(
-    home: Path | None = None, errors: list[str] | None = None
+    home: Path | None = None, errors: list[str] | None = None, *, full: bool = False
 ) -> list[dict[str, Any]]:
     """Open live prompts. A wait whose process is gone is deleted, not shown."""
     home = home or hermes_home()
@@ -1766,6 +1790,13 @@ def wait_items(
                 "title": f"{who} {_WAIT_KINDS.get(kind, 'is waiting on you')}",
                 "ask": _excerpt(str(rec.get("prompt") or ""))
                 or "(prompt text withheld by Hermes)",
+                # A password prompt is never expanded: its excerpt is all the queue ever shows.
+                "ask_truncated": kind != "sudo" and _is_excerpted(str(rec.get("prompt") or "")),
+                **(
+                    _full_fields(str(rec.get("prompt") or ""))
+                    if full and kind != "sudo"
+                    else {}
+                ),
                 "why": "Its run is paused until you answer"
                 + (f" in {_platform_label(platform)}." if platform else "."),
                 "owner": profile,
@@ -1774,6 +1805,44 @@ def wait_items(
             }
         )
     return items
+
+
+class SourceUnavailable(RuntimeError):
+    """The source could not be read, so the record's absence is unknown."""
+
+
+def source_text(item_id: str, version: str) -> dict[str, Any]:
+    """Full permitted text of one current chat or live-prompt record, read on demand.
+
+    Raises ValueError (not a chat/prompt id), LookupError (record gone), StaleAnswer
+    (version changed), SourceUnavailable (source unreadable) or PermissionError (password
+    prompt). The text is returned to the human only; it never feeds a model.
+    """
+    source = item_id.split(":", 1)[0] if isinstance(item_id, str) else ""
+    if source not in ("chat", "prompt") or ":" not in item_id:
+        raise ValueError("full text is available for chat and live-prompt items only")
+    errors: list[str] = []
+    try:
+        items = (chat_items if source == "chat" else wait_items)(
+            hermes_home(), errors=errors, full=True
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise SourceUnavailable(f"{source} source unreadable: {type(exc).__name__}") from exc
+    item = next((i for i in items if i.get("id") == item_id), None)
+    if item is None:
+        if errors:
+            raise SourceUnavailable(f"{source} source could not be read; retry")
+        raise LookupError(f"{source} item is no longer available")
+    if item.get("kind") == "sudo":
+        raise PermissionError("password prompts are never expanded")
+    if item.get("version") != version:
+        raise StaleAnswer("item changed; refresh the queue")
+    return {
+        "id": item_id,
+        "version": version,
+        "text": item.get("text") or item.get("ask") or "",
+        "truncated": bool(item.get("text_cut")),
+    }
 
 
 # --- things waiting outside Hermes ----------------------------------------------------------

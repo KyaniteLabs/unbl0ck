@@ -916,6 +916,8 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const isPrompt = item.source === 'prompt'
   const isPairing = item.source === 'pairing'
   const isOutside = item.source === 'outside'
+  // Chats and live prompts poll only a 480-character tail; the whole record is fetched on demand.
+  const hasFull = isOutside || (item.ask_truncated === true && (item.source === 'chat' || item.source === 'prompt'))
   const answerStale = isKanban && !!answer.trim() && answerVersion !== item.version
   const askStale = askVersion !== item.version
   const platformName = platformLabel(item.platform)
@@ -937,16 +939,17 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     return () => { alive = false }
   }, [item.version, detailOpen])
   useEffect(() => {
-    if (!isOutside || !open || outsideText?.__version === item.version) return
+    if (!hasFull || !open || outsideText?.__version === item.version) return
     let alive = true
     setOutsideTextLoading(true)
     setOutsideTextError('')
-    ctx.rest(`/outside/text?id=${encodeURIComponent(item.id)}&version=${encodeURIComponent(item.version)}`)
+    const id = encodeURIComponent(item.id), version = encodeURIComponent(item.version)
+    ctx.rest(isOutside ? `/outside/text?id=${id}&version=${version}` : `/source/text?id=${id}&version=${version}`)
       .then(d => { if (alive) setOutsideText({ text: d.text, __version: item.version }) })
       .catch(e => { if (alive) setOutsideTextError(String(e?.message || e)) })
       .finally(() => { if (alive) setOutsideTextLoading(false) })
     return () => { alive = false }
-  }, [item.id, item.version, isOutside, open, outsideTextRetry])
+  }, [item.id, item.version, hasFull, open, outsideTextRetry])
   useEffect(() => {
     if (askEnd.current) askEnd.current.scrollIntoView({ block: 'nearest' })
   }, [askMsgs, askBusy])
@@ -1043,7 +1046,10 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
   const outsideBody = outsideText?.__version === item.version ? outsideText.text : item.ask
-  const fullTextStatus = open && isOutside
+  const excerptNote = hasFull && !isOutside && outsideText?.__version !== item.version
+    ? jsx('div', { className: 'ub-hint', role: 'note', children: 'Showing only the last 480 characters. Open Full text to read the whole message.' })
+    : null
+  const fullTextStatus = open && hasFull
     ? outsideTextLoading
       ? jsx('div', { className: 'ub-pending', role: 'status', children: '◇ LOADING FULL TEXT' })
       : outsideTextError
@@ -1345,15 +1351,17 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
           ? [
               jsx('p', { className: 'ub-bluf', children: item.bluf }),
               item.bluf_why ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.bluf_why] }) : null,
-              open ? jsx('p', { className: 'ub-ask open', children: isOutside ? outsideBody : item.ask }) : null,
+              open ? jsx('p', { className: 'ub-ask open', children: hasFull ? outsideBody : item.ask }) : null,
               fullTextStatus,
+              excerptNote,
               jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' })
             ]
           : [
               item.bluf_pending ? jsx('div', { className: 'ub-pending', children: '◇ SUMMARIZING' }) : null,
               item.bluf_status ? jsx('div', { className: 'ub-hint', role: 'note', children: item.bluf_status === 'waiting' ? 'Summary waiting for capacity; showing original text.' : 'Summary unavailable; showing original text.' }) : null,
-              jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: isOutside ? (open ? outsideBody : item.ask) : item.ask }),
+              jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: hasFull ? (open ? outsideBody : item.ask) : item.ask }),
               fullTextStatus,
+              excerptNote,
               jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' }),
               item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null
             ]),

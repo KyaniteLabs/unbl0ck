@@ -50,6 +50,7 @@ control and are not a standalone public API.
 | `GET /queue` | Items, counts, feature flags and source errors; partial failure is visible in the response |
 | `GET /card` | Kanban context by validated ID or board/task reference |
 | `GET /outside/text` | Current bounded outside text; matching item version required |
+| `GET /source/text` | Full text of one current chat or live-prompt record, read on demand; version required (409 if stale, 404 if gone, 503 if the source cannot be read, 403 for password prompts) |
 | `POST /card/ask` | Validated question history; returns a job ID immediately or an explicit admission error |
 | `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502 |
 | `GET /card/ask/{job}?poll=true` | Same job, with terminal model failures encoded as `{ok:false,detail}` for the client |

@@ -3,6 +3,7 @@
 GET  /queue                  the queue (Kanban, outside items, chats, live prompts, pairing requests)
 GET  /card?id=               read-only context for one Kanban card
 GET  /outside/text?id=&version=  full text for one current outside item, fetched on demand
+GET  /source/text?id=&version=   full text for one current chat or live-prompt item, fetched on demand
 GET  /card/ask/{job}         poll a running Ask
 POST /card/ask               ask the configured model about one card (multi-turn)
 POST /kanban/answer          {board, task_id, text, release, version}: comment as the principal, optionally unblock
@@ -263,6 +264,25 @@ def outside_text(id: str = "", version: str = ""):
     if item.get("version") != version:
         raise HTTPException(status_code=409, detail="outside item changed; refresh the queue")
     return {"id": id, "version": version, "text": item.get("text") or "(No text supplied.)"}
+
+
+@router.get("/source/text")
+def source_text(id: str = "", version: str = ""):
+    n = _needs()
+    if not id or len(id) > MAX_ID or len(version) > MAX_ID:
+        raise HTTPException(status_code=400, detail="invalid item reference")
+    try:
+        return n.source_text(id, version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except n.StaleAnswer as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except n.SourceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @router.post("/card/ask")

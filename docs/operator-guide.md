@@ -37,6 +37,12 @@ if the card changed, review it, clear the old draft, then write a current answer
 queue polling does not fetch every card's detail. Failed Context and full-text requests
 have their own retry controls. A failed request does not imply that its content is empty.
 
+Queue polling carries only the last 480 characters of a chat message or live prompt,
+marked with a note. **Full text** then reads the whole record (up to 20,000 characters)
+from its source for that item version, and never sends it to a model. A changed or
+vanished record, or an unreadable source, reports an error with Retry and leaves the
+excerpt labelled as an excerpt. Password prompts are never expanded.
+
 **TL;DR** starts a read-only model job. **Use as answer** copies a suggestion into the
 answer box; the human still submits it. **Discuss in chat** asks the host composer to
 create a draft. The original card stays unchanged by these actions.
