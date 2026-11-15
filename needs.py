@@ -6006,19 +6006,15 @@ def _ask_redact_bare_credential_values(text: str) -> str:
     return _ASK_BARE_CREDENTIAL_VALUE.sub(replace, text)
 
 
-# An explicit key (``? key`` then ``: value``) arrives as one folded line, so ``\s*`` spans it.
 _ASK_YAML_FIELD = re.compile(
     r"^(?P<indent>[ \t]*)(?P<dash>-\s*)?(?P<explicit>\?[ \t]*)?(?P<quote>[\"']?)"
     r"(?P<key>[A-Za-z0-9_.-]+)(?P=quote)\s*:\s*(?P<value>[^\r\n]*)"
 )
-_ASK_YAML_EXPLICIT_KEY = re.compile(r"([ \t]*(?:-[ \t]+)?)\?[ \t]*[^\r\n]*\r?\n\Z")
+_ASK_YAML_EXPLICIT_KEY = re.compile(r"(?P<prefix>[ \t]*(?:-[ \t]+)?)\?(?:[ \t]+|\Z)(?P<key>.*)")
+_ASK_YAML_COMMENT = re.compile(r"(?:^|[ \t])#.*")
 _ASK_YAML_BLOCK = re.compile(
     r"^(?P<style>[|>](?:[+-][1-9]?|[1-9][+-]?)?)(?P<tail>[ \t]*(?:#.*)?)$"
 )
-
-
-def _ask_yaml_field(line: str) -> re.Match[str] | None:
-    return _ASK_YAML_FIELD.match(line.rstrip("\r\n"))
 
 
 def _ask_yaml_indent(match: re.Match[str]) -> int:
@@ -6026,40 +6022,17 @@ def _ask_yaml_indent(match: re.Match[str]) -> int:
 
 
 def _ask_yaml_scalar_end(
-    lines: list[str],
-    index: int,
-    indent: int,
-    explicit_indent: int | None = None,
+    lines: list[str], index: int, indent: int, explicit_indent: int | None = None, plain: bool = False
 ) -> tuple[int, str]:
-    end = index + 1
-    scalar_indent = explicit_indent
-    first_value = ""
-    while end < len(lines):
-        body = lines[end].rstrip("\r\n")
-        if not body.strip():
-            next_line = end + 1
-            while next_line < len(lines) and not lines[next_line].strip():
-                next_line += 1
-            if next_line >= len(lines):
+    """End of the block nested under ``lines[index]`` (blank lines, and comments when *plain*,
+    included) and its first value."""
+    end, first_value = index + 1, ""
+    for at in range(index + 1, len(lines)):
+        body = _ASK_YAML_COMMENT.sub("", lines[at].rstrip("\r\n")) if plain else lines[at].rstrip("\r\n")
+        if body.strip():
+            if len(body) - len(body.lstrip(" \t")) < (explicit_indent or indent + 1):
                 break
-            next_body = lines[next_line].rstrip("\r\n")
-            next_indent = len(next_body) - len(next_body.lstrip(" \t"))
-            if next_indent <= indent or (
-                scalar_indent is not None and next_indent < scalar_indent
-            ):
-                break
-            end += 1
-            continue
-        content_indent = len(body) - len(body.lstrip(" \t"))
-        if content_indent <= indent or (
-            scalar_indent is not None and content_indent < scalar_indent
-        ):
-            break
-        if scalar_indent is None:
-            scalar_indent = indent + 1
-        if not first_value:
-            first_value = body.strip()
-        end += 1
+            end, first_value = at + 1, first_value or body.strip()
     return end, first_value
 
 
@@ -6091,54 +6064,57 @@ def _ask_flow_secret_values(text: str) -> str:
     return value_first.sub(last, name_first.sub(first, text))
 
 
-def _ask_redact_yaml(text: str) -> str:
+def _ask_yaml_explicit_keys(raw: list[str]) -> tuple[list[str], list[str]]:
+    """Fold each one-word explicit key (``? key``, its comments and continuation lines, then
+    ``: value``) into one entry; return the entries and the ``key: value`` line each matches as."""
     lines: list[str] = []
-    for line in _ask_flow_secret_values(text).splitlines(keepends=True):
-        key = _ASK_YAML_EXPLICIT_KEY.match(lines[-1]) if lines else None
-        if key and not line[: key.end(1)].strip() and line[key.end(1) :].startswith(":"):
-            lines[-1] += line
-        else:
-            lines.append(line)
-    fields = [_ask_yaml_field(line) for line in lines]
+    views: list[str] = []
+    i = 0
+    while i < len(raw):
+        head = _ASK_YAML_EXPLICIT_KEY.match(raw[i].rstrip("\r\n"))
+        if head:
+            col, words, j = len(head["prefix"]), _ASK_YAML_COMMENT.sub("", head["key"]).split(), i + 1
+            while j < len(raw):
+                body = raw[j].rstrip("\r\n")
+                text = _ASK_YAML_COMMENT.sub("", body)
+                if text.strip() and len(text) - len(text.lstrip(" \t")) <= col:
+                    break
+                words += text.split()
+                j += 1
+            value = raw[j][col:] if j < len(raw) and not raw[j][:col].strip() else ""
+            if len(words) == 1 and re.match(r":(?:[ \t]|$)", value):
+                lines.append("".join(raw[i : j + 1]))
+                views.append(f"{head['prefix']}? {words[0]}{value}")
+                i = j + 1
+                continue
+        lines.append(raw[i])
+        views.append(raw[i])
+        i += 1
+    return lines, views
+
+
+def _ask_redact_yaml(text: str) -> str:
+    lines, views = _ask_yaml_explicit_keys(_ask_flow_secret_values(text).splitlines(keepends=True))
+    fields = [_ASK_YAML_FIELD.match(view.rstrip("\r\n")) for view in views]
     paired_values: dict[int, str] = {}
     for index, field in enumerate(fields):
-        if field is None or field.group("key").casefold() not in {"name", "key"}:
-            continue
-        name = field.group("value").strip().strip("\"'")
+        name = field["value"].strip().strip("\"'") if field and field["key"].casefold() in {"name", "key"} else ""
         if not _ask_names_credential(name):
             continue
-        base_indent = _ask_yaml_indent(field)
-        paired = False
-        for direction in (1, -1):
-            for distance in range(1, 9):
-                candidate_index = index + direction * distance
-                if not 0 <= candidate_index < len(fields):
-                    break
-                candidate = fields[candidate_index]
-                if candidate is None:
-                    continue
-                candidate_key = candidate.group("key").casefold()
-                candidate_indent = _ask_yaml_indent(candidate)
-                if candidate_key in {"name", "key"} and candidate_indent <= base_indent:
-                    break
-                if candidate_key in {"value", "val", "default"}:
-                    paired_values[candidate_index] = name
-                    paired = True
-                    break
-                if candidate.group("dash") and candidate_indent <= base_indent:
-                    break
-            if paired:
+        # The nearest value field within eight lines, unless another name or list item comes first.
+        for step in (1, -1):
+            near = (c for c in range(index + step, index + 9 * step, step) if 0 <= c < len(fields) and fields[c])
+            stop = next((c for c in near if fields[c]["key"].casefold() in {"value", "val", "default"} or (
+                _ask_yaml_indent(fields[c]) <= _ask_yaml_indent(field) and (fields[c]["dash"] or fields[c]["key"].casefold() in {"name", "key"}))), None)
+            if stop is not None and fields[stop]["key"].casefold() in {"value", "val", "default"}:
+                paired_values[stop] = name
                 break
 
     out: list[str] = []
     index = 0
     while index < len(lines):
         field = fields[index]
-        if field is None:
-            out.append(lines[index])
-            index += 1
-            continue
-        key, raw_value = field.group("key"), field.group("value")
+        key, raw_value = (field["key"], field["value"]) if field else ("", "")
         paired_name = paired_values.get(index)
         secret_name = key if paired_name is None else paired_name
         direct_secret = _ask_names_credential(key)
@@ -6155,21 +6131,23 @@ def _ask_redact_yaml(text: str) -> str:
             index += 1
             continue
         scalar = _ASK_YAML_BLOCK.fullmatch(raw_value.strip())
-        collection = raw_value.strip() == ""
-        end, scalar_value = index + 1, ""
+        value = _ASK_YAML_COMMENT.sub("", raw_value).strip()  # a comment alone leaves the value below
+        collection = value == ""
+        end = index + 1
         if scalar or collection:
             explicit = re.search(r"[1-9]", scalar.group("style")) if scalar else None
             explicit_indent = _ask_yaml_indent(field) + int(explicit.group()) if explicit else None
-            end, scalar_value = _ask_yaml_scalar_end(lines, index, _ask_yaml_indent(field), explicit_indent)
+            end, value = _ask_yaml_scalar_end(lines, index, _ask_yaml_indent(field), explicit_indent, collection)
             collection = collection and end > index + 1
-        if (field.group("quote") and paired_name is None and not scalar and not collection) or not (
-            _ask_is_secret_key(secret_name, scalar_value if scalar or collection else raw_value)
+        if (field.group("quote") and not field.group("explicit") and paired_name is None and not scalar and not collection) or not (
+            _ask_is_secret_key(secret_name, value)
         ):
             out.extend(lines[index:end])
             index = end
             continue
         body = lines[index].rstrip("\r\n")
-        head, newline = body[: field.start("value")], lines[index][len(body) :]
+        cut = field.start("value") + len(lines[index]) - len(views[index])  # entry and view share the value line
+        head, newline = body[:cut], lines[index][len(body) :]
         tail = scalar.group("tail") if scalar else ""
         start = len(raw_value) - len(raw_value.lstrip())
         if not scalar and not collection and raw_value[start : start + 1] in {"[", "{"}:
