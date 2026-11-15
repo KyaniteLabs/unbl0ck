@@ -1,5 +1,7 @@
 """Round-7 lane F: faults evicted from the live-prompt retry list, and legacy journal entries."""
 
+import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -47,6 +49,20 @@ class EvictedClearsAreRetried(WaitCase):
         needs.wait_items(self.home, errors=errors)
         counts = [int(e.split()[1]) for e in errors if "no longer retried" in e]
         self.assertEqual(sum(counts), 10, errors)
+
+
+class LegacyLostEntriesAreReported(WaitCase):
+    def test_a_live_older_agent_lost_count_is_reported(self):
+        """R7-013: an older agent still running wrote its dropped faults as one "+lost" count;
+        the reader must still report them while that agent lives."""
+        pid = os.getppid()
+        needs._fault_path(self.home).parent.mkdir(parents=True, exist_ok=True)
+        needs._fault_path(self.home).write_text(
+            json.dumps({"+lost": {"count": 3, "pid": pid, "proc_start": needs._proc_start(pid)}})
+        )
+        errors: list[str] = []
+        needs.wait_items(self.home, errors=errors)
+        self.assertTrue(any(e.startswith("prompt: 3 ") for e in errors), errors)
 
 
 if __name__ == "__main__":

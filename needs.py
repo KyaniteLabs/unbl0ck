@@ -2823,7 +2823,10 @@ def _other_process_faults(home: Path, errors: list[str]) -> None:
         if not _alive(pid, entry.get("proc_start")):
             _journal_fault(home, rid, None)  # its prompts died with it
             continue
-        if _SAFE_ID.match(rid):
+        if rid == "+lost":  # an agent from before round 6 counts its dropped faults here
+            n = max(1, int(_num(entry.get("count"))))  # a malformed count still lost something
+            errors.append(f"prompt: {n} live prompts could not be recorded or cleared (reported by the agent)")
+        elif _SAFE_ID.match(rid):
             verb = "record" if entry.get("what") == "record" else "clear"
             errors.append(f"prompt: {rid}: could not {verb} a live prompt (reported by the agent)")
 
