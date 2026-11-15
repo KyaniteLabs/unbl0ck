@@ -498,9 +498,9 @@ class DesktopLateDismissals(unittest.TestCase):
 undo=[];
 const mk=v=>({source:'outside',origin:'filed',kind:'draft',id:'outside:filed:1',version:v,title:'T'+v,ask:'a',act_where:'w'});
 let releaseFirst;
-const first=new Promise(res=>{releaseFirst=()=>res({ok:true,done:true,token:'tok-v1'})});
+const first=new Promise(res=>{releaseFirst=()=>res({ok:true,done:true,token:'tok-v1',order:1})});
 const ctx1={rest:()=>first};
-const ctx2={rest:async()=>({ok:true,done:true,token:'tok-v2'})};
+const ctx2={rest:async()=>({ok:true,done:true,token:'tok-v2',order:2})};
 (async()=>{
  cursor=0;state=[];
  const p1=find(Item({ctx:ctx1,item:mk('v1'),n:1,refresh,askEnabled:false}),'Done').onClick();

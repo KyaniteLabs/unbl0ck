@@ -281,7 +281,7 @@ function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.cl
 (async () => {
   for (const [source, id] of [['chat', 'chat:p:s1'], ['prompt', 'prompt:0123456789abcdef']]) {
     state = []; hooks = []; requests.length = 0; mode = 'ok';
-    const item = {id, version: '9', source, title: 't', ask: '…tail of it', ask_truncated: true, since: 1, profile: 'p', platform: 'cli'};
+    const item = {id, version: '9', source, title: 't', ask: '…tail of it', ask_truncated: true, ask_cut: true, since: 1, profile: 'p', platform: 'cli'};
     let tree = render(item);
     assert.ok(text(tree).includes('last 480 characters'), 'excerpt must be labelled while closed');
     assert.equal(requests.length, 0, 'polling view must not fetch');
@@ -296,7 +296,7 @@ function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.cl
   }
   // failure and retry
   state = []; hooks = []; requests.length = 0; mode = 'fail';
-  const item = {id: 'chat:p:s1', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
+  const item = {id: 'chat:p:s1', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, ask_cut: true, since: 1};
   let tree = render(item); openFull(tree); tree = render(item); await flush(); tree = render(item);
   assert.ok(text(tree).includes('Full text could not load: offline'));
   assert.ok(text(tree).includes('last 480 characters'), 'still labelled as an excerpt after failure');
@@ -306,7 +306,7 @@ function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.cl
   assert.ok(text(tree).includes('FIRST sentence.'));
   // a message over the limit keeps a visible warning after the load succeeds
   state = []; hooks = []; requests.length = 0; mode = 'cut';
-  const long = {id: 'chat:p:s3', version: '1', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
+  const long = {id: 'chat:p:s3', version: '1', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, ask_cut: true, since: 1};
   tree = render(long); openFull(tree); tree = render(long); await flush(); tree = render(long);
   assert.ok(text(tree).includes('FIRST sentence.'));
   assert.ok(text(tree).includes('longer than 20,000 characters'), 'limit warning must show');
@@ -316,7 +316,7 @@ function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.cl
   assert.ok(!text(tree).includes('longer than 20,000 characters'), 'no warning when complete');
   // 01-097: an older response arriving after a newer request must not overwrite it
   state = []; hooks = []; requests.length = 0; held.length = 0; mode = 'held';
-  const v9 = {id: 'chat:p:s9', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
+  const v9 = {id: 'chat:p:s9', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, ask_cut: true, since: 1};
   const v10 = {...v9, version: '10'};
   tree = render(v9); openFull(tree); tree = render(v9); await flush();
   tree = render(v10); await flush();
@@ -339,6 +339,15 @@ function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.cl
   const short = {id: 'chat:p:s2', version: '1', source: 'chat', title: 't', ask: 'short?', since: 1};
   tree = render(short); openFull(tree); tree = render(short); await flush();
   assert.equal(requests.length, 0);
+  // password prompts, pairing requests and short chats keep the local expand control and never fetch
+  for (const extra of [{source: 'prompt', id: 'prompt:0123456789abcdef', kind: 'sudo', ask: 'Password:'}, {source: 'pairing', id: 'pairing:x', ask: 'pair?'}, {source: 'chat', id: 'chat:p:s5', ask: 'short?'}]) {
+    state = []; hooks = []; requests.length = 0;
+    const it = {version: '1', title: 't', since: 1, profile: 'p', platform: 'cli', ...extra};
+    tree = render(it);
+    assert.ok(all(tree).some(x => x?.type === 'button' && x.props.className === 'ub-full'), extra.source + ' keeps the local expand control');
+    openFull(tree); tree = render(it); await flush();
+    assert.equal(requests.length, 0, extra.source + ' never fetches a larger record');
+  }
 })().catch(e => { console.error(e); process.exitCode = 1 });
 """
 

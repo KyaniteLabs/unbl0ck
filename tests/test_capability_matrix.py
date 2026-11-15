@@ -301,7 +301,8 @@ class DocsStatements(unittest.TestCase):
         self.assertIn("failed", self.guide)
 
     def test_context_definition_and_password_prompts(self):
-        self.assertIn("password prompts never offer Full text", self.guide)
+        self.assertNotIn("never offer Full text", self.guide)
+        self.assertIn("password prompts and pairing requests never fetch anything", " ".join(self.guide.split()))
 
     def test_pack_says_when_a_source_could_not_be_read(self):
         # Bug: a queue built with unreadable sources exported as an empty, complete pack, so a
