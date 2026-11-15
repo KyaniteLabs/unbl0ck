@@ -907,9 +907,9 @@ function readAnswerDraft(id) {
   for (const [key, draft] of answerDrafts) if (draft.at < cutoff) answerDrafts.delete(key)
   return answerDrafts.get(id)
 }
-function rememberAnswerDraft(id, text, version, ask) {
+function rememberAnswerDraft(id, text, stamp) {
   answerDrafts.delete(id)
-  if (text.trim()) answerDrafts.set(id, { text, version, ask, at: Date.now() })
+  if (text.trim()) answerDrafts.set(id, { text, stamp, at: Date.now() })
   while (answerDrafts.size > 100) answerDrafts.delete(answerDrafts.keys().next().value)
 }
 
@@ -930,7 +930,7 @@ function readAskSession(id) {
   return askSessions.get(id)
 }
 function updateAskSession(id, patch) {
-  const cur = readAskSession(id) || { msgs: [], version: null, job: null, running: false, error: '', gen: 0 }
+  const cur = readAskSession(id) || { msgs: [], stamp: null, job: null, running: false, error: '', gen: 0 }
   askSessions.delete(id)
   askSessions.set(id, { ...cur, ...patch, at: Date.now() })
   while (askSessions.size > 100) askSessions.delete(askSessions.keys().next().value)
@@ -959,11 +959,12 @@ function endAskScope(scope) {
   for (const key of [...answerDrafts.keys()]) if (key.startsWith(`${scope}|`)) answerDrafts.delete(key)
   for (const key of [...askLatest.keys()]) if (key.startsWith(`${scope}|`)) askLatest.delete(key)
 }
-// What an Ask answer was written from: the block version plus the card text the model reads. The
-// version alone does not move when the title, the question, the description or a comment changes
-// (body_sig and comments_sig are digests of those). JSON, not a delimiter: a field that contains
-// the delimiter would move text between fields and look unchanged.
-function askContext(item) {
+// What an answer draft, an Ask conversation, its request id and job, and the Context and Full text
+// caches were made from: the block version plus the card text. The version alone does not move when
+// the title, the question, the description or a comment changes (body_sig and comments_sig are
+// digests of those). JSON, not a delimiter: a field that contains the delimiter would move text
+// between fields and look unchanged. Everything bound to a card compares this one stamp.
+function cardStamp(item) {
   return JSON.stringify([item.version, item.title, item.ask, item.owner, item.comments_sig, item.body_sig].map(v => String(v ?? '')))
 }
 // The 100-conversation cap does not bound one conversation, and every update refreshes its expiry:
@@ -986,19 +987,15 @@ function boundAsk(msgs) {
 
 function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false, scope = '' }) {
   const askId = askKey(scope, item.id)
-  const ctxNow = askContext(item)
+  const ctxNow = cardStamp(item)
   const savedDraft = readAnswerDraft(askId)
   const savedAsk = readAskSession(askId)
   const [answer, setAnswer] = useState(savedDraft?.text || '')
-  const [answerVersion, setAnswerVersion] = useState(savedDraft?.version ?? item.version)
-  // The question text the draft answers: an edit in place keeps the block version, so the text
-  // is part of what the draft is bound to.
-  const [answerAsk, setAnswerAsk] = useState(savedDraft?.ask ?? item.ask)
-  const updateAnswer = (text, version, ask = item.ask) => {
-    rememberAnswerDraft(askId, text, version, ask)
+  const [answerStamp, setAnswerStamp] = useState(savedDraft ? savedDraft.stamp : ctxNow)
+  const updateAnswer = (text, stamp = ctxNow) => {
+    rememberAnswerDraft(askId, text, stamp)
     setAnswer(text)
-    setAnswerVersion(version)
-    setAnswerAsk(ask)
+    setAnswerStamp(stamp)
   }
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState(false)
@@ -1013,8 +1010,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
   const [outsideTextRetry, setOutsideTextRetry] = useState(0)
   const [askOpen, setAskOpen] = useState(!!(savedAsk && (savedAsk.msgs.length || savedAsk.running)))
   const [askMsgs, setAskMsgs] = useState(savedAsk?.msgs || [])
-  const [askVersion, setAskVersion] = useState(savedAsk?.version ?? item.version)
-  const [askCtx, setAskCtx] = useState(savedAsk?.ctx ?? ctxNow)
+  const [askStamp, setAskStamp] = useState(savedAsk ? savedAsk.stamp : ctxNow)
   const [askTrimmed, setAskTrimmed] = useState(!!savedAsk?.trimmed)
   const [askInput, setAskInput] = useState('')
   const [askBusy, setAskBusy] = useState(!!savedAsk?.running)
@@ -1041,8 +1037,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
   const fullButton = hasFull || !(isPairing || item.kind === 'sudo')
     ? jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' })
     : null
-  const answerStale = isKanban && !!answer.trim() && (answerVersion !== item.version || answerAsk !== item.ask)
-  const askStale = askVersion !== item.version || askCtx !== ctxNow
+  const answerStale = isKanban && !!answer.trim() && answerStamp !== ctxNow
+  const askStale = askStamp !== ctxNow
   const platformName = platformLabel(item.platform)
   // Desktop can open its own sessions (and CLI/TUI ones, which share the store). A Telegram or
   // Discord chat is answered in Telegram or Discord.
@@ -1086,7 +1082,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       clearInterval(timer)
       setAskBusy(false)
       if (s) {
-        setAskMsgs(s.msgs); setAskVersion(s.version ?? item.version); setAskCtx(s.ctx ?? ctxNow)
+        setAskMsgs(s.msgs); setAskStamp(s.stamp)
         setAskError(s.error || ''); setAskJob(s.job || null); setAskTrimmed(!!s.trimmed); setAskReq(s.req ?? null)
       } else {
         // The conversation left session memory while its request was outstanding: say so.
@@ -1102,7 +1098,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     const timer = setInterval(() => {
       if (readAskSession(askId)) return
       setAskMsgs([]); setAskError(''); setAskJob(null); setAskReq(null); setAskTrimmed(false)
-      setAskVersion(item.version); setAskCtx(ctxNow); setAskOpen(false)
+      setAskStamp(ctxNow); setAskOpen(false)
     }, 15000)
     return () => clearInterval(timer)
   }, [askBusy, askId, askMsgs.length, askError])
@@ -1167,7 +1163,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     const result = await run(
       () => ctx.rest('/kanban/answer', {
         method: 'POST',
-        body: { board: item.board, task_id: item.task_id, text: answer, release, version: answerVersion }
+        body: { board: item.board, task_id: item.task_id, text: answer, release, version: item.version }
       }),
       r => (triage
         ? `Answered ${item.task_id} (triage)`
@@ -1177,7 +1173,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       'ok',
       // A source fault can remount this card and accept a newer draft while this
       // request is in flight. Its late completion owns only the submitted record.
-      r => { if (r && answerDrafts.get(askId) === submittedDraft) updateAnswer('', item.version) }
+      r => { if (r && answerDrafts.get(askId) === submittedDraft) updateAnswer('') }
     )
     return result
   }
@@ -1258,13 +1254,14 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     if (!built.length || built[built.length - 1].role !== 'user') return
     const { msgs: next, dropped } = boundAsk(built)
     const trimmed = (askStale ? false : askTrimmed) || dropped > 0
-    const before = { msgs: askMsgs, version: askVersion, ctx: askCtx, trimmed: askTrimmed }
-    // One id per ask, reused by Retry, so a lost response never starts a second model call.
-    const reqId = retry && !askStale && askReq?.version === item.version ? askReq.id : newAskRequestId()
-    setAskReq({ id: reqId, version: item.version })
+    const before = { msgs: askMsgs, stamp: askStamp, trimmed: askTrimmed }
+    // One id per ask, reused by Retry, so a lost response never starts a second model call. The id
+    // and the job belong to the stamp the conversation was asked under: a stale one is never reused.
+    const follow = retry && !askStale
+    const reqId = follow && askReq ? askReq : newAskRequestId()
+    setAskReq(reqId)
     setAskMsgs(next)
-    setAskVersion(item.version)
-    setAskCtx(ctxNow)
+    setAskStamp(ctxNow)
     setAskTrimmed(trimmed)
     if (!retry && !preset) setAskInput('')
     setAskBusy(true)
@@ -1282,13 +1279,12 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     const abandon = () => {
       if (mine()) return false
       if (readAskSession(askId) === undefined && !askClosed.has(scope) && askLatest.get(askId) === gen) {
-        updateAskSession(askId, { msgs: next, version: item.version, ctx: ctxNow, trimmed, running: false, error: ASK_DROPPED, job: null, gen })
+        updateAskSession(askId, { msgs: next, stamp: ctxNow, trimmed, running: false, error: ASK_DROPPED, job: null, gen })
         setAskBusy(false); setAskError(ASK_DROPPED); setAskJob(null)
       }
       return true
     }
-    updateAskSession(askId, { msgs: next, version: item.version, ctx: ctxNow, trimmed, running: true, error: '', gen, req: { id: reqId, version: item.version },
-      job: retry && !askStale && askJob?.version === item.version ? askJob : null })
+    updateAskSession(askId, { msgs: next, stamp: ctxNow, trimmed, running: true, error: '', gen, req: reqId, job: follow ? askJob : null })
     let admitted = false
     try {
       // The model can outlast the desktop's 30 s request limit: poll the background job. The
@@ -1299,8 +1295,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       const tooSlow = () => new Error('The model took too long (over 150 s)')
       // Keep displayed history intact while respecting the API's 50-message transport
       // limit. The server applies the configured model history window within that bound.
-      let r = retry && !askStale && askJob?.version === item.version
-        ? { pending: true, job: askJob.id }
+      let r = follow && askJob
+        ? { pending: true, job: askJob }
         : await ctx.rest('/card/ask', {
             method: 'POST',
             body: { id: item.id, messages: next.slice(-50), version: item.version, request_id: reqId }
@@ -1310,8 +1306,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
         // A superseded request (evicted session, newer question) stops polling at once and
         // never records its job id, so Retry cannot follow it into a newer conversation.
         if (abandon()) return
-        updateAskSession(askId, { job: { id: r.job, version: item.version } })
-        setAskJob({ id: r.job, version: item.version })
+        updateAskSession(askId, { job: r.job })
+        setAskJob(r.job)
         const left = ASK_DEADLINE_MS - (Date.now() - t0)
         if (left <= 0) throw tooSlow()
         await new Promise(res => setTimeout(res, Math.min(1500, left)))
@@ -1359,12 +1355,11 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
         // The server refused the request outright: nothing was stored, so the refused message must
         // not stay in the history (it would be resent and refused again) and the text is restored.
         setAskMsgs(before.msgs)
-        setAskVersion(before.version)
-        setAskCtx(before.ctx)
+        setAskStamp(before.stamp)
         setAskTrimmed(before.trimmed)
         dropReq()
         if (!retry && !preset) setAskInput(q)
-        updateAskSession(askId, { msgs: before.msgs, version: before.version, ctx: before.ctx, trimmed: before.trimmed })
+        updateAskSession(askId, { msgs: before.msgs, stamp: before.stamp, trimmed: before.trimmed })
       }
       // An unknown job is gone from the server: it restarted, or the result outlived its
       // 15-minute retention. Either way the work cannot be fetched again.
@@ -1379,7 +1374,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
   const lastSuggestion = lastAssistant >= 0 ? replyPlain(askMsgs[lastAssistant].content) : ''
   const useAsAnswer = () => {
     if (!lastSuggestion || askStale || answerStale) return
-    updateAnswer(answer.trim() ? `${answer.trim()}\n\n${lastSuggestion}` : lastSuggestion, item.version)
+    updateAnswer(answer.trim() ? `${answer.trim()}\n\n${lastSuggestion}` : lastSuggestion)
     sfx.play('move')
   }
   const discussInChat = async () => {
@@ -1469,7 +1464,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
           'aria-label': `Answer for ${item.task_id}`,
           onChange: e => {
             const text = e.target.value
-            updateAnswer(text, !answerStale || !text.trim() ? item.version : answerVersion, !answerStale || !text.trim() ? item.ask : answerAsk)
+            updateAnswer(text, answerStale && text.trim() ? answerStamp : ctxNow)
           },
           onKeyDown: e => {
             if (e.key === 'Enter' && !e.nativeEvent?.isComposing && (e.metaKey || e.ctrlKey) && ready) { e.preventDefault(); saysKeep ? send(false) : sendPrimary() }

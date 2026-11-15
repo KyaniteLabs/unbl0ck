@@ -51,6 +51,26 @@ assert.ok(s.includes('NOT ALL CLEAR'),'asks on the list do not prove the unread 
 """)
 
 
+class CardStamp(NodeCase):
+    def test_an_answer_draft_goes_stale_when_the_card_text_changes_in_place(self):
+        """R5-desk-004: a title, owner, description or comment edit keeps the block version; the draft must still go stale."""
+        self.run_views(r"""
+const sent=[];
+const ctx={rest:async(url,o)=>{if(url==='/kanban/answer')sent.push(o.body);return{released:true}}};
+const it={...item,id:'kanban:default:a4',version:'1',title:'Ship the launch',ask:'Which day?',comments_sig:'1:a'};
+(async()=>{
+ mount(ctx,it);
+ all(mount(ctx,it)).find(n=>n?.type==='textarea').props.onChange({target:{value:'Monday'}});
+ for(const edit of [{title:'Cancel the launch'},{owner:'someone else'},{comments_sig:'2:b'},{body_sig:'b2'}]){
+  const t=mount(ctx,{...it,...edit});
+  assert.ok(texts(t).includes('older version'),'no stale hint after '+JSON.stringify(edit));
+  await find(t,'Answer + unbl0ck').onClick();
+ }
+ assert.deepEqual(sent,[],'a draft written for other card text must not be posted');
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
 class FullTextOffer(NodeCase):
     def test_password_prompts_and_pairing_requests_offer_no_full_text(self):
         """R5-desk-026: the guide says password prompts never offer Full text and pairing requests show neither."""
