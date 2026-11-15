@@ -148,6 +148,67 @@ class QuestionAndBlockReasonAreNotStarved(unittest.TestCase):
         self.assertLessEqual(sum(len(m["content"]) for m in messages), needs.ASK_PROMPT_BUDGET)
 
 
+def kanban_item(**changes):
+    item = {
+        "id": "kanban:ops:t_1",
+        "version": "v1",
+        "source": "kanban",
+        "board": "ops",
+        "task_id": "t_1",
+        "title": "Choose a database",
+        "ask": "Pick one",
+        "why": "Blocked on you",
+        "tier": "ask",
+        "status": "blocked",
+        "owner": "worker",
+    }
+    return {**item, **changes}
+
+
+class PocketPackIsBoundAndHonest(unittest.TestCase):
+    def pack(self, *items, **kw):
+        return needs.pocket_pack({"items": list(items)}, **kw)
+
+    def test_the_unblock_option_names_the_board_and_the_block(self):
+        """01-091 (class A): an action that does not say which block it answers can hit a later one."""
+        (card,) = self.pack(kanban_item())["cards"]
+        sends = [o["send"] for o in card["options"]]
+        self.assertTrue(all("ops" in s and "v1" in s for s in sends), sends)
+
+    def test_a_triage_card_is_not_offered_an_unblock(self):
+        (card,) = self.pack(kanban_item(status="triage", tier="triage"))["cards"]
+        self.assertFalse(any("unblock" in o["send"].lower() for o in card["options"]), card["options"])
+        self.assertTrue(card["options"])
+
+    def test_a_truncated_source_is_flagged_not_called_complete(self):
+        """01-093 (class E): a cut question or file says so in the pack."""
+        pack = self.pack(
+            kanban_item(id="chat:1", source="chat", ask_truncated=True, profile="p"),
+            kanban_item(id="outside:2", source="outside", truncated=True, act_where="Mail"),
+        )
+        self.assertTrue(all(c["truncated"] and c["warning"] for c in pack["cards"]), pack["cards"])
+        self.assertFalse(pack["complete"])
+
+    def test_an_untouched_pack_is_complete(self):
+        pack = self.pack(kanban_item())
+        self.assertTrue(pack["complete"])
+        self.assertFalse(pack["cards"][0]["truncated"])
+
+    def test_dropped_cards_make_the_pack_incomplete(self):
+        pack = self.pack(*[kanban_item(id=f"kanban:ops:t_{i}", task_id=f"t_{i}") for i in range(8)], limit=6)
+        self.assertEqual(len(pack["cards"]), 6)
+        self.assertEqual(pack["omitted"], 2)
+        self.assertFalse(pack["complete"])
+
+    def test_a_huge_block_reason_does_not_make_a_huge_pack(self):
+        """01-094 (class D): prompt text has a per-card and a total budget, disclosed."""
+        pack = self.pack(*[kanban_item(id=f"kanban:ops:t_{i}", task_id=f"t_{i}", ask="x" * 1_048_576) for i in range(6)])
+        self.assertLess(len(json.dumps(pack)), 64 * 1024)
+        self.assertTrue(all(c["truncated"] for c in pack["cards"]))
+        self.assertTrue(pack["cards"][0]["prompt"].endswith("[truncated]"))
+        self.assertFalse(pack["complete"])
+
+
 class AskDocs(unittest.TestCase):
     def test_the_readme_states_what_ask_removes_and_cuts(self):
         """01-089/01-090/01-096 (class I): the README matches what Ask now sends."""
@@ -157,6 +218,15 @@ class AskDocs(unittest.TestCase):
         self.assertIn("wherever it appears in the card text", readme)
         self.assertIn("end in `[truncated]`", readme)
         self.assertIn("your own question is sent whole", readme)
+
+    def test_the_readme_states_what_the_pocket_pack_bounds_and_names(self):
+        """01-091/01-093/01-094 (class I)."""
+        from pathlib import Path
+
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+        self.assertIn("`complete` is false when text was cut or cards were left out", readme)
+        self.assertIn("names the board and block in every Kanban action", readme)
+        self.assertIn("offers no unblock for block-loop cards", readme)
 
 
 if __name__ == "__main__":

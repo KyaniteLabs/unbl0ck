@@ -4510,28 +4510,52 @@ def build_ask_messages(
 # --- Pocket pack (TV / X55 card format) ----------------------------------------------------
 
 
+POCKET_PROMPT_CHARS = 4000  # one card's prompt
+POCKET_TOTAL_PROMPT_CHARS = 20000  # all prompts in one pack
+
+
 def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     """The queue in the Pocket card format, for gadgets that opt in. Written next to the
-    plugin's data, never over the gadget plugin's own pocket-pack.json."""
+    plugin's data, never over the gadget plugin's own pocket-pack.json.
+
+    Prompt text is bounded per card and in total; a cut prompt, a source that was already cut
+    and cards left out are each reported, so ``complete`` is true only when nothing was lost."""
     now = int(time.time())
     cards = []
     asks = [it for it in queue["items"] if it.get("tier") not in ("stuck", "answered")]
+    spent = 0
     for it in asks[:limit]:
         if it["source"] == "kanban":
-            options = [
-                {
-                    "label": "Answer + unblock",
-                    "send": f"Answer and unblock {it['task_id']}",
-                    "effect": "Card resumes",
-                    "tone": "primary",
-                },
-                {
-                    "label": "Keep hold",
-                    "send": f"Keep {it['task_id']} blocked",
-                    "effect": "No change",
-                    "tone": "neutral",
-                },
-            ]
+            # Name the board and the block the answer is for, so a later block is not answered
+            # by an old instruction.
+            where_card = f"{it['task_id']} on board {it.get('board') or 'default'} (block {it.get('version') or 'unknown'})"
+            keep = {
+                "label": "Keep hold",
+                "send": f"Keep {where_card} blocked",
+                "effect": "No change",
+                "tone": "neutral",
+            }
+            if str(getattr(it.get("status"), "value", it.get("status"))) == CardStatus.TRIAGE.value:
+                # A block loop is not ours to release; the unblock would be refused.
+                options = [
+                    {
+                        "label": "Answer, keep blocked",
+                        "send": f"Answer {where_card}; keep it blocked",
+                        "effect": "Your answer is posted",
+                        "tone": "primary",
+                    },
+                    keep,
+                ]
+            else:
+                options = [
+                    {
+                        "label": "Answer + unblock",
+                        "send": f"Answer and unblock {where_card}",
+                        "effect": "Card resumes",
+                        "tone": "primary",
+                    },
+                    keep,
+                ]
         elif it["source"] == "pairing":
             options = [
                 {
@@ -4588,6 +4612,13 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
                     "tone": "primary",
                 }
             ]
+        prompt = str(it["ask"] or "")
+        cut = bool(it.get("ask_truncated") or it.get("truncated"))
+        room = min(POCKET_PROMPT_CHARS, max(0, POCKET_TOTAL_PROMPT_CHARS - spent))
+        if len(prompt) > room:
+            prompt = prompt[: max(0, room - len(_ASK_CUT))] + _ASK_CUT
+            cut = True
+        spent += len(prompt)
         cards.append(
             {
                 "id": it["id"],
@@ -4597,7 +4628,9 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
                 "choices": [o["label"] for o in options],
                 "task_id": it.get("task_id", ""),
                 "options": options,
-                "prompt": it["ask"],
+                "prompt": prompt,
+                "truncated": cut,
+                "warning": "The text was cut; open the original to read all of it." if cut else "",
                 "why_now": it["why"],
                 "owner": it.get("owner") or "",
                 "authority": pocket_authority(),
@@ -4613,6 +4646,8 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         "expires_at": now + 3600,
         "mode": "unblock",
         "cards": cards,
+        "omitted": max(0, len(asks) - len(cards)),
+        "complete": len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
     }
 
 
