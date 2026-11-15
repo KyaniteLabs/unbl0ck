@@ -105,9 +105,10 @@ automerge, deployment or production end-to-end success is claimed here.
 
 The review compared in-memory draft recovery with disk/localStorage persistence;
 session memory preserves short fault recovery without adding private draft storage.
-Losing drafts on full reload remains explicit. Ask conversation restoration after
-unmount remains a separate possible enhancement; transport retry within a mounted card
-is implemented and verified.
+Losing drafts and Ask conversations on full reload remains explicit and by policy: no
+private text is persisted. Ask conversations, running requests and job selection are
+restored after unmount from the same bounded session memory, without a second model
+call; transport retry is implemented and verified.
 
 Bounded folder selection discloses older omissions instead of silently scanning an
 unbounded directory. Folder pagination and automatic export archiving were not adopted;

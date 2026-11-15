@@ -892,8 +892,30 @@ function rememberAnswerDraft(id, text, version) {
   while (answerDrafts.size > 100) answerDrafts.delete(answerDrafts.keys().next().value)
 }
 
+// Ask conversations follow the same session-memory policy as answer drafts: they survive
+// filtering, a source outage and route remounts (the card unmounting) but never a reload,
+// and nothing is written to disk. 30 minutes, 100 conversations. The model reply of a
+// request that outlives its card lands here, so a remounted card shows it without asking
+// again. `gen` identifies the latest request so an old response cannot overwrite newer work.
+const ASK_SESSION_TTL = 30 * 60 * 1000
+const askSessions = new Map()
+function readAskSession(id) {
+  const cutoff = Date.now() - ASK_SESSION_TTL
+  for (const [key, s] of askSessions) if (s.at < cutoff) askSessions.delete(key)
+  return askSessions.get(id)
+}
+function updateAskSession(id, patch) {
+  const cur = readAskSession(id) || { msgs: [], version: null, job: null, running: false, error: '', gen: 0 }
+  askSessions.delete(id)
+  askSessions.set(id, { ...cur, ...patch, at: Date.now() })
+  while (askSessions.size > 100) askSessions.delete(askSessions.keys().next().value)
+  return askSessions.get(id)
+}
+function clearAskSession(id) { askSessions.delete(id) }
+
 function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const savedDraft = readAnswerDraft(item.id)
+  const savedAsk = readAskSession(item.id)
   const [answer, setAnswer] = useState(savedDraft?.text || '')
   const [answerVersion, setAnswerVersion] = useState(savedDraft?.version ?? item.version)
   const updateAnswer = (text, version) => {
@@ -912,13 +934,13 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const [outsideTextLoading, setOutsideTextLoading] = useState(false)
   const [outsideTextError, setOutsideTextError] = useState('')
   const [outsideTextRetry, setOutsideTextRetry] = useState(0)
-  const [askOpen, setAskOpen] = useState(false)
-  const [askMsgs, setAskMsgs] = useState([])
-  const [askVersion, setAskVersion] = useState(item.version)
+  const [askOpen, setAskOpen] = useState(!!(savedAsk && (savedAsk.msgs.length || savedAsk.running)))
+  const [askMsgs, setAskMsgs] = useState(savedAsk?.msgs || [])
+  const [askVersion, setAskVersion] = useState(savedAsk?.version ?? item.version)
   const [askInput, setAskInput] = useState('')
-  const [askBusy, setAskBusy] = useState(false)
-  const [askError, setAskError] = useState('')
-  const [askJob, setAskJob] = useState(null)
+  const [askBusy, setAskBusy] = useState(!!savedAsk?.running)
+  const [askError, setAskError] = useState(savedAsk?.error || '')
+  const [askJob, setAskJob] = useState(savedAsk?.job || null)
   const askEnd = useRef(null)
   const isKanban = item.source === 'kanban'
   const isPrompt = item.source === 'prompt'
@@ -961,6 +983,19 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   useEffect(() => {
     if (askEnd.current) askEnd.current.scrollIntoView({ block: 'nearest' })
   }, [askMsgs, askBusy])
+  // A request started before this card remounted is still running and writes its result to
+  // the session store. Follow it instead of asking the model a second time.
+  useEffect(() => {
+    if (!askBusy) return
+    const timer = setInterval(() => {
+      const s = readAskSession(item.id)
+      if (s?.running) return
+      clearInterval(timer)
+      setAskBusy(false)
+      if (s) { setAskMsgs(s.msgs); setAskVersion(s.version ?? item.version); setAskError(s.error || ''); setAskJob(s.job || null) }
+    }, 500)
+    return () => clearInterval(timer)
+  }, [askBusy, item.id])
 
   const loadDetail = async () => {
     if (detail && detail.__version === item.version) return detail
@@ -1080,6 +1115,10 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
     if (!retry && !preset) setAskInput('')
     setAskBusy(true)
     setAskError('')
+    const gen = (readAskSession(item.id)?.gen || 0) + 1
+    const mine = () => readAskSession(item.id)?.gen === gen
+    updateAskSession(item.id, { msgs: next, version: item.version, running: true, error: '', gen,
+      job: retry && !askStale && askJob?.version === item.version ? askJob : null })
     try {
       // Keep displayed history intact while respecting the API's 50-message transport
       // limit. The server applies the configured model history window within that bound.
@@ -1088,25 +1127,35 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
         : await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next.slice(-50) } })
       const t0 = Date.now()   // the model can outlast the desktop's 30 s request limit: poll the background job
       while (r && r.pending && r.job) {
+        if (mine()) updateAskSession(item.id, { job: { id: r.job, version: item.version } })
         setAskJob({ id: r.job, version: item.version })
         if (Date.now() - t0 > 150000) throw new Error('The model took too long (over 150 s)')
         await new Promise(res => setTimeout(res, 1500))
         r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true')
       }
-      setAskJob(null)
+      if (mine()) { updateAskSession(item.id, { job: null }); setAskJob(null) }
       if (r?.ok === false) throw new Error(String(r.detail || 'The model could not answer'))
       const reply = String(r?.reply || '').trim()
       if (!reply) throw new Error('The model returned an empty answer')
-      setAskMsgs([...next, { role: 'assistant', content: reply }])
+      // A newer request owns the conversation now: drop this late response entirely.
+      if (!mine()) return
+      const msgs = [...next, { role: 'assistant', content: reply }]
+      updateAskSession(item.id, { msgs, running: false, job: null, error: '' })
+      setAskJob(null)
+      setAskMsgs(msgs)
       sfx.play('ok')
     } catch (e) {
+      if (!mine()) return
       sfx.play('err')
       const msg = String(e?.message || e)
-      if (/unknown or expired ask job/.test(msg)) setAskJob(null)
+      const gone = /unknown or expired ask job/.test(msg)
       // An unknown job means the gateway restarted mid-answer: the work is gone, not slow.
-      setAskError(/unknown or expired ask job/.test(msg) ? 'The gateway restarted while the model was answering. Retry to ask again.' : msg)
+      const shown = gone ? 'The gateway restarted while the model was answering. Retry to ask again.' : msg
+      updateAskSession(item.id, { running: false, error: shown, job: gone ? null : readAskSession(item.id)?.job || null })
+      if (gone) setAskJob(null)
+      setAskError(shown)
     } finally {
-      setAskBusy(false)
+      if (mine()) setAskBusy(false)
     }
   }
   const lastAssistant = askMsgs.reduce((index, m, i) => (m.role === 'assistant' ? i : index), -1)

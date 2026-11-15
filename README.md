@@ -61,7 +61,7 @@ Each card shows **Act in:** and its reference so you can finish in the original 
 
 Use **Search queue** and the source selector to find a card by title, preview, app, recipient or reference. Search uses text already loaded in the queue; it does not fetch full exports or call your model. The status count keeps showing the whole queue, and filtering preserves typed answers and open conversations. **Clear filters** restores the list; **Esc** clears the search box. Every card has a keyboard-accessible **+ Full text** button, including when summaries are off. Failed full-text and Context requests have inline retry controls. Folder **Done** also offers the 12-second **Undo**; deleting an agent-filed record does not.
 
-Typed answers also survive temporary source failure in bounded session memory, with
+Typed answers and Ask conversations also survive temporary source failure and route remounts in bounded session memory (never written to disk, cleared on reload), with
 their original question version. See the [operator guide](docs/operator-guide.md) for
 retention, stale-draft recovery and the watched-folder selection limit.
 

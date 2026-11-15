@@ -61,10 +61,17 @@ results are retained in completion order, and every job expires 15 minutes after
 A restart loses in-memory jobs; the UI reports an unknown/expired job and offers a fresh
 attempt. The client polls for up to 150 seconds per attempt.
 
-The displayed Ask conversation remains intact while that card is mounted. Requests
-send its latest 50 messages; the server then applies `ask_history_turns`. Conversation
-history and outstanding job selection are not restored after the card unmounts. Keep
-the card open while collecting an answer, or start a fresh question when returning.
+Requests send the conversation's latest 50 messages; the server then applies
+`ask_history_turns`. The conversation, any running request and its outstanding job are
+kept in Desktop session memory, like answer drafts: up to 100 conversations, each
+expiring 30 minutes after its last activity. Filtering, a source outage or leaving and
+returning to the page restores the conversation without asking the model again; a
+request still running when you left is followed to its result. A reload or app restart
+clears this memory, and nothing is written to disk, so there is nothing to delete and no
+profile data to separate. The recovered conversation stays bound to the question version
+it was asked about: if the card changed, it is marked as out of date and its suggestion
+cannot be used as an answer until you ask again. A late response from an older request
+never replaces a newer one.
 
 ## Recover from a fault
 

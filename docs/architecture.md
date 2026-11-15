@@ -80,6 +80,7 @@ as private. Settings and source files remain owned by their original application
 | `pocket-pack.json` | Written only on explicit pack request |
 | Summary/Ask jobs | Process memory; restart loses pending work and results |
 | Answer drafts | Desktop session memory, 100 entries, 30 minutes after last edit; original question version retained |
+| Ask conversations | Desktop session memory, 100 entries, 30 minutes after last activity; question version and outstanding job retained; never written to disk |
 | Display preferences | Effects and sound only, in Desktop localStorage |
 
 Shared read-modify-write stores for hidden, summary, pending-release and filed state
