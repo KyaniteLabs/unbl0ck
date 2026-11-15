@@ -61,6 +61,10 @@ config_schema:
     type: bool
     default: false
     description: "Also read .eml/.md/.txt files in nested folders under each watched folder, read-only. Bounded to 3 levels, 5,000 directory entries and 2 seconds per folder; symlinks, dotfolders and anything resolving outside the watched folder are skipped. Off reads direct files only."
+  outside_eml_kind:
+    type: str
+    default: draft
+    description: "What a watched-folder .eml is called when its own headers do not say: draft (default), notes, approval or other. A message marked unsent by its mail client is always a draft, and one with received-mail headers is never called a draft. Only changes the label; the text is read the same way."
   chat_window_days:
     type: int
     default: 14
@@ -68,4 +72,4 @@ config_schema:
   outside_dirs:
     type: str
     default: ""
-    description: "Comma-separated absolute folders (~ expanded) to watch read-only for .eml drafts and .md/.txt notes. Empty means off. Regular files only (nested folders only when outside_recursive is on); newest 200 waiting files per folder, 256 KiB per file. Fallback: UNBL0CK_OUTSIDE_DIRS."
+    description: "Comma-separated absolute folders (~ expanded) to watch read-only for .eml mail and .md/.txt notes. Empty means off. Other known export formats (.msg, .mbox, documents, audio) are not read and are reported by count. Regular files only (nested folders only when outside_recursive is on); newest 200 waiting files per folder, 256 KiB per file. Fallback: UNBL0CK_OUTSIDE_DIRS."

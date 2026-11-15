@@ -28,12 +28,14 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import html.parser
 import json
 import logging
 import os
 import re
 import sqlite3
 import stat
+import unicodedata
 import uuid
 from email import policy
 from email.parser import BytesParser
@@ -157,6 +159,19 @@ def outside_recursive(settings: dict[str, Any] | None = None) -> bool:
     """Whether watched folders also read nested folders (``outside_recursive``, off by default)."""
     raw = (settings if settings is not None else _settings()).get("outside_recursive", False)
     return raw if isinstance(raw, bool) else str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+_EML_KINDS = ("draft", "notes", "approval", "other")
+
+
+def outside_eml_kind(settings: dict[str, Any] | None = None) -> str:
+    """What a watched-folder .eml is called when its own headers say nothing (``outside_eml_kind``).
+
+    Default ``draft``, the long-standing behaviour. Anything that is not one of the four kinds
+    falls back to it, so a typo cannot hide or relabel the source."""
+    raw = (settings if settings is not None else _settings()).get("outside_eml_kind", "draft")
+    raw = raw.strip().lower() if isinstance(raw, str) else ""
+    return raw if raw in _EML_KINDS else "draft"
 
 
 def answer_version_required(settings: dict[str, Any] | None = None) -> bool:
@@ -2046,6 +2061,9 @@ OUTSIDE_MAX_DEPTH = 3
 OUTSIDE_SCAN_ENTRIES = 5000
 OUTSIDE_SCAN_SECONDS = 2.0
 _OUTSIDE_EXTS = (".eml", ".md", ".txt")
+# Recognised exports this version does not read. They are counted in the queue errors (extensions
+# and a number, never file names) so a folder of them is not mistaken for an empty one.
+_OUTSIDE_UNSUPPORTED = (".msg", ".mbox", ".pdf", ".doc", ".docx", ".rtf", ".html", ".htm", ".m4a", ".mp3", ".wav")
 # Done on an agent-filed item keeps the record (marked done_at) so Undo can restore it. The
 # text stays on disk only for this long and for at most this many done records; then it is
 # deleted. Nothing is kept for folder items beyond the existing hidden-version list.
@@ -2275,6 +2293,132 @@ def file_outside(
         }
 
 
+_HTML_VOID = frozenset("area base br col embed hr img input link meta param source track wbr".split())
+_HTML_DROP = frozenset(
+    "head script style title noscript template iframe frame frameset object embed applet svg math canvas "
+    "audio video select textarea".split()
+)
+_HTML_BLOCK = frozenset(
+    "p div section article header footer main nav aside blockquote pre table tr ul ol dl dt dd h1 h2 h3 h4 h5 h6 "
+    "form fieldset figure figcaption address hr center".split()
+)
+_HTML_HIDDEN_STYLE = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0\s*(?:;|$)|"
+    r"(?:font-size|max-height|max-width|width|height)\s*:\s*0(?:px|pt|em|rem|%)?\s*(?:;|!|$)",
+    re.I,
+)
+_HTML_MAX_OPEN = 2000  # nesting tracked inside a hidden element; deeper ends the readable text
+
+
+class _InertText(html.parser.HTMLParser):
+    """HTML to plain text without interpreting any of it: nothing is fetched, no attribute value
+    is kept (links, image sources and alt text never reach the output), and script, style, frames,
+    forms of embedding and visually hidden elements contribute no text."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self.out: list[str] = []
+        self.size = 0
+        self.limit = limit
+        self.hidden: list[str] = []  # open elements inside a dropped or hidden region
+
+    def _emit(self, text: str) -> None:
+        if self.size < self.limit:
+            self.out.append(text)
+            self.size += len(text)
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if self.hidden:
+            if tag not in _HTML_VOID and len(self.hidden) < _HTML_MAX_OPEN:
+                self.hidden.append(tag)
+            return
+        a = {k: (v or "") for k, v in attrs}
+        if tag in _HTML_DROP or "hidden" in a or _HTML_HIDDEN_STYLE.search(a.get("style", "")):
+            if tag not in _HTML_VOID:
+                self.hidden.append(tag)
+            return
+        if tag == "br":
+            self._emit("\n")
+        elif tag == "li":
+            self._emit("\n- ")
+        elif tag in _HTML_BLOCK:
+            self._emit("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.hidden:
+            if tag in self.hidden:
+                while self.hidden and self.hidden.pop() != tag:
+                    pass
+            return
+        if tag in _HTML_BLOCK:
+            self._emit("\n")
+        elif tag in ("td", "th"):
+            self._emit(" ")
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden:
+            self._emit(data)
+
+
+def html_to_text(markup: str, limit: int) -> str:
+    """Readable, inert text from HTML, at most about *limit* characters. Never raises."""
+    parser = _InertText(limit)
+    try:
+        # The trailing tag flushes text the parser holds back; an unterminated comment or style
+        # block swallows it, which is the safe outcome for hostile input.
+        parser.feed(markup.replace("\x00", "") + "\n<p></p>")
+    except Exception:  # noqa: BLE001 - hostile or broken markup: keep what was read so far
+        pass
+    text = "".join(parser.out)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in text.split("\n")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()[:limit]
+
+
+_HTML_NOTE = "(Converted from HTML; formatting, images and links are not shown.)\n\n"
+_NO_BODY = "(No readable text body; this message has only attachments or parts that are not read.)"
+# Headers a mail client writes when it saves an unsent message, and headers a receiving server adds.
+_DRAFT_MARKERS = (("x-unsent", lambda v: v.strip() == "1"), ("x-mozilla-draft-info", lambda v: True),
+                  ("x-uniform-type-identifier", lambda v: "mail-draft" in v.lower()))
+_RECEIVED_MARKERS = ("received", "return-path", "delivered-to", "x-received")
+
+
+def _decode_part(part: Any) -> str:
+    payload = part.get_payload(decode=True) or b""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except (LookupError, UnicodeError):
+        return payload.decode("utf-8", errors="replace")
+
+
+def _eml_body(msg: Any) -> str:
+    """The readable body: text/plain when it says anything, else inert text from text/html.
+    Parts with a filename were already marked as attachments and are never used."""
+    plain = msg.get_body(preferencelist=("plain",))
+    if plain is not None:
+        text = _decode_part(plain)
+        if text.strip():
+            return text
+    html_part = msg.get_body(preferencelist=("html",))
+    if html_part is not None:
+        text = html_to_text(_decode_part(html_part), _OUTSIDE_READ_LIMIT)
+        if text:
+            return _HTML_NOTE + text
+    return _NO_BODY
+
+
+def _eml_kind(msg: Any) -> tuple[str, str]:
+    """Purpose from the message's own headers, else the operator's ``outside_eml_kind``."""
+    for name, test in _DRAFT_MARKERS:
+        if name in msg and test(str(msg.get(name) or "")):
+            return "draft", "Your mail app → Drafts"
+    if any(name in msg for name in _RECEIVED_MARKERS):
+        return "other", "Your mail app"
+    kind = outside_eml_kind()
+    return kind, "Your mail app → Drafts" if kind == "draft" else "Your mail app"
+
+
 def _folder_outside_item(
     f: Path, root: Path, expected: os.stat_result
 ) -> dict[str, Any] | None:
@@ -2309,7 +2453,6 @@ def _folder_outside_item(
         msg = BytesParser(policy=policy.default).parsebytes(raw)
         title = str(msg.get("Subject") or f.name).strip()[:160]
         to = str(msg.get("To") or "")[:2000]
-        text = "(No text/plain body; HTML is not displayed.)"
         # MIME body selection skips attachments, including attached messages. Walking
         # every plain-text part can otherwise present an appendix as an HTML draft.
         # An exported file may instead be labelled inline; a filename still makes it
@@ -2321,15 +2464,8 @@ def _folder_outside_item(
                     candidate.replace_header("Content-Disposition", "attachment")
                 else:
                     candidate["Content-Disposition"] = "attachment"
-        part = msg.get_body(preferencelist=("plain",))
-        if part is not None:
-            payload = part.get_payload(decode=True) or b""
-            charset = part.get_content_charset() or "utf-8"
-            try:
-                text = payload.decode(charset, errors="replace")
-            except (LookupError, UnicodeError):
-                text = payload.decode("utf-8", errors="replace")
-        kind, where = "draft", "Your mail app → Drafts"
+        text = _eml_body(msg)
+        kind, where = _eml_kind(msg)
     else:
         text = raw.decode("utf-8", errors="replace")
         title = next(
@@ -2365,6 +2501,7 @@ def _scan_outside_folder(
     deadline = time.monotonic() + OUTSIDE_SCAN_SECONDS
     stopped = ""
     too_deep = False
+    unsupported: collections.Counter[str] = collections.Counter()
     while stack and not stopped:
         d, depth = stack.pop()
         try:
@@ -2400,10 +2537,19 @@ def _scan_outside_folder(
                         continue
                     if f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
                         out.append((f, st))
+                    elif f.suffix.lower() in _OUTSIDE_UNSUPPORTED and stat.S_ISREG(st.st_mode):
+                        unsupported[f.suffix.lower()] += 1
                 except OSError as exc:
                     errors.append(f"outside: {entry.name}: {type(exc).__name__}: {exc}")
     if stopped:
         errors.append(f"outside: {root.name}: scan {stopped}; some files may not be listed")
+    if unsupported:
+        total = sum(unsupported.values())
+        kinds = ", ".join(f"{ext} x{n}" for ext, n in sorted(unsupported.items()))
+        errors.append(
+            f"outside: {root.name}: {total} file{'s' if total != 1 else ''} in unsupported formats "
+            f"were not read ({kinds}); export them as .eml, .md or .txt"
+        )
     if too_deep:
         errors.append(
             f"outside: {root.name}: folders deeper than {OUTSIDE_MAX_DEPTH} levels were not scanned"

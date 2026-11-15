@@ -244,7 +244,7 @@ class Outside(OutsideFixture):
         (it,) = needs.build_queue()["items"]
         self.assertEqual(it["text"].strip(), "Reuni\u00f3n ma\u00f1ana en el caf\u00e9")
 
-    def test_html_only_mail_never_displays_html(self):
+    def test_html_only_mail_shows_inert_text_never_markup(self):
         self.watch()
         msg = EmailMessage()
         msg.set_content(
@@ -252,8 +252,9 @@ class Outside(OutsideFixture):
         )
         (self.folder / "html.eml").write_bytes(msg.as_bytes())
         (it,) = needs.build_queue()["items"]
-        self.assertNotIn("secret HTML", it["text"])
+        self.assertIn("secret HTML", it["text"])
         self.assertNotIn("<img", it["text"])
+        self.assertNotIn("example.com", json.dumps(it))
 
     def test_notes_use_first_nonempty_line_and_decode_replacement(self):
         self.watch()

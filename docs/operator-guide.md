@@ -235,7 +235,7 @@ skipped on its own and does not block the others.
 
 ## Outside-source limits
 
-Watched folders read regular `.eml`, `.md` and `.txt` files. They skip symlinks and
+Watched folders read regular `.eml`, `.md` and `.txt` files (see the format table below). They skip symlinks and
 dotfiles, show the newest 200 waiting files per folder (ties break on path, so the
 order is stable), and read at most 256 KiB per file. By default only the folder's
 direct files count. Set `outside_recursive` to true to also read nested folders, up
@@ -252,7 +252,38 @@ renames or deletes source files; a hidden file that changes comes back.
 
 Mail uses the plain body selected by MIME structure. Attachments, filename-bearing
 inline subtrees, attached messages and non-root related resources do not replace it.
-HTML-only mail shows an explicit no-plain-body notice; HTML is never rendered.
+When the message has no plain text, its HTML body is turned into inert text: nothing is
+rendered or fetched, scripts, styles, frames, embedded objects and visually hidden
+elements contribute nothing, and links, image sources and alt text are dropped, so a
+tracking address never reaches the card, a summary or the model. The card starts with
+"Converted from HTML"; tables and lists are flattened. A message with no readable body
+says so instead of showing an empty card.
+
+**What kind of card an `.eml` becomes** comes from its own headers: a message marked
+unsent by its mail client (`X-Unsent`, Thunderbird or Apple Mail draft markers) is a
+**draft**; one carrying `Received`, `Return-Path` or `Delivered-To` is an ordinary
+message and is never called a draft. Mail with neither uses `outside_eml_kind` (`draft` by
+default; `notes`, `approval` or `other`). It only changes the label and where the card
+says to act; headers can be forged, and the label never makes the text trusted.
+
+### Supported exported formats
+
+| Format | Read? | Notes |
+| --- | --- | --- |
+| `.eml` | Yes | Subject, recipient, plain body, else inert text from the HTML body. Outlook "Save As", Gmail and Thunderbird exports are covered by tests. |
+| `.md` | Yes | Read as notes; first non-empty line is the title. |
+| `.txt` | Yes | Read as notes (for example transcript exports). |
+| `.msg` | No | Outlook binary format. Save as `.eml` instead. |
+| `.mbox` | No | Several messages in one file; export single `.eml` files. |
+| `.pdf`, `.doc`, `.docx`, `.rtf` | No | Documents. Export the text as `.md` or `.txt`. |
+| `.html`, `.htm` | No | Standalone pages are not read; HTML is only read inside an `.eml`. |
+| `.m4a`, `.mp3`, `.wav` | No | Audio. Use the app's transcript export as `.txt`. |
+
+A file in a "No" format is never turned into an empty card. Each poll adds one line to
+the queue errors per folder, with a count and the extensions (never file names), so the
+queue is marked incomplete rather than looking clear. Other file types are ignored
+quietly. Which further formats to add is decided from real exported samples; none is
+committed to here, and native mail or notes connectors are separate work.
 
 Agent-filed records waiting for you are capped at 200; at the cap the queue says how
 many are waiting, new filings are refused with that count (nothing is dropped,

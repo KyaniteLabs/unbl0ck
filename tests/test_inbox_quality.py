@@ -19,7 +19,8 @@ class ExportedMail(OutsideFixture):
         msg.add_attachment("Unrelated attachment", filename="appendix.txt")
         (self.folder / "draft.eml").write_bytes(msg.as_bytes())
         (item,) = needs.build_queue()["items"]
-        self.assertEqual(item["text"], "(No text/plain body; HTML is not displayed.)")
+        self.assertIn("The draft is HTML-only.", item["text"])
+        self.assertNotIn("Unrelated attachment", item["text"])
 
     def test_attached_message_is_not_the_draft_body(self):
         self.watch()
@@ -31,7 +32,7 @@ class ExportedMail(OutsideFixture):
         (self.folder / "draft.eml").write_bytes(msg.as_bytes())
         (item,) = needs.build_queue()["items"]
         self.assertNotIn("entirely different", item["text"])
-        self.assertIn("No text/plain body", item["text"])
+        self.assertIn("HTML draft", item["text"])
 
     def test_attachment_before_the_body_is_skipped(self):
         self.watch()
@@ -50,7 +51,8 @@ class ExportedMail(OutsideFixture):
         msg.add_attachment("APPENDIX TEXT", subtype="plain", filename="appendix.txt", disposition="inline")
         (self.folder / "draft.eml").write_bytes(msg.as_bytes())
         (item,) = needs.build_queue()["items"]
-        self.assertEqual(item["text"], "(No text/plain body; HTML is not displayed.)")
+        self.assertIn("Actual HTML body", item["text"])
+        self.assertNotIn("APPENDIX TEXT", item["text"])
 
     def test_inline_named_part_before_real_plain_alternative_is_skipped(self):
         self.watch()
@@ -70,7 +72,8 @@ class ExportedMail(OutsideFixture):
         msg.add_related("Inline text resource", subtype="plain", cid="resource")
         (self.folder / "draft.eml").write_bytes(msg.as_bytes())
         (item,) = needs.build_queue()["items"]
-        self.assertEqual(item["text"], "(No text/plain body; HTML is not displayed.)")
+        self.assertIn("Actual HTML body", item["text"])
+        self.assertNotIn("Inline text resource", item["text"])
 
     def test_preview_reports_truncation_only_when_bytes_were_omitted(self):
         self.watch()
