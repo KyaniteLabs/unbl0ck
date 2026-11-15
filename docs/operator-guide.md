@@ -21,7 +21,7 @@ restoration is pending, and renews its window after a failed restoration request
 "could not restore, try again". When an entry expires the page announces
 "Undo window ended". If the item changed or its record is already gone, Undo says nothing
 was restored. A filed record is kept on disk for 15 minutes after Done (at most 25 such
-records), then deleted; the agent's own `resolve` action removes a record permanently and
+records), then deleted on the next poll, filing or action while UNBL0CK runs (there is no background timer, so records can remain on disk while UNBL0CK is not running); the agent's own `resolve` action removes a record permanently and
 is the only action that means the work is finished. Re-filing identical content keeps a
 Done item hidden; changed content brings it back.
 
@@ -33,7 +33,7 @@ blocked selects the keep-blocked action.
 
 Typed Kanban answers also survive a card disappearing during a partial source failure
 or a route remount. Up to 100 drafts are held in session memory, each expiring 30 minutes
-after its last edit. A successful answer clears its draft. A full page reload or app
+after its last edit. A successful answer clears its draft. Drafts are kept for each backend connection separately, so a draft typed for one backend never appears on another. A full page reload or app
 restart clears this memory. A recovered draft retains its original question version:
 if the card changed, review it, clear the old draft, then write a current answer.
 
@@ -47,7 +47,10 @@ Queue polling carries only the last 480 characters of a chat message or live pro
 marked with a note. **Full text** then reads the whole record (up to 20,000 characters)
 from its source for that item version, and never sends it to a model. A changed or
 vanished record, or an unreadable source, reports an error with Retry and leaves the
-excerpt labelled as an excerpt. Password prompts are never expanded.
+excerpt labelled as an excerpt. Password prompts are never expanded. A live prompt over
+20,000 characters is stored cut, with its last 2,000 characters kept beside it in the same
+wait record, so the excerpt is the true end of the prompt; a chat message is read from its
+last 100,000 characters.
 
 **TL;DR** starts a read-only model job. **Use as answer** copies a suggestion into the
 answer box; the human still submits it. **Discuss in chat** asks the host composer to
@@ -58,7 +61,13 @@ retry hint rather than joining an unbounded backlog. An Ask poll retries the sam
 after a transport failure. A terminal model failure permits a new attempt. Completed
 results can be read repeatedly: polling does not consume them. At most 128 settled
 results are retained in completion order, and every job expires 15 minutes after creation.
-The client polls for up to 150 seconds per attempt.
+A restart loses in-memory jobs; the UI reports that the answer is no longer available (the gateway restarted or
+the result expired) and offers a fresh attempt. The client polls for up to 150 seconds per attempt, counted from the first request
+and checked after every response, including a finished answer. Each Ask carries a random
+request ID that Retry reuses, so a lost response cannot start a second model call, and it
+carries the card version, so a changed card is refused instead of answered from old context.
+A follow-up over 20,000 characters, or one the server refuses, is not kept in the conversation.
+
 
 After a gateway restart the plugin never sends a request again by itself. Each Ask job
 leaves a small restart marker (see below), so a poll reports one of five states:
@@ -89,10 +98,17 @@ kept in Desktop session memory, like answer drafts: up to 100 conversations, eac
 expiring 30 minutes after its last activity. Filtering, a source outage or leaving and
 returning to the page restores the conversation without asking the model again; a
 request still running when you left is followed to its result. A reload or app restart
-clears this memory, and nothing is written to disk, so there is nothing to delete and no
-profile data to separate. The recovered conversation stays bound to the question version
-it was asked about: if the card changed, it is marked as out of date and its suggestion
-cannot be used as an answer until you ask again. A late response from an older request
+clears this memory, and nothing is written to disk, so there is nothing to delete. Conversations
+are kept for each backend connection separately: the same card id on another backend or
+profile never shows or resends them, and closing a connection removes its conversations.
+One conversation keeps at most 100 messages and 200,000 characters; older messages are
+dropped, and the card says so. A conversation that expires while its card stays open
+leaves the screen too. If a request's conversation is evicted or expires while the model
+is still answering, the card reports that it was dropped from session memory and offers
+Retry; the late answer is not shown. The recovered conversation stays bound to the card it
+was asked about: if the block version or the title, question, owner or comments changed,
+it is marked as out of date and its suggestion cannot be used as an answer until you ask
+again. A late response from an older request
 never replaces a newer one.
 
 ## Recover from a fault
@@ -115,16 +131,20 @@ Watched folders read regular `.eml`, `.md` and `.txt` files. They skip symlinks 
 dotfiles, show the newest 200 waiting files per folder (ties break on path, so the
 order is stable), and read at most 256 KiB per file. By default only the folder's
 direct files count. Set `outside_recursive` to true to also read nested folders, up
-to 3 levels deep, 5,000 directory entries and 2 seconds per folder per poll; symlinked
-folders and files are never followed, and a path that resolves outside the watched
-folder is rejected. Hitting any scan bound is reported in the queue errors.
+to 3 levels deep, 5,000 directory entries and 2 seconds per folder per poll for the scan
+and 2 more for reading; files you already marked Done or Not for me do not use up the
+entry bound, symlinked folders and files are never followed, and a path that resolves
+outside the watched folder is rejected. Hitting any scan or read bound is reported in the
+queue errors, as is a file that cannot be read (the next readable one takes its place).
 Cards mark truncated exports. Full text remains within the read limit; use the
 original app for the complete document.
 
 Files you mark Done or Not for me no longer use up the 200 window, so finishing a
 page brings the next older files into view. When more are waiting, the queue says how
 many ("N older files are waiting") until you work through them. UNBL0CK never moves,
-renames or deletes source files; a hidden file that changes comes back.
+renames or deletes source files; a hidden file that changes comes back. The hidden
+count covers every dismissed file in a folder; a listing with hidden files included shows
+the newest 200 per folder and says how many more it left out.
 
 Mail uses the plain body selected by MIME structure. Attachments, filename-bearing
 inline subtrees, attached messages and non-root related resources do not replace it.
