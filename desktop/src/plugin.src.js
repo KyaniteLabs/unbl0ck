@@ -977,6 +977,10 @@ function boundAsk(msgs) {
     chars -= String(out[0].content || '').length
     out = out.slice(1)
   }
+  // One message can be the whole history: the budget still holds, so keep its newest characters.
+  if (out.length === 1 && chars > ASK_KEEP_CHARS) {
+    out = [{ ...out[0], content: String(out[0].content).slice(-ASK_KEEP_CHARS) }]
+  }
   return { msgs: out, dropped: msgs.length - out.length }
 }
 
@@ -1310,8 +1314,12 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
       setAskJob(null)
       dropReq()
       if (r?.ok === false) throw new Error(String(r.detail || 'The model could not answer'))
-      const reply = String(r?.reply || '').trim()
-      if (!reply) throw new Error('The model returned an empty answer')
+      const full = String(r?.reply || '').trim()
+      if (!full) throw new Error('The model returned an empty answer')
+      // The server refuses any message over its limit, and a stored reply is sent back with every
+      // later request: keep at most the limit so one long answer cannot make the conversation unusable.
+      const parts = Array.from(full)
+      const reply = parts.length > ASK_MAX_CHARS ? parts.slice(0, ASK_MAX_CHARS).join('') : full
       // A newer request owns the conversation now: drop this late response entirely.
       if (abandon()) return
       const kept = boundAsk([...next, { role: 'assistant', content: reply }])

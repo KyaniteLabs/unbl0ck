@@ -414,6 +414,40 @@ const it={...item,id:'kanban:default:rt4',version:'1'};
 """)
 
 
+class ReplyBounds(NodeCase):
+    def test_a_reply_over_the_message_limit_is_clamped_so_the_next_request_is_accepted(self):
+        """R5-desk-009 (class D): a 20,001-character reply must not poison every later request."""
+        self.run_views(r"""
+const posts=[];
+const ctx={rest:async(url,o)=>{if(url!=='/card/ask')return{};posts.push(o.body.messages);
+  return{ok:true,reply:posts.length===1?'x'.repeat(20001):'Short.'}}};
+const it={...item,id:'kanban:default:rb1',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ await find(mount(ctx,it),'TL;DR').onClick();
+ area(mount(ctx,it)).onChange({target:{value:'and then?'}});
+ await find(mount(ctx,it),'Send').onClick();
+ assert.equal(posts.length,2,'the follow-up must be sent');
+ for(const m of posts[1])assert.ok(Array.from(m.content).length<=20000,'every sent message is within the server limit: '+m.role+' '+m.content.length);
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_a_reply_far_over_the_budget_is_not_retained_whole(self):
+        """R5-desk-009 (class D): the character budget holds even when one message is the whole history."""
+        self.run_views(r"""
+const ctx={rest:async()=>({ok:true,reply:'y'.repeat(200001)})};
+const it={...item,id:'kanban:default:rb2',version:'1'};
+(async()=>{
+ mount(ctx,it);
+ await find(mount(ctx,it),'TL;DR').onClick();
+ const s=store.askSessions.get(it.id);
+ const total=s.msgs.reduce((n,m)=>n+m.content.length,0);
+ assert.ok(total<=200000,'retained '+total);
+ assert.ok(s.msgs.every(m=>Array.from(m.content).length<=20000));
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
 class Stack06Docs(unittest.TestCase):
     def test_docs_name_the_text_that_makes_advice_stale_and_the_retry_id(self):
         text = " ".join((ROOT / "docs/operator-guide.md").read_text().split())
