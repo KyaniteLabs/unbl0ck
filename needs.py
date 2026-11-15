@@ -823,8 +823,7 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
             d = _outside_dir(home)
             _purge_logged(d)
             f = d / (filed.group(1) + ".json")
-            if not f.is_symlink() and f.is_file():
-                rec = _read_json(f)
+            rec = _load_filed(d, filed.group(1))
             current = str(rec.get("version")) if rec else None
         done = bool(rec) and _is_done(rec)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
@@ -3310,11 +3309,7 @@ def _done_at(rec: dict[str, Any]) -> float | None:
     value = rec.get("done_at")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    try:
-        number = float(value)  # OverflowError for a JSON integer past the float range
-    except OverflowError:
-        return None
-    return number if math.isfinite(number) else None
+    return _finite(value)
 
 
 def _is_done(rec: dict[str, Any]) -> bool:
@@ -3583,11 +3578,9 @@ def file_outside(
             # hidden.json is left as it is for repair rather than overwritten.
             marker_failed = False
             try:
-                # The raw view: it keeps every other dismissal's undo token intact.
-                marks = _load_hidden_raw(home, errors=(bad := []))
-                if not bad and resolved_id in marks:
-                    marks.pop(resolved_id)
-                    _write_json(_hidden_path(home), marks, ordered=True)
+                _update_state(home, _hidden_path(home), _dropper(resolved_id), entry_ok=_hidden_entry_ok)
+            except RuntimeError:
+                log.warning("unbl0ck: outside: hidden.json is damaged; a dismissal marker was left for repair")
             except OSError as exc:
                 # The record is already gone: report that, not a failure that would make the
                 # caller retry a resolve that can no longer find it. The stale marker is harmless.
@@ -4706,16 +4699,9 @@ def done_outside(
             d = _outside_dir(home)
             cleanup_failed = _purge_logged(d)
             f = d / (match.group(1) + ".json")
-            if f.is_symlink():
-                raise SourceUnavailable("filed outside record is not a regular file")
-            try:
-                rec = _read_json(f, strict=True)   # a corrupt record is a failure, not "gone"
-            except RuntimeError as exc:
-                raise SourceUnavailable(str(exc)) from exc
+            rec = _load_filed(d, match.group(1))  # a corrupt record is a failure, not "gone"
             if not rec:
                 raise LookupError("Filed outside item no longer exists")
-            if not _is_filed_record(rec, match.group(1)):
-                raise SourceUnavailable("filed outside record is invalid; repair it")
             if rec.get("version") != version:
                 raise RuntimeError(
                     "Outside item changed; refresh before marking it Done"
@@ -4946,8 +4932,10 @@ def capability_key(item: dict[str, Any]) -> str:
 
 
 def build_queue(
-    home: Path | None = None, *, include_hidden: bool = False
+    home: Path | None = None, *, include_hidden: bool = False, record: bool = True
 ) -> dict[str, Any]:
+    """The queue. ``record=False`` is a lookup that changes no state: it neither prunes
+    summaries, saves the backfill floor, clears stale prompts nor purges expired Done records."""
     home = home or hermes_home()
     observed_at = time.time()
     errors: list[str] = []
