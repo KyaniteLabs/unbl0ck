@@ -108,10 +108,8 @@ def _needs():
 
 
 class _Data:
-    """Descriptors for ``plugin-data/unbl0ck`` and, on demand, its ``recovery/`` directory. Each is
-    opened through its parent's descriptor without following a link, and every later read, write,
-    replace and listing works through them, so a directory swapped for a link after it was opened
-    cannot redirect anything. ``fd`` is None when the data directory does not exist."""
+    """Descriptors for ``plugin-data/unbl0ck`` and, on demand, ``recovery/``, opened without
+    following links; ``fd`` is None when the data directory does not exist."""
 
     def __init__(self, home: Path | None):
         if not _DIR_FD:
@@ -196,10 +194,8 @@ class _Budget:
 
 
 def _read_file(dfd: int, name: str, limit: int = MAX_STORE_BYTES, budget: _Budget | None = None):
-    """``(raw, fstat, None)`` or ``(None, fstat or None, why)`` with why absent | unsafe | too_large.
-    The bytes come from one descriptor opened in ``dfd`` that is not a link, FIFO or device, at
-    most ``limit + 1`` of them are read (one more than allowed, so a longer file cannot pass), and
-    each is charged to ``budget``; nothing is decided on a name that can change."""
+    """``(raw, fstat, None)`` or ``(None, fstat or None, why)``, why absent | unsafe | too_large;
+    read from one non-link regular descriptor, at most ``limit + 1`` bytes, charged to ``budget``."""
     try:
         fd = os.open(name, os.O_RDONLY | _NOFOLLOW | _NONBLOCK, dir_fd=dfd)
     except FileNotFoundError:
@@ -289,11 +285,8 @@ def _fsync_dir(fd: int) -> None:
 
 
 def _list_backups(d: _Data) -> dict[str, Any]:
-    """Backups, newest label first, within one budget (count, bytes read and time, all counted from
-    before the directory is listed), so a large archive cannot turn a read-only diagnosis into a
-    multi-gigabyte scan. Every backup name found is either a row (``unsafe`` when it cannot even be
-    examined, ``not_checked`` past the budget) or counted in ``omitted``; ``complete`` is false when
-    time ran out while listing, so ``total`` is then a lower bound."""
+    """Backups, newest first, within one budget (count, bytes, time); the rest are ``not_checked``
+    or ``omitted``, and ``complete`` is false when listing ran out of time."""
     empty = {"items": [], "total": 0, "omitted": 0, "complete": True}
     budget = _Budget()
     try:
@@ -357,9 +350,7 @@ def _read_back(fd: int, expected: int) -> bytes:
 
 
 def _write_new(dfd: int, name: str, raw: bytes) -> None:
-    """Create ``name`` in ``dfd`` exclusively with mode 0600 (never through a link), write, flush to
-    disk, read the same descriptor back and check the name still holds it. A copy that does not
-    match is removed."""
+    """Create ``name`` exclusively (0600, no link), write, fsync and read back; a mismatch is removed."""
     fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=dfd)
     try:
         view = memoryview(raw)

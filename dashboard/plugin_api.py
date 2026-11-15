@@ -458,9 +458,8 @@ _UNREADABLE = "the saved state for this request cannot be read right now. Retry 
 
 
 def _bind_existing(request_id: str, card: str) -> Optional[dict[str, Any]]:
-    """The pending reply for a request id that already names a job the caller can see, None when
-    it names none. A job answers only for the card it was created for (409 otherwise), and storage
-    that cannot be read is 503, never a fresh start."""
+    """The pending reply for a request id naming a job the caller can see, else None (409 for
+    another card, 503 for unreadable storage)."""
     st = _ASK_JOBS.get(request_id)
     if st is None:
         return None

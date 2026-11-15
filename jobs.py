@@ -323,9 +323,7 @@ class AskJournal:
 
     @contextlib.contextmanager
     def _locked(self, fd: int, until: float):
-        """Hold the directory lock, waiting until ``until`` (``time.monotonic``) at most: one
-        deadline covers a whole housekeeping pass, so many records cannot each wait in turn.
-        Yields False (fail closed) when the lock cannot be taken in time."""
+        """Hold the directory lock until ``until`` (monotonic) at most; yields False when not taken."""
         lfd = None
         got = False
         try:
@@ -624,17 +622,12 @@ class AskJournal:
                 return "ok" if self._publish(fd, job, body) else "failed"
 
     def write(self, job: str, rec: dict[str, Any], d: Optional[Path] = None) -> bool:
-        """True when the record is on disk and synced. False when it is not (or no journal is available).
-
-        A new file first evicts the oldest evictable ones (``protect`` names jobs alive in
-        memory), under the directory lock, so the directory never exceeds MAX_FILES however many
-        workers have written to it; if nothing can be evicted the record stays in memory only."""
+        """True when the record is on disk and synced; a new file first evicts the oldest evictable ones."""
         return self._put(job, rec, d, claim=False) == "ok"
 
     def claim(self, job: str, rec: dict[str, Any], d: Optional[Path] = None) -> str:
-        """Write a new job's first record only if no record or tombstone holds the id, checked and
-        written under the directory lock, so two tables sharing the directory cannot both admit
-        it. "ok", "taken" or "failed" (not written; the job may run in memory only)."""
+        """Write a first record under the directory lock unless a record or tombstone holds the id:
+        "ok", "taken" or "failed"."""
         return self._put(job, rec, d, claim=True)
 
     def _touch(self, fd: int, name: str) -> bool:
@@ -648,10 +641,8 @@ class AskJournal:
 
     def delete(self, job: str, d: Optional[Path] = None, tombstone: bool = False,
                until: Optional[float] = None) -> bool:
-        """True when a record was removed. With ``tombstone`` an existing record is first fenced
-        (``job.gone``), whatever its state and owner: no worker writes the id again and no reader
-        serves it, even if the removal itself then fails. A fence that cannot be written removes
-        nothing and returns False, so a caller never reports a deletion a live owner could undo."""
+        """True when a record was removed; with ``tombstone`` it is fenced first, and a failed fence
+        removes nothing."""
         if not self._valid(job):
             return False
         with self._session(False, d) as (fd, _status):
@@ -791,14 +782,8 @@ class AskJournal:
 
 
 class AskJobs:
-    """``{(dir, job): {"status", "started", ...}}``. Every write goes through one named transition.
-
-    A job belongs to the journal directory (profile) its creating request resolved, captured with
-    the reply-persistence setting of that request. A caller sees only the jobs of its own scope;
-    a caller whose scope cannot be resolved sees none and creates none (fail closed). A worker,
-    which carries no request context, names its job by the generation token ``create`` returned,
-    so a late worker of a deleted job never settles a newer job that reuses the id. Every
-    directory a job was created in or recovered from stays known to housekeeping."""
+    """``{(dir, job): {"status", ...}}``, one named transition per write. A job belongs to the
+    scope (journal directory) its request resolved; workers name it by ``create``'s generation."""
 
     TTL_S = 900
     MAX_SETTLED = 128
@@ -903,11 +888,8 @@ class AskJobs:
         return {**base, "status": AskState.UNKNOWN, "ok": False, "detail": "the saved record for this request is unreadable, so its outcome is unknown"}
 
     def create(self, job: str, card: Optional[str] = None) -> str:
-        """absent -> PENDING in the caller's scope (after expiring old jobs). Returns the generation
-        token the worker passes to ``mark_sent``/``finish``/``fail``.
-
-        Raises ScopeUnavailable when the caller's directory cannot be resolved, and
-        IllegalTransition when the id is taken in this scope, in memory or on disk."""
+        """absent -> PENDING in the caller's scope; returns the worker's generation token. Raises
+        ScopeUnavailable or IllegalTransition."""
         self._sweep(False)
         with self._lock:
             where = self._scope()
@@ -1041,11 +1023,8 @@ class AskJobs:
             self._journal.delete(job, d=where, tombstone=True, until=until)
 
     def _sweep(self, prune: bool, adopt: bool = True) -> None:
-        """Expire old jobs and, when due (always with ``prune``), prune every known directory. The
-        disk work runs outside the table lock under one deadline for the whole pass, so a held or
-        slow journal can neither stall the table nor multiply its wait by the number of records.
-        ``adopt`` (a request thread) adds the caller's directory to the known ones, so records an
-        earlier run left there are cleaned up even if nobody asks for them again."""
+        """Expire jobs and, when due, prune every known directory outside the table lock under one
+        deadline; ``adopt`` adds the caller's directory."""
         where = None
         if adopt and self._journal is not None:
             with contextlib.suppress(ScopeUnavailable):
