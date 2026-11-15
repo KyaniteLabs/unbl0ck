@@ -118,6 +118,31 @@ class HostCompat(unittest.TestCase):
                     patch.object(hc.metadata, "version", fake):
                 self.assertEqual(hc._hermes_identity(), {"hermes_version": "unknown", "hermes_release_date": "unknown"})
 
+    def test_the_acceptance_row_check_rejects_a_row_without_hermes_identity(self):
+        """R5-api-016: the check runs on synthetic rows, so it cannot pass by having nothing to check."""
+        good = ["Source tests", "host", "source abcdef0 / Hermes 0.23.1 released 2026.9.24", "2026-11-15T10:00:00Z", "passed"]
+        self.assertEqual(hc.matrix_row_problems(good), [])
+        bad = {
+            "source abcdef0 / Hermes unknown released 2026.9.24": "no Hermes version",
+            "source abcdef0 / Hermes 0.0.0 released 2026.9.24": "no Hermes version",
+            "source abcdef0 / Hermes 0.23.1": "no Hermes release date",
+            "source abcdef0 / Hermes 0.23.1 released unknown": "no Hermes release date",
+            "Hermes 0.23.1 released 2026.9.24": "no source commit",
+        }
+        for revision, problem in bad.items():
+            self.assertIn(problem, hc.matrix_row_problems([*good[:2], revision, *good[3:]]), revision)
+        self.assertIn("recorded at is not a UTC time", hc.matrix_row_problems([*good[:3], "2026-11-15 10:00", "passed"]))
+        self.assertEqual(hc.matrix_row_problems([*good[:2], "not recorded", "not recorded", "not run"]), [])
+
+    def test_every_shipped_acceptance_row_is_not_run_or_identifies_its_run(self):
+        """R5-api-016: the shipped table goes through the same check."""
+        text = (ROOT / "docs" / "verification.md").read_text()
+        section = text.split("## Acceptance matrix", 1)[1].split("\n## ", 1)[0]
+        rows = [[c.strip() for c in line.strip().strip("|").split("|")] for line in section.splitlines()
+                if line.startswith("|") and not line.startswith(("| ---", "| Receipt"))]
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(hc.matrix_row_problems(row), [], row[0])
 
 
 if __name__ == "__main__":

@@ -71,6 +71,29 @@ def _hermes_identity() -> dict:
     return {"hermes_version": version or "unknown", "hermes_release_date": date or "unknown"}
 
 
+def matrix_row_problems(row: list[str]) -> list[str]:
+    """What stops one acceptance-matrix row in docs/verification.md from identifying its run.
+
+    ``row`` is the five cells: receipt, host, revision, recorded at, result. A "not run" row
+    claims nothing and has no problems. Any other row needs a revision cell naming
+    ``source <commit>``, ``Hermes <version>`` (not a placeholder) and the Hermes release date
+    (``YYYY.M.D`` as Hermes prints it, or ``YYYY-MM-DD``), and a UTC ``recorded at`` time.
+    """
+    _receipt, _host, revision, when, result = row
+    if result.strip().lower().startswith("not run"):
+        return []
+    problems = []
+    if not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", when.strip()):
+        problems.append("recorded at is not a UTC time")
+    if not re.search(r"\bsource [0-9a-f]{7,40}\b", revision):
+        problems.append("no source commit")
+    hermes = re.search(r"\bHermes (\S+)(.*)", revision)
+    if not hermes or hermes.group(1).lower() in _PLACEHOLDERS:
+        problems.append("no Hermes version")
+    if not hermes or not re.search(r"\b\d{4}([.-])\d{1,2}\1\d{1,2}\b", hermes.group(2)):
+        problems.append("no Hermes release date")
+    return problems
+
 
 def record() -> dict:
     needs = _load_needs()
