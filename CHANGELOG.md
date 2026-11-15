@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **The hidden and pending-release caps now drop the oldest entry, not the alphabetically first (#37 sweep).** Both stores were written with sorted keys, so after a reload "oldest first" meant "first in the alphabet": a recent dismissal could be evicted while an old one stayed, and folder paging progress (hash keys) was lost at random. They now keep insertion order on disk.
 - **The folder scan's time budget also covers empty directories (#37 review).** The deadline is checked before each queued directory is opened, so a tree of empty folders can no longer scan past the 2-second budget without the "stopped after" notice.
 - **Folder paging keeps its progress and overlapping roots lose nothing (#37 review).** Folder Done records have their own 5,000-entry bound in `hidden.json` (other dismissals stay at 1,000), so finishing a backlog past 1,200 files no longer evicts the earliest completions and cycles back to them; a file is claimed by an overlapping root only when it is actually shown, so an older file under a separately watched child folder is no longer dropped.
 - **Hiding the first page of a watched folder no longer strands older files (#37).** Done and Not for me files no longer use the 200-file window, ties order by path, and the queue reports how many older files are waiting. Optional `outside_recursive` reads nested folders within depth, entry and time limits, never following symlinks; the filed-item cap reports counts and how to continue. Source files are never moved.

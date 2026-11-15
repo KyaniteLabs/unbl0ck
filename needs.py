@@ -317,14 +317,15 @@ def _read_json(p: Path, *, errors: list[str] | None = None, source: str = "state
     return data
 
 
-def _write_json(p: Path, data: dict[str, Any]) -> None:
+def _write_json(p: Path, data: dict[str, Any], *, ordered: bool = False) -> None:
+    """Atomic JSON write. ``ordered`` keeps insertion order (stores that evict the oldest entry)."""
     tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
     fd = os.open(
         tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
     )  # waits hold prompt text
     try:
         with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps(data, indent=1, sort_keys=True))
+            fh.write(json.dumps(data, indent=1, sort_keys=not ordered))
         tmp.replace(p)
     finally:
         tmp.unlink(
@@ -385,7 +386,7 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
         hidden.pop(item_id, None)
         hidden[item_id] = version
         hidden = _trim_hidden(hidden)  # oldest first out; the store never grows unbounded
-        _write_json(_hidden_path(home), hidden)
+        _write_json(_hidden_path(home), hidden, ordered=True)
 
 
 def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:
@@ -431,7 +432,7 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
         # Hidden marker first: if the second write fails the Done token still matches on retry.
         if clear_hidden:
             del hidden[item_id]
-            _write_json(_hidden_path(home), hidden)
+            _write_json(_hidden_path(home), hidden, ordered=True)
         if clear_done:
             rec.pop("done_at")
             _write_json(f, rec)
@@ -464,7 +465,7 @@ def _set_pending_release(
             data[item_id] = version
             if len(data) > _HIDDEN_KEEP:
                 data = dict(list(data.items())[-_HIDDEN_KEEP:])
-        _write_json(_pending_path(home), data)
+        _write_json(_pending_path(home), data, ordered=True)
 
 
 # --- BLUF cache (one model summary per item version) ----------------------------------------
