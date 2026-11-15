@@ -2188,8 +2188,8 @@ def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, ov
 
 
 def _open_chat_db(db: Path) -> sqlite3.Connection:
-    """Open *db* read-only by the pinned descriptor's own name (Linux's descriptor link, macOS's
-    ``F_GETPATH``; Windows cannot rename an open file), while that name still names the pin."""
+    """Open *db* read-only by the pin's own name (Linux's fd link, macOS's ``F_GETPATH``, Windows
+    holds it) while it and *db* still name the pin. Not seen: a swap and swap back inside SQLite's open."""
     fd, _ = _pinned_open(db, os.O_RDONLY)
     try:
         if os.path.isdir("/proc/self/fd"):
@@ -2202,7 +2202,8 @@ def _open_chat_db(db: Path) -> sqlite3.Connection:
             raise UnsafeStateFile("state.db cannot be opened by descriptor on this platform", "changed")
         conn = sqlite3.connect(Path(name).as_uri() + "?mode=ro", uri=True, timeout=2)
         try:
-            if not _names_open_file(fd, Path(conn.execute("PRAGMA database_list").fetchone()[2])):
+            opened = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+            if not (_names_open_file(fd, db) and _names_open_file(fd, opened)):
                 raise UnsafeStateFile("state.db changed while it was opened", "changed")
         except BaseException:
             conn.close()
