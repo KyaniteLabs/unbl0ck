@@ -1,5 +1,6 @@
 """Round-4 review findings owned by the first stack branch (full text), group by group."""
 
+import os
 import re
 import subprocess
 import types
@@ -415,7 +416,7 @@ class OutsideLookups(OutsideFixture):
         ids = {i["path"] for i in needs.outside_items()}
         self.assertNotIn("old.txt", ids)
         item_id = "outside:folder:" + __import__("hashlib").sha256(str(old.resolve()).encode()).hexdigest()
-        version = f"{old.stat().st_mtime_ns}:{old.stat().st_size}"
+        version = needs.outside_lookup(item_id, self.home)["version"]
         got = self.client.get("/outside/text", params={"id": item_id, "version": version})
         self.assertEqual(got.status_code, 200, got.text)
         self.assertEqual(got.json()["text"], "the oldest note")
@@ -426,7 +427,7 @@ class OutsideLookups(OutsideFixture):
         self.assertEqual(self.client.get("/outside/text", params={"id": item["id"], "version": item["version"]}).status_code, 200)
         gone = "outside:folder:" + "0" * 64
         self.assertEqual(self.client.get("/outside/text", params={"id": gone, "version": "1"}).status_code, 404)
-        with patch.object(Path, "iterdir", side_effect=PermissionError("denied")):
+        with patch.object(os, "listdir", side_effect=PermissionError("denied")):
             r = self.client.get("/outside/text", params={"id": item["id"], "version": item["version"]})
         self.assertEqual(r.status_code, 503, r.text)
 

@@ -2318,10 +2318,16 @@ def _outside_field(
         raise ValueError(
             f"{name} must be {'a non-empty string' if required else 'a string'}"
         )
+    if name == "dedupe_key" and len(value) > limit:
+        # An identifier is never shortened: two long keys would collapse into one record.
+        raise ValueError(f"{name} must be at most {limit} characters")
     if name == "body" and len(value) > limit:
         marker = "\n[truncated]"
         return value[: limit - len(marker)] + marker
-    return value[:limit]
+    value = value[:limit]
+    if required and not value.strip():
+        raise ValueError(f"{name} must not be blank within its first {limit} characters")
+    return value
 
 
 def file_outside(
@@ -2356,6 +2362,11 @@ def file_outside(
             raise ValueError("id must identify an agent-filed outside item")
         if bool(item_id) == bool(key):
             raise ValueError("resolve requires either id or dedupe_key")
+        version = args.get("version")
+        if version is not None and (not isinstance(version, str) or not version):
+            raise ValueError("version must be the version returned when the item was filed")
+        if item_id and version is None:
+            raise ValueError("resolving by id requires the version returned when it was filed")
     with _state_lock(home):
         d = _outside_dir(home)
         files = _list_files(d, ".json")  # a listing that fails must not look like "no match"
@@ -2382,6 +2393,14 @@ def file_outside(
         if action == "resolve":
             if match is None or not match.is_file() or match.is_symlink():
                 raise LookupError("No filed outside item matches that id or dedupe_key")
+            if version is not None:
+                try:
+                    current = _read_json(match, strict=True).get("version")
+                except RuntimeError as exc:
+                    raise SourceUnavailable(str(exc)) from exc
+                if current != version:
+                    # Another agent refiled this item since: its newer text is not yours to delete.
+                    raise StaleAnswer("the filed item changed since you filed it; re-read it first")
             match.unlink()
             return {"ok": True, "resolved": True, "id": f"outside:filed:{match.stem}"}
         if match is None and len(files) >= _OUTSIDE_LIMIT:
@@ -2407,16 +2426,45 @@ def file_outside(
         return {"ok": True, "id": item_id, "version": version}
 
 
+_DIR_FD = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.listdir in os.supports_fd
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+)
+
+
+@contextmanager
+def _watched_dir(root: Path):
+    """Yield ``(dir_fd, names)`` for one watched folder.
+
+    The directory is opened once, without following a link, and everything after (listing,
+    stat, open) is relative to that descriptor, so replacing the folder or one of its parents
+    with a link after the scan cannot redirect a read. Where descriptors are not supported the
+    path is used (``dir_fd`` is None)."""
+    if not _DIR_FD:
+        yield None, os.listdir(root)
+        return
+    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        yield dfd, os.listdir(dfd)
+    finally:
+        os.close(dfd)
+
+
 def _folder_outside_item(
-    f: Path, root: Path, expected: os.stat_result
+    f: Path, root: Path, expected: os.stat_result, root_fd: int | None = None
 ) -> dict[str, Any] | None:
     # Recheck containment at read time. O_NOFOLLOW and fstat also reject a leaf swapped for
     # a symlink, FIFO or device after the directory scan; never block on a special file.
     if f.is_symlink() or f.resolve().parent != root:
         return None
-    fd = os.open(
-        f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if root_fd is not None:
+        fd = os.open(f.name, flags, dir_fd=root_fd)  # relative to the directory that was scanned
+    else:
+        fd = os.open(f, flags)
     with os.fdopen(fd, "rb") as fh:
         st = os.fstat(fh.fileno())
         if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (
@@ -2463,7 +2511,8 @@ def _folder_outside_item(
         kind, where = "notes", "Your notes app"
     return {
         "id": "outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest(),
-        "version": f"{st.st_mtime_ns}:{st.st_size}",
+        # Time and size alone can repeat after an in-place edit with a restored timestamp.
+        "version": f"{st.st_mtime_ns}:{st.st_size}:{hashlib.sha256(raw).hexdigest()[:16]}",
         "source": "outside",
         "tier": "normal",
         "origin": "folder",
@@ -2506,7 +2555,8 @@ def outside_items(
             and isinstance(rec.get("text"), str)
         ):
             items.append(rec)
-        elif len(errors) == before:
+        elif len(errors) == before and os.path.lexists(f):
+            # (A record purged between the listing and the read is gone, not invalid.)
             errors.append(f"outside: {f.name}: invalid filed record")
     raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
     seen: set[Path] = set()
@@ -2522,29 +2572,35 @@ def outside_items(
                 continue
             seen.add(root)
             candidates = []
-            for f in root.iterdir():
-                if f.name.startswith(".") or f.suffix.lower() not in (
-                    ".eml",
-                    ".md",
-                    ".txt",
-                ):
-                    continue
-                try:
-                    st = f.lstat()
-                    if stat.S_ISREG(st.st_mode) and f.resolve().parent == root:
-                        candidates.append((f, st))
-                except OSError as exc:
-                    errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
-            candidates.sort(key=lambda pair: (-pair[1].st_mtime_ns, pair[0].name))
-            if len(candidates) > _OUTSIDE_LIMIT:
-                errors.append(f"outside: {root.name}: folder limit {_OUTSIDE_LIMIT} of {len(candidates)} files; only the newest are shown")
-            for f, st in candidates[:_OUTSIDE_LIMIT]:
-                try:
-                    item = _folder_outside_item(f, root, st)
-                    if item is not None:
-                        items.append(item)
-                except (OSError, ValueError) as exc:
-                    errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
+            with _watched_dir(root) as (dfd, names):
+                for fname in names:
+                    f = root / fname
+                    if fname.startswith(".") or f.suffix.lower() not in (
+                        ".eml",
+                        ".md",
+                        ".txt",
+                    ):
+                        continue
+                    try:
+                        st = (
+                            os.stat(fname, dir_fd=dfd, follow_symlinks=False)
+                            if dfd is not None
+                            else f.lstat()
+                        )
+                        if stat.S_ISREG(st.st_mode) and f.resolve().parent == root:
+                            candidates.append((f, st))
+                    except OSError as exc:
+                        errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
+                candidates.sort(key=lambda pair: (-pair[1].st_mtime_ns, pair[0].name))
+                if len(candidates) > _OUTSIDE_LIMIT:
+                    errors.append(f"outside: {root.name}: folder limit {_OUTSIDE_LIMIT} of {len(candidates)} files; only the newest are shown")
+                for f, st in candidates[:_OUTSIDE_LIMIT]:
+                    try:
+                        item = _folder_outside_item(f, root, st, dfd)
+                        if item is not None:
+                            items.append(item)
+                    except (OSError, ValueError) as exc:
+                        errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
         except (OSError, ValueError, RuntimeError) as exc:
             errors.append(f"outside: {name.strip()}: {type(exc).__name__}: {exc}")
     for it in items:
@@ -2594,18 +2650,24 @@ def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
             if root in seen:
                 continue
             seen.add(root)
-            for f in root.iterdir():
-                if f.name.startswith(".") or f.suffix.lower() not in (".eml", ".md", ".txt"):
-                    continue
-                if "outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest() != item_id:
-                    continue
-                st = f.lstat()
-                if not stat.S_ISREG(st.st_mode) or f.resolve().parent != root:
-                    raise LookupError("outside item is no longer available")
-                item = _folder_outside_item(f, root, st)
-                if item is None:
-                    raise SourceUnavailable("outside file changed while it was read; retry")
-                return item
+            with _watched_dir(root) as (dfd, names):
+                for fname in names:
+                    f = root / fname
+                    if fname.startswith(".") or f.suffix.lower() not in (".eml", ".md", ".txt"):
+                        continue
+                    if "outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest() != item_id:
+                        continue
+                    st = (
+                        os.stat(fname, dir_fd=dfd, follow_symlinks=False)
+                        if dfd is not None
+                        else f.lstat()
+                    )
+                    if not stat.S_ISREG(st.st_mode) or f.resolve().parent != root:
+                        raise LookupError("outside item is no longer available")
+                    item = _folder_outside_item(f, root, st, dfd)
+                    if item is None:
+                        raise SourceUnavailable("outside file changed while it was read; retry")
+                    return item
         except (LookupError, SourceUnavailable):
             raise
         except (OSError, ValueError, RuntimeError) as exc:

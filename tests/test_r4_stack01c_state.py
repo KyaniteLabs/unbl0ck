@@ -174,7 +174,9 @@ class OutsideStoreContainment(HomeCase):
 
     def test_resolve_does_not_delete_through_a_symlinked_outside_directory(self):
         with self.assertRaises(OSError):
-            needs.file_outside({"action": "resolve", "id": "outside:filed:" + "a" * 32}, self.home)
+            needs.file_outside(
+                {"action": "resolve", "id": "outside:filed:" + "a" * 32, "version": "v"}, self.home
+            )
         self.assertTrue(self.victim.exists())
 
     def test_polling_does_not_read_through_a_symlinked_outside_directory(self):

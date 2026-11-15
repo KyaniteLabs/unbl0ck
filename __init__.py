@@ -107,6 +107,7 @@ FILE_SCHEMA = {
             "ref": {"type": "string", "maxLength": 300, "description": "Plain-text id, URL or path; never opened automatically"},
             "dedupe_key": {"type": "string", "maxLength": 120, "description": "Re-file this key to update in place; also usable with resolve"},
             "id": {"type": "string", "description": "Previously returned item id, for resolve"},
+            "version": {"type": "string", "description": "The version returned when the item was filed. Required when resolving by id; a changed item is not resolved"},
         },
         "description": "file requires kind, title, body and act_where; resolve requires either id or dedupe_key",
         "additionalProperties": False,
