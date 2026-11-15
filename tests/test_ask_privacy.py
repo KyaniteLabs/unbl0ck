@@ -6,6 +6,7 @@ import os
 import time
 
 import needs
+from _redaction import assert_redacted
 
 HOME = os.path.expanduser("~")
 SENTINEL_KEY = "sk-" + "A" * 40
@@ -989,7 +990,7 @@ def test_round10_credential_shape_keeps_ordinary_scheme_and_key_prose():
 
     credential = "Bearer R10_BARE_SCHEME_SECRET_0123"
     redacted = needs._ask_redact(credential)
-    assert credential not in redacted
+    assert_redacted(redacted, "R10_BARE_SCHEME_SECRET_0123", label="Bearer")
     assert "Bearer [redacted]" in redacted
 
 

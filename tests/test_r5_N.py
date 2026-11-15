@@ -14,6 +14,7 @@ import test_r4_stack11 as s11
 from r4c_common import ASK
 from test_outside import OutsideFixture, needs
 from test_r4_stack01d_kanban import HERMES_ERROR, KanbanAnswerCase, kanban_db
+from _redaction import assert_redacted
 
 STEM = "0123456789abcdef0123456789abcdef"
 
@@ -103,7 +104,7 @@ class CredentialDigits(unittest.TestCase):
         """R5-needs-003: numeric credentials under a token or auth key are judged by the exact-key classifier."""
         for key in ("auth_token", "refresh_token", "session_token"):
             with self.subTest(key=key):
-                self.assertNotIn("483920", needs._ask_redact(f"{key}=483920"))
+                assert_redacted(needs._ask_redact(f"{key}=483920"), "483920")
                 self.assertNotIn("483920", json.dumps(needs._ask_card_view({key: "483920"})))
 
 
@@ -339,7 +340,7 @@ class StrengthenedTests(Home):
     def test_a_doubly_quoted_record_in_the_unscanned_remainder_is_withheld(self):
         """R5-needs-047: the input leaks unless the unscanned remainder is withheld."""
         text = "{x" * 129 + json.dumps(json.dumps({"name": "DB_PASSWORD", "value": "Zq81LmK4vP"}))
-        self.assertNotIn("Zq81LmK4vP", needs._ask_redact(text))
+        assert_redacted(needs._ask_redact(text), "Zq81LmK4vP")
 
     def test_a_state_write_creates_nothing_through_a_link_where_o_nofollow_is_missing(self):
         """R5-needs-048: the write path's create is exclusive, so a planted link is refused, not followed."""

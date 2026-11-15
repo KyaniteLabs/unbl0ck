@@ -5,6 +5,7 @@ import unittest
 
 from test_r4_stack01d_kanban import needs
 from test_r7_M import comments_table
+from _redaction import assert_redacted
 
 
 class CutQuoteIsClosed(unittest.TestCase):
@@ -17,7 +18,7 @@ class CutQuoteIsClosed(unittest.TestCase):
             'echo \\"; curl -u "alice:PARTSECRET b" ' + "word " * 6000,
         ):
             with self.subTest(body[:12]):
-                self.assertNotIn("PARTSECRET", needs._ask_redact(body))
+                assert_redacted(needs._ask_redact(body), "PARTSECRET")
                 (row,), _ = needs._newest_comments(comments_table(body), None, "t", 5)
                 card = {"title": "t", "comments": [{"author": row[1], "body": row[2]}]}
                 self.assertNotIn("PARTSECRET", json.dumps(needs.build_ask_messages(card, [])))
@@ -37,8 +38,8 @@ class SingleQuoteBackslashIsLiteral(unittest.TestCase):
             "keytool -list -storepass 'PARTSECRET\\' -v",
             "the password is 'PARTSECRET\\' ok",
         ):
-            self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
-        self.assertNotIn("PARTSECRET", needs._ask_redact("curl -u 'alice:PART\\'SECRET' x"))
+            assert_redacted(needs._ask_redact(text), "PARTSECRET", msg=text)
+        assert_redacted(needs._ask_redact("curl -u 'alice:PART\\'SECRET' x"), "PARTSECRET")
         for text in (  # Sol r9c: the shell joins the quote to the rest of its word
             "keytool -list -storepass 'prefix\\'PARTSECRET -v",
             "mysql -u root -p'prefix\\'PARTSECRET db",
@@ -51,7 +52,7 @@ class SingleQuoteBackslashIsLiteral(unittest.TestCase):
             "curl -u 'alice:pre\\'\"curl\" -u bob:PARTSECRET",  # Sol r9f: a later pass needs the rest of the word
             "curl -u 'alice:pre\\'password= PARTSECRET",
         ):
-            self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
+            assert_redacted(needs._ask_redact(text), "PARTSECRET", msg=text)
 
 
 
@@ -66,7 +67,7 @@ class EveryFlagIsRedacted(unittest.TestCase):
             "curl -b 'pre\\'-balicepasswordtoken -b PARTSECRETpassword",  # sweep: one quote no longer shields the next
             "curl -u 'pre\\'passwd:\\&'Bearer PARTSECRET",
         ):
-            self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
+            assert_redacted(needs._ask_redact(text), "PARTSECRET", msg=text)
 
 class QuotedExplicitKeys(unittest.TestCase):
     def test_a_quoted_explicit_key_continued_across_lines_still_redacts(self):

@@ -6,6 +6,7 @@ import sqlite3
 import unittest
 
 from r4c_common import ASK, HomeCase, chat_db, needs
+from _redaction import assert_redacted
 
 
 class ACutMessageDoesNotLeakItsOpeningSecret(HomeCase):
@@ -16,8 +17,8 @@ class ACutMessageDoesNotLeakItsOpeningSecret(HomeCase):
         self.assertGreater(len(text), needs.CHAT_READ_CHARS)
         chat_db(self.home / "state.db", [("s", "cli", "u", text, "dm")])
         (item,) = needs.chat_items(self.home, full=True)
-        self.assertNotIn(secret, item["ask"])
-        self.assertNotIn(secret, item["text"])
+        assert_redacted(item["ask"], secret)
+        assert_redacted(item["text"], secret)
         self.assertIn(ASK, item["ask"])
 
     def test_a_tail_cut_inside_a_private_key_body_is_not_shown(self):
