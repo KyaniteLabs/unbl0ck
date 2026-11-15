@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Answer drafts are kept per backend connection too (#34 round 4).** A draft typed for a card on one backend no longer shows up, or gets submitted, on another backend that has the same card id and version.
+- **One Ask conversation is bounded and expires on a mounted card (#34 round 4).** A conversation keeps at most 100 messages and 200,000 characters and says when older ones were dropped; an expired conversation leaves the screen and is never resent.
+- **An Ask request whose conversation is evicted or expires now reports it (#34 round 4).** The card shows that the conversation was dropped from session memory and offers Retry, instead of clearing Thinking and discarding the reply without a word.
+- **Ask conversations are kept per backend connection (#34 round 4).** The same card id on another backend or profile never shows or resends a conversation, and closing a connection removes its conversations.
+- **An unknown Ask job no longer claims a gateway restart (#34 round 4).** The card now says the answer is no longer available because the gateway restarted or the result expired, since the server cannot tell the two apart.
+- **Ask advice goes out of date when the card text changes (#34 round 4).** A recovered conversation is marked old, and Use as answer is disabled, when the title, question, owner or comments change, not only when a new block event appears.
 - **A superseded Ask request stops polling and cannot hand Retry its job (#34 review).** When the running session is evicted while the card is mounted and a second question starts, the older request now exits at its next step instead of recording its job id over the newer one or appending its answer to the newer conversation.
 - **Ask conversations survive filtering, source outages and route remounts (#34).** The conversation, a running request and its job are kept in bounded Desktop session memory (100 conversations, 30 minutes, never written to disk), so returning to a card shows the answer without a second model call. Recovered conversations stay bound to their question version and a late response cannot overwrite newer work. Reload still clears them by policy.
 - **Resolving a filed item reports success once its record is gone (#46 round 4).** If the stale Not for me marker cannot be removed after the record was deleted, resolve still returns resolved, with a note, instead of an error that invites a pointless retry.

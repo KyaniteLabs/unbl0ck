@@ -913,6 +913,7 @@ function rememberAnswerDraft(id, text, version) {
 // request that outlives its card lands here, so a remounted card shows it without asking
 // again. `gen` identifies the latest request so an old response cannot overwrite newer work.
 const ASK_SESSION_TTL = 30 * 60 * 1000
+const ASK_DROPPED = 'This conversation was dropped from session memory while the model was answering. Retry to ask again.'
 const askSessions = new Map()
 // Request tokens come from one counter for the whole page. A per-card counter restarted at 1 when a
 // cache entry expired or was evicted, so a request still outstanding could match a newer one.
@@ -930,14 +931,45 @@ function updateAskSession(id, patch) {
   return askSessions.get(id)
 }
 function clearAskSession(id) { askSessions.delete(id) }
+// A conversation belongs to one backend connection: the same card id on another backend or profile
+// is a different card. Each registration of the plugin (one per connection) gets its own scope, so
+// a remount under another backend never finds, shows or resends this one's conversation.
+let askScopeSeq = 0
+const askClosed = new Set()
+function askKey(scope, id) { return scope ? `${scope}|${id}` : id }
+function endAskScope(scope) {
+  askClosed.add(scope)
+  for (const key of [...askSessions.keys()]) if (key.startsWith(`${scope}|`)) askSessions.delete(key)
+  for (const key of [...answerDrafts.keys()]) if (key.startsWith(`${scope}|`)) answerDrafts.delete(key)
+}
+// What an Ask answer was written from: the block version plus the visible card text. The version
+// alone does not move when the title, the question or the comments change.
+function askContext(item) {
+  return [item.version, item.title, item.ask, item.owner, item.comments_sig].map(v => String(v ?? '')).join('\u001f')
+}
+// The 100-conversation cap does not bound one conversation, and every update refreshes its expiry:
+// keep the newest messages within a message and character budget and say when older ones were dropped.
+const ASK_KEEP_MESSAGES = 100
+const ASK_KEEP_CHARS = 200000
+function boundAsk(msgs) {
+  let out = msgs.slice(-ASK_KEEP_MESSAGES)
+  let chars = out.reduce((n, m) => n + String(m.content || '').length, 0)
+  while (out.length > 1 && (chars > ASK_KEEP_CHARS || out[0].role !== 'user')) {
+    chars -= String(out[0].content || '').length
+    out = out.slice(1)
+  }
+  return { msgs: out, dropped: msgs.length - out.length }
+}
 
-function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
-  const savedDraft = readAnswerDraft(item.id)
-  const savedAsk = readAskSession(item.id)
+function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' }) {
+  const askId = askKey(scope, item.id)
+  const ctxNow = askContext(item)
+  const savedDraft = readAnswerDraft(askId)
+  const savedAsk = readAskSession(askId)
   const [answer, setAnswer] = useState(savedDraft?.text || '')
   const [answerVersion, setAnswerVersion] = useState(savedDraft?.version ?? item.version)
   const updateAnswer = (text, version) => {
-    rememberAnswerDraft(item.id, text, version)
+    rememberAnswerDraft(askId, text, version)
     setAnswer(text)
     setAnswerVersion(version)
   }
@@ -955,6 +987,8 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const [askOpen, setAskOpen] = useState(!!(savedAsk && (savedAsk.msgs.length || savedAsk.running)))
   const [askMsgs, setAskMsgs] = useState(savedAsk?.msgs || [])
   const [askVersion, setAskVersion] = useState(savedAsk?.version ?? item.version)
+  const [askCtx, setAskCtx] = useState(savedAsk?.ctx ?? ctxNow)
+  const [askTrimmed, setAskTrimmed] = useState(!!savedAsk?.trimmed)
   const [askInput, setAskInput] = useState('')
   const [askBusy, setAskBusy] = useState(!!savedAsk?.running)
   const [askError, setAskError] = useState(savedAsk?.error || '')
@@ -968,7 +1002,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   // Chats and live prompts poll only a 480-character tail; the whole record is fetched on demand.
   const hasFull = isOutside || (item.ask_truncated === true && (item.source === 'chat' || item.source === 'prompt'))
   const answerStale = isKanban && !!answer.trim() && answerVersion !== item.version
-  const askStale = askVersion !== item.version
+  const askStale = askVersion !== item.version || askCtx !== ctxNow
   const platformName = platformLabel(item.platform)
   // Desktop can open its own sessions (and CLI/TUI ones, which share the store). A Telegram or
   // Discord chat is answered in Telegram or Discord.
@@ -1007,14 +1041,31 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   useEffect(() => {
     if (!askBusy) return
     const timer = setInterval(() => {
-      const s = readAskSession(item.id)
+      const s = readAskSession(askId)
       if (s?.running) return
       clearInterval(timer)
       setAskBusy(false)
-      if (s) { setAskMsgs(s.msgs); setAskVersion(s.version ?? item.version); setAskError(s.error || ''); setAskJob(s.job || null) }
+      if (s) {
+        setAskMsgs(s.msgs); setAskVersion(s.version ?? item.version); setAskCtx(s.ctx ?? ctxNow)
+        setAskError(s.error || ''); setAskJob(s.job || null); setAskTrimmed(!!s.trimmed)
+      } else {
+        // The conversation left session memory while its request was outstanding: say so.
+        setAskError(ASK_DROPPED)
+      }
     }, 500)
     return () => clearInterval(timer)
-  }, [askBusy, item.id])
+  }, [askBusy, askId])
+  // The 30-minute retention also applies to a card that stays mounted: once the stored
+  // conversation has expired or been evicted, the displayed copy goes with it.
+  useEffect(() => {
+    if (askBusy || (!askMsgs.length && !askError)) return
+    const timer = setInterval(() => {
+      if (readAskSession(askId)) return
+      setAskMsgs([]); setAskError(''); setAskJob(null); setAskReq(null); setAskTrimmed(false)
+      setAskVersion(item.version); setAskCtx(ctxNow); setAskOpen(false)
+    }, 15000)
+    return () => clearInterval(timer)
+  }, [askBusy, askId, askMsgs.length, askError])
 
   const loadDetail = async () => {
     if (detail && detail.__version === item.version) return detail
@@ -1072,7 +1123,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   }
   const send = async release => {
     if (answerStale) return null
-    const submittedDraft = answerDrafts.get(item.id)
+    const submittedDraft = answerDrafts.get(askId)
     const result = await run(
       () => ctx.rest('/kanban/answer', {
         method: 'POST',
@@ -1086,7 +1137,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
       'ok',
       // A source fault can remount this card and accept a newer draft while this
       // request is in flight. Its late completion owns only the submitted record.
-      r => { if (r && answerDrafts.get(item.id) === submittedDraft) updateAnswer('', item.version) }
+      r => { if (r && answerDrafts.get(askId) === submittedDraft) updateAnswer('', item.version) }
     )
     return result
   }
@@ -1146,22 +1197,39 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
       setAskError(`That message is ${Array.from(q).length} characters long; the limit is ${ASK_MAX_CHARS}. Shorten it and send again.`)
       return
     }
-    const next = askStale
+    // A conversation that expired from session memory while this card stayed mounted is gone:
+    // it is neither shown nor sent again.
+    const held = askMsgs.length && !readAskSession(askId) ? [] : askMsgs
+    const built = askStale
       ? [{ role: 'user', content: retry ? TLDR_ASK : q }]
-      : retry ? askMsgs : [...askMsgs, { role: 'user', content: q }]
-    if (!next.length || next[next.length - 1].role !== 'user') return
-    const before = { msgs: askMsgs, version: askVersion }
+      : retry ? held : [...held, { role: 'user', content: q }]
+    if (!built.length || built[built.length - 1].role !== 'user') return
+    const { msgs: next, dropped } = boundAsk(built)
+    const trimmed = (askStale ? false : askTrimmed) || dropped > 0
+    const before = { msgs: askMsgs, version: askVersion, ctx: askCtx, trimmed: askTrimmed }
     // One id per ask, reused by Retry, so a lost response never starts a second model call.
     const reqId = retry && !askStale && askReq?.version === item.version ? askReq.id : newAskRequestId()
     setAskReq({ id: reqId, version: item.version })
     setAskMsgs(next)
     setAskVersion(item.version)
+    setAskCtx(ctxNow)
+    setAskTrimmed(trimmed)
     if (!retry && !preset) setAskInput('')
     setAskBusy(true)
     setAskError('')
     const gen = ++askGenSeq
-    const mine = () => readAskSession(item.id)?.gen === gen
-    updateAskSession(item.id, { msgs: next, version: item.version, running: true, error: '', gen,
+    const mine = () => readAskSession(askId)?.gen === gen
+    // Stop when a newer request owns the conversation. When the entry was instead evicted or
+    // expired, nothing replaced it: report the lost work with a Retry rather than going quiet.
+    const abandon = () => {
+      if (mine()) return false
+      if (readAskSession(askId) === undefined && !askClosed.has(scope)) {
+        updateAskSession(askId, { msgs: next, version: item.version, ctx: ctxNow, trimmed, running: false, error: ASK_DROPPED, job: null, gen })
+        setAskBusy(false); setAskError(ASK_DROPPED); setAskJob(null)
+      }
+      return true
+    }
+    updateAskSession(askId, { msgs: next, version: item.version, ctx: ctxNow, trimmed, running: true, error: '', gen,
       job: retry && !askStale && askJob?.version === item.version ? askJob : null })
     let admitted = false
     try {
@@ -1183,33 +1251,36 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
       while (r && r.pending && r.job) {
         // A superseded request (evicted session, newer question) stops polling at once and
         // never records its job id, so Retry cannot follow it into a newer conversation.
-        if (!mine()) return
-        updateAskSession(item.id, { job: { id: r.job, version: item.version } })
+        if (abandon()) return
+        updateAskSession(askId, { job: { id: r.job, version: item.version } })
         setAskJob({ id: r.job, version: item.version })
         const left = ASK_DEADLINE_MS - (Date.now() - t0)
         if (left <= 0) throw tooSlow()
         await new Promise(res => setTimeout(res, Math.min(1500, left)))
-        if (!mine()) return
+        if (abandon()) return
         r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true')
         if (over() && !(r && r.pending && r.job)) { setAskJob(null); setAskReq(null); throw tooSlow() }
       }
-      if (!mine()) return
+      if (abandon()) return
       if (over()) { setAskJob(null); setAskReq(null); throw tooSlow() }
-      updateAskSession(item.id, { job: null })
+      updateAskSession(askId, { job: null })
       setAskJob(null)
       setAskReq(null)
       if (r?.ok === false) throw new Error(String(r.detail || 'The model could not answer'))
       const reply = String(r?.reply || '').trim()
       if (!reply) throw new Error('The model returned an empty answer')
       // A newer request owns the conversation now: drop this late response entirely.
-      if (!mine()) return
-      const msgs = [...next, { role: 'assistant', content: reply }]
-      updateAskSession(item.id, { msgs, running: false, job: null, error: '' })
+      if (abandon()) return
+      const kept = boundAsk([...next, { role: 'assistant', content: reply }])
+      const msgs = kept.msgs
+      const keptTrimmed = trimmed || kept.dropped > 0
+      updateAskSession(askId, { msgs, running: false, job: null, error: '', trimmed: keptTrimmed })
       setAskJob(null)
       setAskMsgs(msgs)
+      setAskTrimmed(keptTrimmed)
       sfx.play('ok')
     } catch (e) {
-      if (!mine()) return
+      if (abandon()) return
       sfx.play('err')
       const msg = String(e?.message || e)
       const unknownJob = /unknown or expired ask job/.test(msg)
@@ -1220,13 +1291,16 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
         // not stay in the history (it would be resent and refused again) and the text is restored.
         setAskMsgs(before.msgs)
         setAskVersion(before.version)
+        setAskCtx(before.ctx)
+        setAskTrimmed(before.trimmed)
         setAskReq(null)
         if (!retry && !preset) setAskInput(q)
-        updateAskSession(item.id, { msgs: before.msgs, version: before.version })
+        updateAskSession(askId, { msgs: before.msgs, version: before.version, ctx: before.ctx, trimmed: before.trimmed })
       }
-      // An unknown job means the gateway restarted mid-answer: the work is gone, not slow.
-      const shown = unknownJob ? 'The gateway restarted while the model was answering. Retry to ask again.' : msg
-      updateAskSession(item.id, { running: false, error: shown, job: unknownJob ? null : readAskSession(item.id)?.job || null })
+      // An unknown job is gone from the server: it restarted, or the result outlived its
+      // 15-minute retention. Either way the work cannot be fetched again.
+      const shown = unknownJob ? 'The answer is no longer available: the gateway restarted or the result expired. Retry to ask again.' : msg
+      updateAskSession(askId, { running: false, error: shown, job: unknownJob ? null : readAskSession(askId)?.job || null })
       setAskError(shown)
     } finally {
       if (mine()) setAskBusy(false)
@@ -1402,6 +1476,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
             children: [jsx('span', { children: 'TL;DR' }), jsx('span', { children: 'READ-ONLY · NEVER ACTS' })]
           }),
           askStale ? jsx('div', { className: 'ub-hint', role: 'status', children: 'This card changed. Ask again for its current version before using an answer suggestion.' }) : null,
+          askTrimmed ? jsx('div', { className: 'ub-hint', role: 'status', children: 'Earlier messages in this conversation were dropped to keep it small.' }) : null,
           jsxs('div', {
             className: 'ub-msgs',
             children: [
@@ -1510,7 +1585,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   })
 }
 
-function Page({ ctx, refresh }) {
+function Page({ ctx, refresh, scope = '' }) {
   const q = useValue($queue)
   const [query, setQuery] = useState('')
   const [source, setSource] = useState('all')
@@ -1590,7 +1665,7 @@ function Page({ ctx, refresh }) {
                   className: 'ub-sec',
                   style: { cursor: 'pointer', listStyle: 'none' },
                   children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
-                }), jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })]
+                }), jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, scope, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })]
               }, label)
             : jsxs('div', {
                 hidden: !items.some(i => visibleIds.has(i.id)),
@@ -1599,7 +1674,7 @@ function Page({ ctx, refresh }) {
                     className: 'ub-sec',
                     children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
                   }),
-                  jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })
+                  jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, scope, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })
                 ]
               }, label)
         ]
@@ -1745,6 +1820,7 @@ export default {
   id: 'unbl0ck',
   name: 'UNBL0CK',
   register(ctx) {
+    const scope = `c${++askScopeSeq}`
     const style = document.createElement('style')
     style.dataset.plugin = 'unbl0ck'
     style.textContent = CSS
@@ -1790,7 +1866,7 @@ export default {
     }
 
     ctx.registerMany([
-      { id: 'page', area: ROUTES_AREA, data: { path: PATH }, render: () => jsx(Page, { ctx, refresh }) },
+      { id: 'page', area: ROUTES_AREA, data: { path: PATH }, render: () => jsx(Page, { ctx, refresh, scope }) },
       { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: PATH, label: 'UNBL0CK', codicon: 'debug-continue' } },
       { id: 'count', area: STATUSBAR_AREAS.right, order: 115, render: () => jsx(Chip, {}) }
     ])
@@ -1802,6 +1878,7 @@ export default {
     document.addEventListener('visibilitychange', onVisible)
     ctx.onDispose(() => {
       disposed = true
+      endAskScope(scope)
       clearInterval(timer)
       clearTimeout(follow)
       document.removeEventListener('visibilitychange', onVisible)

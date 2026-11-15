@@ -33,7 +33,7 @@ blocked selects the keep-blocked action.
 
 Typed Kanban answers also survive a card disappearing during a partial source failure
 or a route remount. Up to 100 drafts are held in session memory, each expiring 30 minutes
-after its last edit. A successful answer clears its draft. A full page reload or app
+after its last edit. A successful answer clears its draft. Drafts are kept for each backend connection separately, so a draft typed for one backend never appears on another. A full page reload or app
 restart clears this memory. A recovered draft retains its original question version:
 if the card changed, review it, clear the old draft, then write a current answer.
 
@@ -61,8 +61,8 @@ retry hint rather than joining an unbounded backlog. An Ask poll retries the sam
 after a transport failure. A terminal model failure permits a new attempt. Completed
 results can be read repeatedly: polling does not consume them. At most 128 settled
 results are retained in completion order, and every job expires 15 minutes after creation.
-A restart loses in-memory jobs; the UI reports an unknown/expired job and offers a fresh
-attempt. The client polls for up to 150 seconds per attempt, counted from the first request
+A restart loses in-memory jobs; the UI reports that the answer is no longer available (the gateway restarted or
+the result expired) and offers a fresh attempt. The client polls for up to 150 seconds per attempt, counted from the first request
 and checked after every response, including a finished answer. Each Ask carries a random
 request ID that Retry reuses, so a lost response cannot start a second model call, and it
 carries the card version, so a changed card is refused instead of answered from old context.
@@ -74,10 +74,17 @@ kept in Desktop session memory, like answer drafts: up to 100 conversations, eac
 expiring 30 minutes after its last activity. Filtering, a source outage or leaving and
 returning to the page restores the conversation without asking the model again; a
 request still running when you left is followed to its result. A reload or app restart
-clears this memory, and nothing is written to disk, so there is nothing to delete and no
-profile data to separate. The recovered conversation stays bound to the question version
-it was asked about: if the card changed, it is marked as out of date and its suggestion
-cannot be used as an answer until you ask again. A late response from an older request
+clears this memory, and nothing is written to disk, so there is nothing to delete. Conversations
+are kept for each backend connection separately: the same card id on another backend or
+profile never shows or resends them, and closing a connection removes its conversations.
+One conversation keeps at most 100 messages and 200,000 characters; older messages are
+dropped, and the card says so. A conversation that expires while its card stays open
+leaves the screen too. If a request's conversation is evicted or expires while the model
+is still answering, the card reports that it was dropped from session memory and offers
+Retry; the late answer is not shown. The recovered conversation stays bound to the card it
+was asked about: if the block version or the title, question, owner or comments changed,
+it is marked as out of date and its suggestion cannot be used as an answer until you ask
+again. A late response from an older request
 never replaces a newer one.
 
 ## Recover from a fault
