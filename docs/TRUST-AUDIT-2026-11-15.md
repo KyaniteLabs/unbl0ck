@@ -21,7 +21,7 @@ An outside audit found 15 gaps in how UNBL0CK checks its own guarantees (#71). T
 
 | # | Finding | Status |
 |---|---|---|
-| 1 | Allowlist card view (the queue's trust boundary) is spread across `needs.py` | Deferred: a redesign that needs the owner's approval |
+| 1 | Allowlist card view (the queue's trust boundary) is spread across `needs.py` | Fixed: Ask builds its payload from a fixed list of named fields in `_ask_card_payload`, pinned by `tests/test_r5_stack01_ask.py` |
 | 2 | Process-start test is a characterization labelled as a contract; redaction tests assert on substrings | Fixed: the ps test is relabelled and a syntax-tree scan pins the one process start; `assert_redacted` fails on any surviving 4-character piece of a secret |
 | 3 | CI runs no linter or type checker | Fixed for lint (ruff). No type-check job: mypy is not set up and could not be shown passing |
 | 4 | CI has no job timeout or dependency cache | Fixed. Making the checks required on `main` is a repository setting for the owner |

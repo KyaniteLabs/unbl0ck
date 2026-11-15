@@ -6467,25 +6467,36 @@ def _fit(text: str, room: int) -> str:
     return text[: room - len(_ASK_CUT)] + _ASK_CUT if room > len(_ASK_CUT) else text[:room]
 
 
-def _ask_redact_value(value: Any) -> Any:
+def _ask_workspace_path(value: Any) -> str:
+    """The ``workspace.path`` of a card or JSON object, trimmed, or "" when it has none worth hiding."""
+    workspace = value.get("workspace") if isinstance(value, dict) else None
+    path = workspace.get("path") if isinstance(workspace, dict) else None
+    path = path.strip().rstrip("/") if isinstance(path, str) else ""
+    return path if len(path) > 1 else ""
+
+
+def _ask_redact_value(value: Any, scrub: str | None = None, _key: str = "") -> Any:
     """*value* with every string redacted and every credential-named field's value replaced: the
-    second line for JSON found inside text. What Ask sends is chosen by :func:`_ask_card_payload`."""
+    second line for JSON found inside text. An object's own workspace path is dropped and replaced
+    wherever else it appears. What Ask sends is chosen by :func:`_ask_card_payload`."""
+    scrub = _ask_workspace_path(value) if scrub is None else scrub
     if isinstance(value, dict):
         named = [
             v for k, v in value.items()
             if str(k).casefold() in {"name", "key"} and isinstance(v, str) and _ask_names_credential(v)
         ]
         return {
-            k: "[redacted]"
+            _ask_redact_value(k, scrub) if isinstance(k, str) else k: "[redacted]"
             if _ask_is_secret_key(str(k), v)
             or str(k).casefold() in {"value", "val", "default"}
             and any(_ask_secret_word(n) is not None or _ask_is_secret_key(n, v) for n in named)
-            else _ask_redact_value(v)
+            else _ask_redact_value(v, scrub, str(k))
             for k, v in value.items()
+            if not (_key == "workspace" and k == "path")
         }
     if isinstance(value, (list, tuple)):
-        return [_ask_redact_value(v) for v in value]
-    return _ask_redact(value) if isinstance(value, str) else value
+        return [_ask_redact_value(v, scrub, _key) for v in value]
+    return _ask_redact(value.replace(scrub, "[workspace]") if scrub else value) if isinstance(value, str) else value
 
 
 def _ask_card_payload(card: Any, budget: int) -> dict[str, Any]:
@@ -6499,14 +6510,14 @@ def _ask_card_payload(card: Any, budget: int) -> dict[str, Any]:
         value = card.get(name)
         return value if isinstance(value, dict) else {}
 
-    path = part("workspace").get("path")
-    scrub = path.strip().rstrip("/") if isinstance(path, str) and len(path.strip().rstrip("/")) > 1 else ""
+    scrub = _ask_workspace_path(card)
     left = [budget]
 
     def text(value: Any) -> Any:
         if value is None or isinstance(value, (bool, int, float)):
             return value
-        value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        if not isinstance(value, str):  # each named field holds text in Hermes; a container is not sent
+            return "[not text]"
         if scrub:
             value = value.replace(scrub, "[workspace]")
         if left[0] <= 0:

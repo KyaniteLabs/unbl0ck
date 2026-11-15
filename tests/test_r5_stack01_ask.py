@@ -78,6 +78,29 @@ class OnlyNamedFieldsReachTheModel(unittest.TestCase):
         self.assertIn("[workspace]/a", out)
         self.assertIn('"events": [{"kind": "k", "created_at": null}]', out)
 
+    def test_a_container_under_a_named_field_is_not_sent(self):
+        """#71 review: a container was JSON-dumped whole, escaping the path past the scrub and carrying
+        a numeric credential and arbitrary nested fields. Hermes stores these fields as text."""
+        card = {
+            "workspace": {"path": '/srv/a"b'},
+            "result": {"note": '/srv/a"b/file'},
+            "block": {"limit": {"signing key": 123456, "attachments": [{"content": "PRIVATE"}]}},
+        }
+        out = needs.build_ask_messages(card, [])[1]["content"]
+        for gone in ("srv", "123456", "PRIVATE"):
+            self.assertNotIn(gone, out)
+        payload = needs._ask_card_payload(card, 10_000)
+        self.assertEqual((payload["result"], payload["block"]["limit"]), ("[not text]", "[not text]"))
+
+    def test_json_inside_text_loses_its_own_workspace_path(self):
+        """#71 review: embedded JSON kept ``workspace.path``; the card view used to drop and scrub it."""
+        s = '{"workspace": {"path": "/srv/private/repo"}, "note": "/srv/private/repo/x", "password": "x"}'
+        for content in (
+            needs.build_ask_messages({"body": s}, [])[1]["content"],
+            needs.bluf_messages({"ask": s})[1]["content"],
+        ):
+            self.assertNotIn("/srv/private", content)
+
 
 class TheAskTestsLoadWithoutHermes(unittest.TestCase):
     def test_the_pure_payload_tests_import_when_hermes_is_absent(self):
