@@ -70,7 +70,7 @@ and status) and each difference below.
 | CLI and local slash | Asks only, 12 listed; says how many more and how many stuck or answered cards are not listed | One line per ask: where, title, summary or first 140 characters | Prints the native `hermes pairing approve` command; no inline action | Run it again | Source errors are printed; run it again | Local surfaces only (`cli`, `tui`, `desktop`, `local`) |
 | CLI --json | The raw queue, every tier | Full item fields | None | Run it again | Pairs with `--pack` | Machine owner only; contains private text |
 | Remote slash | Counts only: asks, plus counts of stuck and answered cards and whether the queue is incomplete | None: never a title, text, id, name or approval command | Says to open Desktop or run `hermes unbl0ck` on the machine | Ask again after acting there | "Incomplete" is stated as a count-level fact | Anyone admitted to a gateway can type it, so an unknown or missing platform counts as remote |
-| Pocket pack | Up to six asks in queue order; no stuck or answered cards; `omitted` gives counts of what is left out | Title, short summary and ask text | One fixed pointer per card ("Answer in Telegram", "Open pairing requests"); never an approval or inline action | Pack is regenerated, expires in one hour | Written only when you ask for it | Counts in `omitted` are the only disclosure of omitted work |
+| Pocket pack | Up to six asks in queue order; no stuck or answered cards; `omitted` gives counts of what is left out, and `complete` is false (with `omitted.unread_sources` counting them) when a source could not be read, so an empty pack is not "nothing needs you" | Title, short summary and ask text | One fixed pointer per card ("Answer in Telegram", "Open pairing requests"); never an approval or inline action | Pack is regenerated, expires in one hour | Written only when you ask for it | Counts in `omitted` are the only disclosure of omitted work |
 <!-- surface-matrix:end -->
 
 Actions are not flattened into every surface: a surface gets a new action only after its
@@ -142,7 +142,7 @@ leaves a small restart marker (see below), so a poll reports one of five states:
 | `unknown` | The restart happened after the request was sent (or the saved record is unreadable, or the answer was finished but not kept) | "Outcome unknown ... Retry sends a new request." The provider may or may not have answered; only you can ask again |
 | `not_submitted` | The restart happened before the request reached the model | "Not sent ... Retry sends it now." Nothing left the machine |
 
-Restart markers live in `<HERMES_HOME>/plugin-data/unbl0ck/ask/<job>.json`: one owner-only
+Restart markers live in `<HERMES_HOME>/plugin-data/unbl0ck/ask/<profile>/<job>.json`: one owner-only
 (0600) file per job in an owner-only (0700) directory, at most 256, deleted 15 minutes
 after the request started, when the job is evicted or consumed, or immediately with
 `DELETE /card/ask/{job}`. A marker holds the job id, state, timestamps, the card id,

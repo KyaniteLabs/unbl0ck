@@ -1461,6 +1461,9 @@ function Page({ ctx, refresh }) {
   const [source, setSource] = useState('all')
   // Full-text results belong to the query that produced them; editing the query drops them.
   const [fullHits, setFullHits] = useState(null)
+  // A search answer belongs to the query it was asked for: editing or clearing the query bumps
+  // this, and a response that finds it changed is dropped (hits, error and busy flag alike).
+  const searchGen = useRef(0)
   const [fullBusy, setFullBusy] = useState(false)
   const [fullError, setFullError] = useState('')
   useEffect(() => { if (Date.now() - (q.at || 0) > 10000) refresh() }, [])   // opening the page shows fresh data
@@ -1523,22 +1526,25 @@ function Page({ ctx, refresh }) {
   const outside = q.items.filter(i => i.source === 'outside')
   const prompts = q.items.filter(i => i.source === 'prompt')
   const pairing = q.items.filter(i => i.source === 'pairing')
-  const clearFilters = () => { setQuery(''); setSource('all'); setFullHits(null); setFullError('') }
-  const changeQuery = value => { setQuery(value); setFullHits(null); setFullError('') }
+  const clearFilters = () => { searchGen.current += 1; setFullBusy(false); setQuery(''); setSource('all'); setFullHits(null); setFullError('') }
+  const changeQuery = value => { searchGen.current += 1; setFullBusy(false); setQuery(value); setFullHits(null); setFullError('') }
   // Explicit, one request per click: never from typing, an effect or a timer, and never a model call.
   const runFullSearch = async () => {
     const asked = query.trim()
     if (!asked || fullBusy) return
+    const gen = searchGen.current
     setFullBusy(true)
     setFullError('')
     try {
       const d = await ctx.rest(`/search?q=${encodeURIComponent(asked)}`)
+      if (searchGen.current !== gen) return
       setFullHits({ ...d, query: asked })
     } catch (e) {
+      if (searchGen.current !== gen) return
       setFullHits(null)
       setFullError(String(e?.message || e))
     } finally {
-      setFullBusy(false)
+      if (searchGen.current === gen) setFullBusy(false)
     }
   }
   const fullSummary = h => {
@@ -1746,7 +1752,13 @@ export default {
     let lastErr = ''
     let inflight = null
     let disposed = false
-    const refresh = () => (inflight ||= load().finally(() => { inflight = null }))
+    // One load at a time. A refresh asked for while a load is running (after an answer or a Done)
+    // waits for it and then reads again: the running load may have read the queue before the change.
+    let rerun = null
+    const refresh = () => {
+      if (!inflight) return (inflight = load().finally(() => { inflight = null }))
+      return (rerun ||= inflight.then(() => { rerun = null; return refresh() }))
+    }
     const load = async () => {
       if (disposed) return
       clearTimeout(follow)
