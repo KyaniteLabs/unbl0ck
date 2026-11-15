@@ -1720,12 +1720,13 @@ def _comment_events(conn: Any, kanban_db: Any, task_id: str, author: str, block_
     """The logged ``len`` of each ``commented`` event of *author* after the block (all when there is
     none), newest first. Kanban writes a comment with its event in one transaction and ids only grow."""
     try:
-        rows = conn.execute(  # a payload is an author and a length: a longer one is not read
-            "SELECT SUBSTR(payload, 1, 4096) FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ? "
+        rows = conn.execute(
+            "SELECT rowid FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ? "
             "ORDER BY id DESC LIMIT ?", (task_id, block_id or 0, PLACEMENT_ROWS)).fetchall()
+        rows = [_read_text(conn, "task_events", "payload", r, 4096) for (r,) in rows]  # an author and a length
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        rows = [(e.payload,) for e in kanban_db.list_events(conn, task_id)[::-1] if e.kind == "commented" and e.id > (block_id or 0)]
-    payloads = (_json_payload(p) for (p,) in rows[:PLACEMENT_ROWS])
+        rows = [(e.payload, 0) for e in kanban_db.list_events(conn, task_id)[::-1] if e.kind == "commented" and e.id > (block_id or 0)]
+    payloads = (_json_payload(p) for p, _ in rows[:PLACEMENT_ROWS])
     return [p.get("len") for p in payloads if _same_author(p.get("author"), author)]
 
 
@@ -1741,9 +1742,9 @@ def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_i
     k events of that length after the block logged the author's k newest comments of that length."""
     k = _comment_events(conn, kanban_db, task_id, author, block_id).count(len(text))
     try:
-        rows = conn.execute(  # enough bytes to tell a longer body
-            "SELECT author, SUBSTR(CAST(body AS BLOB), 1, ?) FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?",
-            (4 * len(text) + 1, task_id, PLACEMENT_ROWS)).fetchall()
+        rows = conn.execute(
+            "SELECT rowid, author FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?", (task_id, PLACEMENT_ROWS)).fetchall()
+        rows = [(a, _read_text(conn, "task_comments", "body", r, 4 * len(text) + 1)[0]) for r, a in rows]  # tells a longer body
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
         listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: -(getattr(c, "id", 0) or 0))
         rows = [(c.author, str(c.body).encode("utf-8", "replace")) for c in listed]
@@ -2159,9 +2160,8 @@ _CUT_PEM_TAIL = re.compile(r"[A-Za-z0-9+/=\s]*(?=-----END )")
 def _read_text(conn: sqlite3.Connection, table: str, column: str, rowid: Any, room: int, tail: bool = False) -> tuple[bytes, int]:
     """At most *room* bytes of a stored text, from its start or *tail*, and its byte length; SQLite loads no more."""
     with conn.blobopen(table, column, rowid, readonly=True) as blob:
-        size = len(blob)
-        blob.seek(max(0, size - room) if tail else 0)
-        return blob.read(room), size
+        blob.seek(max(0, len(blob) - room) if tail else 0)
+        return blob.read(room), len(blob)
 
 
 def _drop_cut(text: str, at_start: bool) -> str:

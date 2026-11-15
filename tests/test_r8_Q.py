@@ -64,20 +64,28 @@ class BoundedTextReads(unittest.TestCase):
         return json.loads(done.stdout.strip().splitlines()[-1])
 
     def test_a_huge_comment_is_read_without_sqlite_loading_it(self):
-        """R8-009: the comment view reads a bounded piece of a body, not SQLite's whole value."""
+        """R8-009: the comment view and the answer check read a bounded piece of a body or event
+        payload, not SQLite's whole value."""
         with tempfile.TemporaryDirectory() as d:
             conn = sqlite3.connect(Path(d) / "k.db")
             conn.execute(
                 "CREATE TABLE task_comments(id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INT)"
             )
+            conn.execute("CREATE TABLE task_events(id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)")
             conn.execute("INSERT INTO task_comments VALUES(1, 't', 'w', ?, 1)", ("Pick A or B? " * (BIG // 13),))
+            conn.execute("INSERT INTO task_comments VALUES(2, 't', 'w', 'Pick', 2)")
+            conn.execute("INSERT INTO task_events VALUES(1, 't', 'commented', ?)", (" " * BIG + '{"author": "w"}',))
+            conn.execute("""INSERT INTO task_events VALUES(2, 't', 'commented', '{"author": "w", "len": 4}')""")
             conn.commit()
             conn.close()
-            rows, count = self.run_child(
-                d, "needs._newest_comments(sqlite3.connect(home / 'k.db'), None, 't', 5)"
+            (rows, count), answered = self.run_child(
+                d,
+                "[needs._newest_comments(sqlite3.connect(home / 'k.db'), None, 't', 5), "
+                "needs._answered_with(sqlite3.connect(home / 'k.db'), None, 't', 'w', 0, 'Pick')]",
             )
-        self.assertEqual(count, 1)
+        self.assertEqual(count, 2)
         self.assertTrue(rows[0][2].startswith("Pick A or B?"))
+        self.assertTrue(answered)
 
     def test_a_huge_chat_message_is_read_without_sqlite_loading_it(self):
         """R8-009: the chat read neither slices nor trims SQLite's whole value of a long message."""
