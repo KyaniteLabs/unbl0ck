@@ -2771,9 +2771,27 @@ def _remember_wait_fault(home: Path, rid: str, what: str, rec: dict[str, Any] | 
             _WAIT_FAULTS.pop(dropped[-1])
         for h, r in dropped:
             _WAIT_FAULTS_LOST[h] = _WAIT_FAULTS_LOST.get(h, 0) + 1
-    _journal_fault(home, rid, what)
-    for h, r in dropped:
-        _journal_fault(Path(h), r, None, lost=1)
+        _journal_fault(home, rid, what)
+        for h, r in dropped:
+            _journal_fault(Path(h), r, None, lost=1)
+
+
+def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
+    """Write or remove one prompt's record and settle its fault under the fault lock, so this
+    cleanup can never remove a newer fault for the same prompt. Raises if the write fails."""
+    with _WAIT_FAULT_LOCK:
+        had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
+        try:
+            path = _waits_dir(home) / f"{rid}.json"
+            if what == "record":
+                _write_json(path, rec)
+            else:
+                _unlink_wait(path)
+        except Exception:
+            _remember_wait_fault(home, rid, what, rec)
+            raise
+        if had_fault:
+            _journal_fault(home, rid, None)
 
 
 def _unlink_wait(path: Path) -> None:
@@ -2856,15 +2874,7 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
             "proc_start": _proc_start(pid),
             "since": int(time.time()),
         }
-        with _WAIT_FAULT_LOCK:
-            had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
-            try:
-                _write_json(_waits_dir(home) / f"{rid}.json", rec)
-            except Exception:
-                _remember_wait_fault(home, rid, "record", rec)
-                raise
-        if had_fault:
-            _journal_fault(home, rid, None)
+        _settle_wait(home, rid, "record", rec)
     except Exception as exc:  # noqa: BLE001 - observability must never break a human prompt
         log.warning("unbl0ck: could not record wait: %s", type(exc).__name__)
 
@@ -2874,16 +2884,7 @@ def clear_wait(home: Path | None = None, **payload: Any) -> None:
     try:
         rid = str(payload.get("request_id") or "")
         if _SAFE_ID.match(rid):
-            home = home or hermes_home()
-            with _WAIT_FAULT_LOCK:
-                had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
-                try:
-                    _unlink_wait(_waits_dir(home) / f"{rid}.json")
-                except Exception:
-                    _remember_wait_fault(home, rid, "clear", None)
-                    raise
-            if had_fault:
-                _journal_fault(home, rid, None)
+            _settle_wait(home or hermes_home(), rid, "clear", None)
     except Exception as exc:  # noqa: BLE001
         log.warning("unbl0ck: could not clear wait: %s", type(exc).__name__)
 

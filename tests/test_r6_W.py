@@ -86,6 +86,47 @@ class AnUnreadableFaultJournalIsReported(WaitCase):
         self.assertTrue(any(e.startswith("prompt") and "wait-faults.json" in e for e in errors), errors)
 
 
+class HookCleanupKeepsANewerFault(WaitCase):
+    def test_a_successful_record_does_not_erase_a_clear_fault_that_came_after_it(self):
+        """R6-015: the cleanup after a successful record runs before a later clear fault is
+        journaled, never after it."""
+        real_write = needs._write_json
+
+        def fail_waits(path, data, **kw):
+            if "waits" in Path(path).parts:
+                raise OSError("disk full")
+            return real_write(path, data, **kw)
+
+        with patch.object(needs, "_write_json", fail_waits):
+            self.record()
+        self.assertIn(RID, self.journal())
+        real = needs._journal_fault
+        paused, proceed = threading.Event(), threading.Event()
+
+        def journal(home, rid, what):
+            if what is None and not paused.is_set():
+                paused.set()
+                proceed.wait(10)
+            return real(home, rid, what)
+
+        def failing_unlink(path):
+            raise OSError("read-only")
+
+        with patch.object(needs, "_journal_fault", journal), patch.object(
+            needs, "_unlink_wait", failing_unlink
+        ):
+            rec = threading.Thread(target=self.record)
+            rec.start()
+            self.assertTrue(paused.wait(10))
+            clear = threading.Thread(target=lambda: needs.clear_wait(self.home, request_id=RID))
+            clear.start()
+            clear.join(1)  # it finishes here only if it does not wait for the record's cleanup
+            proceed.set()
+            rec.join(10)
+            clear.join(10)
+        self.assertEqual(self.journal().get(RID, {}).get("what"), "clear", self.journal())
+
+
 class OutOfRangePidsAreRefused(WaitCase):
     def test_a_huge_pid_in_the_fault_journal_does_not_abort_the_poll(self):
         """R6-018: an out-of-range pid is malformed input, not an OverflowError from os.kill."""
