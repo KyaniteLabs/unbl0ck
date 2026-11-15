@@ -466,6 +466,20 @@ def visibility(hidden: dict[str, Any], item_id: str, version: str) -> Visibility
 
 _HIDDEN_KEEP = 1000
 
+_ORDER_LOCK = threading.Lock()
+_last_order = 0
+
+
+def _dismissal_order() -> int:
+    """A number that grows with each dismissal this process commits (milliseconds, never repeated
+    or lowered by a clock that stands still or steps back). Taken while the state lock is held,
+    so it follows the order the server committed dismissals in, which the client cannot see from
+    the order of its clicks or of the responses."""
+    global _last_order
+    with _ORDER_LOCK:
+        _last_order = max(int(time.time() * 1000), _last_order + 1)
+        return _last_order
+
 
 class StaleHide(RuntimeError):
     """The dismissal names an older version than the card now has, and a newer one is already hidden."""
@@ -484,6 +498,12 @@ def _current_version(item_id: str, home: Path | None) -> str | None:
 
 def hide(item_id: str, version: str, home: Path | None = None) -> str:
     """Hide one version. Returns the token naming this dismissal, for ``unhide``."""
+    return hide_ordered(item_id, version, home)[0]
+
+
+def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[str, int]:
+    """``hide`` that also returns the commit order of the dismissal, so a caller holding two
+    replies can tell which dismissal the server holds now."""
     item_id, version = str(item_id or ""), str(version or "")
     if not item_id or len(item_id) > 300 or len(version) > 300 or "\x1f" in version:
         raise ValueError("item id and version must be short strings")
@@ -507,8 +527,9 @@ def hide(item_id: str, version: str, home: Path | None = None) -> str:
                     len(hidden) > _HIDDEN_KEEP
                 ):  # oldest hides first out; the store never grows unbounded
                     hidden = dict(list(hidden.items())[-_HIDDEN_KEEP:])
+                order = _dismissal_order()
                 _write_json(_hidden_path(home), hidden, ordered=True)
-                return token
+                return token, order
         current = _current_version(item_id, home)
         looked_up = True
 
@@ -685,7 +706,7 @@ def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str,
     def saved_at(entry: Any) -> int:
         try:
             return int(entry.get("at") or 0) if isinstance(entry, dict) else 0
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
 
     ranked = sorted(
@@ -705,8 +726,9 @@ def save_bluf(
     fp: str | None = None,
 ) -> None:
     """Cache one summary. ``started_at`` is when the model request began. A request that began
-    before the one behind the cached summary of a different version is superseded and dropped,
-    so a slow request for an old question cannot replace the newer question's summary. Start
+    before the one behind the cached summary is superseded and dropped, whether it is for another
+    version or for other text of the same version (a different fingerprint), so a slow request
+    for an old question cannot replace the newer question's summary. Start
     order decides, not completion order: the older request finishing first must not make the
     newer one look stale. A summary saved without a start time is never treated as newer."""
     with _state_lock(
@@ -717,7 +739,6 @@ def save_bluf(
         if (
             started_at is not None
             and isinstance(existing, dict)
-            and existing.get("version") != version
             and _num(existing.get("started_at")) > started_at
         ):
             return
@@ -2190,7 +2211,7 @@ WAIT_MAX_AGE = (
 def _num(value: Any) -> float:
     try:
         number = float(value or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: a JSON integer past the float range
         return 0.0
     return number if math.isfinite(number) else 0.0  # NaN/inf are not times
 
@@ -2295,7 +2316,7 @@ def _journal_fault(
             if lost:
                 pid = os.getpid()
                 old = data.get(_FAULT_LOST_KEY)
-                count = int(old.get("count") or 0) if isinstance(old, dict) else 0
+                count = int(_num(old.get("count"))) if isinstance(old, dict) else 0
                 data[_FAULT_LOST_KEY] = {
                     "count": count + lost,
                     "pid": pid,
@@ -2339,7 +2360,7 @@ def _other_process_faults(home: Path, errors: list[str]) -> None:
             continue
         try:
             pid = int(entry.get("pid") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if pid <= 0 or pid == os.getpid():
             continue
@@ -2471,7 +2492,7 @@ def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitSt
     now = time.time() if now is None else now
     try:
         pid = int(rec.get("pid") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pid = 0
     rid = str(rec.get("request_id") or "")
     if (
@@ -2691,9 +2712,13 @@ def _done_at(rec: dict[str, Any]) -> float | None:
     """The Done time, or None when there is none or it is not a real finite time (a boolean is
     an int to Python, and NaN or infinity never compare as expired)."""
     value = rec.get("done_at")
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)  # OverflowError for a JSON integer past the float range
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _is_done(rec: dict[str, Any]) -> bool:
@@ -2717,9 +2742,12 @@ _TOO_MANY_FILED = (
 def _filed_files(d: Path) -> tuple[list[Path], bool]:
     """At most ``_PURGE_SCAN_LIMIT`` filed-record paths of *d*, and whether there were more."""
     with os.scandir(d) as entries:
-        names = [Path(e.path) for e in itertools.islice((e for e in entries if e.name.endswith(".json")), _PURGE_SCAN_LIMIT + 1)]
+        # Every entry counts toward the bound, not just the JSON ones: a folder of other files
+        # must not be read to the end before the limit applies.
+        seen = list(itertools.islice(entries, _PURGE_SCAN_LIMIT + 1))
+    names = [Path(e.path) for e in seen[:_PURGE_SCAN_LIMIT] if e.name.endswith(".json")]
     names.sort(key=lambda p: p.name)
-    return names[:_PURGE_SCAN_LIMIT], len(names) > _PURGE_SCAN_LIMIT
+    return names, len(seen) > _PURGE_SCAN_LIMIT
 
 
 def _count_active(files: list[Path], skip: Path | None = None) -> int:
@@ -2758,12 +2786,12 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
         return 0
     with scan as entries:
         for entry in entries:
-            if not entry.name.endswith(".json"):
-                continue
             if scanned >= _PURGE_SCAN_LIMIT or time.monotonic() > deadline:
                 errors.append("outside: retention cleanup stopped early; some filed records were not checked")
                 break
-            scanned += 1
+            scanned += 1  # every entry counts, so non-JSON files cannot stretch the scan
+            if not entry.name.endswith(".json"):
+                continue
             f = Path(entry.path)
             if f.is_symlink():
                 continue
@@ -3243,19 +3271,26 @@ def done_outside(
             if not _is_done(rec):
                 rec["done_at"] = time.time()
                 rec["done_token"] = uuid.uuid4().hex
+                rec["done_order"] = _dismissal_order()
                 _write_json(f, rec)
                 # The Done is committed. Enforcing the keep limit is best effort: a failure there
                 # is reported in the reply, never as a failed Done the client could not undo.
                 cleanup_failed += _purge_logged(d)
             token = _done_token(rec)
-        reply = {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS, "token": token}
+        order = rec.get("done_order")
+        if isinstance(order, bool) or not isinstance(order, int):
+            order = int((_done_at(rec) or 0) * 1000)  # a Done written before orders existed
+        reply = {
+            "ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS,
+            "token": token, "order": order,
+        }
         if cleanup_failed:
             reply["cleanup_failed"] = cleanup_failed
         return reply
     if not _FOLDER_ID.fullmatch(item_id):
         raise ValueError("id must identify an outside item")
-    token = hide(item_id, version, home)
-    return {"ok": True, "hidden": True, "local_only": True, "token": token}
+    token, order = hide_ordered(item_id, version, home)
+    return {"ok": True, "hidden": True, "local_only": True, "token": token, "order": order}
 
 
 # --- the queue -----------------------------------------------------------------------------

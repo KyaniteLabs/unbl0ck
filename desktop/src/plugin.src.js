@@ -885,14 +885,18 @@ const newAskRequestId = () => {
 // Local dismissals the human can still undo, newest first, bounded. A second dismissal
 // no longer replaces the first. The server keeps a filed record only for a short period,
 // so an entry can outlive its record; Undo then says so instead of pretending.
-// seq is taken when the human clicks, not when the response arrives: a late response for an older
-// dismissal of this item must not displace the entry (and Undo token) of a newer one.
+// `order` is the number the server gave the dismissal when it committed it. Neither the order of
+// the clicks nor the order the responses arrive in says which dismissal the server holds now, so
+// a late response for an older dismissal of this item must not displace the entry (and Undo
+// token) of a newer one, and the five kept are the five the server committed last.
+// seq is only a local identity for one entry; entries without an order fall back to their time.
 let undoSeq = 0
+const undoRank = u => (typeof u.order === 'number' ? u.order : u.at || 0)
 function undoPush(entry) {
   const list = $undo.get?.() || []
-  if (list.some(u => u.id === entry.id && (u.seq || 0) > (entry.seq || 0))) return
+  if (list.some(u => u.id === entry.id && undoRank(u) > undoRank(entry))) return
   const rest = list.filter(u => u.id !== entry.id)
-  $undo.set([entry, ...rest].slice(0, 5))
+  $undo.set([entry, ...rest].sort((a, b) => undoRank(b) - undoRank(a)).slice(0, 5))
 }
 const answerDrafts = new Map()
 function readAnswerDraft(id) {
@@ -1069,12 +1073,12 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const hide = async () => {
     const seq = ++undoSeq
     await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn',
-      r => { if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: r.token, seq }) })
+      r => { if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: r.token, order: r.order, seq }) })
   }
   const outsideDone = async () => {
     const seq = ++undoSeq
     await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'ok',
-      r => { if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.token, seq }) })
+      r => { if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.token, order: r.order, seq }) })
   }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
