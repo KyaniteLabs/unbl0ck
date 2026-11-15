@@ -344,13 +344,6 @@ class Notice(str):
         return notice
 
 
-def _list_files(d: Path, suffix: str = "") -> list[Path]:
-    """Entries of *d* whose name ends with *suffix*, sorted by name. Unlike ``Path.glob``, a
-    directory that cannot be listed raises instead of looking empty."""
-    with os.scandir(d) as entries:
-        return sorted((Path(e.path) for e in entries if e.name.endswith(suffix)), key=lambda p: p.name)
-
-
 # --- hidden items -------------------------------------------------------------------------
 
 
@@ -1985,7 +1978,9 @@ def _state_dbs(
         consider("default", home / "state.db")
     if only != "default":
         try:
-            entries = [home / "profiles" / only] if only else _list_files(home / "profiles")
+            entries, cut = ([home / "profiles" / only], False) if only else _list_files(home / "profiles")
+            if cut and errors is not None:
+                errors.append(_listing_cut("chat: profiles folder"))
         except FileNotFoundError:
             entries = []
         except OSError as exc:
@@ -2538,7 +2533,9 @@ def _pairing_dirs(home: Path, errors: list[str] | None = None) -> list[tuple[str
     out: list[tuple[str, Path]] = []
     cands = [("default", home / "platforms" / "pairing"), ("default", home / "pairing")]
     try:
-        profiles = _list_files(home / "profiles")
+        profiles, cut = _list_files(home / "profiles")
+        if cut and errors is not None:
+            errors.append(_listing_cut("pairing: profiles folder"))
     except FileNotFoundError:
         profiles = []
     except OSError as exc:
@@ -2609,7 +2606,10 @@ def pairing_items(
     folders = _pairing_dirs(home, errors)
     for profile, folder in folders:
         try:
-            for f in _list_files(folder, "-pending.json"):
+            files, cut = _list_files(folder, "-pending.json")
+            if cut and errors is not None:
+                errors.append(_listing_cut(f"pairing[{profile}]"))
+            for f in files:
                 if _pending_file_damage(f) and errors is not None:
                     errors.append(f"pairing[{profile}]: {f.name}: could not read pending requests")
         except OSError as exc:
@@ -2987,11 +2987,13 @@ def wait_items(
     if not readonly:
         _reconcile_waits(home, errors)
     try:
-        records = _list_files(waits, ".json")
+        records, cut = _list_files(waits, ".json")
     except OSError as exc:
         # An unreadable folder is not an empty one: the prompts in it are unknown.
         errors.append(f"prompt: waits: {type(exc).__name__}; could not list live prompts")
         return items
+    if cut:
+        errors.append(_listing_cut("prompt: waits"))
     if only_rid is not None:
         records = [f for f in records if f.name == f"{only_rid}.json"]
     for f in records:
@@ -3371,11 +3373,20 @@ def _bounded_scandir(d: Path, *, limit: int, deadline: float | None = None) -> t
     return out, False
 
 
-def _filed_files(d: Path) -> tuple[list[Path], bool]:
-    """The filed-record paths among the first ``_PURGE_SCAN_LIMIT`` entries of *d*, by name,
-    and whether the listing was cut."""
+def _list_files(d: Path, suffix: str = "") -> tuple[list[Path], bool]:
+    """The entries among the first ``_PURGE_SCAN_LIMIT`` of *d* whose name ends with *suffix*,
+    by name, and whether the listing was cut. Every state-folder read goes through this one
+    bound. Unlike ``Path.glob``, a folder that cannot be listed raises instead of looking empty."""
     entries, cut = _bounded_scandir(d, limit=_PURGE_SCAN_LIMIT)
-    return sorted((p for p in entries if p.name.endswith(".json")), key=lambda p: p.name), cut
+    return sorted((p for p in entries if p.name.endswith(suffix)), key=lambda p: p.name), cut
+
+
+def _filed_files(d: Path) -> tuple[list[Path], bool]:
+    return _list_files(d, ".json")
+
+
+def _listing_cut(where: str, what: str = "entries") -> Notice:
+    return Notice(f"{where}: more than {_PURGE_SCAN_LIMIT} {what}; only the first {_PURGE_SCAN_LIMIT} are read", "listing_cut")
 
 
 def _count_active(files: list[Path], skip: Path | None = None) -> int:
@@ -4446,10 +4457,7 @@ def outside_items(
         else:
             filed, over = _filed_files(outside)
         if over:
-            errors.append(Notice(
-                f"outside: more than {_PURGE_SCAN_LIMIT} filed entries; only the first {_PURGE_SCAN_LIMIT} are read",
-                "listing_cut",
-            ))
+            errors.append(_listing_cut("outside", "filed entries"))
     except OSError as exc:
         errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
         filed = []

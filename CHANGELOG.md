@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Every state-folder listing reads at most 1,000 entries and says when it stops (#70).** Live prompts, pairing requests and profile folders used an unbounded listing, so a folder full of files made each poll read every record. They now share the bounded listing the filed outside records already used, and a cut listing adds a `listing_cut` notice so the queue does not claim to be complete.
 - **A nested watched file is read from the watched folder's descriptor (#70).** Each subfolder is opened in turn without following a link, so a subfolder swapped for a link after the containment check fails the read instead of redirecting it outside the folder.
 
 ## 0.6.0 (2026-11-15)

@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import needs
+from r4c_common import HomeCase, needs
 
 
 @unittest.skipUnless(needs._DIR_FD, "descriptor-relative opens are not supported here")
@@ -47,6 +47,40 @@ class NestedReadIsPinned(unittest.TestCase):
                 item = None
         self.assertTrue(swapped)
         self.assertIsNone(item)
+
+
+class StateListingsAreBounded(HomeCase):
+    """Every state folder read is one bounded listing: a folder full of records cannot make a
+    poll read every one of them, and a cut listing says so instead of looking complete."""
+
+    def counted(self, fn):
+        reads = []
+        real = needs._read_plain_bytes_st
+
+        def read(path, *a, **kw):
+            reads.append(Path(path).name)
+            return real(path, *a, **kw)
+
+        with patch.object(needs, "_PURGE_SCAN_LIMIT", 3), patch.object(needs, "_read_plain_bytes_st", read):
+            return reads, fn()
+
+    def test_live_prompt_records_are_read_at_most_the_listing_limit(self):
+        for n in range(6):
+            needs.record_wait(self.home, request_id=f"{n:016x}", kind="clarify", prompt="Pick?", platform="cli")
+        errors = []
+        reads, _ = self.counted(lambda: needs.wait_items(self.home, errors, readonly=True))
+        self.assertLessEqual(len([r for r in reads if r.endswith(".json")]), 3, reads)
+        self.assertTrue(any("only the first 3" in str(e) for e in errors), errors)
+
+    def test_pairing_requests_are_read_at_most_the_listing_limit(self):
+        folder = self.home / "platforms" / "pairing"
+        folder.mkdir(parents=True)
+        for n in range(6):
+            (folder / f"p{n}-pending.json").write_text("{}")
+        errors = []
+        reads, _ = self.counted(lambda: needs.pairing_items(self.home, errors, store=lambda p: type("S", (), {"list_pending": lambda self: []})()))
+        self.assertLessEqual(len(reads), 3, reads)
+        self.assertTrue(any("only the first 3" in str(e) for e in errors), errors)
 
 
 if __name__ == "__main__":
