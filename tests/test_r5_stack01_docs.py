@@ -51,7 +51,7 @@ class DocsStateTheCompatibilityExceptions(unittest.TestCase):
             needs.hide("chat:p:s", "1", home)  # succeeds: the link is removed, not an error
             self.assertEqual(victim.read_text(encoding="utf-8"), "keep me")
             self.assertFalse(target.is_symlink())
-            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"chat:p:s": "1"})
+            self.assertEqual(needs.load_hidden(home), {"chat:p:s": "1"})
 
 
 class OperatorGuideStatesWhichFollowUpsStay(unittest.TestCase):

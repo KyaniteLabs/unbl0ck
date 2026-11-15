@@ -43,11 +43,11 @@ class AStaleDismissalIsJudgedUnderTheLock(Home):
         ):
             with self.assertRaises(needs.StaleHide):
                 needs.hide("kanban:b:t", "1", self.home)
-        self.assertEqual(json.loads((self.data / "hidden.json").read_text()), {"kanban:b:t": "2"})
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "2"})
 
     def test_a_dismissal_with_nothing_stored_still_works(self):
         needs.hide("kanban:b:t", "1", self.home)
-        self.assertEqual(json.loads((self.data / "hidden.json").read_text()), {"kanban:b:t": "1"})
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "1"})
 
 
 class TheLockFileIsNeverFollowedWithoutNoFollow(Home):
@@ -140,7 +140,7 @@ class AForeignJsonFileIsNeverTreatedAsAFiledItem(Home):
         )
         self.assertEqual([i["id"] for i in needs.outside_items(self.home)], [filed["id"]])
         self.assertEqual(needs.outside_lookup(filed["id"], self.home)["id"], filed["id"])
-        self.assertEqual(needs.done_outside(filed["id"], filed["version"], self.home)["deleted"], True)
+        self.assertEqual(needs.done_outside(filed["id"], filed["version"], self.home)["done"], True)
 
 
 if __name__ == "__main__":
