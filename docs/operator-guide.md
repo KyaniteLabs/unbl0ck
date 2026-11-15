@@ -319,19 +319,22 @@ card, search, a summary and the model. Text in a `textarea` is shown; `input` va
 not. The card starts with "Converted from HTML"; tables and lists are flattened. A message
 with no readable body says so instead of showing an empty card.
 
-Hidden text is decided from the element's own `hidden` attribute, its inline `style` and
-the message's `<style>` rules, read properly (whole property names, comments and
-`!important` understood; `min-width` is not `width`; custom properties are ignored).
-`display:none`, zero `opacity` and a zero width or height with clipped overflow remove the
-whole element; `visibility:hidden` and `font-size:0` apply to what is inside unless an
-inner element sets them back. Stylesheet rules with tag, class, id, descendant and child
-selectors are applied; media queries and attribute, pseudo-class or sibling selectors are
-not evaluated, and when one of those could hide text the card says "styles ... were not
-evaluated" and may show text such a rule hides. External stylesheets are never fetched,
-and positioning, colour or text-indent tricks are not evaluated. When part of the body
-could not be shown (an element that is hidden or never closed, markup nested too deeply,
-an unterminated comment, tag or quoted value, a reader failure) the card says so instead
-of presenting the rest as complete.
+Hidden text is decided from the element's own `hidden` attribute and its inline `style`,
+read properly (whole property names, comments and `!important` understood; `min-width` is not
+`width`; custom properties are ignored). `display:none`, zero `opacity` and a zero width or
+height with clipped overflow remove the whole element; `visibility:hidden` and `font-size:0`
+apply to what is inside unless an inner element sets them back (`visible`, `initial` or a real
+size). The message's `<style>` rules are never matched to elements: when a stylesheet could hide
+text, or could show again text an inline style or `hidden` hides, that text is kept and the card
+says "styles or markup ... were not evaluated". The same note covers markup the converter does
+not fully follow: an inline style that sets one property twice with different values, a value it
+does not know, a hidden element whose end tag HTML may imply earlier (an omitted `</p>`, `</li>`
+or table-section end) and a hidden formatting element closed by another element's end tag. In
+those cases hidden text may appear: the converter keeps text rather than guess it is hidden.
+External stylesheets are never fetched, and positioning, colour or text-indent tricks are not
+evaluated. When text is left out (an element that is hidden or never closed, markup nested too
+deeply, an unterminated comment, tag or quoted value, a reader failure, or a body longer than is
+read) the card says so instead of presenting the rest as complete.
 
 **What kind of card an `.eml` becomes** comes from its own headers: a message marked
 unsent by its mail client (`X-Unsent`, Thunderbird or Apple Mail draft markers) is a
