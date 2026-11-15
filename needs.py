@@ -27,6 +27,7 @@ This module imports Hermes lazily so it can be unit-tested without a Hermes inst
 from __future__ import annotations
 
 import collections
+import errno
 import hashlib
 import html.parser
 import itertools
@@ -357,6 +358,18 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # absent on Windows
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
+_WIN_LOCK_VIOLATION = 33  # ERROR_LOCK_VIOLATION
+
+
+def _msvcrt_contention(exc: OSError) -> bool:
+    """True when ``msvcrt.locking`` failed only because another holder has the byte: EACCES
+    (LK_NBLCK on a held range), EDEADLK/EDEADLOCK (a blocking lock that gave up) or the Windows
+    lock-violation code. EBADF, EINVAL and the rest are permanent and must not read as "busy"."""
+    if getattr(exc, "winerror", None) == _WIN_LOCK_VIOLATION:
+        return True
+    return exc.errno in {errno.EACCES, errno.EDEADLK, getattr(errno, "EDEADLOCK", errno.EDEADLK)}
+
+
 @contextmanager
 def _state_lock(home: Path | None):
     """Serialise a read-modify-write of UNBL0CK's state files across threads AND processes
@@ -395,7 +408,9 @@ def _state_lock(home: Path | None):
                         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                         locked_with_msvcrt = True
                         break
-                    except OSError:
+                    except OSError as exc:
+                        if not _msvcrt_contention(exc):
+                            raise  # a bad descriptor, argument or filesystem is not a busy lock
                         if time.monotonic() >= deadline:
                             raise TimeoutError(
                                 "unbl0ck: state lock busy (another process holds it)"

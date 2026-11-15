@@ -108,15 +108,15 @@ as private. Settings and source files remain owned by their original application
 | --- | --- |
 | `hidden.json` | Version-specific hides, capped at 1,000 (the oldest dismissal goes first), plus Not for me and Done on watched-folder files, capped separately at 5,000 per watched folder (the per-folder scan bound; up to 8 folders) so paging progress is not evicted, and always kept under the 16 MiB state limit by dropping the oldest; a hide for a version older than the card's current one is refused; shared by local operator surfaces |
 | `chat-backfill.json` | The oldest time a queue read reached and the ids (at most 1,000) of chats only a widened `chat_window_days` found, so they are never summarized automatically; no chat text |
-| `.state.lock` | Empty owner-only (0600) lock file that serializes writes to the files above across threads and processes; holds no data |
+| `.state.lock` | Empty lock file (0600 on macOS and Linux; on Windows it inherits the folder ACL, see below) that serializes writes to the files above across threads and processes; holds no data |
 | `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is always recoverable |
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; visible to every profile, with `dedupe_key` private to the filing profile unless `dedupe_scope` is `global` |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
-| `recovery/*.bak` | Byte-for-byte copies of a shared state file, written only when an operator runs `recovery.py preserve` or `restore --apply` (directory 0700, files 0600). They hold the same private content as the file they copy and are never deleted by the plugin; remove them yourself when no longer needed |
+| `recovery/*.bak` | Byte-for-byte copies of a shared state file, written only when an operator runs `recovery.py preserve` or `restore --apply` (directory 0700, files 0600 on macOS and Linux; on Windows they inherit the folder ACL). They hold the same private content as the file they copy and are never deleted by the plugin; remove them yourself when no longer needed |
 | `bluf.json` | Summary cache capped at 2,000, bound to the item version and to a hash of its title, text, owner and comment count (an edit or a new comment is summarized again); failed-source entries retained subject to cap |
 | `pocket-pack.json` | Written only on explicit pack request |
 | Summary jobs | Process memory; restart loses pending work and results |
-| `ask/<profile>/<job>.json` | Owner-only (0600/0700) Ask restart markers, one directory per profile, capped at 256 per profile, 15-minute retention, with a `.lock` file and short-lived `.gone` delete markers; no card or question text; answer text only with `ask_persist_replies` (default off) |
+| `ask/<profile>/<job>.json` | Ask restart markers (0600/0700 on macOS and Linux; on Windows they inherit the folder ACL), one directory per profile, capped at 256 per profile, 15-minute retention, with a `.lock` file and short-lived `.gone` delete markers; no card or question text; answer text only with `ask_persist_replies` (default off) |
 | Ask jobs | Process memory plus the marker above; a restart recovers `not_submitted`, `unknown`, `failed` or (opt-in) `complete`, and never resends |
 | Answer drafts | Desktop session memory, 100 entries, 30 minutes after last edit; original question version retained |
 | Ask conversations | Desktop session memory, 100 entries, 30 minutes after last activity; question version and outstanding job retained; never written to disk |
@@ -136,6 +136,13 @@ names which one applies):
 | macOS, Linux | `fcntl.flock`, released by the OS if the holder dies | real multi-process test in the suite (`tests/test_state_lock_platforms.py`) |
 | Windows | byte-range lock (`msvcrt.locking`) on the first byte of the same file, released by the OS if the holder dies | logic tested against a simulated lock only; **no run on a real Windows host yet** |
 | Any other platform without either module | thread lock only; run a single writer | none |
+
+On Windows the `0600` and `0700` modes used for the lock file and every other state file are
+POSIX modes: `os.open` with a mode never installs an owner-only ACL there, so the files inherit
+the ACL of `plugin-data` and its parents. The plugin therefore never installs an owner-only ACL
+on Windows and cannot promise the owner-only protection that macOS and Linux get; keep the
+Hermes home in a folder that only the owning user can read. The mode test runs on macOS and
+Linux only.
 
 The lock file is never deleted, so an active lock is never removed. A busy lock raises
 `TimeoutError` after the timeout instead of hanging. Live prompt files and Pocket pack use

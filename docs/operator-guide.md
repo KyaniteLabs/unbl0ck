@@ -171,7 +171,7 @@ leaves a small restart marker (see below), so a poll reports one of five states:
 | `not_submitted` | The restart happened before the request reached the model | "Not sent ... Retry sends it now." Nothing left the machine |
 
 Restart markers live in `<organization HERMES_HOME>/plugin-data/unbl0ck/ask/<profile>/<job>.json`: one owner-only
-(0600) file per job in an owner-only (0700) directory per profile, at most 256 per profile, deleted 15 minutes
+(0600) file per job in an owner-only (0700) directory per profile (POSIX modes; on Windows they inherit the Hermes home's ACL), at most 256 per profile, deleted 15 minutes
 after the request started, when the job is evicted or consumed, or immediately with
 `DELETE /card/ask/{job}?card=<id>` (the call fails honestly if the file cannot be removed, and cleanup keeps retrying). The directory also holds a `.lock` file and short-lived `.gone` markers that stop a deleted job from reappearing. A marker holds the job id, state, timestamps, the card id,
 provider and model names and an error message. It holds no card text, no question and no
@@ -280,7 +280,7 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
 Consequences to expect: everything changed after the backup was made is lost (dismissals,
 pending releases, summaries). The tool never creates defaults for a record it cannot read,
 and it never clears a lock. If it reports `writer_active`, wait for the other process or
-stop it in its owning installation, then run it again. On Windows this tool does not
+stop it in its owning installation, then run it again. On Windows the state files inherit the ACL of the Hermes home (the owner-only modes are POSIX modes), so restrict that folder to the owning user. On Windows this tool does not
 yet probe the state lock, so `--apply` is refused until that is verified on a real host; dry runs and `preserve` still work.
 Per-record files (`outside/`, `waits/`, `ask/`) are not covered: a corrupt record there is
 skipped on its own and does not block the others.
