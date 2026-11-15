@@ -108,11 +108,12 @@ as private. Settings and source files remain owned by their original application
 | `hidden.json` | Version-specific hides, capped at 1,000 (the oldest dismissal goes first), plus Not for me and Done on watched-folder files, capped separately at 5,000 per watched folder (the per-folder scan bound; up to 8 folders) so paging progress is not evicted, and always kept under the 16 MiB state limit by dropping the oldest; a hide for a version older than the card's current one is refused; shared by local operator surfaces |
 | `chat-backfill.json` | The oldest time a queue read reached and the ids (at most 1,000) of chats only a widened `chat_window_days` found, so they are never summarized automatically; no chat text |
 | `.state.lock` | Empty owner-only (0600) lock file that serializes writes to the files above across threads and processes; holds no data |
-| `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is always recoverable |
+| `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is recoverable; when the store is full the answer is still posted without a marker and the result says the release could not be remembered |
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; visible to every profile, with `dedupe_key` private to the filing profile unless `dedupe_scope` is `global` |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
 | `recovery/*.bak` | Byte-for-byte copies of a shared state file, written only when an operator runs `recovery.py preserve` or `restore --apply` (directory 0700, files 0600). They hold the same private content as the file they copy and are never deleted by the plugin; remove them yourself when no longer needed |
-| `bluf.json` | Summary cache capped at 2,000, bound to the item version and to a hash of its title, text, owner and comment count (an edit or a new comment is summarized again); failed-source entries retained subject to cap |
+| `wait-faults.json` | Only while an agent process could not record or clear a live prompt: request ids, what failed and that process's identity (never prompt text), removed when the fault settles or the process is gone; it lets the dashboard report the missing prompt |
+| `bluf.json` | Summary cache capped at 2,000, bound to the item version and to a hash of its title, text, owner and comment count (an edit or a new comment is summarized again; an entry saved before that hash existed is bound to the item version alone until it is next summarized); failed-source entries retained subject to cap |
 | `pocket-pack.json` | Written only on explicit pack request |
 | Summary jobs | Process memory; restart loses pending work and results |
 | `ask/<profile>/<job>.json` | Owner-only (0600/0700) Ask restart markers, one directory per profile, capped at 256 per profile, 15-minute retention, with a `.lock` file and short-lived `.gone` delete markers; no card or question text; answer text only with `ask_persist_replies` (default off) |
@@ -125,14 +126,16 @@ An answer with release is one Kanban write transaction: a stale version is refus
 written, and a release that fails after the answer is written (false or an error) leaves the comment and a
 recovery marker for the retry. Duplicate detection looks only at comments made since the current block.
 
-Shared read-modify-write stores for hidden, summary, pending-release and filed state
+Shared read-modify-write stores for hidden, summary, pending-release, filed and chat-backfill state
 use thread locks and atomic replacement. macOS/Linux additionally use `fcntl`
 cross-process locking with a five-second timeout. Live prompt files and Pocket pack
 use per-file atomic replacement without those shared-store locks. Windows lacks that
 cross-process guarantee. Never repair corruption by silently replacing it with defaults.
+The Ask restart markers are stricter: without `fcntl` (Windows) they are not written at all, so a
+restart there reports an Ask job as unknown instead of two processes sharing an unlocked journal.
 
 State reads and writes never follow a link: a symbolic link in place of `plugin-data/unbl0ck`,
-its subfolders, the lock file, a state file or a temporary file is refused, and a state file
+its subfolders, the lock file or a state file is refused; a link planted where a temporary file would go is removed, never followed, and the write continues with a fresh private file; a state file
 that is not a regular file or is over 16 MiB is treated as unreadable. A state file whose
 entries are not in the shape this version writes is likewise left untouched until repaired.
 
