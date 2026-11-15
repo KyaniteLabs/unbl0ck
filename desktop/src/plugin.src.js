@@ -892,10 +892,13 @@ const newAskRequestId = () => {
 // seq is only a local identity for one entry; entries without an order fall back to their time.
 let undoSeq = 0
 const undoRank = u => (typeof u.order === 'number' ? u.order : u.at || 0)
+// An entry belongs to the backend connection (scope) it was made on: the same card id on another
+// connection is another card, and Undo must go back to the backend that holds the dismissal.
+const sameCard = (u, entry) => u.id === entry.id && (u.scope || '') === (entry.scope || '')
 function undoPush(entry) {
   const list = $undo.get?.() || []
-  if (list.some(u => u.id === entry.id && undoRank(u) > undoRank(entry))) return
-  const rest = list.filter(u => u.id !== entry.id)
+  if (list.some(u => sameCard(u, entry) && undoRank(u) > undoRank(entry))) return
+  const rest = list.filter(u => !sameCard(u, entry))
   $undo.set([entry, ...rest].sort((a, b) => undoRank(b) - undoRank(a)).slice(0, 5))
 }
 const answerDrafts = new Map()
@@ -944,8 +947,14 @@ const askClosed = new Set()
 // later must not recreate the entry under its own, older token.
 const askLatest = new Map()
 function askKey(scope, id) { return scope ? `${scope}|${id}` : id }
+// The queue and the Undo list are shared atoms; every value written to them is stamped with the
+// connection that wrote it, and disposing a connection removes only what it wrote.
+const EMPTY_QUEUE = { items: [], count: 0, errors: [], loading: true, at: 0 }
 function endAskScope(scope) {
   askClosed.add(scope)
+  if ($queue.get?.()?.scope === scope) $queue.set({ ...EMPTY_QUEUE })
+  const keep = ($undo.get?.() || []).filter(u => (u.scope || '') !== scope)
+  if (keep.length !== ($undo.get?.() || []).length) $undo.set(keep)
   for (const key of [...askSessions.keys()]) if (key.startsWith(`${scope}|`)) askSessions.delete(key)
   for (const key of [...answerDrafts.keys()]) if (key.startsWith(`${scope}|`)) answerDrafts.delete(key)
   for (const key of [...askLatest.keys()]) if (key.startsWith(`${scope}|`)) askLatest.delete(key)
@@ -1169,12 +1178,12 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
   const hide = async () => {
     const seq = ++undoSeq
     await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn',
-      r => { if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: r.token, order: r.order, seq }) })
+      r => { if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: r.token, order: r.order, seq, scope }) })
   }
   const outsideDone = async () => {
     const seq = ++undoSeq
     await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'ok',
-      r => { if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.token, order: r.order, seq }) })
+      r => { if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.token, order: r.order, seq, scope }) })
   }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
@@ -1608,12 +1617,14 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
 }
 
 function Page({ ctx, refresh, scope = '' }) {
-  const q = useValue($queue)
+  const queue = useValue($queue)
+  // Another connection's queue is not this page's: until this connection loads, show it as loading.
+  const q = queue.scope && queue.scope !== scope ? EMPTY_QUEUE : queue
   const [query, setQuery] = useState('')
   const [source, setSource] = useState('all')
   useEffect(() => { if (Date.now() - (q.at || 0) > 10000) refresh() }, [])   // opening the page shows fresh data
   const fx = useValue($fxOn)
-  const undoList = useValue($undo) || []
+  const undoList = (useValue($undo) || []).filter(u => (u.scope || '') === scope)
   const [undoBusy, setUndoBusy] = useState(false)
   const [ended, setEnded] = useState([])
   useEffect(() => {
@@ -1687,7 +1698,7 @@ function Page({ ctx, refresh, scope = '' }) {
                   className: 'ub-sec',
                   style: { cursor: 'pointer', listStyle: 'none' },
                   children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
-                }), jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, scope, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })]
+                }), jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, scope, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, askKey(scope, item.id))) })]
               }, label)
             : jsxs('div', {
                 hidden: !items.some(i => visibleIds.has(i.id)),
@@ -1696,7 +1707,7 @@ function Page({ ctx, refresh, scope = '' }) {
                     className: 'ub-sec',
                     children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
                   }),
-                  jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, scope, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })
+                  jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, scope, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, askKey(scope, item.id))) })
                 ]
               }, label)
         ]
@@ -1876,19 +1887,21 @@ export default {
         const errKey = (q.errors || []).join('|')
         if (errKey && errKey !== lastErr) { sfx.play('err'); petEmit('err') }   // once per new fault, not every poll
         lastErr = errKey
-        $queue.set({ ...q, fresh, fault: '', loading: false, at: Date.now() })
+        $queue.set({ ...q, fresh, fault: '', loading: false, at: Date.now(), scope })
       } catch (e) {
         if (disposed) return
         // Keep the last good queue: a transient fetch fault must not wipe the list
         // or tell the user that nothing is blocked.
-        const prev = $queue.get() || {}
+        // Only this connection's own last queue: another connection's cards are not ours to show.
+        const last = $queue.get() || {}
+        const prev = last.scope === scope ? last : { ...EMPTY_QUEUE }
         if (!prev.fault) { sfx.play('err'); petEmit('err') }
-        $queue.set({ ...prev, fault: String(e?.message || e), loading: false })
+        $queue.set({ ...prev, fault: String(e?.message || e), loading: false, scope })
       }
     }
 
     ctx.registerMany([
-      { id: 'page', area: ROUTES_AREA, data: { path: PATH }, render: () => jsx(Page, { ctx, refresh, scope }) },
+      { id: 'page', area: ROUTES_AREA, data: { path: PATH }, render: () => jsx(Page, { ctx, refresh, scope }, scope) },
       { id: 'nav', area: SIDEBAR_NAV_AREA, data: { path: PATH, label: 'UNBL0CK', codicon: 'debug-continue' } },
       { id: 'count', area: STATUSBAR_AREAS.right, order: 115, render: () => jsx(Chip, {}) }
     ])

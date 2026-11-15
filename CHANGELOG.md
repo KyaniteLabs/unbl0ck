@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **The queue, Undo records and mounted cards belong to one backend connection (#34 round 5).** Disposing a connection clears the queue and Undo entries it wrote, a failed load on the next connection no longer shows the previous one's cards, an Undo made on one backend is never offered or sent through another, and the page and every card are keyed by connection so typed answers and advice cannot carry over.
 - **Ask requests and advice stay tied to what they were made from (#34 round 5).** The request id survives a remount, so Retry after a lost response never starts a second model call. An older evicted request can no longer reclaim a conversation a newer one owns. Advice goes stale when the description or an existing comment is rewritten (the card carries digests, not text), and the context fingerprints no longer collide when text contains the separator.
 - **Answer drafts are kept per backend connection too (#34 round 4).** A draft typed for a card on one backend no longer shows up, or gets submitted, on another backend that has the same card id and version.
 - **One Ask conversation is bounded and expires on a mounted card (#34 round 4).** A conversation keeps at most 100 messages and 200,000 characters and says when older ones were dropped; an expired conversation leaves the screen and is never resent.

@@ -200,12 +200,147 @@ class KanbanContextSignature(unittest.TestCase):
         self.assertNotEqual(one, two)
 
 
+
+# The whole module with its imports stubbed: real atoms, the real register(), Page, Item and Undo.
+MODULE = r"""
+const fs = require('fs'), assert = require('node:assert/strict');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const noop = () => {};
+const atoms = [];
+const atom = init => { let v = init; const a = {get: () => v, set: x => { v = x }}; atoms.push(a); return a; };
+const hooks = {state: [], cursor: 0};
+const node = (type, props, key) => ({type, props, key});
+const styleEl = () => ({dataset: {}, remove: noop});
+const doc = {createElement: styleEl, head: {appendChild: noop}, addEventListener: noop, removeEventListener: noop, hidden: false};
+const sdk = {
+  atom, host: {notify: noop, notifyError: noop, navigate: noop}, useValue: a => a.get(),
+  ROUTES_AREA: 'route', SIDEBAR_NAV_AREA: 'nav', STATUSBAR_AREAS: {right: 'right'},
+  useEffect: noop, useRef: () => ({}), jsx: node, jsxs: node,
+  useState: init => { const i = hooks.cursor++; if (!(i in hooks.state)) hooks.state[i] = init; return [hooks.state[i], v => { hooks.state[i] = typeof v === 'function' ? v(hooks.state[i]) : v }]; },
+};
+const body = src.replace(/^import \{[\s\S]*?\} from '[^']+'\n/gm, '').replace(/^import .*\n/gm, '').replace('export default ', 'return ');
+const names = Object.keys(sdk);
+const plugin = new Function(...names, 'document', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout', body)(
+  ...names.map(k => sdk[k]), doc, () => 1, noop, () => 1, noop);
+const $queue = atoms.find(a => a.get() && 'loading' in a.get());
+const $undo = atoms.find(a => Array.isArray(a.get()));
+const tick = () => new Promise(r => setImmediate(r));
+function all(n) { if (n == null) return []; if (Array.isArray(n)) return n.flatMap(all); if (typeof n !== 'object') return [n]; return [n, ...all(n.props?.children)]; }
+function connect(rest) {
+  let dispose, page;
+  plugin.register({rest, registerMany: list => { page = list[0] }, onDispose: f => { dispose = f }});
+  return {page: () => page.render(), dispose: () => dispose(), scope: page.render().props.scope};
+}
+// Render a connection's Page component once and return its element tree.
+function renderPage(conn) {
+  hooks.cursor = 0; hooks.state = [];
+  const el = conn.page();
+  return el.type(el.props);
+}
+"""
+
+
+class ConnectionScope(unittest.TestCase):
+    def run_module(self, script):
+        for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
+            with self.subTest(path=path.name):
+                result = subprocess.run(
+                    ["node", "-e", MODULE + script, str(path)], capture_output=True, text=True, timeout=60
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_failed_queue_on_the_next_connection_does_not_show_the_last_one(self):
+        """R5-desk-002 (class F): dispose A, register B whose /queue fails: B shows nothing of A."""
+        self.run_module(r"""
+(async () => {
+  const a = connect(async () => ({items: [{id: 'kanban:default:a', source: 'kanban', title: 'Card of A', version: '1'}], count: 1, errors: []}));
+  await tick(); await tick();
+  assert.equal($queue.get().items.length, 1, 'A loaded its queue');
+  $undo.set([{id: 'kanban:default:a', title: 'Card of A', at: Date.now(), kind: 'hidden', token: 'ta', scope: a.scope}]);
+  a.dispose();
+  const b = connect(async () => { throw new Error('backend B is down'); });
+  await tick(); await tick();
+  const q = $queue.get();
+  assert.deepEqual(q.items, [], 'B must not show A cards: ' + JSON.stringify(q.items));
+  assert.equal(q.fault, 'backend B is down');
+  assert.deepEqual(($undo.get() || []).filter(u => u.title === 'Card of A'), [], 'A Undo record must not outlive A');
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
+    def test_a_failed_queue_hides_the_last_connection_when_the_next_registers_first(self):
+        """R5-desk-002 (class F): the host may register B before it disposes A."""
+        self.run_module(r"""
+(async () => {
+  const a = connect(async () => ({items: [{id: 'kanban:default:a', source: 'kanban', title: 'Card of A', version: '1'}], count: 1, errors: []}));
+  await tick(); await tick();
+  const b = connect(async () => { throw new Error('backend B is down'); });
+  await tick(); await tick();
+  assert.deepEqual($queue.get().items, [], 'B must not show A cards: ' + JSON.stringify($queue.get().items));
+  a.dispose();
+  assert.equal($queue.get().fault, 'backend B is down', 'disposing A leaves what B shows alone');
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
+    def test_a_dismissal_made_on_one_connection_is_not_offered_by_another(self):
+        """R5-desk-002 (class F): Undo of A's dismissal is not shown by B's page, so it is never sent through B."""
+        self.run_module(r"""
+(async () => {
+  const a = connect(async () => ({items: [], count: 0, errors: []}));
+  const b = connect(async () => ({items: [], count: 0, errors: []}));
+  await tick(); await tick();
+  $undo.set([{id: 'kanban:default:a', title: 'Card of A', at: Date.now(), kind: 'hidden', token: 'ta', scope: a.scope}]);
+  const undoButtons = conn => all(renderPage(conn)).filter(x => x?.type === 'button' && all(x.props.children).includes('Undo'));
+  assert.equal(undoButtons(b).length, 0, 'B must not offer the dismissal made on A');
+  assert.equal(undoButtons(a).length, 1, 'A still offers its own');
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
+    def test_the_page_and_each_card_are_keyed_by_connection(self):
+        """R5-desk-003 (class F): without a key React reuses mounted answer and advice state across connections."""
+        self.run_module(r"""
+(async () => {
+  const items = [{id: 'kanban:default:t1', source: 'kanban', tier: 'ask', title: 'T', ask: 'Q?', version: '1', board: 'default', task_id: 't1', since: 1}];
+  const a = connect(async () => ({items, count: 1, errors: []}));
+  await tick(); await tick();
+  const keyA = a.page().key;
+  const cardsA = all(renderPage(a)).filter(x => x?.props?.item?.id === items[0].id);
+  a.dispose();
+  const b = connect(async () => ({items, count: 1, errors: []}));
+  await tick(); await tick();
+  const cardsB = all(renderPage(b)).filter(x => x?.props?.item?.id === items[0].id);
+  assert.ok(keyA && b.page().key && keyA !== b.page().key, 'Page needs a per-connection key');
+  assert.equal(cardsA.length, 1); assert.equal(cardsB.length, 1);
+  assert.ok(cardsA[0].key && cardsA[0].key !== cardsB[0].key, 'the same card id under two connections must not share a mounted component: ' + cardsA[0].key + ' / ' + cardsB[0].key);
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
+
+class DismissalScope(NodeCase):
+    def test_every_dismissal_is_stamped_with_its_connection(self):
+        """R5-desk-002 (class F): both Undo records carry the scope they were made under."""
+        self.run_views(r"""
+undo=[];
+const ctx={rest:async url=>url==='/hide'?{token:'t1',order:1}:{hidden:true,token:'t2',order:2}};
+const render=(it,scope)=>{cursor=0;return store.Item({ctx,item:it,n:1,refresh,askEnabled:false,scope})};
+(async()=>{
+ await find(render({...item,id:'kanban:default:s1'},'c7'),'Not for me').onClick();
+ const o={source:'outside',origin:'filed',id:'outside:s2',version:'1',kind:'note',title:'T',ask:'a',act_where:'x',since:1};
+ await find(render(o,'c7'),'Done').onClick();
+ const entries=undo;
+ assert.ok(entries.length>=1);
+ for(const e of entries)assert.equal(e.scope,'c7',JSON.stringify(e));
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
 class Stack06Docs(unittest.TestCase):
     def test_docs_name_the_text_that_makes_advice_stale_and_the_retry_id(self):
         text = " ".join((ROOT / "docs/operator-guide.md").read_text().split())
         for needle in (
             "owner, description or comments (including a comment rewritten in place)",
             "reuses the request's id",
+            "removes its conversations, its queue and its Undo list",
+            "remounted per connection",
         ):
             self.assertIn(needle, text)
 

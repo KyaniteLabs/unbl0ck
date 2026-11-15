@@ -76,7 +76,7 @@ returning to the page restores the conversation without asking the model again; 
 request still running when you left is followed to its result. A reload or app restart
 clears this memory, and nothing is written to disk, so there is nothing to delete. Conversations
 are kept for each backend connection separately: the same card id on another backend or
-profile never shows or resends them, and closing a connection removes its conversations.
+profile never shows or resends them, and closing a connection removes its conversations, its queue and its Undo list. A card and the page itself are remounted per connection, so an answer being typed or advice for the same card id never carries over to another backend.
 One conversation keeps at most 100 messages and 200,000 characters; older messages are
 dropped, and the card says so. A conversation that expires while its card stays open
 leaves the screen too. If a request's conversation is evicted or expires while the model
