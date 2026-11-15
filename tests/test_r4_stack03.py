@@ -548,6 +548,13 @@ const it={source:'outside',origin:'folder',kind:'notes',id:'outside:folder:'+'a'
  await find(Item({ctx,item:it,n:1,refresh,askEnabled:false}),'Done — hides until the file changes').onClick();
  assert.equal(undo.length,1);
  assert.equal(undo[0].token,'srv-token');
+ // Not for me takes its token from the server too, never the item version.
+ undo=[];cursor=0;state=[];
+ const kb={source:'kanban',id:'kanban:default:t1',board:'default',task_id:'t1',version:'v1',title:'K',ask:'a',tier:'ask'};
+ await find(Item({ctx,item:kb,n:1,refresh,askEnabled:false}),'Not for me').onClick();
+ assert.equal(undo.length,1);
+ assert.equal(undo[0].kind,'hidden');
+ assert.equal(undo[0].token,'srv-token');
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)
 

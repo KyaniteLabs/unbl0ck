@@ -692,24 +692,44 @@ const render = mount(ctx);
 """)
 
     def test_the_150_second_limit_covers_posts_sleeps_and_terminal_replies(self):
-        """01-018: polls that each take 30 s must fail at the limit, even when the last one answers."""
+        """01-018: the limit starts before the first request, is checked after every response
+        (a terminal one included) and cuts a hung step at the time left, not a fresh 150 s."""
         self.check(r"""
 let now = 0;
 env.Date = {now: () => now};
 env.setTimeout = (fn, ms) => { now += ms; fn(); return 1; };
-let polls = 0;
-const ctx = {rest: async url => {
-  if (url === '/card/ask') { now += 30000; return {pending: true, job: 'j'}; }
-  if (!url.startsWith('/card/ask/')) return {};
-  polls++; now += 30000;
-  return polls < 6 ? {pending: true, job: 'j'} : {ok: true, reply: 'late answer'};
-}};
-const render = mount(ctx);
+const limits = [];
+const realInterval = setInterval;
+global.setInterval = (fn, ms) => { limits.push({ms, at: now}); return realInterval(fn, 1e9); };
+// Each scenario: [POST reply, POST ms, poll replies with their ms]; every one ends past 150 s.
+async function ask(name, post, postMs, polls) {
+  const starts = [];
+  let i = 0;
+  const ctx = {rest: async url => {
+    if (url === '/card/ask') { starts.push(now); now += postMs; return post; }
+    if (!url.startsWith('/card/ask/')) return {};
+    starts.push(now);
+    const [reply, ms] = polls[Math.min(i++, polls.length - 1)];
+    now += ms;
+    return reply;
+  }};
+  now = 0;
+  const render = mount(ctx, {...chat, id: 'kanban:default:' + name});
+  btn(render(), 'TL;DR').props.onClick(); for (let k = 0; k < 20; k++) await tick();
+  assert.ok(!text(render()).includes('late answer'), name + ': an answer after 150 s is not accepted');
+  assert.ok(text(render()).includes('over 150 s'), name + ': the card says why');
+  assert.ok(starts.every(t => t < 150000), name + ': no request starts after the limit: ' + starts);
+}
+const pending = {pending: true, job: 'j'}, late = {ok: true, reply: 'late answer'};
 (async () => {
-  btn(render(), 'TL;DR').props.onClick(); await tick(); await tick();
-  assert.ok(!text(render()).includes('late answer'), 'an answer after 150 s is not accepted');
-  assert.ok(text(render()).includes('over 150 s'));
-  assert.ok(now <= 150000 + 30000, 'at most one request runs past the limit: ' + now);
+  // Polls of 30 s each; the sixth answers.
+  await ask('polls', pending, 30000, [[pending, 30000], [pending, 30000], [pending, 30000], [pending, 30000], [pending, 30000], [late, 30000]]);
+  // A 30 s POST counts: the one poll that answers at 156.5 s is late.
+  await ask('slowpoll', pending, 30000, [[late, 125000]]);
+  // A POST that answers directly after 151 s is late too.
+  await ask('slowpost', late, 151000, [[late, 0]]);
+  // A step that hangs is cut at the time left, not after a fresh 150 s.
+  assert.ok(limits.length > 0 && limits.every(l => l.ms <= 150000 - l.at), 'limit timers: ' + JSON.stringify(limits));
 })().catch(e => { console.error(e); process.exitCode = 1 });
 """)
 
