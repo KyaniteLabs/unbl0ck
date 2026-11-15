@@ -5679,6 +5679,13 @@ _ASK_SECRET_KEY_TERMINALS = frozenset(
         "storepass",
     }
 )
+# Keys whose value is a short numeric code: secret only as digits in key position (``otp=123456``).
+_ASK_CODE_KEY_TERMINALS = frozenset({"bearer", "otp", "totp", "pin", "passcode", "sessionid"})
+_ASK_CODE_ASSIGNMENT = re.compile(
+    r"""(?i)(?<![A-Za-z0-9_.-])(?P<key>["']?(?:[a-z0-9]+[_.-]){0,3}"""
+    r"""(?:bearer|t?otp|pin|passcode|session[_-]?id|signing[_-]?key)["']?)"""
+    r"""(?P<sep>[ \t]*[=:][ \t]*)(?P<value>"\d+"|'\d+'|\d+)(?![A-Za-z0-9_.-])"""
+)
 _ASK_SECRET_ASSIGNMENT = re.compile(
     rf"""(?ix)(?<![A-Za-z0-9.-])(?P<flag>--)?(?P<key_open>\\*["']?)(?P<key>{_ASK_SECRET_KEY})(?P<key_close>\\*["']?)(?![A-Za-z0-9_.-])"""
     r"""(?P<sep>[ \t]*(?:=>|[=:])[ \t]*(?:\r?\n[ \t]*)?|[ \t]+)"""
@@ -5791,13 +5798,14 @@ def _ask_secret_key_is_exact(key: str) -> bool:
         "access_key",
         "private_key",
         "secret_key",
+        "session_id",
     }:
         return True
     parts = normalized.split("_")
     if not parts:
         return False
     terminal = parts[-1]
-    if terminal in _ASK_SECRET_KEY_TERMINALS:
+    if terminal in _ASK_SECRET_KEY_TERMINALS | _ASK_CODE_KEY_TERMINALS:
         return True
     if re.search(
         r"(?:password|passwd|passphrase|credential|authentication|authorization|cookie|oauth|token|secret|auth|storepass)\d+$",
@@ -5809,7 +5817,7 @@ def _ask_secret_key_is_exact(key: str) -> bool:
     return (
         terminal == "key"
         and len(parts) > 1
-        and parts[-2] in {"api", "access", "private", "secret"}
+        and parts[-2] in {"api", "access", "private", "secret", "signing"}
     )
 
 
@@ -5888,8 +5896,8 @@ def _ask_secret_value_shape(value: Any) -> bool:
 
 def _ask_is_secret_key(key: str, value: Any = None) -> bool:
     word = _ask_secret_word(key)
-    if word is None:
-        return False
+    if word is None:  # a numeric code under a code key (``otp: 123456``), never a short count
+        return _ask_numeric_credential(key, value) and len(str(value).strip("\"' ")) >= 4
     if _ask_harmless_secret_value(value) and not _ask_numeric_credential(key, value):
         return False
     if _ask_path_field_value(key, value):
@@ -5962,6 +5970,16 @@ def _ask_redact_authorization_headers(text: str) -> str:
         )
 
     return _ASK_BARE_AUTH_SCHEME_LINE.sub(bare_scheme, text)
+
+
+def _ask_redact_numeric_codes(text: str) -> str:
+    def code(match: re.Match[str]) -> str:
+        if not _ask_is_secret_key(match.group("key"), match.group("value")):
+            return match.group(0)
+        quote = match.group("value")[0] if match.group("value")[0] in "\"'" else ""
+        return f"{match.group('key')}{match.group('sep')}{quote}[redacted]{quote}"
+
+    return _ASK_CODE_ASSIGNMENT.sub(code, text)
 
 
 def _ask_redact_bare_credential_values(text: str) -> str:
@@ -6502,7 +6520,7 @@ def _ask_redact(text: str) -> str:
     text = _ask_redact_yaml(text)
     text = _ask_redact_embedded_json(text)
     text = _ask_redact_assignments(text)
-    return text
+    return _ask_redact_numeric_codes(text)
 
 
 ASK_CARD_CONTEXT_LIMIT = 24000
