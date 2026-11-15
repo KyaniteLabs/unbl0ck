@@ -49,6 +49,49 @@ from its source for that item version, and never sends it to a model. A changed 
 vanished record, or an unreadable source, reports an error with Retry and leaves the
 excerpt labelled as an excerpt. Password prompts are never expanded.
 
+## What you can do per source
+
+One queue does not mean one set of abilities. This table is published as `capabilities` in
+the queue payload and is checked against the code by `tests/test_capability_matrix.py`.
+**Yes** means built. **By design** means withheld on purpose for safety, privacy or native
+authorization: it is not a gap and will not be added. **Not yet** is a real gap.
+
+<!-- capability-matrix:start -->
+| Source | Context | Model help (TL;DR) | Reply or act in UNBL0CK | Route to the original | Dismiss |
+|---|---|---|---|---|---|
+| kanban | Yes | Yes | Yes | Yes | Yes |
+| chat | Not yet | Not yet | By design | Yes | Yes |
+| prompt | By design | By design | By design | Yes | Yes |
+| pairing | By design | By design | By design | Yes | Yes |
+| outside_filed | Yes | Not yet | By design | Yes | Yes |
+| outside_folder | Yes | Not yet | By design | By design | Yes |
+<!-- capability-matrix:end -->
+
+- **Context** is the Context panel for Kanban and the Full text view for chats, live prompts
+  and outside items. Chats have no richer context panel yet.
+- **Model help** sends card text to your configured provider only on an explicit click, and
+  only for Kanban. Chats, filed items and folder files get the one-line summary but no
+  follow-up questions yet. Live prompts (command approvals, password prompts) and pairing
+  requests are never sent to a model. Where it is missing, the card says
+  "TL;DR is not offered here" and why.
+- **Reply or act** stays in the original surface: a Kanban answer is a comment under your
+  name (plus an optional release); chats are answered in the chat, prompts where they were
+  asked, pairing with `hermes pairing approve` or the dashboard Pairing page, and filed items
+  in the app named on the card. UNBL0CK has no route that sends a message, approves a
+  pairing or answers a prompt, so the platform's own sign-in, recipient identity and
+  confirmation always apply; `tests/test_capability_matrix.py` fails if a new write route
+  appears without a review.
+- **Route to the original** is **Open session** / **Open chat + reply** for local platforms,
+  and a line naming where to act for everything else. Completion shows up as the card
+  leaving the list on the next poll. Watched folder files are read-only, so there is
+  nothing to open; Done only hides the card.
+- **Dismiss** is **Not for me** (comes back when the source changes) and, for outside items,
+  Done with Undo. Neither completes anything in the original app.
+- Pocket packs only name the original surface ("Answer in Telegram", "Open pairing
+  requests"); they never carry a pairing code, a person's platform id or an inline action.
+- With no usable provider (Ask off, or no model reachable) Ask returns 403 or 503 and the
+  other sources are unaffected.
+
 **TL;DR** starts a read-only model job. **Use as answer** copies a suggestion into the
 answer box; the human still submits it. **Discuss in chat** asks the host composer to
 create a draft. The original card stays unchanged by these actions.

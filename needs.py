@@ -2353,6 +2353,80 @@ SOURCE_ORDER = {s: i for i, s in enumerate(SOURCES)}
 # Sources whose text is already one plain line; a model summary would only add latency and cost.
 NO_BLUF_SOURCES = ("prompt", "pairing")
 
+# What each kind of card lets you do inside UNBL0CK, and why not when it does not.
+# "supported": built. "restricted": withheld on purpose (safety, privacy or native
+# authorization); not a gap and not planned. "missing": not built yet; a real gap.
+# The docs table, the queue payload and the Desktop notes all read this one table.
+CAPABILITY_ABILITIES = ("context", "model_help", "reply", "route", "dismiss")
+CAPABILITY_STATUSES = ("supported", "restricted", "missing")
+
+
+def _cap(status: str, why: str = "") -> dict[str, str]:
+    return {"status": status, "why": why}
+
+
+_CAP_OUTSIDE_REPLY = _cap(
+    "restricted",
+    "UNBL0CK never sends, files or approves for another app; act in the original app, where its own sign-in and confirmation apply",
+)
+_CAP_OUTSIDE_HELP = _cap(
+    "missing",
+    "only the one-line summary exists; follow-up questions for filed items and folder files are not built yet",
+)
+
+CAPABILITIES: dict[str, dict[str, dict[str, str]]] = {
+    "kanban": {
+        "context": _cap("supported"),
+        "model_help": _cap("supported"),
+        "reply": _cap("supported"),
+        "route": _cap("supported"),
+        "dismiss": _cap("supported"),
+    },
+    "chat": {
+        "context": _cap("missing", "the card shows the last message and its full text; a chat context panel is not built yet"),
+        "model_help": _cap("missing", "only the one-line summary exists; TL;DR follow-ups are Kanban-only today"),
+        "reply": _cap("restricted", "reply in the chat itself so that platform's own identity and authorization apply; UNBL0CK never sends for you"),
+        "route": _cap("supported"),
+        "dismiss": _cap("supported"),
+    },
+    "prompt": {
+        "context": _cap("restricted", "a live prompt shows only what Hermes already redacted; nothing more is read"),
+        "model_help": _cap("restricted", "live prompts, including command approvals and password prompts, are never sent to a model"),
+        "reply": _cap("restricted", "answer it where it was asked; approvals and passwords are never taken here"),
+        "route": _cap("supported"),
+        "dismiss": _cap("supported"),
+    },
+    "pairing": {
+        "context": _cap("restricted", "the pairing code and the person's platform id are never shown"),
+        "model_help": _cap("restricted", "pairing requests are never sent to a model"),
+        "reply": _cap("restricted", "approve with the native pairing command or the dashboard Pairing page"),
+        "route": _cap("supported"),
+        "dismiss": _cap("supported"),
+    },
+    "outside_filed": {
+        "context": _cap("supported"),
+        "model_help": _CAP_OUTSIDE_HELP,
+        "reply": _CAP_OUTSIDE_REPLY,
+        "route": _cap("supported"),
+        "dismiss": _cap("supported"),
+    },
+    "outside_folder": {
+        "context": _cap("supported"),
+        "model_help": _CAP_OUTSIDE_HELP,
+        "reply": _CAP_OUTSIDE_REPLY,
+        "route": _cap("restricted", "watched files are read-only: UNBL0CK never edits, moves or deletes them"),
+        "dismiss": _cap("supported"),
+    },
+}
+
+
+def capability_key(item: dict[str, Any]) -> str:
+    """The CAPABILITIES row for a queue item."""
+    source = str(item.get("source") or "")
+    if source == "outside":
+        return "outside_folder" if item.get("origin") == "folder" else "outside_filed"
+    return source if source in CAPABILITIES else ""
+
 
 def build_queue(
     home: Path | None = None, *, include_hidden: bool = False
@@ -2438,6 +2512,7 @@ def build_queue(
         "errors": errors,
         "ask_enabled": ask_enabled(),
         "bluf_enabled": bluf_enabled(),
+        "capabilities": CAPABILITIES,
     }
 
 

@@ -913,7 +913,7 @@ function updateAskSession(id, patch) {
 }
 function clearAskSession(id) { askSessions.delete(id) }
 
-function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
+function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false }) {
   const savedDraft = readAnswerDraft(item.id)
   const savedAsk = readAskSession(item.id)
   const [answer, setAnswer] = useState(savedDraft?.text || '')
@@ -946,6 +946,12 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const isPrompt = item.source === 'prompt'
   const isPairing = item.source === 'pairing'
   const isOutside = item.source === 'outside'
+  // Model help exists for Kanban only; every other source says why, from the published matrix.
+  const capKey = isOutside ? (item.origin === 'folder' ? 'outside_folder' : 'outside_filed') : item.source
+  const helpCap = !isKanban ? capabilities?.[capKey]?.model_help : null
+  const helpLimit = helpCap && helpCap.status !== 'supported' && helpCap.why
+    ? jsx('div', { className: 'ub-hint', role: 'note', children: `TL;DR is not offered here: ${helpCap.why}` })
+    : null
   // Chats and live prompts poll only a 480-character tail; the whole record is fetched on demand.
   const hasFull = isOutside || (item.ask_truncated === true && (item.source === 'chat' || item.source === 'prompt'))
   const answerStale = isKanban && !!answer.trim() && answerVersion !== item.version
@@ -1434,6 +1440,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
           : null,
         isOutside && item.truncated ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This export exceeds 256 KiB. Only the beginning is shown; read the complete text in the original app.' }) : null,
         jsx('div', { className: 'ub-act', children: actions }),
+        helpLimit,
         detailNode || askNode ? jsxs('div', { className: 'ub-detail', children: [detailNode, askNode] }) : null
       ]
     })
@@ -1516,7 +1523,7 @@ function Page({ ctx, refresh }) {
                   className: 'ub-sec',
                   style: { cursor: 'pointer', listStyle: 'none' },
                   children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
-                }), jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })]
+                }), jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, capabilities: q.capabilities, hidden: !visibleIds.has(item.id) }, item.id)) })]
               }, label)
             : jsxs('div', {
                 hidden: !items.some(i => visibleIds.has(i.id)),
@@ -1525,7 +1532,7 @@ function Page({ ctx, refresh }) {
                     className: 'ub-sec',
                     children: [jsx('span', { className: 'ub-eyebrow', children: `\\\\ ${label} · ${pad(items.length)}` }), jsx('hr', {})]
                   }),
-                  jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, hidden: !visibleIds.has(item.id) }, item.id)) })
+                  jsx('div', { className: 'ub-list', children: items.map(item => jsx(Item, { ctx, item, n: ++n, refresh, askEnabled: q.ask_enabled !== false, capabilities: q.capabilities, hidden: !visibleIds.has(item.id) }, item.id)) })
                 ]
               }, label)
         ]
