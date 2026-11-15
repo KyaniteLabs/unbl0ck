@@ -27,6 +27,20 @@ class CutQuoteIsClosed(unittest.TestCase):
         self.assertTrue(row[2].startswith("first line\ncurl -u "), row[2][:40])
 
 
+class SingleQuoteBackslashIsLiteral(unittest.TestCase):
+    def test_a_single_quoted_value_ending_in_a_backslash_is_redacted(self):
+        """Sol r9: in the shell a backslash inside single quotes is literal, so 'PARTSECRET\\' ends the value."""
+        for text in (
+            "curl -u 'alice:PARTSECRET\\' https://example.test",
+            "curl -b 'sid=PARTSECRET\\' https://example.test",
+            "mysql -u root -p'PARTSECRET\\' db",
+            "keytool -list -storepass 'PARTSECRET\\' -v",
+            "the password is 'PARTSECRET\\' ok",
+        ):
+            self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
+        self.assertNotIn("PARTSECRET", needs._ask_redact("curl -u 'alice:PART\\'SECRET' x"))
+
+
 class QuotedExplicitKeys(unittest.TestCase):
     def test_a_quoted_explicit_key_continued_across_lines_still_redacts(self):
         """R9-002: ``? "o\\`` then ``tp"`` is the key otp, so its value is redacted."""

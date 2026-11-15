@@ -5511,20 +5511,25 @@ _ASK_CODE_KEY = r"(?:[a-z0-9]+[_.-]){0,3}(?:bearer|t?otp|pin|passcode|session[_-
 _ASK_CREDENTIAL_NAME = rf"(?:{_ASK_SECRET_KEY}|{_ASK_CODE_KEY})"
 
 
+# A single-quoted value: read with backslash escapes, else as the shell reads it (a backslash is literal),
+# so a value ending in a backslash is still redacted.
+_SQ = r"'(?:\\.|[^'\\])*'|'[^']*'"
+
+
 _ASK_SECRET_PATTERNS = (
     # URL userinfo: scheme://user:pass@host
     (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]*:[^/\s@]+@"), r"\1[redacted]@"),
     (
         re.compile(
             r"(?i)((?:proxy-)?authorization\s*:\s*digest\b[^\r\n]*?\bnonce\s*[=:]\s*)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"""
+            r"""(?:"(?:\\.|[^"\\])*"|""" + _SQ + r"""|[^\s,;]+)"""
         ),
         r"\1[redacted]",
     ),
     (
         re.compile(
             r"(?i)((?:proxy-)?authorization\s*:\s*digest\b[^\r\n]*?\bresponse\s*[=:]\s*)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)"""
+            r"""(?:"(?:\\.|[^"\\])*"|""" + _SQ + r"""|[^\s,;]+)"""
         ),
         r"\1[redacted]",
     ),
@@ -5538,14 +5543,14 @@ _ASK_SECRET_PATTERNS = (
     (
         re.compile(
             r"(?i)(\bcurl\b[^\r\n]*?\s(?:--user|-u)(?:=|\s+)?)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^:\s'\"]+:[^\s'\"]+)"""
+            r"""(?:"(?:\\.|[^"\\])*"|""" + _SQ + r"""|[^:\s'\"]+:[^\s'\"]+)"""
         ),
         r"\1[redacted]",
     ),
     (
         re.compile(
             r"(?i)(\bcurl\b[^\r\n]*?\s(?:--cookie|-b)(?:=|\s+)?)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s'\"]+)"""
+            r"""(?:"(?:\\.|[^"\\])*"|""" + _SQ + r"""|[^\s'\"]+)"""
         ),
         r"\1[redacted]",
     ),
@@ -5553,27 +5558,27 @@ _ASK_SECRET_PATTERNS = (
         re.compile(
             r"(?i)(\b(?:mysql|mysqldump|mariadb|sshpass|docker\s+login)\b"
             r"[^;\r\n]*?\s-(?-i:p)(?:=|\s+)?)"
-            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s'\"]+)"""
+            r"""(?:"(?:\\.|[^"\\])*"|""" + _SQ + r"""|[^\s'\"]+)"""
         ),
         r"\1[redacted]",
     ),
     (
         re.compile(
             r"(?i)(?P<prefix>\bkeytool\b[^\r\n]*?\s-storepass(?:=|[ \t]+))"
-            r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s;]+)"
+            r"(?P<value>\"(?:\\.|[^\"\\])*\"|" + _SQ + r"|[^\s;]+)"
         ),
         r"\g<prefix>[redacted]",
     ),
     (
         re.compile(
             r"(?i)(?P<prefix>\bIDENTIFIED\s+BY\s+)"
-            r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
+            r"(?P<value>\"(?:\\.|[^\"\\])*\"|" + _SQ + r"|[^\s,;]+)"
         ),
         r"\g<prefix>[redacted]",
     ),
     (
         re.compile(
-            r"""(?i)\b(password|passwd)\s+is\s+(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,'";]+)"""
+            r"""(?i)\b(password|passwd)\s+is\s+(?:"(?:\\.|[^"\\])*"|""" + _SQ + r"""|[^\s,'";]+)"""
         ),
         r"\1 is [redacted]",
     ),
@@ -5725,7 +5730,7 @@ _ASK_BARE_AUTH_SCHEME_LINE = re.compile(
 
 _ASK_SHORT_PASSWORD_FLAG = re.compile(
     r"(?P<prefix>(?<!\S)-p(?:=|[ \t]+))"
-    r"(?P<value>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s;]+)"
+    r"(?P<value>\"(?:\\.|[^\"\\])*\"|" + _SQ + r"|[^\s;]+)"
 )
 _ASK_AUTH_CREDENTIAL_MARKER = re.compile(
     r"(?i)\b(?:token|oauth|key|secret|password|credential|session)\b"
@@ -6041,7 +6046,7 @@ def _ask_yaml_scalar_end(
 
 
 def _ask_flow_secret_values(text: str) -> str:
-    quoted_value = r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^,}]+"""
+    quoted_value = r""""(?:\\.|[^"\\])*"|""" + _SQ + r"""|[^,}]+"""
     name_first = re.compile(
         rf"""(?ix)(?P<before>["']?(?:name|key)["']?\s*:\s*["']?)(?P<name>{_ASK_CREDENTIAL_NAME})"""
         rf"""(?P<after>["']?\s*,\s*["']?(?:value|val|default)["']?\s*:\s*)(?P<value>{quoted_value})"""
@@ -6318,9 +6323,9 @@ def _ask_redact_assignments(text: str) -> str:
 
 _ASK_HTTP_BASIC_AUTH = re.compile(
     r"(?i)(?P<prefix>\bHTTPBasicAuth\(\s*)"
-    r"(?P<user>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^,)]*)"
+    r"(?P<user>\"(?:\\.|[^\"\\])*\"|" + _SQ + r"|[^,)]*)"
     r"(?P<between>\s*,\s*)"
-    r"(?P<password>\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^)]*)"
+    r"(?P<password>\"(?:\\.|[^\"\\])*\"|" + _SQ + r"|[^)]*)"
     r"(?P<suffix>\s*\))"
 )
 
