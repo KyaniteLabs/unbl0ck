@@ -1413,6 +1413,7 @@ def chat_items(
     errors: list[str] | None = None,
     *,
     full: bool = False,
+    full_limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
     last visible turn is the bot asking you something you have not answered."""
@@ -1544,7 +1545,8 @@ def chat_items(
                         "title": f"{_bot_name(home, profile)} is asking you",
                         "ask": _excerpt(content),
                         "ask_truncated": _is_excerpted(content),
-                        **(_full_fields(content) if full else {}),
+                        # Only the first `full_limit` items pay for a full-text copy.
+                        **(_full_fields(content) if full and (full_limit is None or len(items) < full_limit) else {}),
                         "why": f"Last turn in this {where_} is a question for you",
                         "owner": profile,
                         "priority": 0,
@@ -1829,7 +1831,11 @@ def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitSt
 
 
 def wait_items(
-    home: Path | None = None, errors: list[str] | None = None, *, full: bool = False
+    home: Path | None = None,
+    errors: list[str] | None = None,
+    *,
+    full: bool = False,
+    full_limit: int | None = None,
 ) -> list[dict[str, Any]]:
     """Open live prompts. A wait whose process is gone is deleted, not shown."""
     home = home or hermes_home()
@@ -1853,6 +1859,8 @@ def wait_items(
         profile = str(rec.get("profile") or "default")
         who = _bot_name(home, profile) if profile != "default" else "An agent"
         platform = str(rec.get("platform") or "")
+        expand = full and kind != "sudo" and (full_limit is None or len(items) < full_limit)
+        fields = _full_fields(str(rec.get("prompt") or "")) if expand else {}
         items.append(
             {
                 "id": f"prompt:{rid}",
@@ -1868,12 +1876,8 @@ def wait_items(
                 # A password prompt is never expanded: its excerpt is all the queue ever shows.
                 "ask_truncated": kind != "sudo" and _is_excerpted(str(rec.get("prompt") or "")),
                 **(
-                    {
-                        **_full_fields(str(rec.get("prompt") or "")),
-                        "text_cut": _full_fields(str(rec.get("prompt") or ""))["text_cut"]
-                        or bool(rec.get("prompt_cut")),
-                    }
-                    if full and kind != "sudo"
+                    {**fields, "text_cut": fields["text_cut"] or bool(rec.get("prompt_cut"))}
+                    if expand
                     else {}
                 ),
                 "why": "Its run is paused until you answer"
@@ -1947,8 +1951,8 @@ def search_text(query: Any) -> dict[str, Any]:
     home = hermes_home()
     readers = (
         ("outside", lambda errs: outside_items(errors=errs)),
-        ("chat", lambda errs: chat_items(home, errors=errs, full=True)),
-        ("prompt", lambda errs: wait_items(home, errors=errs, full=True)),
+        ("chat", lambda errs: chat_items(home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS)),
+        ("prompt", lambda errs: wait_items(home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS)),
     )
     matches: list[dict[str, str]] = []
     searched: dict[str, int] = {}
@@ -1974,7 +1978,8 @@ def search_text(query: Any) -> dict[str, Any]:
                 private += 1  # password prompts are never expanded, searched or returned
                 continue
             text = str(item.get("text") or item.get("ask") or "")
-            if len(text) > SEARCH_MAX_CHARS:
+            # The readers already cut chat and prompt text at the same limit and say so.
+            if item.get("text_cut") or len(text) > SEARCH_MAX_CHARS:
                 cut += 1
                 text = text[:SEARCH_MAX_CHARS]
             hay = f"{item.get('title') or ''}\n{text}".casefold()
