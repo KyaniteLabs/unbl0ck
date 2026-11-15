@@ -270,21 +270,21 @@ class UndoTokens(OutsideFixture):
     def test_old_not_for_me_undo_cannot_remove_a_newer_hide(self):
         self.file(dedupe_key="a")
         (it,) = self.queue()
-        needs.hide(it["id"], "v-old")
-        needs.hide(it["id"], it["version"])  # dismissed again at the current version
-        self.assertFalse(needs.unhide(it["id"], token="v-old"))
+        old = needs.hide(it["id"], "v-old")
+        new = needs.hide(it["id"], it["version"])  # dismissed again at the current version
+        self.assertFalse(needs.unhide(it["id"], token=old))
         self.assertEqual(self.queue(), [])
-        self.assertTrue(needs.unhide(it["id"], token=it["version"]))
+        self.assertTrue(needs.unhide(it["id"], token=new))
 
     def test_done_and_not_for_me_on_one_version_are_cleared_together(self):
         for name in ("done", "hidden"):
             with self.subTest(undo=name):
                 result = self.file(dedupe_key=name)
                 item = next(i for i in self.queue() if i["id"].endswith(self.record(result).stem))
-                needs.hide(item["id"], item["version"])  # tab A: Not for me
+                hide_token = needs.hide(item["id"], item["version"])  # tab A: Not for me
                 done_token = needs.done_outside(item["id"], item["version"])["token"]  # tab B: Done
                 self.assertTrue(all(i["id"] != item["id"] for i in self.queue()))
-                token = done_token if name == "done" else item["version"]
+                token = done_token if name == "done" else hide_token
                 self.assertTrue(needs.unhide(item["id"], token=token))
                 self.assertIn(item["id"], [i["id"] for i in self.queue()])  # not left hidden by the other marker
                 self.assertNotIn("done_at", json.loads(self.record(result).read_text()))
@@ -334,7 +334,7 @@ class UndoTokens(OutsideFixture):
         for name in ("desktop/src/plugin.src.js", "desktop/plugin.js"):
             src = (Path(__file__).resolve().parents[1] / name).read_text()
             with self.subTest(name):
-                self.assertIn("token: r.done ? r.token : item.version", src)
+                self.assertIn("token: r.token", src)
                 self.assertIn("{ id: u.id, token: u.token }", src)
 
     def test_tokenless_callers_keep_the_old_behavior(self):

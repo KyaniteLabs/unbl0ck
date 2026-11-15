@@ -130,6 +130,8 @@ class Outside(OutsideFixture):
             ref="r" * 400,
             dedupe_key="d" * 120,
         )
+        # An identifier is never shortened (round 4, 01-068): a longer key is refused instead.
+        self.assertIn("error", self.file(dedupe_key="d" * 150))
         (it,) = needs.build_queue()["items"]
         self.assertEqual(len(it["title"]), 160)
         self.assertEqual(len(it["text"]), 8000)
@@ -160,7 +162,11 @@ class Outside(OutsideFixture):
             result = self.file(dedupe_key=key)
             args = {
                 "action": "resolve",
-                **({"id": result["id"]} if key == "one" else {"dedupe_key": key}),
+                **(
+                    {"id": result["id"], "version": result["version"]}
+                    if key == "one"
+                    else {"dedupe_key": key}
+                ),
             }
             reply = json.loads(self.tools["unbl0ck_file"][2](args, profile="work"))
             self.assertTrue(reply["ok"])
@@ -324,7 +330,7 @@ class Outside(OutsideFixture):
         f = self.folder / "note.txt"
         f.write_text("Before")
         (it,) = needs.build_queue()["items"]
-        self.assertEqual(it["version"], f"{f.stat().st_mtime_ns}:{f.stat().st_size}")
+        self.assertRegex(it["version"], rf"\A{f.stat().st_mtime_ns}:{f.stat().st_size}:[0-9a-f]{{16}}\Z")
         needs.hide(it["id"], it["version"], self.home)
         self.assertEqual(needs.build_queue()["count"], 0)
         f.write_text("After, a longer note")
