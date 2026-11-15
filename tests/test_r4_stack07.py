@@ -90,6 +90,16 @@ class Containment(Base):
         self.jobs.mark_sent(J1)
         self.assertEqual(stat.S_IMODE(os.stat(self.dir / f"{J1}.json").st_mode), 0o600)
 
+    def test_reading_a_world_readable_record_tightens_it_without_rewriting(self):
+        """R5-jobs-027: the replacement test above also passed on the base; this one needs the read to chmod."""
+        self.keep = True
+        self.jobs.create(J1, card="c1")
+        self.jobs.finish(J1, "PRIVATE", "p", "m")
+        os.chmod(self.dir / f"{J1}.json", 0o644)
+        self.boot()
+        self.assertEqual(self.jobs.get(J1)["reply"], "PRIVATE")
+        self.assertEqual(stat.S_IMODE(os.stat(self.dir / f"{J1}.json").st_mode), 0o600)
+
     def test_a_group_writable_record_is_not_trusted(self):
         self.jobs.create(J1, card="c1")
         os.chmod(self.dir / f"{J1}.json", 0o666)
@@ -109,6 +119,74 @@ class TempFiles(Base):
 
 
 class ReadSafety(Base):
+    def swap_before_open(self, install):
+        """Patches that run ``install()`` once, between the last check of the record and the moment it is opened.
+
+        The base journal checks the path with lstat and then reads it by path, so the swap follows
+        that lstat; the descriptor-based reader opens the entry relative to its directory, so the
+        swap precedes that open. Either way nothing else has looked at the record yet."""
+        done, name = [], f"{J1}.json"
+        real_lstat, real_open = os.lstat, os.open
+
+        def fire():
+            if not done:
+                done.append(1)
+                install()
+
+        def lstat(p, *a, **k):
+            out = real_lstat(p, *a, **k)
+            if str(p).endswith(name) and k.get("dir_fd") is None:
+                fire()
+            return out
+
+        def opening(p, flags, *a, **k):
+            if str(p) == name and k.get("dir_fd") is not None:
+                fire()
+            return real_open(p, flags, *a, **k)
+
+        return patch.object(os, "lstat", lstat), patch.object(os, "open", opening), done
+
+    def test_a_record_swapped_for_a_symlink_just_before_it_is_opened_is_not_followed(self):
+        """R5-jobs-028: the swap happens at the read's own check, not at a housekeeping lstat."""
+        self.jobs.create(J1, card="c1")
+        stolen = Path(self.tmp.name) / "stolen.json"
+        stolen.write_text(json.dumps({"v": 1, "job": J1, "state": "done", "started": self.clock(), "card": "c1",
+                                      "reply": "STOLEN"}))
+        os.chmod(stolen, 0o600)
+        path = self.dir / f"{J1}.json"
+
+        def install():
+            path.unlink()
+            path.symlink_to(stolen)
+
+        a, b, done = self.swap_before_open(install)
+        with a, b:
+            got = self.journal.read(J1)
+        self.assertTrue(done, "the swap must have happened")
+        self.assertNotIn("STOLEN", json.dumps(got, default=str))
+
+    def test_a_record_swapped_for_a_fifo_just_before_it_is_opened_does_not_block(self):
+        """R5-jobs-029: a FIFO that is already there was refused by the base; one swapped in after the check was not."""
+        self.jobs.create(J1, card="c1")
+        path = self.dir / f"{J1}.json"
+
+        def install():
+            path.unlink()
+            os.mkfifo(path)
+
+        a, b, done = self.swap_before_open(install)
+        out = []
+
+        def run():
+            with a, b:
+                out.append(self.journal.read(J1))
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "the read must not block on a FIFO")
+        self.assertTrue(out and out[0].get("corrupt"))
+
     def test_a_path_swapped_for_a_symlink_after_the_size_check_is_not_followed(self):
         self.jobs.create(J1, card="c1")
         big = Path(self.tmp.name) / "big.json"
@@ -278,6 +356,23 @@ class UnverifiedAbsence(Base):
             self.jobs.discard(J1)
         self.assertEqual(self.files(), [f"{J1}.json"])
 
+    def test_a_resolver_failing_with_a_non_os_error_is_unknown_not_absent_and_not_a_crash(self):
+        """R5-jobs-030: the base caught only OSError, so these escaped from discard() and verified_absent()."""
+        self.keep = True
+        self.jobs.create(J1, card="c1")
+        self.jobs.finish(J1, "ANSWER", "p", "m")
+        self.boot()
+        for exc in (RuntimeError("settings gone"), ValueError("bad profile")):
+            with self.subTest(exc=type(exc).__name__):
+                def broken(exc=exc):
+                    raise exc
+
+                self.journal._directory = broken
+                self.assertFalse(self.journal.verified_absent(J1))
+                with self.assertRaises(jobs.DiscardFailed):
+                    self.jobs.discard(J1)
+        self.assertEqual(self.files(), [f"{J1}.json"])
+
     def test_unavailable_storage_reads_as_unknown_not_as_an_expired_job(self):
         self.jobs.create(J1, card="c1")
         self.jobs.mark_sent(J1)
@@ -303,6 +398,26 @@ class WorkerOwnership(Base):
         a._journal.pid = dead_pid()
         a.create(J1, card="c1")
         self.assertEqual(jobs.ASK_WIRE[self.other().get(J1)["status"]], "not_submitted")
+
+    def test_the_same_marker_flips_between_pending_and_not_submitted_with_its_owner(self):
+        """R5-jobs-031: ignoring ownership entirely satisfied the dead-owner test alone, so one marker is read both ways."""
+        for state in ("queued", "sent"):
+            with self.subTest(state=state):
+                job = hexid(7 if state == "queued" else 8)
+                a = self.other()
+                ticket = a.create(job, card="c1")
+                if state == "sent":
+                    a.mark_sent(ticket)
+                path = self.dir / f"{job}.json"
+                body = json.loads(path.read_text())
+                outcomes = {}
+                for label, pid in (("live", os.getppid()), ("dead", dead_pid())):
+                    body["owner"] = {"pid": pid, "inst": f"other-{label}"}
+                    path.write_text(json.dumps(body))
+                    os.chmod(path, 0o600)
+                    outcomes[label] = jobs.ASK_WIRE[self.other().get(job)["status"]]
+                self.assertEqual(outcomes["live"], "pending")
+                self.assertEqual(outcomes["dead"], "not_submitted" if state == "queued" else "unknown")
 
 
 class SettledAcrossRestart(Base):
