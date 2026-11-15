@@ -6010,29 +6010,7 @@ def _ask_harmless_secret_value(value: Any) -> bool:
     )
 
 
-_ASK_NUMERIC_SECRET_WORDS = frozenset(
-    {
-        "password",
-        "passwd",
-        "passphrase",
-        "pwd",
-        "pw",
-        "secret",
-        "api_key",
-        "access_key",
-        "secret_key",
-        "private_key",
-        "credential",
-        "storepass",
-        "token",
-        "auth",
-        "authentication",
-        "oauth",
-    }
-)
-
-
-def _ask_numeric_credential(key: str, value: Any, word: str) -> bool:
+def _ask_numeric_credential(key: str, value: Any) -> bool:
     """A number or digit-only string under an exact credential key (``password=123456``) is the
     credential itself. Counts under other keys (``password_attempts: 3``) are not."""
     if isinstance(value, bool):
@@ -6045,7 +6023,7 @@ def _ask_numeric_credential(key: str, value: Any, word: str) -> bool:
         return False
     if str(key).strip().strip("\"' ").casefold().endswith("tokens"):
         return False  # a count of tokens (``tokens: 12``), not a token
-    return digits and word in _ASK_NUMERIC_SECRET_WORDS and _ask_secret_key_is_exact(key)
+    return digits and _ask_secret_key_is_exact(key)
 
 
 def _ask_path_field_value(key: str, value: Any) -> bool:
@@ -6093,7 +6071,7 @@ def _ask_is_secret_key(key: str, value: Any = None) -> bool:
     word = _ask_secret_word(key)
     if word is None:
         return False
-    if _ask_harmless_secret_value(value) and not _ask_numeric_credential(key, value, word):
+    if _ask_harmless_secret_value(value) and not _ask_numeric_credential(key, value):
         return False
     if _ask_path_field_value(key, value):
         return False
