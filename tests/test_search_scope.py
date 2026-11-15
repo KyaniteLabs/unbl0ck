@@ -235,6 +235,17 @@ class SearchBudget(RealReaders):
         needs.hide(it["id"], it["version"], self.home)
         self.assertEqual(needs.search_text("change")["matches"], [])
 
+    def test_a_dismissed_live_prompt_is_not_searched_but_a_changed_one_is(self):
+        needs.record_wait(self.home, request_id="0123456789abcdef", kind="clarify",
+                          prompt="Should I ship the needle build?", platform="cli")
+        (it,) = needs.wait_items(self.home)
+        needs.hide(it["id"], it["version"], self.home)
+        r = needs.search_text("needle")
+        self.assertEqual((r["matches"], r["searched"].get("prompt", 0)), ([], 0))
+        needs.record_wait(self.home, request_id="0123456789abcdef", kind="clarify",
+                          prompt="Should I ship the other needle build?", platform="cli")
+        self.assertEqual(len(needs.search_text("needle")["matches"]), 1)
+
     def test_password_prompts_are_skipped_not_counted_as_searched(self):
         needs.record_wait(self.home, request_id="0123456789abcdef", kind="sudo", prompt="sudo password for ada", platform="cli")
         r = needs.search_text("ada")
