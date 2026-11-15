@@ -33,6 +33,35 @@ resolve({items:[{id:'a',bluf_pending:true}],errors:[]});
 setImmediate(()=>{assert.equal(writes,0,'disposed plugin must ignore late data');assert.equal(follows,0,'disposed plugin must not restart polling');assert.equal(intervals,0)});
 """)
 
+    def test_a_refresh_after_an_action_never_reuses_a_load_that_started_before_it(self):
+        self.run_views(r"""
+const fs = require('fs'), assert = require('node:assert/strict');
+const src = fs.readFileSync(process.argv[1], 'utf8');
+const resolvers = [], writes = [];
+const noop = () => {};
+const env = {
+  CSS:'', PATH:'/unblock', ROUTES_AREA:'route', SIDEBAR_NAV_AREA:'nav', STATUSBAR_AREAS:{right:'right'}, POLL_MS:45000,
+  document:{createElement:()=>({dataset:{},remove:noop}),head:{appendChild:noop},addEventListener:noop,removeEventListener:noop},
+  setTimeout:()=>1,clearTimeout:noop,setInterval:()=>2,clearInterval:noop,
+  $queue:{get:()=>({}),set:v=>{writes.push(v)}},sfx:{close:noop,play:noop},petEmit:noop,
+  jsx:(type,props)=>({type,props}),Page:'Page',Chip:'Chip',
+};
+const plugin = new Function('env', `with(env) { return (${src.slice(src.indexOf('export default ') + 'export default '.length)}); }`)(env);
+let refresh;
+plugin.register({rest:()=>new Promise(r=>{resolvers.push(r)}),registerMany:list=>{refresh=list[0].render().props.refresh},onDispose:noop});
+(async () => {
+  assert.equal(resolvers.length, 1, 'the first load started at registration');
+  // An action completes while that load is still in flight: its answer was read BEFORE the action.
+  const after = refresh();
+  resolvers[0]({items:[{id:'old'}],errors:[]});
+  await new Promise(r => setImmediate(r));
+  assert.equal(resolvers.length, 2, 'a load that began after the action must run');
+  resolvers[1]({items:[{id:'new'}],errors:[]});
+  await after;
+  assert.equal(writes[writes.length - 1].items[0].id, 'new', 'the queue shown is the one read after the action');
+})().catch(e => { console.error(e); process.exitCode = 1 });
+""")
+
     def test_chip_warns_when_no_items_could_be_loaded(self):
         self.run_views(r"""
 const fs = require('fs'), assert = require('node:assert/strict');

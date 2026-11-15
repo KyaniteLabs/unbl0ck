@@ -161,6 +161,27 @@ class HtmlOnly(OutsideFixture):
             self.assertNotIn("COMMENT-TEXT", it["text"])
             self.assertNotIn("STYLE-TEXT", it["text"])
 
+    def test_text_swallowed_by_an_unclosed_hidden_element_is_reported_not_called_attachments(self):
+        # Class sweep (E): an element that never closes hides the rest of the body. The queue
+        # must say text was left out, not that the message has only attachments.
+        for html in ("<div hidden>The whole real message", "<div style='display:none'>All of it",
+                     "<style>never closed <p>real words</p>"):
+            (self.folder / "m.eml").unlink(missing_ok=True)
+            t = self.one(mail(html))["text"]
+            self.assertNotIn("only attachments", t, html)
+            self.assertIn("hidden or never closed", t, html)
+            self.assertNotIn("real message", t)
+
+    def test_a_note_is_added_when_some_text_survives_but_the_rest_was_swallowed(self):
+        t = self.one(mail("<p>Visible start</p><div hidden>Lost tail"))["text"]
+        self.assertIn("Visible start", t)
+        self.assertIn("hidden or never closed", t)
+        self.assertNotIn("Lost tail", t)
+
+    def test_a_normal_message_carries_no_swallowed_note(self):
+        t = self.one(mail(OUTLOOK_HTML))["text"]
+        self.assertNotIn("hidden or never closed", t)
+
     def test_output_is_bounded_by_the_read_limit(self):
         big = "<p>" + ("word " * 200_000) + "</p>"  # about 1 MB
         it = self.one(mail(big))

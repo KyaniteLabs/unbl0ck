@@ -285,6 +285,26 @@ class SearchFolders(unittest.TestCase):
         self.assertEqual(len(r["matches"]), 1)
         self.assertFalse(r["partial"])
 
+    def test_folder_files_past_the_folder_window_are_counted_not_silently_skipped(self):
+        # Bug: a folder with more than 200 waiting files showed the newest 200 and the rest were
+        # neither searched nor listed as not searched; only a generic read error appeared.
+        for n in range(230):
+            (self.a / f"{n}.txt").write_text(f"note {n}")
+        r = needs.search_text("note")
+        self.assertEqual(r["searched"]["outside"], 200)
+        self.assertEqual(r["not_searched"]["outside"], 30)
+        self.assertTrue(r["partial"])
+
+    def test_a_damaged_hidden_file_is_reported_not_treated_as_no_dismissals(self):
+        # Bug: a corrupt hidden.json read as empty, so dismissed cards became searchable and
+        # the result said errors: [].
+        (self.a / "x.txt").write_text("a needle here")
+        hidden = needs.data_dir(self.home) / "hidden.json"
+        hidden.write_text("{not json")
+        r = needs.search_text("needle")
+        self.assertTrue(r["partial"])
+        self.assertTrue(any("dismiss" in e for e in r["errors"]), r["errors"])
+
 
 class SearchProfileBoundary(unittest.TestCase):
     """Search reads exactly what the queue reads: every profile under the Hermes home, nothing outside it."""
@@ -346,6 +366,20 @@ class DesktopSearchPreservesState(unittest.TestCase):
         for forbidden in ("refresh(", "reload(", "load(", "setItems", "setQuery", "setSource", "localStorage", "composer", "notify("):
             self.assertNotIn(forbidden, body)
         self.assertEqual(body.count("ctx.rest("), 1)
+
+    def test_a_late_search_answer_never_lands_after_the_query_changed(self):
+        # Bug: a slow /search response for the old query still wrote its hits, error and busy flag
+        # after the person had edited or cleared the query.
+        s = (ROOT / "desktop/src/plugin.src.js").read_text()
+        start = s.index("const runFullSearch = async () => {")
+        end = s.index("const fullSummary", start)
+        body = s[start:end]
+        self.assertIn("searchGen.current", body)
+        self.assertGreaterEqual(body.count("searchGen.current !== gen"), 2)  # hits and error
+        self.assertIn("if (searchGen.current === gen) setFullBusy(false)", body)
+        for fn in ("const clearFilters", "const changeQuery"):
+            line = s[s.index(fn):].split("\n", 1)[0]
+            self.assertIn("searchGen.current += 1", line)
 
     def test_cards_stay_mounted_by_id_so_their_state_survives_a_search(self):
         s = (ROOT / "desktop/src/plugin.src.js").read_text()
