@@ -53,6 +53,10 @@ class IllegalTransition(RuntimeError):
     """A job was asked to move between two states that are not connected."""
 
 
+class DiscardFailed(RuntimeError):
+    """A saved Ask record could not be deleted, so the job still exists."""
+
+
 # --- Summary (BLUF) jobs ---------------------------------------------------------------------
 
 class BlufState(str, Enum):
@@ -179,6 +183,7 @@ class AskJournal:
         self._keep_replies = keep_replies
         self._clock = clock or (lambda: time.time())
         self.failures = 0
+        self.protect: Callable[[str], bool] = lambda job: False  # set by AskJobs: live jobs are never evicted
 
     def _dir(self, create: bool = False) -> Optional[Path]:
         try:
@@ -202,10 +207,30 @@ class AskJournal:
         except Exception:  # noqa: BLE001 - a settings fault must not break Ask
             return False
 
+    def _make_room(self, d: Path, keep: Callable[[str], bool]) -> bool:
+        """Evict the oldest unprotected files so one more record fits under MAX_FILES."""
+        try:
+            files = sorted((f.stat().st_mtime, f) for f in d.iterdir() if f.suffix == ".json")
+            while len(files) >= self.MAX_FILES:
+                victim = next((i for i, (_, f) in enumerate(files) if not keep(f.stem)), None)
+                if victim is None:
+                    return False
+                files.pop(victim)[1].unlink(missing_ok=True)
+            return True
+        except OSError:
+            self.failures += 1
+            return False
+
     def write(self, job: str, rec: dict[str, Any]) -> bool:
-        """True when the record is on disk. False when it is not (or no journal is available)."""
+        """True when the record is on disk. False when it is not (or no journal is available).
+
+        A new file first evicts the oldest unprotected ones (``protect`` names jobs alive in
+        memory), so the directory never exceeds MAX_FILES however many processes have written
+        to it; if nothing can be evicted the record stays in memory only."""
         d = self._dir(create=True)
         if d is None or not self._valid(job):
+            return False
+        if not (d / f"{job}.json").exists() and not self._make_room(d, self.protect):
             return False
         tmp = d / f".{job}.tmp"
         try:
@@ -323,6 +348,8 @@ class AskJobs:
         self._lock = threading.Lock()
         self._jobs: dict[str, dict[str, Any]] = {}
         self._journal = journal
+        if journal is not None:
+            journal.protect = lambda j: j in self._jobs
         self._last_prune = float("-inf")
         self._bg_every: Optional[float] = None
         self._timer: Optional[threading.Timer] = None
@@ -408,12 +435,17 @@ class AskJobs:
             return self._journal.read(job) is None
 
     def discard(self, job: str) -> bool:
-        """Delete a job and its journal file at the caller's request, whatever its state."""
+        """Delete a job and its journal file at the caller's request, whatever its state.
+
+        Raises DiscardFailed, leaving the job in place, when the saved record cannot be removed:
+        dropping only the memory entry would let the next GET recover the saved answer."""
         with self._lock:
-            had = self._jobs.pop(job, None) is not None
+            gone = False
             if self._journal:
-                had = self._journal.delete(job) or had
-            return had
+                gone = self._journal.delete(job)
+                if not gone and self._journal.read(job) is not None:
+                    raise DiscardFailed(f"the saved record for ask job {job} could not be deleted")
+            return (self._jobs.pop(job, None) is not None) or gone
 
     def finish(self, job: str, reply: str, provider: Any = None, model: Any = None) -> bool:
         """PENDING -> DONE. False when the job expired meanwhile (a late worker is a no-op)."""

@@ -448,7 +448,11 @@ def card_ask_discard(job: str, card: str = ""):
     st = _ASK_JOBS.get(job)
     if st is not None and card and st.get("card") and st["card"] != card:
         raise HTTPException(status_code=404, detail="unknown or expired ask job")
-    return {"ok": True, "deleted": _ASK_JOBS.discard(job)}
+    try:
+        return {"ok": True, "deleted": _ASK_JOBS.discard(job)}
+    except jobs.DiscardFailed:
+        # The saved record is still there and the job is still readable: say so, never "deleted".
+        raise HTTPException(status_code=500, detail="the saved answer could not be deleted; it expires on its own within 15 minutes")
 
 
 UNVERSIONED_WARNING = (
