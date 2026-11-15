@@ -132,6 +132,7 @@
 - **One Ask id runs once across gateway processes, and restore locks the directory it changes (round 6).** A new Ask whose journal lock another worker holds past the wait is refused (503) instead of admitted twice; a deletion fences a record published while it waited; `recovery.py restore --apply` takes the state lock of the directory it opened, not of whatever that path names later.
 - **An Ask the journal cannot record is never sent (round 7).** A new Ask whose first journal record cannot be written for any reason (no room, an I/O fault, an untrusted directory) is refused (503) instead of running memory-only, and a job whose "sent" marker cannot be written is failed before the model is called.
 - **A resolved live prompt no longer stays listed after storage recovers (round 7).** A failed clear pushed out of the full retry list is still retried, the faults kept past that list are capped at 1000 (anything beyond is counted in the error for a day), and a dropped-prompt count written by an agent from before round 6 is reported again.
+- **Explicit-key YAML codes are redacted, and a lost dismissal counter never reorders (round 7).** A code under `? otp` / `: |` is redacted like `otp: 123456`; an invalid `display` such as `block block` no longer shows `hidden` text; a missing `dismissal-order.json` restarts above every stored order, and a damaged one (or stored orders that cannot all be read) refuses "Not for me" and Done, instead of handing out an order older than one Desktop holds.
 
 ## 0.5.1 (2026-11-14)
 

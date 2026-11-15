@@ -783,17 +783,28 @@ def _dismissal_order(home: Path | None) -> int:
     """A number that grows with each dismissal any process commits (milliseconds, never repeated
     or lowered by a clock that stands still or steps back). The last one is kept in ORDER_FILE
     and taken under the state lock, so it follows the order dismissals were committed in, which
-    the client cannot see from the order of its clicks or of the responses."""
+    the client cannot see from the order of its clicks or of the responses. A missing counter
+    restarts above every stored order; a malformed one refuses the dismissal."""
     out: dict[str, int] = {}
 
     def bump(data: dict[str, Any]) -> dict[str, Any]:
-        last = data.get("last")
-        last = last if isinstance(last, int) and not isinstance(last, bool) else 0
-        out["order"] = max(int(time.time() * 1000), last + 1)
+        out["order"] = max(int(time.time() * 1000), (data["last"] if "last" in data else _orders_issued(home)) + 1)
         return {"last": out["order"]}
 
-    _update_state(home, data_dir(home) / ORDER_FILE, bump)
+    _update_state(home, data_dir(home) / ORDER_FILE, bump, entry_ok=lambda v: type(v) is int and v >= 0)
     return out["order"]
+
+
+def _orders_issued(home: Path | None) -> int:
+    """The highest order a stored dismissal carries (a hidden token's 13-hex prefix, a Done's
+    done_order). Raises when a record cannot be read or the filed listing is cut."""
+    tokens = (_split_hidden(v)[1] for v in _load_hidden_raw(home, strict=True).values())
+    d, errors = _outside_dir(home, create=False), []
+    files, cut = _filed_files(d) if d.is_dir() else ([], False)
+    recs = [_read_json(f, errors=errors) for f in files]
+    if cut or errors:
+        raise RuntimeError(f"{ORDER_FILE} is missing and the stored orders could not all be read; restore it")
+    return max([int(t[:13], 16) for t in tokens if t] + [_done_order(r) for r in recs if "done_order" in r], default=0)
 
 
 class StaleHide(RuntimeError):
@@ -840,9 +851,9 @@ def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[
                 out["existing"] = existing
                 return None
             hidden.pop(item_id, None)
-            out["token"] = uuid.uuid4().hex
+            out["order"] = _dismissal_order(home)  # the token starts with it, so a lost counter can restart above it
+            out["token"] = f"{out['order']:013x}{uuid.uuid4().hex[:19]}"
             hidden[item_id] = f"{version}\x1f{out['token']}"
-            out["order"] = _dismissal_order(home)
             return _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
 
         _update_state(home, _hidden_path(home), mutate, entry_ok=_hidden_entry_ok)
@@ -3764,18 +3775,24 @@ def _css_font_kind(value: str) -> str | None:
     return None
 
 
+# CSS Display 3: one keyword, or one word from each of outside, inside and list-item (list-item
+# only with a flow inside); any other combination is invalid and does not override ``hidden``.
+_CSS_DISPLAY_GROUPS = ({"block", "inline", "run-in"}, {"flow", "flow-root", "table", "flex", "grid", "ruby", "math"}, {"list-item"})
 _CSS_DISPLAY_WORDS = frozenset(
-    "block inline run-in flow flow-root table flex grid ruby list-item contents math inline-block "
-    "inline-table inline-flex inline-grid table-row-group table-header-group table-footer-group "
-    "table-row table-cell table-column-group table-column table-caption ruby-base ruby-text "
-    "ruby-base-container ruby-text-container".split()
-)
+    "contents inline-block inline-table inline-flex inline-grid table-row-group table-header-group "
+    "table-footer-group table-row table-cell table-column-group table-column table-caption ruby-base "
+    "ruby-text ruby-base-container ruby-text-container initial unset inherit".split()
+).union(*_CSS_DISPLAY_GROUPS)
 
 
 def _css_display_shows(value: str) -> bool:
     """Whether an inline ``display`` value is a real one that overrides the ``hidden`` attribute."""
     words = value.split()
-    return value in ("initial", "unset", "inherit") or 0 < len(words) <= 3 and all(w in _CSS_DISPLAY_WORDS for w in words)
+    picks = [g.intersection(words) for g in _CSS_DISPLAY_GROUPS]
+    if len(words) == 1:
+        return words[0] in _CSS_DISPLAY_WORDS
+    return len(set(words)) == len(words) == sum(map(len, picks)) and max(map(len, picks)) == 1 and not (
+        picks[2] and picks[1] - {"flow", "flow-root"})
 
 
 def _css_could_hide(name: str, value: str) -> bool:
@@ -6071,14 +6088,12 @@ def _ask_redact_bare_credential_values(text: str) -> str:
     return _ASK_BARE_CREDENTIAL_VALUE.sub(replace, text)
 
 
+# An explicit key (``? key`` then ``: value``) arrives as one folded line, so ``\s*`` spans it.
 _ASK_YAML_FIELD = re.compile(
-    r"^(?P<indent>[ \t]*)(?P<dash>-\s*)?(?P<quote>[\"']?)"
+    r"^(?P<indent>[ \t]*)(?P<dash>-\s*)?(?P<explicit>\?[ \t]*)?(?P<quote>[\"']?)"
     r"(?P<key>[A-Za-z0-9_.-]+)(?P=quote)\s*:\s*(?P<value>[^\r\n]*)"
 )
-_ASK_YAML_EXPLICIT_FIELD = re.compile(
-    rf"(?im)^(?P<indent>[ \t]*)\?[ \t]*(?P<key>{_ASK_CREDENTIAL_NAME})[ \t]*"
-    r"\r?\n(?P=indent):[ \t]*(?P<value>[^\r\n]*)"
-)
+_ASK_YAML_EXPLICIT_KEY = re.compile(r"([ \t]*(?:-[ \t]+)?)\?[ \t]*[^\r\n]*\r?\n\Z")
 _ASK_YAML_BLOCK = re.compile(
     r"^(?P<style>[|>](?:[+-][1-9]?|[1-9][+-]?)?)(?P<tail>[ \t]*(?:#.*)?)$"
 )
@@ -6159,17 +6174,13 @@ def _ask_flow_secret_values(text: str) -> str:
 
 
 def _ask_redact_yaml(text: str) -> str:
-    text = _ask_flow_secret_values(text)
-
-    def explicit_field(match: re.Match[str]) -> str:
-        key = match.group("key")
-        value = match.group("value")
-        if not _ask_is_secret_key(key, value):
-            return match.group(0)
-        return f"{match.group('indent')}? {key}\n{match.group('indent')}: [redacted]"
-
-    text = _ASK_YAML_EXPLICIT_FIELD.sub(explicit_field, text)
-    lines = text.splitlines(keepends=True)
+    lines: list[str] = []
+    for line in _ask_flow_secret_values(text).splitlines(keepends=True):
+        key = _ASK_YAML_EXPLICIT_KEY.match(lines[-1]) if lines else None
+        if key and not line[: key.end(1)].strip() and line[key.end(1) :].startswith(":"):
+            lines[-1] += line
+        else:
+            lines.append(line)
     fields = [_ask_yaml_field(line) for line in lines]
     paired_values: dict[int, str] = {}
     for index, field in enumerate(fields):
@@ -6209,97 +6220,48 @@ def _ask_redact_yaml(text: str) -> str:
             out.append(lines[index])
             index += 1
             continue
-        key = field.group("key")
-        raw_value = field.group("value")
+        key, raw_value = field.group("key"), field.group("value")
         paired_name = paired_values.get(index)
+        secret_name = key if paired_name is None else paired_name
         direct_secret = _ask_names_credential(key)
-        if direct_secret and raw_value.lstrip().startswith(('"', "'")):
+        if (
+            not (direct_secret or paired_name is not None)
+            or (direct_secret and not field.group("explicit") and raw_value.lstrip().startswith(('"', "'")))
+            or (
+                paired_name is None
+                and _ask_secret_word(key) in {"auth", "authentication", "authorization", "oauth", "cookie"}
+                and _ask_auth_value_is_prose(raw_value)
+            )
+        ):
             out.append(lines[index])
             index += 1
             continue
         scalar = _ASK_YAML_BLOCK.fullmatch(raw_value.strip())
-        collection = raw_value.strip() == "" and (
-            direct_secret or paired_name is not None
-        )
-        scalar_end = index + 1
-        scalar_value = ""
+        collection = raw_value.strip() == ""
+        end, scalar_value = index + 1, ""
         if scalar or collection:
             explicit = re.search(r"[1-9]", scalar.group("style")) if scalar else None
-            explicit_indent = (
-                _ask_yaml_indent(field) + int(explicit.group()) if explicit else None
-            )
-            scalar_end, scalar_value = _ask_yaml_scalar_end(
-                lines, index, _ask_yaml_indent(field), explicit_indent
-            )
-            collection = collection and scalar_end > index + 1
-        if (
-            field.group("quote")
-            and paired_name is None
-            and not scalar
-            and not collection
+            explicit_indent = _ask_yaml_indent(field) + int(explicit.group()) if explicit else None
+            end, scalar_value = _ask_yaml_scalar_end(lines, index, _ask_yaml_indent(field), explicit_indent)
+            collection = collection and end > index + 1
+        if (field.group("quote") and paired_name is None and not scalar and not collection) or not (
+            _ask_is_secret_key(secret_name, scalar_value if scalar or collection else raw_value)
         ):
-            out.append(lines[index])
-            index += 1
+            out.extend(lines[index:end])
+            index = end
             continue
-        if not direct_secret and paired_name is None:
-            out.append(lines[index])
-            index += 1
-            continue
-        secret_name = paired_name if paired_name is not None else key
-        secret_word = _ask_secret_word(secret_name)
-        if (
-            paired_name is None
-            and secret_word
-            in {"auth", "authentication", "authorization", "oauth", "cookie"}
-            and _ask_auth_value_is_prose(raw_value)
-        ):
-            out.append(lines[index])
-            index += 1
-            continue
-        if not _ask_is_secret_key(
-            secret_name, scalar_value if scalar or collection else raw_value
-        ):
-            out.extend(lines[index:scalar_end])
-            index = scalar_end
-            continue
-        container_start = len(raw_value) - len(raw_value.lstrip())
-        if (
-            scalar is None
-            and not collection
-            and raw_value[container_start : container_start + 1] in {"[", "{"}
-        ):
-            container_end = _ask_json_container_end(raw_value, container_start)
-            if container_end is None:
-                scalar_end, _ = _ask_yaml_scalar_end(
-                    lines, index, _ask_yaml_indent(field)
-                )
-                container_end = len(raw_value)
-                if scalar_end > index + 1:
-                    line_without_newline = lines[index].rstrip("\r\n")
-                    newline = lines[index][len(line_without_newline) :]
-                    before_value = line_without_newline[: field.start("value")]
-                    out.append(f"{before_value}[redacted]{newline}")
-                    index = scalar_end
-                    continue
-            line_without_newline = lines[index].rstrip("\r\n")
-            newline = lines[index][len(line_without_newline) :]
-            before_value = line_without_newline[: field.start("value")]
-            tail = raw_value[container_end:]
-            if re.match(r"\s*,\s*[\"']?[A-Za-z0-9_.-]+[\"']?\s*:", tail):
-                tail = ""
-            out.append(f"{before_value}[redacted]{tail}{newline}")
-            index += 1
-            continue
-        line_without_newline = lines[index].rstrip("\r\n")
-        newline = lines[index][len(line_without_newline) :]
-        before_value = line_without_newline[: field.start("value")]
-        if scalar or collection:
-            tail = scalar.group("tail") if scalar else ""
-            out.append(f"{before_value}[redacted]{tail}{newline}")
-            index = scalar_end
-            continue
-        out.append(f"{before_value}[redacted]{newline}")
-        index += 1
+        body = lines[index].rstrip("\r\n")
+        head, newline = body[: field.start("value")], lines[index][len(body) :]
+        tail = scalar.group("tail") if scalar else ""
+        start = len(raw_value) - len(raw_value.lstrip())
+        if not scalar and not collection and raw_value[start : start + 1] in {"[", "{"}:
+            close = _ask_json_container_end(raw_value, start)
+            if close is None:  # an unclosed container may continue on the lines below
+                end, _ = _ask_yaml_scalar_end(lines, index, _ask_yaml_indent(field))
+            elif not re.match(r"\s*,\s*[\"']?[A-Za-z0-9_.-]+[\"']?\s*:", raw_value[close:]):
+                tail = raw_value[close:]
+        out.append(f"{head}[redacted]{tail}{newline}")
+        index = end
     return "".join(out)
 
 
