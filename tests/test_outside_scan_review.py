@@ -98,6 +98,24 @@ class ScanReview(OutsideFixture):
             q = self.queue()
         self.assertTrue(any("stopped after" in e for e in q["errors"]), q["errors"])
 
+    def test_time_budget_also_applies_to_queued_empty_directories(self):
+        for n in range(30):
+            (self.folder / f"empty{n}").mkdir()
+        self.make("late.txt")
+        clock = {"t": 0.0}
+        real = os.scandir
+
+        def slow_scandir(path, *a, **k):
+            clock["t"] += 1.0  # opening each directory costs a second
+            return real(path, *a, **k)
+
+        with patch.object(needs.os, "scandir", slow_scandir), patch.object(
+            needs.time, "monotonic", lambda: clock["t"]
+        ):
+            q = self.queue()
+        self.assertTrue(any("stopped after" in e for e in q["errors"]), q["errors"])
+        self.assertLess(clock["t"], 10.0)  # it did not open all 31 directories
+
     def test_files_below_the_depth_limit_produce_a_notice_not_silence(self):
         self.make("a/b/c/d/note.txt")
         q = self.queue()
