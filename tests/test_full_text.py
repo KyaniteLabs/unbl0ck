@@ -139,6 +139,26 @@ class SourceFullText(unittest.TestCase):
         got = needs.source_text(item["id"], item["version"])
         self.assertEqual(got["text"], LONG)
 
+    def test_prompt_between_4000_and_20000_characters_is_kept_whole(self):
+        prompt = "START " + ("middle text. " * 1000) + "Which option do you want, A or B?"
+        self.assertGreater(len(prompt), 4001)
+        item = self.wait(prompt=prompt)
+        got = needs.source_text(item["id"], item["version"])
+        self.assertEqual(got["text"], prompt)
+        self.assertFalse(got["truncated"])
+
+    def test_prompt_over_the_limit_reports_truncation(self):
+        item = self.wait(prompt="x" * (needs.FULL_TEXT_LIMIT + 500))
+        got = needs.source_text(item["id"], item["version"])
+        self.assertEqual(len(got["text"]), needs.FULL_TEXT_LIMIT)
+        self.assertTrue(got["truncated"])
+
+    def test_password_prompt_text_stays_bounded_on_disk(self):
+        item = self.wait(kind="sudo", prompt="[sudo] " + "p" * 9000)
+        rec = needs._read_json(needs._waits_dir(self.home) / f"{RID}.json")
+        self.assertLessEqual(len(rec["prompt"]), 4000)
+        self.assertFalse(item["ask_truncated"])
+
     def test_password_prompt_is_never_expanded(self):
         item = self.wait(kind="sudo", prompt="[sudo] password for ada: " + "p" * 900)
         self.assertFalse(item["ask_truncated"])
@@ -239,7 +259,7 @@ function text(n) { return all(n).filter(x => typeof x === 'string').join(''); }
 const FULL = 'FIRST sentence.\n\nmiddle é ✓\nLAST?';
 const requests = [];
 let mode = 'ok';
-const ctx = {rest: async url => { requests.push(url); if (mode === 'fail') throw new Error('offline'); return {text: FULL}; }};
+const ctx = {rest: async url => { requests.push(url); if (mode === 'fail') throw new Error('offline'); return {text: FULL, truncated: mode === 'cut'}; }};
 function render(item) { cursor = 0; effects = []; return Item({ctx, item, n: 1, refresh: async () => {}, askEnabled: false}); }
 async function flush() { const run = effects.splice(0); for (const [, fn] of run) fn(); await new Promise(r => setImmediate(r)); }
 function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.className === 'ub-full').props.onClick(); }
@@ -269,6 +289,16 @@ function openFull(tree) { all(tree).find(x => x?.type === 'button' && x.props.cl
   assert.ok(retry, 'retry control');
   mode = 'ok'; retry.props.onClick(); tree = render(item); await flush(); tree = render(item);
   assert.ok(text(tree).includes('FIRST sentence.'));
+  // a message over the limit keeps a visible warning after the load succeeds
+  state = []; deps = []; requests.length = 0; mode = 'cut';
+  const long = {id: 'chat:p:s3', version: '1', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
+  tree = render(long); openFull(tree); tree = render(long); await flush(); tree = render(long);
+  assert.ok(text(tree).includes('FIRST sentence.'));
+  assert.ok(text(tree).includes('longer than 20,000 characters'), 'limit warning must show');
+  assert.ok(text(tree).includes('original chat'));
+  state = []; deps = []; mode = 'ok';
+  tree = render(long); openFull(tree); tree = render(long); await flush(); tree = render(long);
+  assert.ok(!text(tree).includes('longer than 20,000 characters'), 'no warning when complete');
   // an untruncated chat never fetches
   state = []; deps = []; requests.length = 0;
   const short = {id: 'chat:p:s2', version: '1', source: 'chat', title: 't', ask: 'short?', since: 1};
