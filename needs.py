@@ -3645,9 +3645,16 @@ def outside_items(
     except OSError as exc:
         errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
         filed = []
-    for f in filed:
+    tried = 0
+    for index, f in enumerate(filed):
         if f.is_symlink():
             continue
+        if read_budget is not None and tried >= read_budget:
+            # The budget is spent before the next record is read, and what is left is reported.
+            if unread is not None:
+                unread[0] += sum(1 for rest in filed[index:] if not rest.is_symlink())
+            break
+        tried += 1
         before = len(errors)
         rec = _read_json(f, errors=errors, source="outside")
         if _is_done(rec):
@@ -3691,7 +3698,7 @@ def outside_items(
     claimed: set[Path] = set()
     omitted: set[Path] = set()  # files never read, and dismissed ones never listed: each counted once
     hidden_omitted: set[Path] = set()
-    attempts = [max(0, read_budget - len(items))] if read_budget is not None else None
+    attempts = [max(0, read_budget - tried)] if read_budget is not None else None
     for name in str(raw).split(","):
         if not name.strip():
             continue
