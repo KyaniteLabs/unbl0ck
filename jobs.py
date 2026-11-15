@@ -183,6 +183,7 @@ class AskJournal:
         self._keep_replies = keep_replies
         self._clock = clock or (lambda: time.time())
         self.failures = 0
+        self._written: set[str] = set()  # jobs whose marker reached disk at some point
         self.protect: Callable[[str], bool] = lambda job: False  # set by AskJobs: live jobs are never evicted
 
     def _dir(self, create: bool = False) -> Optional[Path]:
@@ -207,10 +208,31 @@ class AskJournal:
         except Exception:  # noqa: BLE001 - a settings fault must not break Ask
             return False
 
+    def _entries(self, d: Path) -> list[tuple[float, Path]]:
+        """(mtime, path) of the regular .json files, judged without following symlinks. A dangling
+        symlink named like a record is junk in a directory only this plugin writes: it is removed (the
+        link, never a target) and any one entry that cannot be examined is skipped, so a single
+        bad entry cannot stop every later record from being written or cleaned up."""
+        out: list[tuple[float, Path]] = []
+        for f in d.iterdir():
+            if f.suffix != ".json":
+                continue
+            try:
+                st = os.lstat(f)
+                if stat.S_ISLNK(st.st_mode):
+                    if not f.exists():  # dangling: junk. A live link is left for read() to call corrupt
+                        f.unlink(missing_ok=True)
+                    continue
+                if stat.S_ISREG(st.st_mode):
+                    out.append((st.st_mtime, f))
+            except OSError:
+                self.failures += 1
+        return out
+
     def _make_room(self, d: Path, keep: Callable[[str], bool]) -> bool:
         """Evict the oldest unprotected files so one more record fits under MAX_FILES."""
         try:
-            files = sorted((f.stat().st_mtime, f) for f in d.iterdir() if f.suffix == ".json")
+            files = sorted(self._entries(d))
             while len(files) >= self.MAX_FILES:
                 victim = next((i for i, (_, f) in enumerate(files) if not keep(f.stem)), None)
                 if victim is None:
@@ -220,6 +242,27 @@ class AskJournal:
         except OSError:
             self.failures += 1
             return False
+
+    def verified_absent(self, job: str) -> bool:
+        """True only when the marker is known not to exist. Storage that cannot be examined
+        (directory unresolvable, lstat failing) is unknown, never absent: a caller deciding
+        whether a model call may start, or whether a saved answer is gone, must not treat a
+        failed look as an empty directory."""
+        try:
+            d = self._directory()
+        except OSError:
+            self.failures += 1
+            return False
+        if d is None or not self._valid(job):
+            return job not in self._written  # no location: only safe if nothing was ever stored
+        try:
+            os.lstat(d / f"{job}.json")
+        except FileNotFoundError:
+            return True
+        except OSError:
+            self.failures += 1
+            return False
+        return False
 
     def write(self, job: str, rec: dict[str, Any]) -> bool:
         """True when the record is on disk. False when it is not (or no journal is available).
@@ -238,6 +281,7 @@ class AskJournal:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({"v": 1, "job": job, **rec}, fh, ensure_ascii=False)
             os.replace(tmp, d / f"{job}.json")
+            self._written.add(job)
             return True
         except OSError:
             self.failures += 1
@@ -276,6 +320,7 @@ class AskJournal:
             return False
         try:
             (d / f"{job}.json").unlink()
+            self._written.discard(job)
             return True
         except FileNotFoundError:
             return False
@@ -307,6 +352,10 @@ class AskJournal:
             return 0
         for f in files:
             try:
+                if stat.S_ISLNK(os.lstat(f).st_mode) and not f.exists():
+                    f.unlink(missing_ok=True)  # a dangling link: removed itself, never followed
+                    removed += 1
+                    continue
                 if f.name.endswith(".tmp"):
                     if now - f.stat().st_mtime > ttl:
                         f.unlink(missing_ok=True)
@@ -432,7 +481,7 @@ class AskJobs:
             # Could not record it. A stale "queued" marker would turn into a false not_submitted,
             # so remove it: an unknown job is reported as unknown, never as safe to resend.
             self._journal.delete(job)
-            return self._journal.read(job) is None
+            return self._journal.verified_absent(job)
 
     def discard(self, job: str) -> bool:
         """Delete a job and its journal file at the caller's request, whatever its state.
@@ -443,7 +492,7 @@ class AskJobs:
             gone = False
             if self._journal:
                 gone = self._journal.delete(job)
-                if not gone and self._journal.read(job) is not None:
+                if not gone and not self._journal.verified_absent(job):
                     raise DiscardFailed(f"the saved record for ask job {job} could not be deleted")
             return (self._jobs.pop(job, None) is not None) or gone
 

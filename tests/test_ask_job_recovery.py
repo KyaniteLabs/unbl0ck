@@ -508,6 +508,75 @@ class MarkSentFailure(RecoveryBase):
         self.assertTrue(plain.mark_sent(J1))
 
 
+class UnavailableStorage(RecoveryBase):
+    """Round-3 review: storage that cannot be examined is unknown, never an empty directory."""
+
+    def lose_directory(self):
+        def broken():
+            raise OSError("storage unavailable")
+
+        self.journal._directory = broken
+
+    def test_model_is_not_called_when_the_queued_marker_cannot_be_checked_or_removed(self):
+        self.jobs.create(J1, card="c1")
+        self.assertEqual(self.files(), [f"{J1}.json"])
+        self.lose_directory()
+        self.assertFalse(self.jobs.mark_sent(J1))
+
+    def test_discard_does_not_claim_success_while_the_saved_record_cannot_be_checked(self):
+        self.jobs.create(J1, card="c1")
+        self.lose_directory()
+        with self.assertRaises(jobs.DiscardFailed):
+            self.jobs.discard(J1)
+        self.assertIsNotNone(self.jobs.get(J1))  # still there, and so is the file
+        self.assertEqual(self.files(), [f"{J1}.json"])
+
+    def test_a_job_that_was_never_journaled_is_verifiably_absent_without_a_location(self):
+        plain = jobs.AskJournal(lambda: None)
+        self.assertTrue(plain.verified_absent(J1))
+
+    def test_verified_absence_means_the_file_is_really_gone(self):
+        self.jobs.create(J1, card="c1")
+        self.assertFalse(self.journal.verified_absent(J1))
+        self.journal.delete(J1)
+        self.assertTrue(self.journal.verified_absent(J1))
+
+
+class BadEntries(RecoveryBase):
+    def dangle(self, name):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        link = self.dir / f"{name}.json"
+        link.symlink_to(Path(self.tmp.name) / "nowhere")
+        return link
+
+    def test_one_dangling_symlink_does_not_stop_new_markers(self):
+        link = self.dangle(J3)
+        self.jobs.create(J1, card="c1")
+        self.assertIn(f"{J1}.json", self.files())
+        self.assertEqual(self.journal.read(J1)["state"], "queued")
+        self.assertFalse(link.is_symlink(), "the junk link was removed")
+
+    def test_housekeeping_removes_a_dangling_symlink_and_never_follows_it(self):
+        target = Path(self.tmp.name) / "precious.json"
+        target.write_text("{}")
+        good = self.dir / f"{J1}.json"
+        self.jobs.create(J2, card="c1")
+        link = self.dir / f"{J3}.json"
+        link.symlink_to(target)
+        dangling = self.dangle("d" * 32)
+        self.assertGreaterEqual(self.journal.prune(900), 1)
+        self.assertFalse(dangling.is_symlink())
+        self.assertTrue(target.exists(), "the link's target is untouched")
+        self.assertTrue((self.dir / f"{J2}.json").exists())
+
+    def test_a_full_directory_with_a_bad_entry_still_makes_room(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        for n in range(self.journal.MAX_FILES):
+            (self.dir / f"{n:032x}.json").write_text("{}")
+        self.dangle("e" * 32)
+        self.assertTrue(self.journal.write(J1, {"state": "queued", "started": 1.0}))
+
+
 class Housekeeping(RecoveryBase):
     keep = True
 
