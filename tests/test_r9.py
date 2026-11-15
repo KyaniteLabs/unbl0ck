@@ -44,6 +44,8 @@ class SingleQuoteBackslashIsLiteral(unittest.TestCase):
             "mysql -u root -p'prefix\\'PARTSECRET db",
             "curl -u 'alice:pre\\'PARTSECRET https://example.test",
             "curl -b 'sid=pre\\'PARTSECRET https://example.test",
+            "curl -u 'alice:pre\\'password=\"PARTSECRET\" x",  # Sol r9d: the word runs on through quotes
+            "curl -u 'alice:pre\\'password=\"PART SECRET\" x",
         ):
             self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
 
