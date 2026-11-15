@@ -47,7 +47,9 @@ def _summary(limit: int = 12) -> str:
             lines.append(f"  approve: {it['approve_command']}")
     if q["count"] > limit:
         lines.append(f"…and {q['count'] - limit} more. Open /unblock in Desktop.")
-    if other and q["count"]:
+    if other:
+        # Also when the ask list is empty because a source failed: stuck and answered
+        # cards are still omitted from the lines above, so the counts have to be said.
         lines.append(f"Not listed here: {', '.join(other)}. Open /unblock in Desktop.")
     for err in q["errors"]:
         lines.append(f"(source error: {err})")

@@ -1090,11 +1090,11 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false 
     )
   const hide = async () => {
     const r = await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn')
-    if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden' })
+    if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: item.version })
   }
   const outsideDone = async () => {
     const r = await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null)
-    if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done' })
+    if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.done ? r.token : item.version })
   }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
@@ -1137,12 +1137,17 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false 
         : await ctx.rest('/card/ask', { method: 'POST', body: { id: item.id, messages: next.slice(-50) } })
       const t0 = Date.now()   // the model can outlast the desktop's 30 s request limit: poll the background job
       while (r && r.pending && r.job) {
-        if (mine()) updateAskSession(item.id, { job: { id: r.job, version: item.version } })
+        // A superseded request (evicted session, newer question) stops polling at once and
+        // never records its job id, so Retry cannot follow it into a newer conversation.
+        if (!mine()) return
+        updateAskSession(item.id, { job: { id: r.job, version: item.version } })
         setAskJob({ id: r.job, version: item.version })
         if (Date.now() - t0 > 150000) throw new Error('The model took too long (over 150 s)')
         await new Promise(res => setTimeout(res, 1500))
+        if (!mine()) return
         r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true&card=' + encodeURIComponent(item.id))
       }
+      if (!mine()) return
       if (mine()) { updateAskSession(item.id, { job: null }); setAskJob(null) }
       // After a gateway restart the plugin never resends on its own. Say which of the five
       // outcomes this is; Retry then sends a new request only because the human chose it.
@@ -1312,7 +1317,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false 
         ] }),
         jsx('div', { className: 'ub-hint', role: 'note', children: item.origin === 'folder'
           ? 'Done only hides this card until the file changes. The file is not changed, moved or deleted. You can Undo.'
-          : 'Done only clears this card here. It does not send, file or finish anything in the original app, and you can Undo for a few minutes.' })
+          : 'Done only clears this card here. It does not send, file or finish anything in the original app. Undo stays on the banner for 12 seconds.' })
       ].filter(Boolean)
     : [
         opensHere ? null : jsx('div', { className: 'ub-hint', role: 'note', children: `Reply in ${platformName || 'the chat'}. It leaves this list once you answer.` }),
@@ -1483,7 +1488,7 @@ function Page({ ctx, refresh }) {
     const same = x => x.id === u.id && x.at === u.at
     const drop = () => $undo.set(($undo.get() || []).filter(x => !same(x)))
     try {
-      const r = await ctx.rest('/unhide', { method: 'POST', body: { id: u.id } })
+      const r = await ctx.rest('/unhide', { method: 'POST', body: u.token ? { id: u.id, token: u.token } : { id: u.id } })
       drop()
       if (r && r.restored === false) {
         host.notify({ kind: 'info', message: `Nothing to restore for "${u.title}": it changed or its undo period ended.` })
