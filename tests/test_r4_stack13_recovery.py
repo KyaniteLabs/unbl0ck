@@ -413,8 +413,9 @@ class DocsMatchBehavior(unittest.TestCase):
         self.assertIn("``preserve`` adds a backup file (creating the recovery directory on first use), sets that directory", doc)
         self.assertIn("creates the recovery directory", self.guide)
 
-    def test_windows_dry_runs_are_documented(self):
-        self.assertIn("dry runs and `preserve` still work", self.guide)
+    def test_the_windows_refusal_is_documented(self):
+        self.assertIn("refuses every command there", self.guide)
+        self.assertNotIn("dry runs and `preserve` still work", self.guide)
 
     def test_ask_markers_are_documented_where_the_code_puts_them(self):
         self.assertNotIn("profile's own data directory", self.guide)

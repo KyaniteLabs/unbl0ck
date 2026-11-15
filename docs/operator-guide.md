@@ -257,8 +257,8 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
    `recovery_dir` is `absent`, `ok` or `unsafe` (a file or link where the directory
    belongs; the command exits 1). A diagnosis lists at most 100 backups, newest label
    first, and reads at most 64 MiB of them; the rest are counted in `backups_omitted` or
-   marked `not_checked`. A link anywhere in `plugin-data/unbl0ck` makes every command
-   refuse.
+   marked `not_checked`. A link at `plugin-data`, `unbl0ck`, `recovery` or a store or
+   backup file makes every command refuse; other entries in the tree are not read.
 2. **Preserve.** `preserve` copies the exact current bytes, readable or not, into
    `plugin-data/unbl0ck/recovery/` (it creates the recovery directory, mode 700, on first
    use), checks the copy and syncs it and its directory to disk; a sync that fails is
@@ -282,8 +282,9 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
 Consequences to expect: everything changed after the backup was made is lost (dismissals,
 pending releases, summaries). The tool never creates defaults for a record it cannot read,
 and it never clears a lock. If it reports `writer_active`, wait for the other process or
-stop it in its owning installation, then run it again. On Windows the state files inherit the ACL of the Hermes home (the owner-only modes are POSIX modes), so restrict that folder to the owning user. On Windows this tool does not
-yet probe the state lock, so `--apply` is refused until that is verified on a real host; dry runs and `preserve` still work.
+stop it in its owning installation, then run it again. On Windows the state files inherit the ACL of the Hermes home (the owner-only modes are POSIX modes), so restrict that folder to the owning user. On Windows this tool
+cannot open the state directory without following links, so it refuses every command there,
+dry runs and `preserve` included, until that is verified on a real host.
 Per-record files (`outside/`, `waits/`, `ask/`) are not covered: a corrupt record there is
 skipped on its own and does not block the others.
 
