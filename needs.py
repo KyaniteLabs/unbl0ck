@@ -2178,11 +2178,14 @@ def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
 BACKFILL_FILE = "chat-backfill.json"
 
 
-def _backfill_floor(home: Path | None, since: float, *, record: bool, errors: list[str] | None) -> float:
+def _backfill_floor(
+    home: Path | None, since: float, *, record: bool, errors: list[str] | None
+) -> tuple[float, frozenset[str]]:
     """The start of the first window any queue build read (``{"floor": time}``, written once
-    under the state lock), or *since* before one exists. Nothing here is chat text. A floor
-    that cannot be read or saved counts as a day ago, so a widened window never passes for
-    an ordinary one."""
+    under the state lock), or *since* before one exists, plus the chat ids an older store
+    listed as backfill (``ids``), which stay flagged. Nothing here is chat text. A floor that
+    cannot be read or saved counts as a day ago, so a widened window never passes for an
+    ordinary one."""
     try:
         if record:
             data = _update_state(
@@ -2193,9 +2196,11 @@ def _backfill_floor(home: Path | None, since: float, *, record: bool, errors: li
     except (OSError, RuntimeError) as exc:
         if errors is not None:
             errors.append(f"chat: the backfill floor could not be read or saved ({type(exc).__name__})")
-        return time.time() - 86400
+        return time.time() - 86400, frozenset()
     floor = _finite(data.get("floor", since))
-    return floor if floor is not None else time.time() - 86400
+    ids = data.get("ids")
+    kept = frozenset(i for i in ids if isinstance(i, str)) if isinstance(ids, list) else frozenset()
+    return (floor if floor is not None else time.time() - 86400), kept
 
 
 def _mark_backfill(
@@ -2208,15 +2213,13 @@ def _mark_backfill(
 ) -> None:
     """Flag chats that only a widened window reached (``backfilled``), so nothing is sent to a
     model for them automatically: a chat older than the default window or than the first
-    window any queue build read. Both edges only move forward in time relative to a chat, so
-    the flag stays with it and a later refresh cannot turn it back into an ordinary ask. Only
-    ``record`` (the queue build) saves the floor."""
-    edge = max(
-        _backfill_floor(home, since, record=record, errors=errors),
-        time.time() - CHAT_WINDOW_DAYS * 86400,
-    )
+    window any queue build read, or one an older store listed. Both edges only move forward in
+    time relative to a chat, so the flag stays with it and a later refresh cannot turn it back
+    into an ordinary ask. Only ``record`` (the queue build) saves the floor."""
+    floor, listed = _backfill_floor(home, since, record=record, errors=errors)
+    edge = max(floor, time.time() - CHAT_WINDOW_DAYS * 86400)
     for it in items:
-        if (it.get("since") or 0) < edge:
+        if (it.get("since") or 0) < edge or it.get("id") in listed:
             it["backfilled"] = True
 
 
