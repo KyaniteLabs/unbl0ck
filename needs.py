@@ -1269,17 +1269,8 @@ def recent_comments(item: dict[str, Any], limit: int = 6) -> list[dict[str, Any]
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
 
     with closing(kbc.connect(board=item["board"])) as conn:
-        try:
-            rows = conn.execute(
-                "SELECT author, body FROM task_comments WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-                (item["task_id"], limit),
-            ).fetchall()
-            return [{"author": r[0], "body": r[1]} for r in reversed(rows)]
-        except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-            return [
-                {"author": c.author, "body": c.body}
-                for c in kanban_db.list_comments(conn, item["task_id"])[-limit:]
-            ]
+        rows, _ = _newest_comments(conn, kanban_db, item["task_id"], limit)
+    return [{"author": r[1], "body": r[2]} for r in rows]
 
 
 # --- classification (pure) -----------------------------------------------------------------
@@ -1811,29 +1802,34 @@ def _digest(*texts: Any) -> str:
 
 def _comments_sig(conn: Any, kanban_db: Any, task_id: str) -> str:
     """"count:newest id:digest" of a card's comments: it changes when a comment is added and when
-    one that a model call can see (the newest CARD_CONTEXT_COMMENTS, each up to
-    ASK_CARD_CONTEXT_LIMIT characters) is rewritten, so advice or a summary written from the old
-    text is not shown for the card as it is now. The bounds are applied by the query."""
+    the bounded read every model call and Desktop are given (:func:`_newest_comments`) changes."""
+    rows, count = _newest_comments(conn, kanban_db, task_id, CARD_CONTEXT_COMMENTS)
+    return f"{count}:{max((r[0] or 0 for r in rows), default=0)}:{_digest(*(p for r in rows for p in r[:3]))}"
+
+
+def _newest_comments(conn: Any, kanban_db: Any, task_id: str, limit: int) -> tuple[list[tuple[Any, ...]], int]:
+    """The newest *limit* ``(id, author, body, created_at)`` comments of a card, oldest first, and
+    its comment count. A body is its first ASK_CARD_CONTEXT_LIMIT bytes (past any NUL), ending in
+    ``_ASK_CUT`` when cut: the one bounded read the signature, Ask, summaries and Desktop share."""
     try:
-        count, newest = conn.execute(
-            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?", (task_id,)
-        ).fetchone()
+        count = conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)).fetchone()[0]
         rows = conn.execute(
-            "SELECT id, author, LENGTH(body), SUBSTR(body, 1, ?) FROM task_comments WHERE task_id = ? "
-            "ORDER BY created_at DESC, id DESC LIMIT ?",
-            (ASK_CARD_CONTEXT_LIMIT, task_id, CARD_CONTEXT_COMMENTS),
-        ).fetchall()
+            "SELECT id, author, SUBSTR(CAST(body AS BLOB), 1, ?), created_at FROM task_comments "
+            "WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (ASK_CARD_CONTEXT_LIMIT + 1, task_id, limit),
+        ).fetchall()[::-1]
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments, count = _newest_rows(
-            conn, kanban_db, "task_comments", "Comment", "list_comments", task_id, CARD_CONTEXT_COMMENTS
-        )
-        newest = max((getattr(c, "id", 0) or 0 for c in comments), default=0)
+        listed = list(kanban_db.list_comments(conn, task_id))
+        count = len(listed)
         rows = [
-            (getattr(c, "id", 0) or 0, getattr(c, "author", ""), len(body), body[:ASK_CARD_CONTEXT_LIMIT])
-            for c in reversed(comments)
-            for body in (str(getattr(c, "body", "") or ""),)
+            (getattr(c, "id", 0), c.author, str(c.body or "").encode("utf-8", "replace"), getattr(c, "created_at", None))
+            for c in listed[-limit:]
         ]
-    return f"{count}:{newest}:{_digest(*(part for r in rows for part in r))}"
+    cut = ASK_CARD_CONTEXT_LIMIT
+    return [
+        (i, a, bytes(b or b"")[:cut].decode("utf-8", "replace") + (_ASK_CUT if len(b or b"") > cut else ""), t)
+        for i, a, b, t in rows
+    ], int(count)
 
 
 def kanban_items(
@@ -5363,9 +5359,7 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
         recent, events_total = _newest_rows(
             conn, kanban_db, "task_events", "Event", "list_events", task_id, CARD_CONTEXT_EVENTS
         )
-        comments, comments_total = _newest_rows(
-            conn, kanban_db, "task_comments", "Comment", "list_comments", task_id, CARD_CONTEXT_COMMENTS
-        )
+        comments, comments_total = _newest_comments(conn, kanban_db, task_id, CARD_CONTEXT_COMMENTS)
         receipt_event = _latest_event_of_kind(conn, kanban_db, task_id, "pr_acceptance")
         graph = kanban_db.task_graph_context(conn, task_id)
         attachments, attachments_total = _newest_rows(
@@ -5425,15 +5419,7 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
             "since": getattr(block, "created_at", None)
             or getattr(task, "created_at", None),
         },
-        "comments": [
-            {
-                "id": c.id,
-                "author": c.author,
-                "body": c.body,
-                "created_at": c.created_at,
-            }
-            for c in comments
-        ],
+        "comments": [dict(zip(("id", "author", "body", "created_at"), c)) for c in comments],
         "graph": {
             "parents": list(graph.get("parents") or [])[:CARD_CONTEXT_GRAPH],
             "children": list(graph.get("children") or [])[:CARD_CONTEXT_GRAPH],
