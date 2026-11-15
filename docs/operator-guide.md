@@ -63,37 +63,49 @@ authorization: it is not a gap and will not be added. **Not yet** is a real gap.
 | Source | Context | Model help (TL;DR) | Reply or act in UNBL0CK | Route to the original | Dismiss |
 |---|---|---|---|---|---|
 | kanban | Yes | Yes | Yes | Yes | Yes |
-| chat | Not yet | Not yet | By design | Yes | Yes |
-| prompt | By design | By design | By design | Yes | Yes |
+| chat | Yes | Not yet | By design | Yes | Yes |
+| prompt | Yes | By design | By design | Yes | Yes |
 | pairing | By design | By design | By design | Yes | Yes |
 | outside_filed | Yes | Not yet | By design | Yes | Yes |
-| outside_folder | Yes | Not yet | By design | By design | Yes |
+| outside_folder | Yes | Not yet | By design | Yes | Yes |
 <!-- capability-matrix:end -->
 
 - **Context** is the Context panel for Kanban and the Full text view for chats, live prompts
-  and outside items. Chats have no richer context panel yet.
-- **Model help** sends card text to your configured provider only on an explicit click, and
-  only for Kanban. Chats, filed items and folder files get the one-line summary but no
-  follow-up questions yet. Live prompts (command approvals, password prompts) and pairing
-  requests are never sent to a model. Where it is missing, the card says
-  "TL;DR is not offered here" and why.
+  and outside items. Chats and live prompts show Full text only when the card holds a
+  shortened tail; password prompts never offer Full text, and pairing requests show neither
+  (the code and the person's platform id are never shown).
+- **Model help** is the interactive TL;DR: it sends card text to your configured provider
+  only on an explicit click, and only for Kanban. It is separate from the one-line summary,
+  which is on by default and is sent automatically in the background when the queue is
+  read, for Kanban cards, chats, filed items and folder files (see the README disclosure;
+  `bluf_enabled: false` stops it). Chats, filed items and folder files therefore get the
+  summary but no follow-up questions yet. Live prompts (command approvals, password
+  prompts) and pairing requests are never sent to a model. Where TL;DR is missing, the card
+  says "TL;DR is not offered here" and why; a Kanban card says so when Ask is turned off.
 - **Reply or act** stays in the original surface: a Kanban answer is a comment under your
   name (plus an optional release); chats are answered in the chat, prompts where they were
   asked, pairing with `hermes pairing approve` or the dashboard Pairing page, and filed items
   in the app named on the card. UNBL0CK has no route that sends a message, approves a
   pairing or answers a prompt, so the platform's own sign-in, recipient identity and
   confirmation always apply; `tests/test_capability_matrix.py` fails if a new write route
-  appears without a review.
+  (method and path) appears without a review.
 - **Route to the original** is **Open session** / **Open chat + reply** for local platforms,
-  and a line naming where to act for everything else. Completion shows up as the card
-  leaving the list on the next poll. Watched folder files are read-only, so there is
+  and a line naming where to act (**Act in:** with its reference) for everything else,
+  including watched folder files. Chats, live prompts, pairing requests and Kanban cards
+  leave the list on the next poll once the original state changes. Filed items and folder
+  files do not: UNBL0CK never checks the original app, so finishing there does not remove the
+  card and you mark it **Done** yourself. Watched folder files are read-only, so there is
   nothing to open; Done only hides the card.
 - **Dismiss** is **Not for me** (comes back when the source changes) and, for outside items,
   Done with Undo. Neither completes anything in the original app.
-- Pocket packs only name the original surface ("Answer in Telegram", "Open pairing
-  requests"); they never carry a pairing code, a person's platform id or an inline action.
-- With no usable provider (Ask off, or no model reachable) Ask returns 403 or 503 and the
-  other sources are unaffected.
+- Pocket packs name the original surface for chats, prompts, pairing requests and outside
+  items ("Answer in Telegram", "Open pairing requests"). Kanban cards carry two fixed
+  choices that name the task and block ("Answer and unblock <task>", "Keep <task>
+  blocked"). No pack carries a pairing code, a person's platform id or an answer text.
+- With Ask turned off, Ask returns 403, and 503 when the host's model interface is not
+  reachable at all; the other sources are unaffected. When the interface is present but the
+  provider call fails (for example a connection error), the request is accepted, polling
+  reports `failed`, and a plain result request returns 502; a new attempt is allowed.
 
 **TL;DR** starts a read-only model job. **Use as answer** copies a suggestion into the
 answer box; the human still submits it. **Discuss in chat** asks the host composer to

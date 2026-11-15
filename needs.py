@@ -3426,14 +3426,14 @@ CAPABILITIES: dict[str, dict[str, dict[str, str]]] = {
         "dismiss": _cap("supported"),
     },
     "chat": {
-        "context": _cap("missing", "the card shows the last message and its full text; a chat context panel is not built yet"),
+        "context": _cap("supported"),
         "model_help": _cap("missing", "only the one-line summary exists; TL;DR follow-ups are Kanban-only today"),
         "reply": _cap("restricted", "reply in the chat itself so that platform's own identity and authorization apply; UNBL0CK never sends for you"),
         "route": _cap("supported"),
         "dismiss": _cap("supported"),
     },
     "prompt": {
-        "context": _cap("restricted", "a live prompt shows only what Hermes already redacted; nothing more is read"),
+        "context": _cap("supported"),
         "model_help": _cap("restricted", "live prompts, including command approvals and password prompts, are never sent to a model"),
         "reply": _cap("restricted", "answer it where it was asked; approvals and passwords are never taken here"),
         "route": _cap("supported"),
@@ -3457,7 +3457,7 @@ CAPABILITIES: dict[str, dict[str, dict[str, str]]] = {
         "context": _cap("supported"),
         "model_help": _CAP_OUTSIDE_HELP,
         "reply": _CAP_OUTSIDE_REPLY,
-        "route": _cap("restricted", "watched files are read-only: UNBL0CK never edits, moves or deletes them"),
+        "route": _cap("supported"),
         "dismiss": _cap("supported"),
     },
 }

@@ -49,7 +49,12 @@ class Matrix(unittest.TestCase):
             self.assertEqual(caps[row]["model_help"]["status"], "restricted", f"{row} is never sent to a model")
         self.assertIn("password", caps["prompt"]["model_help"]["why"])
         self.assertIn("code", caps["pairing"]["context"]["why"])
-        self.assertEqual(caps["outside_folder"]["route"]["status"], "restricted")  # read-only folder
+        # A folder card already names where to act ("Act in:" plus a file reference): that is routing.
+        self.assertEqual(caps["outside_folder"]["route"]["status"], "supported")
+        # Context means the Context panel or the Full text view; both exist for chats and non-password prompts.
+        self.assertEqual(caps["chat"]["context"]["status"], "supported")
+        self.assertEqual(caps["prompt"]["context"]["status"], "supported")
+        self.assertEqual(caps["pairing"]["context"]["status"], "restricted")
 
     def test_gaps_are_marked_missing_not_restricted(self):
         # Only intentional safety rules may read "by design"; unbuilt help must say "not yet".
@@ -117,6 +122,17 @@ for(const [row,it] of Object.entries(samples)){
 const tree=render(item);
 assert.ok(buttons(tree).includes('TL;DR'));
 assert.ok(!texts(tree).includes('TL;DR is not offered here'));
+""")
+
+    def test_kanban_with_ask_turned_off_says_why_the_button_is_gone(self):
+        self.run_views(r"""
+cursor=0;state=[];
+const off=Item({ctx:{rest:async()=>({})},item,n:1,refresh,askEnabled:false,capabilities:caps});
+assert.ok(!buttons(off).includes('TL;DR'));
+assert.ok(texts(off).includes('TL;DR is not offered here: Ask is turned off'),texts(off));
+cursor=0;state=[];
+const on=Item({ctx:{rest:async()=>({})},item,n:1,refresh,askEnabled:true,capabilities:caps});
+assert.ok(!texts(on).includes('not offered here'));
 """)
 
     def test_password_prompts_say_they_are_never_sent_to_a_model(self):
@@ -194,12 +210,41 @@ class ApiBoundaries(unittest.TestCase):
 
     def test_no_route_can_send_a_reply_approve_pairing_or_answer_a_prompt(self):
         routes = {(m, r.path) for r in self.api.router.routes for m in getattr(r, "methods", ()) if m != "HEAD"}
-        writes = {p for m, p in routes if m in ("POST", "PUT", "PATCH", "DELETE")}
+        writes = {(m, p) for m, p in routes if m in ("POST", "PUT", "PATCH", "DELETE")}
         self.assertEqual(
             writes,
-            {"/card/ask", "/card/ask/{job}", "/kanban/answer", "/hide", "/unhide", "/outside/done", "/pack"},
+            {
+                ("POST", "/card/ask"),
+                ("DELETE", "/card/ask/{job}"),
+                ("POST", "/kanban/answer"),
+                ("POST", "/hide"),
+                ("POST", "/unhide"),
+                ("POST", "/outside/done"),
+                ("POST", "/pack"),
+            },
             "a new write route needs a capability-matrix decision and a native-authorization review",
         )
+
+    def test_a_provider_that_raises_is_accepted_then_reported_failed(self):
+        # A reachable host LLM object whose call fails is not "no usable provider": submission succeeds,
+        # polling says failed, and a plain result request is a 502.
+        import time
+
+        def boom(messages, **kw):
+            raise ConnectionError("provider down")
+
+        self.api._loaded_ctx = lambda: types.SimpleNamespace(llm=types.SimpleNamespace(complete=boom))
+        r = self.ask("kanban:default:t1")
+        self.assertEqual(r.status_code, 200, r.text)
+        job = r.json()["job"]
+        for _ in range(100):
+            polled = self.c.get(f"/card/ask/{job}", params={"poll": "true", "card": "kanban:default:t1"}).json()
+            if polled.get("state") != "pending":
+                break
+            time.sleep(0.05)
+        self.assertEqual(polled["state"], "failed")
+        plain = self.c.get(f"/card/ask/{job}", params={"card": "kanban:default:t1"})
+        self.assertEqual(plain.status_code, 502)
 
 
 class ReadOnlyExport(unittest.TestCase):
@@ -211,16 +256,52 @@ class ReadOnlyExport(unittest.TestCase):
             {"source": "prompt", "id": "prompt:p:1", "title": "Prompt", "ask": "Run it?", "why": "w", "tier": "ask", "profile": "p"},
             {"source": "chat", "id": "chat:p:s1", "title": "Chat", "ask": "Ship?", "why": "w", "tier": "ask", "profile": "p", "platform": "telegram"},
             {"source": "outside", "id": "outside:o1", "title": "Draft", "ask": "Send?", "why": "w", "tier": "ask", "act_where": "Mail"},
+            {"source": "kanban", "id": "kanban:default:t1", "task_id": "t1", "board": "default", "version": "v1", "title": "Task", "ask": "Pick?", "why": "w", "tier": "ask", "status": "blocked"},
         ]}
         pack = needs.pocket_pack(queue)
         blob = repr(pack)
         self.assertNotIn(secret, blob)
         self.assertNotIn("u-77", blob)
+        self.assertEqual(len(pack["cards"]), 5)
         for card in pack["cards"]:
             for option in card["options"]:
                 # A fixed instruction that points back at the original surface, never an inline action.
-                self.assertRegex(option["send"], r"^(Open|Answer|Act) ")
+                self.assertRegex(option["send"], r"^(Open|Answer|Act|Keep) ")
                 self.assertNotRegex(option["send"], r"(?i)approve .*telegram|code")
+        kanban = next(c for c in pack["cards"] if "kanban" in repr(c) and "t1" in repr(c))
+        self.assertTrue(any(o["send"].startswith("Answer and unblock t1") for o in kanban["options"]), kanban)
+
+
+class DocsStatements(unittest.TestCase):
+    """The guide's prose is pinned to behavior, not only its table."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.guide = " ".join((ROOT / "docs/operator-guide.md").read_text().split())
+        cls.verification = " ".join((ROOT / "docs/verification.md").read_text().split())
+
+    def test_summaries_are_automatic_and_ask_is_interactive(self):
+        self.assertIn("one-line summary", self.guide)
+        self.assertIn("automatically", self.guide)
+        self.assertIn("sent automatically in the background", self.guide)
+        self.assertIn("follow-up questions", self.guide)
+        row = next(l for l in self.verification.split("| ") if l.startswith("Capability matrix"))
+        self.assertNotIn("never reach Ask or the provider", row)
+
+    def test_completion_claim_is_limited_to_sources_that_can_observe_it(self):
+        self.assertNotIn("Completion shows up as the card leaving the list on the next poll.", self.guide)
+        self.assertIn("never checks the original app", self.guide)
+
+    def test_pocket_pack_statement_covers_kanban(self):
+        self.assertNotIn("an inline action.", self.guide)
+        self.assertIn("Answer and unblock", self.guide)
+
+    def test_provider_failure_contract_is_documented(self):
+        self.assertIn("502", self.guide)
+        self.assertIn("failed", self.guide)
+
+    def test_context_definition_and_password_prompts(self):
+        self.assertIn("password prompts never offer Full text", self.guide)
 
 
 if __name__ == "__main__":

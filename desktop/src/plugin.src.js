@@ -1001,9 +1001,12 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
   // Model help exists for Kanban only; every other source says why, from the published matrix.
   const capKey = isOutside ? (item.origin === 'folder' ? 'outside_folder' : 'outside_filed') : item.source
   const helpCap = !isKanban ? capabilities?.[capKey]?.model_help : null
-  const helpLimit = helpCap && helpCap.status !== 'supported' && helpCap.why
-    ? jsx('div', { className: 'ub-hint', role: 'note', children: `TL;DR is not offered here: ${helpCap.why}` })
-    : null
+  // A Kanban card loses the TL;DR button only when Ask is switched off; say so rather than leave a gap.
+  const helpLimit = isKanban
+    ? (askEnabled ? null : jsx('div', { className: 'ub-hint', role: 'note', children: 'TL;DR is not offered here: Ask is turned off in UNBL0CK settings (ask_enabled).' }))
+    : helpCap && helpCap.status !== 'supported' && helpCap.why
+      ? jsx('div', { className: 'ub-hint', role: 'note', children: `TL;DR is not offered here: ${helpCap.why}` })
+      : null
   // Chats and live prompts poll only a 480-character tail; the whole record is fetched on demand.
   const hasFull = isOutside || (item.ask_truncated === true && (item.source === 'chat' || item.source === 'prompt'))
   const answerStale = isKanban && !!answer.trim() && answerVersion !== item.version
