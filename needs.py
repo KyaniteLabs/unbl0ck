@@ -1992,7 +1992,10 @@ def file_outside(
     if action not in ("file", "resolve"):
         raise ValueError("action must be file or resolve")
     key = _outside_field(args, "dedupe_key", 120)
-    caller = str(kwargs.get("profile") or "")
+    # Hermes' tool dispatch passes task_id, session_id and user_task but not the profile, so
+    # an absent kwarg falls back to the profile the process is running under, the same way
+    # record_wait() resolves it. An explicit kwarg still wins.
+    caller = str(kwargs.get("profile") or "") or _profile_of(home or hermes_home())
     scope = _dedupe_scope(args, caller) if (key or action == "file") else "global"
     if action == "resolve" and not caller and args.get("dedupe_scope") in (None, ""):
         scope = None  # unknown caller: resolve only an unambiguous key

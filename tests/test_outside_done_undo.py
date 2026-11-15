@@ -161,7 +161,7 @@ class DoneUndo(OutsideFixture):
         result = self.file(dedupe_key="a")
         (it,) = self.queue()
         self.done(it)
-        resolved = json.loads(self.tools["unbl0ck_file"][2]({"action": "resolve", "dedupe_key": "a"}))
+        resolved = json.loads(self.tools["unbl0ck_file"][2]({"action": "resolve", "dedupe_key": "a"}, profile="work"))
         self.assertTrue(resolved["resolved"])
         self.assertFalse(self.record(result).exists())
         self.assertFalse(needs.unhide(it["id"]))
