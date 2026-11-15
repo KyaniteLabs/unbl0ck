@@ -45,6 +45,7 @@ GUESSED = "heuristic"  # inferred (for example a draft that vanished and a messa
 
 OK, ACCESS_REVOKED, AUTH_FAILED, RATE_LIMITED = "ok", "access_revoked", "auth_failed", "rate_limited"
 HOLD_STATUSES = frozenset({ACCESS_REVOKED, AUTH_FAILED})
+ACCESS = "access"  # hold reason: a read of the account failed (LEFT_VIEW is the other reason)
 STATUSES = frozenset({OK, RATE_LIMITED}) | HOLD_STATUSES
 
 
@@ -88,7 +89,7 @@ class Local:
     evidence: str | None = None  # None while open; ASSERTED, HEURISTIC or VERIFIED once done
     acted_revision: str | None = None  # the revision the human dismissed or answered
     pending_edit: bool = False  # the human has an unsent change in flight
-    held: bool = False  # access failed; possibly stale. Held keeps the open or done state underneath
+    held: bool | str = False  # ACCESS or LEFT_VIEW (True: legacy ACCESS); keeps the open or done state underneath
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,7 @@ class Action:
     seq: int | None = None  # the watermark this action moves the item to
     revision: str | None = None
     evidence: str | None = None  # for completion actions
+    hold: str | None = None  # for ``hold``: ACCESS or LEFT_VIEW
 
 
 @dataclass
@@ -157,8 +159,8 @@ def reconcile(local: Mapping[Key, Local], batch: ChangeBatch, accounts: Iterable
         plan.complete = False
         plan.omitted = None
         plan.stop_reason = batch.status
-        plan.actions = [Action("hold", k, "access failed; items may be stale") for k, v in local.items()
-                        if (k[0], k[1]) in scope and v.state != "gone" and not (v.held or v.state == "held")]
+        plan.actions = [Action("hold", k, "access failed; items may be stale", hold=ACCESS) for k, v in local.items()
+                        if (k[0], k[1]) in scope and v.state != "gone" and not _hold(v)]
         return plan  # absence after a failed grant is not completion or deletion
     if batch.status != OK:
         plan.error = f"unrecognised batch status {batch.status!r}; nothing was applied"
@@ -184,10 +186,8 @@ def reconcile(local: Mapping[Key, Local], batch: ChangeBatch, accounts: Iterable
             plan.actions.append(Action("seq_collision", item.key, "same seq, different content; the first was kept"))
     for item in winners.values():  # one event per item: the newest wins, so a batch folds into one state
         plan.actions.extend(_one(item, local.get(item.key)))
-    if batch.complete and not rejected:
-        for k, v in local.items():  # a successful full read proves access: unmentioned held items are current
-            if (k[0], k[1]) in scope and k not in winners and (v.held or v.state == "held") and v.state != "gone":
-                plan.actions.append(Action("release_hold", k, "reads work again"))
+    plan.actions.extend(Action("release_hold", k, "reads work again") for k, v in local.items()
+                        if (k[0], k[1]) in scope and k not in winners and _releases(v, None, batch.complete and not rejected))
     plan.complete = batch.complete and not rejected
     if not plan.complete:
         plan.omitted = None if batch.omitted is None and not batch.complete else (batch.omitted or 0) + rejected
@@ -208,10 +208,32 @@ def _scope(accounts: Iterable[tuple[str, str]], batch: ChangeBatch) -> set[tuple
     return scope
 
 
-def _view(cur: Local) -> tuple[str, str | None, bool]:
-    held = cur.held or cur.state == "held"
-    state = (DONE if cur.evidence else OPEN) if cur.state == "held" else cur.state
-    return state, cur.evidence, held
+def _hold(cur: Local) -> str | None:
+    """Why ``cur`` is held (ACCESS or LEFT_VIEW), or None. ``held=True`` and the state "held" are
+    the legacy spellings of an access hold."""
+    if cur.state == "gone":
+        return None
+    if cur.held in (ACCESS, LEFT_VIEW):
+        return cur.held
+    return ACCESS if cur.held is True or cur.state == "held" else None
+
+
+def _releases(cur: Local, item: ExternalItem | None, complete: bool) -> bool:
+    """The one release rule. An access hold ends when a successful read of its account mentions
+    the item (even as a stale event) or, unmentioned, when the read is complete. A left-view hold
+    ends only when the provider lists the item again with a newer seq; reads working says nothing
+    about where it went."""
+    if item is not None and item.state not in ITEM_STATES - {LEFT_VIEW}:
+        return False
+    hold = _hold(cur)
+    if hold == LEFT_VIEW:
+        return item is not None and item.seq > cur.seq
+    return hold == ACCESS and (item is not None or complete)
+
+
+def _view(cur: Local) -> tuple[str, str | None]:
+    return (DONE if cur.evidence else OPEN) if cur.state == "held" else cur.state, cur.evidence
+
 
 
 def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
@@ -230,12 +252,12 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
         if item.state == DONE:
             return [Action("track_done", k, "already done at the provider; no card", seq=s, revision=r, evidence=ev)]
         return [] if item.state == LEFT_VIEW else [Action("add", k, seq=s, revision=r)]
+    out: list[Action] = [Action("release_hold", k)] if _releases(cur, item, False) else []
     if s < cur.seq:
-        return [Action("ignore_stale", k)]
+        return out + [Action("ignore_stale", k)]
     if s == cur.seq and r != cur.revision:
-        return [Action("seq_collision", k, "same seq, different revision; the stored one was kept")]
-    state, cur_ev, held = _view(cur)
-    out: list[Action] = [Action("release_hold", k)] if held and item.state != LEFT_VIEW else []
+        return out + [Action("seq_collision", k, "same seq, different revision; the stored one was kept")]
+    state, cur_ev = _view(cur)
     edit = cur.pending_edit
     conflict = Action("conflict", k, "changed at the provider while a local edit is unsent; nothing was written")
     if cur.state == "gone":
@@ -252,9 +274,10 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
             out.append(conflict)
         return out + [Action("remove", k, "deleted at the provider", seq=s, revision=r)]
     if item.state == LEFT_VIEW:
-        if held:
+        if _hold(cur) == LEFT_VIEW:
             return [Action("advance", k, seq=s, revision=r)] if s > cur.seq else []
-        return [Action("hold", k, "no longer listed where it was read; existence is not confirmed", seq=s, revision=r)]
+        return [Action("hold", k, "no longer listed where it was read; existence is not confirmed", seq=s, revision=r,
+                       hold=LEFT_VIEW)]
     if item.state == DONE:
         if state == DONE and _RANK.get(cur_ev, 0) >= _RANK[ev]:
             if r != cur.revision:
@@ -305,7 +328,7 @@ def apply(local: Mapping[Key, Local], plan: Plan) -> dict[Key, Local]:
         if cur is None:
             continue
         if a.op == "hold":
-            cur = replace(cur, held=True)
+            cur = replace(cur, held=a.hold or ACCESS)
         elif a.op == "release_hold":
             cur = replace(cur, held=False, state=(DONE if cur.evidence else OPEN) if cur.state == "held" else cur.state)
         elif a.op in ("complete_verified", "complete_unconfirmed", "verify_done"):
