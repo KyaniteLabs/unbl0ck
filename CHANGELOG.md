@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **A nested watched file is read from the watched folder's descriptor (#70).** Each subfolder is opened in turn without following a link, so a subfolder swapped for a link after the containment check fails the read instead of redirecting it outside the folder.
+
 ## 0.6.0 (2026-11-15)
 
 Known gaps: the Windows state lock has not been run on a real Windows host (#43); the provider adapters, chat backfill, host acceptance and operator recovery have not been run against a real host or live account (#39, #42, #44, #48); and the Desktop views have no real-browser test harness.

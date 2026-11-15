@@ -4135,6 +4135,23 @@ def _watched_dir(root: Path):
         os.close(dfd)
 
 
+def _open_beneath(root_fd: int, parts: tuple[str, ...]) -> int:
+    """Open the file *parts* names below the folder *root_fd* for reading, one directory at a
+    time from that descriptor and never through a link, so a subfolder swapped for a link
+    after a check raises instead of redirecting the read."""
+    fd = root_fd
+    try:
+        for part in parts[:-1]:
+            sub = os.open(part, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW, dir_fd=fd)
+            if fd != root_fd:
+                os.close(fd)
+            fd = sub
+        return os.open(parts[-1], os.O_RDONLY | _NOFOLLOW | _NONBLOCK, dir_fd=fd)
+    finally:
+        if fd != root_fd:
+            os.close(fd)
+
+
 def _folder_outside_item(
     f: Path, root: Path, expected: os.stat_result, root_fd: int | None = None
 ) -> dict[str, Any] | None:
@@ -4148,13 +4165,10 @@ def _folder_outside_item(
     # hidden folder inside the root) must not pass as a visible nested file.
     if real != f or (real.parent != root and root not in real.parents):
         return None
-    if any(part.startswith(".") for part in f.relative_to(root).parts):
+    rel = f.relative_to(root).parts
+    if any(part.startswith(".") for part in rel):
         return None
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    if root_fd is not None and f.parent == root:
-        fd = os.open(f.name, flags, dir_fd=root_fd)  # relative to the directory that was scanned
-    else:
-        fd = os.open(f, flags)
+    fd = os.open(f, os.O_RDONLY | _NOFOLLOW | _NONBLOCK) if root_fd is None else _open_beneath(root_fd, rel)
     with os.fdopen(fd, "rb") as fh:
         st = os.fstat(fh.fileno())
         if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (
