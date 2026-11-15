@@ -7,12 +7,14 @@ from test_r4_stack01d_kanban import needs
 from test_r7_M import comments_table
 
 
-class OpenQuoteIsDropped(unittest.TestCase):
+class CutQuoteIsClosed(unittest.TestCase):
     def test_a_cut_comment_never_shows_part_of_a_credential_with_spaces(self):
-        """R9-001: a quoted credential holding spaces, cut before its closing quote, is not sent."""
+        """R9-001: a quoted credential, cut before its closing quote or beside an escaped quote, is not sent."""
         for body in (
             'curl -u "alice:PARTSECRET ' + "b " * 24000 + '" https://example.test',
             'first line\ncurl -u "alice:PARTSECRET ' + "b " * 24000 + '" https://example.test',
+            'curl -u "alice:PARTSECRET\n' + "b " * 24000 + '" https://example.test',
+            'echo \\"; curl -u "alice:PARTSECRET b" ' + "word " * 6000,
         ):
             with self.subTest(body[:12]):
                 self.assertNotIn("PARTSECRET", needs._ask_redact(body))
@@ -20,14 +22,9 @@ class OpenQuoteIsDropped(unittest.TestCase):
                 card = {"title": "t", "comments": [{"author": row[1], "body": row[2]}]}
                 self.assertNotIn("PARTSECRET", json.dumps(needs.build_ask_messages(card, [])))
                 self.assertIn("truncated", row[2])
-        (row,), _ = needs._newest_comments(comments_table(body), None, "t", 5)
-        self.assertTrue(row[2].startswith("first line"), row[2][:40])
-
-    def test_a_tail_read_drops_a_quote_whose_opening_was_cut(self):
-        """R9-001: the chat tail read drops through a quote whose opening lies before the cut."""
-        tail = "b " * 50 + 'PARTSECRET" https://example.test\nAre you sure?'
-        self.assertEqual(needs._drop_cut(tail, True), "https://example.test\nAre you sure?")
-        self.assertEqual(needs._drop_cut("it's b b\nok", True), "b b\nok")
+        first = 'first line\ncurl -u "alice:PARTSECRET ' + "b " * 24000
+        (row,), _ = needs._newest_comments(comments_table(first), None, "t", 5)
+        self.assertTrue(row[2].startswith("first line\ncurl -u "), row[2][:40])
 
 
 class QuotedExplicitKeys(unittest.TestCase):

@@ -1839,7 +1839,7 @@ def _newest_comments(conn: Any, kanban_db: Any, task_id: str, limit: int) -> tup
             for c in listed[-limit:]
         ]
     return [
-        (i, a, _drop_cut(b[:cut].decode("utf-8", "replace"), False) + _ASK_CUT if len(b) > cut else b.decode("utf-8", "replace"), t)
+        (i, a, _close_cut(_drop_cut(b[:cut].decode("utf-8", "replace"), False)) + _ASK_CUT if len(b) > cut else b.decode("utf-8", "replace"), t)
         for i, a, b, t in rows
     ], int(count)
 
@@ -2151,7 +2151,7 @@ def _text_digest(length: Any, text: str) -> str:
 
 
 _CUT_TOKEN = re.compile(r"\s*[A-Za-z0-9+/=_.\-]{32,}(?=\s|$)")
-_CUT_QUOTE = re.compile(r"[\"`]|(?<![A-Za-z])'|'(?![A-Za-z])")  # an apostrophe in a word is no quote
+_CUT_CLOSERS = "\"'`"
 _CUT_PEM_TAIL = re.compile(r"[A-Za-z0-9+/=\s]*(?=-----END )")
 
 
@@ -2162,17 +2162,18 @@ def _read_text(conn: sqlite3.Connection, table: str, column: str, rowid: Any, ro
         return blob.read(room), len(blob)
 
 
+def _close_cut(text: str) -> str:
+    """Redact a comment cut at its end as if every quote ended at the cut, so a credential whose
+    closing quote lies past the cut is still redacted."""
+    closed = _ask_redact(_ask_redact(text) + _CUT_CLOSERS)
+    return closed[: -len(_CUT_CLOSERS)] if closed.endswith(_CUT_CLOSERS) else closed
+
+
 def _drop_cut(text: str, at_start: bool) -> str:
-    """Drop the partial word at a cut (*at_start* or end), a quote left open across it, and the long
-    key-like run beside them: their label or end lies past the cut, so they cannot be judged.
-    Every cut made before redaction comes here."""
+    """Drop the partial word at a cut (*at_start* or end) and the long key-like run beside it: their
+    label lies past the cut, so they cannot be judged. Every cut made before redaction comes here."""
     if not at_start:
         return _drop_cut(text[::-1], True)[::-1]
-    line = text.partition("\n")[0]
-    for quote in ('"', "`", "'"):
-        found = [m.end() for m in _CUT_QUOTE.finditer(line) if m.group() == quote]
-        text = text[found[0] :] if len(found) % 2 else text  # through the quote whose opening was cut off
-        line = text.partition("\n")[0]
     rest = text[re.match(r"\S*", text).end() :]
     while hit := _CUT_TOKEN.match(rest):
         rest = rest[hit.end() :]
@@ -5537,7 +5538,7 @@ _ASK_SECRET_PATTERNS = (
     (
         re.compile(
             r"(?i)(\bcurl\b[^\r\n]*?\s(?:--user|-u)(?:=|\s+)?)"
-            r"""(?:"[^"\r\n]*:[^"\r\n]*"|'[^'\r\n]*:[^'\r\n]*'|[^:\s'\"]+:[^\s'\"]+)"""
+            r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^:\s'\"]+:[^\s'\"]+)"""
         ),
         r"\1[redacted]",
     ),
