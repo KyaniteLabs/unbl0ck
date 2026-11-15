@@ -162,6 +162,19 @@ def ask_enabled(settings: dict[str, Any] | None = None) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def ask_persist_replies(settings: dict[str, Any] | None = None) -> bool:
+    """Keep finished Ask replies on disk for the job TTL so a restart can still show them.
+
+    Off by default: a reply is private card-derived text. Status markers (queued, sent,
+    done, error) are always journaled; they hold no card or reply text."""
+    raw = (settings if settings is not None else _settings()).get("ask_persist_replies", False)
+    return raw if isinstance(raw, bool) else str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def ask_journal_dir(home: Path | None = None) -> Path:
+    return data_dir(home) / "ask"
+
+
 CHAT_WINDOW_DAYS = 14
 CHAT_TITLES = ("Bot Chat",)
 

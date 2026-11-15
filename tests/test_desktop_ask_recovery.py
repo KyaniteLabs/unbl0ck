@@ -135,6 +135,42 @@ const reloaded=new Function('env',`with(env){${views};return{readAskSession};}`)
 assert.equal(reloaded.readAskSession('chat:work:s1'),undefined);
 """)
 
+    def _recovered(self, state, detail, extra=""):
+        return r"""
+let posts=0,urls=[];
+const ctx={rest:async(url)=>{urls.push(url);if(url==='/card/ask'){posts++;return{pending:true,job:'j9'}}
+  return{ok:false,state:'%s',detail:'%s'%s}}};
+const it={...item,id:'kanban:default:ask9',version:'1'};
+const render=()=>{cursor=0;return store.Item({ctx,item:it,n:1,refresh,askEnabled:true})};
+const realSet=global.setTimeout;global.setTimeout=(fn)=>realSet(fn,0);
+(async()=>{
+ render();
+ const first=find(render(),'TL;DR').onClick();
+ await new Promise(r=>realSet(r,1800));await first;
+ assert.ok(urls.some(u=>u.includes('poll=true')&&u.includes('card='+encodeURIComponent(it.id))),'poll names its card: '+urls);
+ assert.equal(posts,1,'the first ask is the only POST');
+ state=[];
+ const t=texts(render());
+ const s=store.readAskSession(it.id);
+ assert.equal(s.running,false);assert.equal(s.job,null,'a recovered job is never followed again');
+ CHECKS
+ assert.equal(posts,1,'recovery never resends by itself');
+ global.setTimeout=realSet;
+})().catch(e=>{console.error(e);process.exitCode=1});
+""" % (state, detail, extra)
+
+    def test_unknown_outcome_after_restart_is_explicit_and_not_resent(self):
+        script = self._recovered("unknown", "may or may not have completed", ",resubmit_safe:false").replace(
+            "CHECKS", "assert.ok(t.includes('Outcome unknown. may or may not have completed Retry sends a new request.'),t);"
+        )
+        self.run_views(script)
+
+    def test_not_submitted_after_restart_says_nothing_was_sent(self):
+        script = self._recovered("not_submitted", "nothing was sent", ",resubmit_safe:true").replace(
+            "CHECKS", "assert.ok(t.includes('Not sent. nothing was sent Retry sends it now.'),t);"
+        )
+        self.run_views(script)
+
     def test_nothing_is_persisted_outside_session_memory(self):
         for path in (ROOT / "desktop/src/plugin.src.js",):
             text = path.read_text()

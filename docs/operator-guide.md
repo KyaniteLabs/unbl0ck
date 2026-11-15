@@ -58,8 +58,30 @@ retry hint rather than joining an unbounded backlog. An Ask poll retries the sam
 after a transport failure. A terminal model failure permits a new attempt. Completed
 results can be read repeatedly: polling does not consume them. At most 128 settled
 results are retained in completion order, and every job expires 15 minutes after creation.
-A restart loses in-memory jobs; the UI reports an unknown/expired job and offers a fresh
-attempt. The client polls for up to 150 seconds per attempt.
+The client polls for up to 150 seconds per attempt.
+
+After a gateway restart the plugin never sends a request again by itself. Each Ask job
+leaves a small restart marker (see below), so a poll reports one of five states:
+
+| State | Meaning | What the card says |
+|---|---|---|
+| `pending` | The model is still working | Thinking |
+| `complete` | The answer is available | The answer |
+| `failed` | The model reported an error | The error; Retry sends a new request |
+| `unknown` | The restart happened after the request was sent (or the saved record is unreadable, or the answer was finished but not kept) | "Outcome unknown ... Retry sends a new request." The provider may or may not have answered; only you can ask again |
+| `not_submitted` | The restart happened before the request reached the model | "Not sent ... Retry sends it now." Nothing left the machine |
+
+Restart markers live in `<HERMES_HOME>/plugin-data/unbl0ck/ask/<job>.json`: one owner-only
+(0600) file per job in an owner-only (0700) directory, at most 256, deleted 15 minutes
+after the request started, when the job is evicted or consumed, or immediately with
+`DELETE /card/ask/{job}`. A marker holds the job id, state, timestamps, the card id,
+provider and model names and an error message. It holds no card text, no question and no
+answer. Finished answers are written to the marker only when `ask_persist_replies` is
+true (default false; a restart then shows the answer for the rest of the 15 minutes).
+An unreadable, foreign or symlinked marker is treated as `unknown`; an unwritable
+directory silently falls back to in-memory Ask. A job id answers only for the card it was
+created for. Markers belong to the profile's own data directory, so profiles do not see
+each other's jobs.
 
 Requests send the conversation's latest 50 messages; the server then applies
 `ask_history_turns`. The conversation, any running request and its outstanding job are
@@ -84,7 +106,7 @@ never replaces a newer one.
 | Busy/retry state write | Another process owns the lock | Wait briefly and retry. Never delete a lock to bypass the writer. |
 | Corrupt hidden or release state | The stored record cannot be interpreted safely | Preserve the file, repair or restore it through the owning installation, then retry. Mutations refuse to overwrite corrupt state. |
 | Summary unavailable | The original text remains available | Read Full text. Automatic retry follows the bounded summary retry schedule. |
-| Ask fault | The model, its capacity, or transport failed | Retry. A transport retry resumes the same job; an expired/restarted job requires a new attempt. |
+| Ask fault | The model, its capacity, or transport failed | Retry. A transport retry resumes the same job; after a restart the card says `unknown` or `not sent` and Retry is your decision to ask again. |
 | Security reconciliation pending | A signed request has no authenticated current verdict | Follow the [Security recovery procedure](security-review-link.md). An acknowledgement is not an approval. |
 
 ## Outside-source limits

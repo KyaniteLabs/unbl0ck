@@ -1132,9 +1132,13 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
         setAskJob({ id: r.job, version: item.version })
         if (Date.now() - t0 > 150000) throw new Error('The model took too long (over 150 s)')
         await new Promise(res => setTimeout(res, 1500))
-        r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true')
+        r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true&card=' + encodeURIComponent(item.id))
       }
       if (mine()) { updateAskSession(item.id, { job: null }); setAskJob(null) }
+      // After a gateway restart the plugin never resends on its own. Say which of the five
+      // outcomes this is; Retry then sends a new request only because the human chose it.
+      if (r?.ok === false && r.state === 'unknown') throw new Error(`Outcome unknown. ${r.detail || ''} Retry sends a new request.`.replace(/\s+/g, ' '))
+      if (r?.ok === false && r.state === 'not_submitted') throw new Error(`Not sent. ${r.detail || ''} Retry sends it now.`.replace(/\s+/g, ' '))
       if (r?.ok === false) throw new Error(String(r.detail || 'The model could not answer'))
       const reply = String(r?.reply || '').trim()
       if (!reply) throw new Error('The model returned an empty answer')
@@ -1149,9 +1153,9 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
       if (!mine()) return
       sfx.play('err')
       const msg = String(e?.message || e)
-      const gone = /unknown or expired ask job/.test(msg)
+      const gone = /unknown or expired ask job|^Outcome unknown\.|^Not sent\./.test(msg)
       // An unknown job means the gateway restarted mid-answer: the work is gone, not slow.
-      const shown = gone ? 'The gateway restarted while the model was answering. Retry to ask again.' : msg
+      const shown = gone && /unknown or expired ask job/.test(msg) ? 'The gateway restarted while the model was answering. Retry to ask again.' : msg
       updateAskSession(item.id, { running: false, error: shown, job: gone ? null : readAskSession(item.id)?.job || null })
       if (gone) setAskJob(null)
       setAskError(shown)

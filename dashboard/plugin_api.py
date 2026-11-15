@@ -339,7 +339,7 @@ def card_ask(body: CardAsk):
     if not _ASK_SLOTS.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Ask is busy. Retry when an active answer finishes.", headers={"Retry-After": "15"})
     try:
-        _ASK_JOBS.create(job)
+        _ASK_JOBS.create(job, card=body.id or None)
         _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, job, ctx, messages)
     except Exception as exc:
         _ASK_SLOTS.release()
@@ -352,11 +352,28 @@ def card_ask(body: CardAsk):
 
 # Lifecycle and bounded retention of repeatably readable results are jobs.AskJobs.
 _ASK_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unbl0ck-ask")
-_ASK_JOBS = jobs.AskJobs()
+def _ask_journal_dir():
+    """The restart journal directory, or None when the plugin state is unavailable."""
+    try:
+        return _needs().ask_journal_dir()
+    except Exception:  # noqa: BLE001 - no journal means in-memory Ask, never a broken Ask
+        return None
+
+
+def _ask_keep_replies() -> bool:
+    try:
+        return bool(_needs().ask_persist_replies())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_ASK_JOBS = jobs.AskJobs(journal=jobs.AskJournal(_ask_journal_dir, _ask_keep_replies))
 _ASK_SLOTS = threading.BoundedSemaphore(4)
 
 
 def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
+    # Durable marker first: after a crash from here on the outcome is unknown, never "resend".
+    _ASK_JOBS.mark_sent(job)
     try:
         result = ctx.llm.complete(
             messages,
@@ -390,20 +407,43 @@ def ask_reply_text(text: Any) -> str:
     return _THINK_RE.sub("", text if isinstance(text, str) else "").strip()
 
 
+def _ask_wire(st: dict[str, Any]) -> str:
+    return jobs.ASK_WIRE[st["status"]]
+
+
 @router.get("/card/ask/{job}")
-def card_ask_result(job: str, poll: bool = False):
+def card_ask_result(job: str, poll: bool = False, card: str = ""):
     st = _ASK_JOBS.get(job)
     if st is None:
         raise HTTPException(status_code=404, detail="unknown or expired ask job")
+    # A job id only answers for the card it was created for.
+    if card and st.get("card") and st["card"] != card:
+        raise HTTPException(status_code=404, detail="unknown or expired ask job")
     if st["status"] is jobs.AskState.PENDING:
-        return {"ok": True, "pending": True, "job": job, "elapsed": round(time.time() - st["started"], 1)}
+        return {"ok": True, "pending": True, "state": "pending", "job": job, "elapsed": round(time.time() - st["started"], 1)}
     # A GET must remain repeatable: a lost HTTP response must not destroy model work.
     # Results expire through the job table's bounded lifetime instead of being consumed.
+    if st["status"] in (jobs.AskState.UNKNOWN, jobs.AskState.NOT_SUBMITTED):
+        # Recovered after a restart. The plugin never resends: only the human can ask again.
+        out = {"ok": False, "state": _ask_wire(st), "detail": st["detail"],
+               "resubmit_safe": st["status"] is jobs.AskState.NOT_SUBMITTED}
+        if poll:
+            return out
+        raise HTTPException(status_code=409, detail=st["detail"])
     if st["status"] is jobs.AskState.ERROR:
         if poll:
-            return {"ok": False, "detail": st["detail"]}
+            return {"ok": False, "state": "failed", "detail": st["detail"]}
         raise HTTPException(status_code=502, detail=st["detail"])
-    return {k: st[k] for k in ("ok", "reply", "provider", "model")}
+    return {"ok": True, "state": "complete", **{k: st[k] for k in ("reply", "provider", "model")}}
+
+
+@router.delete("/card/ask/{job}")
+def card_ask_discard(job: str, card: str = ""):
+    """Delete a job and its saved record now, whatever its state."""
+    st = _ASK_JOBS.get(job)
+    if st is not None and card and st.get("card") and st["card"] != card:
+        raise HTTPException(status_code=404, detail="unknown or expired ask job")
+    return {"ok": True, "deleted": _ASK_JOBS.discard(job)}
 
 
 UNVERSIONED_WARNING = (

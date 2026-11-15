@@ -27,6 +27,9 @@ class BlufTest(unittest.TestCase):
             def post(self, *args, **kwargs):
                 return lambda fn: fn
 
+            def delete(self, *args, **kwargs):
+                return lambda fn: fn
+
         fastapi = types.ModuleType("fastapi")
         fastapi.APIRouter = Router
 
@@ -217,6 +220,9 @@ class BlufTest(unittest.TestCase):
                 return lambda fn: fn
 
             def post(self, *args, **kwargs):
+                return lambda fn: fn
+
+            def delete(self, *args, **kwargs):
                 return lambda fn: fn
 
         fastapi = types.ModuleType("fastapi")

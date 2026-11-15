@@ -497,8 +497,9 @@ class AskJobsMachine(unittest.TestCase):
         self.j = jobs.AskJobs(clock=self.clock)
 
     def test_states_are_named(self):
-        self.assertEqual({s.value for s in jobs.AskState}, {"pending", "done", "error"})
-        self.assertEqual(jobs.ASK_SETTLED, set(jobs.AskState) - {jobs.AskState.PENDING})
+        # unknown and not_submitted exist only for jobs recovered from the restart journal
+        self.assertEqual({s.value for s in jobs.AskState}, {"pending", "done", "error", "unknown", "not_submitted"})
+        self.assertEqual(jobs.ASK_SETTLED, {jobs.AskState.DONE, jobs.AskState.ERROR})
 
     def test_done_path(self):
         self.j.create("a")

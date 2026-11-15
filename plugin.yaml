@@ -33,6 +33,10 @@ config_schema:
     type: int
     default: 6
     description: "How many earlier chat turns an Ask sends along with the card, newest first. The whole prompt also stays under a 40,000-character budget."
+  ask_persist_replies:
+    type: bool
+    default: false
+    description: "Keep finished Ask answers on disk (owner-only, 15 minutes, at most 256 files) so a gateway restart can still show them. Off by default: an answer is private text derived from the card. Restart markers without any text are always kept so a restart never resends a request."
   comment_author:
     type: str
     default: ""

@@ -52,8 +52,9 @@ control and are not a standalone public API.
 | `GET /outside/text` | Current bounded outside text; matching item version required |
 | `GET /source/text` | Full text of one current chat or live-prompt record, read on demand; version required (409 if stale, 404 if gone, 503 if the source cannot be read, 403 for password prompts) |
 | `POST /card/ask` | Validated question history; returns a job ID immediately or an explicit admission error |
-| `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502 |
-| `GET /card/ask/{job}?poll=true` | Same job, with terminal model failures encoded as `{ok:false,detail}` for the client |
+| `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502; a job recovered after a restart as `unknown` or `not_submitted` uses 409; a mismatched `card` is 404 |
+| `GET /card/ask/{job}?poll=true&card=<id>` | Same job, with every outcome encoded for the client: `state` is `pending`, `complete`, `failed`, `unknown` or `not_submitted` (`resubmit_safe` only when nothing was sent) |
+| `DELETE /card/ask/{job}` | Deletes the job and its restart marker now |
 | `POST /kanban/answer` | Versioned native comment and optional release; stale version 409 with no comment or release; empty version 400; unversioned comment-only answers still work for older callers (response `versioned:false`, `Warning: 299` header) unless `require_answer_version` is on (428, nothing written); the response reports the block `version` applied; settings uncertainty prevents writes |
 | `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID (also restores a filed record marked done; `restored:false` when nothing was restorable). Identifiers (and `board`/`task_id` on `/card`, `/kanban/answer`, `/outside/done`) are limited to 300 characters with no control characters (400); a malformed or non-Kanban `id`, or one that disagrees with `board`/`task_id`, is rejected instead of retargeted |
 | `POST /outside/done` | Local, reversible Done: mark a filed record done (kept up to 15 minutes, at most 25) or hide a folder item version; `local_only:true`; nothing is sent or completed externally |
@@ -78,7 +79,9 @@ as private. Settings and source files remain owned by their original application
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
 | `bluf.json` | Summary cache capped at 2,000, version-bound; failed-source entries retained subject to cap |
 | `pocket-pack.json` | Written only on explicit pack request |
-| Summary/Ask jobs | Process memory; restart loses pending work and results |
+| Summary jobs | Process memory; restart loses pending work and results |
+| `ask/*.json` | Owner-only (0600/0700) Ask restart markers, capped at 256, 15-minute retention; no card or question text; answer text only with `ask_persist_replies` (default off) |
+| Ask jobs | Process memory plus the marker above; a restart recovers `not_submitted`, `unknown`, `failed` or (opt-in) `complete`, and never resends |
 | Answer drafts | Desktop session memory, 100 entries, 30 minutes after last edit; original question version retained |
 | Ask conversations | Desktop session memory, 100 entries, 30 minutes after last activity; question version and outstanding job retained; never written to disk |
 | Display preferences | Effects and sound only, in Desktop localStorage |

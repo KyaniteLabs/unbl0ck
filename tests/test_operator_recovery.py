@@ -128,7 +128,7 @@ let posts=0,polls=0;
 env.setTimeout=fn=>{fn();return 1};
 const ctx={rest:async path=>{
  if(path==='/card/ask'){posts++;return{pending:true,job:'saved'}}
- assert.equal(path,'/card/ask/saved?poll=true');
+ assert.equal(path,'/card/ask/saved?poll=true&card='+encodeURIComponent(item.id));
  if(++polls===1)throw new Error('temporary transport failure');
  return{ok:true,reply:'Recovered answer'};
 }};
