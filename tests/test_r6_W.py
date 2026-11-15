@@ -127,6 +127,39 @@ class HookCleanupKeepsANewerFault(WaitCase):
         self.assertEqual(self.journal().get(RID, {}).get("what"), "clear", self.journal())
 
 
+class DroppedFaultsKeepTheirOwner(WaitCase):
+    def test_one_process_exiting_does_not_hide_another_process_dropped_prompts(self):
+        """R6-016: each process's dropped prompts stay attributed to it, so another process's exit
+        does not erase them."""
+        n = needs.WAIT_FAULT_LIMIT + 1
+        self.agent("a", n)
+        b = self.agent("b", n)
+        b.stdin.close()
+        b.wait(10)
+        errors: list[str] = []
+        needs.wait_items(self.home, errors=errors)
+        self.assertEqual(reported(errors), n, errors)
+        self.assertFalse(any("b000" in e for e in errors), errors)
+
+
+class DroppedFaultsSettle(WaitCase):
+    def test_clearing_every_prompt_stops_the_dropped_prompt_warning(self):
+        """R6-017: a dropped prompt that later resolves is no longer counted as missing."""
+        rids = [f"{n:016x}" for n in range(needs.WAIT_FAULT_LIMIT + 1)]
+        with patch.object(needs, "_write_json", side_effect=OSError("disk full")):
+            for rid in rids:
+                self.record(rid)
+        errors: list[str] = []
+        needs.wait_items(self.home, errors=errors)
+        self.assertTrue(any("no longer retried" in e for e in errors), errors)
+        for rid in rids:
+            needs.clear_wait(self.home, request_id=rid)
+        errors = []
+        needs.wait_items(self.home, errors=errors)
+        self.assertEqual(errors, [])
+        self.assertEqual(self.journal(), {})
+
+
 class OutOfRangePidsAreRefused(WaitCase):
     def test_a_huge_pid_in_the_fault_journal_does_not_abort_the_poll(self):
         """R6-018: an out-of-range pid is malformed input, not an OverflowError from os.kill."""
@@ -146,7 +179,6 @@ class OutOfRangePidsAreRefused(WaitCase):
         self.assertIsNone(needs._valid_pid(True))
         self.assertIsNone(needs._valid_pid(2**31))
         self.assertEqual(needs._valid_pid(2**31 - 1), 2**31 - 1)
-
 
 
 if __name__ == "__main__":

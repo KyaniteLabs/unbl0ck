@@ -2711,28 +2711,26 @@ WAIT_FAULT_LIMIT = 50
 # (home, request id) -> (what failed, the record to write). The hooks run in the agent; when a
 # write or removal fails there, polling in the same process retries it and says so until it works.
 _WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
-# Faults dropped because the list was full, per home: never retried, so reported, not forgotten.
-_WAIT_FAULTS_LOST: dict[str, int] = {}
+# Request ids dropped because the list was full, per home: never retried, so reported until
+# the prompt settles. Ids only, never the prompt.
+_WAIT_FAULTS_LOST: dict[str, set[str]] = {}
 # Hooks and polls in one process settle a prompt one at a time: a retry in flight must not
 # recreate a record that a clear has just removed.
 _WAIT_FAULT_LOCK = threading.RLock()
-_FAULT_LOST_KEY = "+lost"  # not a request id, so it never collides with one
 
 
 def _fault_path(home: Path) -> Path:
     return data_dir(home) / "wait-faults.json"
 
 
-def _journal_fault(
-    home: Path, rid: str, what: str | None, *, lost: int = 0
-) -> None:
+def _journal_fault(home: Path, rid: str, what: str | None) -> None:
     """Best effort: tell other processes that this one holds a prompt it could not record or
     clear. It holds only the request id, what failed and this process's identity, never the
     prompt, and it is removed when the fault is settled. ``what=None`` removes *rid*."""
     try:
         with _state_lock(home):
             data = _read_json(_fault_path(home))
-            if what is None and not lost and rid not in data:
+            if what is None and rid not in data:
                 return
             if what is not None:
                 pid = os.getpid()
@@ -2744,15 +2742,6 @@ def _journal_fault(
                 }
             else:
                 data.pop(rid, None)
-            if lost:
-                pid = os.getpid()
-                old = data.get(_FAULT_LOST_KEY)
-                count = int(_num(old.get("count"))) if isinstance(old, dict) else 0
-                data[_FAULT_LOST_KEY] = {
-                    "count": count + lost,
-                    "pid": pid,
-                    "proc_start": _proc_start(pid),
-                }
             if data:
                 _write_json(_fault_path(home), data, ordered=True)
             else:
@@ -2762,18 +2751,15 @@ def _journal_fault(
 
 
 def _remember_wait_fault(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
+    """A dropped fault keeps its journal entry, so other processes still see it under its owner."""
     with _WAIT_FAULT_LOCK:
         _WAIT_FAULTS.pop((str(home), rid), None)
         _WAIT_FAULTS[(str(home), rid)] = (what, rec)
-        dropped: list[tuple[str, str]] = []
         while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
-            dropped.append(next(iter(_WAIT_FAULTS)))
-            _WAIT_FAULTS.pop(dropped[-1])
-        for h, r in dropped:
-            _WAIT_FAULTS_LOST[h] = _WAIT_FAULTS_LOST.get(h, 0) + 1
+            h, r = next(iter(_WAIT_FAULTS))
+            _WAIT_FAULTS.pop((h, r))
+            _WAIT_FAULTS_LOST.setdefault(h, set()).add(r)
         _journal_fault(home, rid, what)
-        for h, r in dropped:
-            _journal_fault(Path(h), r, None, lost=1)
 
 
 def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
@@ -2781,6 +2767,9 @@ def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) ->
     cleanup can never remove a newer fault for the same prompt. Raises if the write fails."""
     with _WAIT_FAULT_LOCK:
         had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
+        lost = _WAIT_FAULTS_LOST.get(str(home), set())
+        had_fault |= rid in lost
+        lost.discard(rid)
         try:
             path = _waits_dir(home) / f"{rid}.json"
             if what == "record":
@@ -2814,12 +2803,7 @@ def _other_process_faults(home: Path, errors: list[str]) -> None:
         if not _alive(pid, entry.get("proc_start")):
             _journal_fault(home, rid, None)  # its prompts died with it
             continue
-        if rid == _FAULT_LOST_KEY:
-            errors.append(
-                f"prompt: {int(_num(entry.get('count')))} live prompts could not be recorded or cleared "
-                "and are no longer retried"
-            )
-        elif _SAFE_ID.match(rid):
+        if _SAFE_ID.match(rid):
             verb = "record" if entry.get("what") == "record" else "clear"
             errors.append(f"prompt: {rid}: could not {verb} a live prompt (reported by the agent)")
 
@@ -2827,7 +2811,7 @@ def _other_process_faults(home: Path, errors: list[str]) -> None:
 def _reconcile_waits(home: Path, errors: list[str]) -> None:
     """Retry hook writes/removals that failed; what still fails is a reported source error."""
     _other_process_faults(home, errors)
-    lost = _WAIT_FAULTS_LOST.get(str(home), 0)
+    lost = len(_WAIT_FAULTS_LOST.get(str(home), ()))
     if lost:
         errors.append(f"prompt: {lost} live prompts could not be recorded or cleared and are no longer retried")
     with _WAIT_FAULT_LOCK:
