@@ -943,6 +943,8 @@ function clearAskSession(id) { askSessions.delete(id) }
 // a remount under another backend never finds, shows or resends this one's conversation.
 let askScopeSeq = 0
 const askClosed = new Set()
+// A request that settles after its connection was disposed writes nothing back to shared state.
+const scopeOpen = scope => !askClosed.has(scope)
 // The newest request started for each card, whether or not its session still exists. An evicted
 // request may only report its loss while it is still the newest one: an older one that finishes
 // later must not recreate the entry under its own, older token.
@@ -1201,16 +1203,13 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       }),
       r => (r && r.released ? `Unblocked ${item.task_id}` : `Could not unblock ${item.task_id}`)
     )
-  const hide = async () => {
+  const dismiss = async (path, kind, cue, took) => {
     const seq = ++undoSeq
-    await run(() => ctx.rest('/hide', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'warn',
-      r => { if (r) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'hidden', token: r.token, order: r.order, seq, scope }) })
+    await run(() => ctx.rest(path, { method: 'POST', body: { id: item.id, version: item.version } }), null, cue,
+      r => { if (took(r) && scopeOpen(scope)) undoPush({ id: item.id, title: item.title, at: Date.now(), kind, token: r.token, order: r.order, seq, scope }) })
   }
-  const outsideDone = async () => {
-    const seq = ++undoSeq
-    await run(() => ctx.rest('/outside/done', { method: 'POST', body: { id: item.id, version: item.version } }), null, 'ok',
-      r => { if (r?.hidden || r?.done) undoPush({ id: item.id, title: item.title, at: Date.now(), kind: 'done', token: r.token, order: r.order, seq, scope }) })
-  }
+  const hide = () => dismiss('/hide', 'hidden', 'warn', r => !!r)
+  const outsideDone = () => dismiss('/outside/done', 'done', 'ok', r => !!(r?.hidden || r?.done))
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
   const outsideBody = outsideText?.__ctx === ctxNow ? outsideText.text : item.ask
@@ -1288,7 +1287,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     // expired, nothing replaced it: report the lost work with a Retry rather than going quiet.
     const abandon = () => {
       if (mine()) return false
-      if (readAskSession(askId) === undefined && !askClosed.has(scope) && askLatest.get(askId) === gen) {
+      if (readAskSession(askId) === undefined && scopeOpen(scope) && askLatest.get(askId) === gen) {
         updateAskSession(askId, { msgs: next, stamp: ctxNow, trimmed, running: false, error: ASK_DROPPED, job: null, gen })
         setAskBusy(false); setAskError(ASK_DROPPED); setAskJob(null)
       }

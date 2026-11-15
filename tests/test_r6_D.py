@@ -36,6 +36,29 @@ class NodeCase(unittest.TestCase):
 
 
 class Desktop(NodeCase):
+    def test_a_dismissal_that_settles_after_its_connection_closed_leaves_the_undo_list_alone(self):
+        """R6-020: a late hide or Done on a disposed connection neither returns nor evicts another connection's Undo."""
+        self.run_views(r"""
+const mk=n=>({source:'outside',origin:'filed',kind:'draft',id:'outside:filed:'+n,version:'v'+n,title:'T'+n,ask:'a',act_where:'w'});
+(async()=>{
+ for(const label of ['Not for me','Done']){
+  undo=[];
+  let release;
+  const ctxA={rest:()=>new Promise(res=>{release=res})};
+  const pending=find(mount(ctxA,mk(0),'cA'+label),label).onClick();
+  store.endAskScope('cA'+label);
+  for(let n=1;n<=5;n++){
+   const ctxB={rest:async()=>({ok:true,hidden:true,done:true,token:'t'+n,order:n})};
+   await find(mount(ctxB,mk(n),'cB'+label),label).onClick();
+  }
+  release({ok:true,hidden:true,done:true,token:'late',order:100});
+  await pending;
+  assert.equal(undo.length,5,label);
+  assert.ok(undo.every(u=>u.scope==='cB'+label),label+': a closed connection wrote to the Undo list: '+JSON.stringify(undo.map(u=>u.scope)));
+ }
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
     def test_a_step_that_throws_synchronously_rejects_and_clears_the_deadline_timer(self):
         """R6-023: withinDeadline turns a synchronous throw into a rejection and leaves no interval behind."""
         self.run_views(r"""
