@@ -80,15 +80,14 @@ leaves a small restart marker (see below), so a poll reports one of five states:
 | `unknown` | The restart happened after the request was sent (or the saved record is unreadable, or the answer was finished but not kept) | "Outcome unknown ... Retry sends a new request." The provider may or may not have answered; only you can ask again |
 | `not_submitted` | The restart happened before the request reached the model | "Not sent ... Retry sends it now." Nothing left the machine |
 
-Restart markers live in `<HERMES_HOME>/plugin-data/unbl0ck/ask/<job>.json`: one owner-only
-(0600) file per job in an owner-only (0700) directory, at most 256, deleted 15 minutes
+Restart markers live in `<organization HERMES_HOME>/plugin-data/unbl0ck/ask/<profile>/<job>.json`: one owner-only
+(0600) file per job in an owner-only (0700) directory per profile, at most 256 per profile, deleted 15 minutes
 after the request started, when the job is evicted or consumed, or immediately with
-`DELETE /card/ask/{job}`. A marker holds the job id, state, timestamps, the card id,
+`DELETE /card/ask/{job}?card=<id>` (the call fails honestly if the file cannot be removed, and cleanup keeps retrying). The directory also holds a `.lock` file and short-lived `.gone` markers that stop a deleted job from reappearing. A marker holds the job id, state, timestamps, the card id,
 provider and model names and an error message. It holds no card text, no question and no
 answer. Finished answers are written to the marker only when `ask_persist_replies` is
 true (default false; a restart then shows the answer for the rest of the 15 minutes).
-An unreadable, foreign or symlinked marker is treated as `unknown`; an unwritable
-directory silently falls back to in-memory Ask. A job id answers only for the card it was
+An unreadable, oversized, foreign or symlinked marker is treated as `unknown`; an answer too large to keep is reported as such; if the storage cannot be checked the poll reports `unknown` instead of claiming the job never existed. A job whose worker is still running in another gateway process stays `pending`. A job id answers only for the card it was
 created for. Markers belong to the profile's own data directory, so profiles do not see
 each other's jobs.
 

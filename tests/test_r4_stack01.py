@@ -232,7 +232,7 @@ class AskAdmission(unittest.TestCase):
 
         self.needs = types.SimpleNamespace(
             ask_enabled=lambda: self.enabled, card_context=card_context, build_ask_messages=build,
-            bluf_enabled=lambda: self.enabled,
+            bluf_enabled=lambda: self.enabled, ask_journal_dir=lambda: None, ask_persist_replies=lambda: False,
         )
         self.api._needs = lambda: self.needs
         self.api._checked_card_ref = lambda i, b, t: ("factory", "t_1")

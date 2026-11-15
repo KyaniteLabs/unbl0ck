@@ -376,8 +376,15 @@ def card_ask(body: CardAsk):
             detail="Ask is unavailable: the plugin host LLM is not reachable",
         )
     # A retry of the same request returns the same job; no second model call.
-    if body.request_id and _ASK_JOBS.get(body.request_id) is not None:
-        return {"ok": True, "pending": True, "job": body.request_id}
+    if body.request_id:
+        existing = _ASK_JOBS.get(body.request_id)
+        if existing is not None:
+            if existing.get("unavailable"):
+                raise HTTPException(status_code=503, detail="the saved state for this request cannot be read right now. Retry in a moment.")
+            if existing.get("card") != f"kanban:{board}:{task_id}":
+                # A request id answers only for the card it was created for.
+                raise HTTPException(status_code=409, detail="this request id belongs to a different card")
+            return {"ok": True, "pending": True, "job": body.request_id}
     # Admission comes before any card read or prompt build, so a busy server does no work.
     if not _ASK_SLOTS.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Ask is busy. Retry when an active answer finishes.", headers={"Retry-After": "15"})
@@ -421,11 +428,11 @@ def card_ask(body: CardAsk):
 # Lifecycle and bounded retention of repeatably readable results are jobs.AskJobs.
 _ASK_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unbl0ck-ask")
 def _ask_journal_dir():
-    """The restart journal directory, or None when the plugin state is unavailable."""
-    try:
-        return _needs().ask_journal_dir()
-    except Exception:  # noqa: BLE001 - no journal means in-memory Ask, never a broken Ask
-        return None
+    """The restart journal directory for the current profile.
+
+    A failure to resolve it is raised, not turned into "no journal": the journal reports
+    storage it cannot find as unavailable (outcome unknown), never as an empty directory."""
+    return _needs().ask_journal_dir()
 
 
 def _ask_keep_replies() -> bool:
@@ -489,11 +496,14 @@ def _ask_wire(st: dict[str, Any]) -> str:
 
 @router.get("/card/ask/{job}")
 def card_ask_result(job: str, poll: bool = False, card: str = ""):
+    if not card:
+        raise HTTPException(status_code=400, detail="the card this answer belongs to is required")
     st = _ASK_JOBS.get(job)
     if st is None:
         raise HTTPException(status_code=404, detail="unknown or expired ask job")
-    # A job id only answers for the card it was created for.
-    if card and st.get("card") and st["card"] != card:
+    # A job id only answers for the card it was created for; a record with no card answers nobody.
+    # (Unreadable storage reports "unknown" for any id: it carries no card text or answer.)
+    if not st.get("unavailable") and st.get("card") != card:
         raise HTTPException(status_code=404, detail="unknown or expired ask job")
     if st["status"] is jobs.AskState.PENDING:
         return {"ok": True, "pending": True, "state": "pending", "job": job, "elapsed": round(time.time() - st["started"], 1)}
@@ -516,14 +526,17 @@ def card_ask_result(job: str, poll: bool = False, card: str = ""):
 @router.delete("/card/ask/{job}")
 def card_ask_discard(job: str, card: str = ""):
     """Delete a job and its saved record now, whatever its state."""
+    if not card:
+        raise HTTPException(status_code=400, detail="the card this answer belongs to is required")
     st = _ASK_JOBS.get(job)
-    if st is not None and card and st.get("card") and st["card"] != card:
+    if st is not None and not st.get("unavailable") and st.get("card") != card:
         raise HTTPException(status_code=404, detail="unknown or expired ask job")
     try:
         return {"ok": True, "deleted": _ASK_JOBS.discard(job)}
     except jobs.DiscardFailed:
         # The saved record is still there and the job is still readable: say so, never "deleted".
-        raise HTTPException(status_code=500, detail="the saved answer could not be deleted; it expires on its own within 15 minutes")
+        # No expiry is promised: cleanup retries, but only works once the storage is writable again.
+        raise HTTPException(status_code=500, detail="the saved answer was not deleted; it stays on disk until the plugin's storage is writable again and cleanup retries")
 
 
 UNVERSIONED_WARNING = (

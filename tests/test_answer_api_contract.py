@@ -228,7 +228,7 @@ class AnswerContract(unittest.TestCase):
         self.assertEqual(self.client.post("/hide", json={"id": exact, "version": exact}).status_code, 200)
 
     def test_ask_job_identifier_is_bounded(self):
-        self.assertEqual(self.client.get("/card/ask/" + "j" * 301).status_code, 404)
+        self.assertEqual(self.client.get("/card/ask/" + "j" * 301 + "?card=kanban:factory:t_1").status_code, 404)
 
     def test_oversize_answer_fields_stay_422(self):
         tid, _ = self.block()
