@@ -1242,14 +1242,13 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     : null
 
   const lastTurn = askMsgs.length ? askMsgs[askMsgs.length - 1].role : ''
-  // Retry resends the last user turn. After a refused follow-up the history is rolled back to an
-  // assistant turn and the refused text is back in the input, so that text is what Retry resends.
-  const canRetry = askStale || !askMsgs.length || lastTurn === 'user' || !!askInput.trim()
+  // What Retry does, decided once for the button and the click: resend the last user turn (or ask
+  // again from scratch), or, after a refused follow-up rolled the history back to an assistant turn,
+  // send the refused text that is back in the input. Null: nothing to retry, so no button.
+  const retryPlan = askStale || lastTurn === 'user' ? 'resend' : askInput.trim() ? 'input' : askMsgs.length ? null : 'resend'
   const askSend = async (retry = false, preset = '') => {
-    if (retry && !askStale && (lastTurn === 'assistant' || !askMsgs.length)) {
-      if (askInput.trim()) retry = false
-      else if (lastTurn === 'assistant') return
-    }
+    if (retry && !retryPlan) return
+    if (retry && retryPlan === 'input') retry = false
     const q = preset || askInput.trim()
     if (askBusy || (!retry && !q)) return
     // The server refuses a longer message with 422. Refuse it here first, so it never enters
@@ -1570,7 +1569,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
                 style: { padding: '0 12px 8px', display: 'flex', gap: 12, alignItems: 'baseline', flexWrap: 'wrap' },
                 children: [
                   jsx('div', { className: 'ub-fault', style: { flex: '1 1 240px' }, children: `ASK FAULT \\\\ ${askError}` }),
-                  canRetry ? button({ kind: 'ghost', disabled: askBusy, onClick: () => askSend(true), children: 'Retry' }) : null
+                  retryPlan ? button({ kind: 'ghost', disabled: askBusy, onClick: () => askSend(true), children: 'Retry' }) : null
                 ]
               })
             : null,
