@@ -24,6 +24,9 @@ def _other_work(q: dict) -> list[str]:
     return parts
 
 
+APPROVE_COMMAND_SHOWN = 400
+
+
 def _gaps(n, q) -> list:
     """Fixed sentences on chat sessions the queue did not read (empty when it read them all)."""
     fn = getattr(n, "coverage_gaps", None)
@@ -55,7 +58,14 @@ def _summary(limit: int = 12) -> str:
         lead = (n._SUDO_WITHHELD if it.get("kind") == "sudo" else c(it.get("bluf") or it.get("ask"), 140))
         lines.append(f"- [{where}] {c(it.get('title'), 160)}: {lead}")
         if it.get("approve_command"):
-            lines.append(f"  approve: {c(it['approve_command'], 300)}")
+            # A command cut short is a different command: show it whole or not at all. The
+            # longest valid one (a 250-character profile name) is under 330 characters.
+            cmd = c(it["approve_command"], APPROVE_COMMAND_SHOWN + 1)
+            lines.append(
+                f"  approve: {cmd}"
+                if len(cmd) <= APPROVE_COMMAND_SHOWN
+                else "  approve: (command too long to show here; use the Desktop card)"
+            )
     if q["count"] > limit:
         lines.append(f"…and {q['count'] - limit} more. Open /unblock in Desktop.")
     if other:
@@ -135,7 +145,7 @@ FILE_SCHEMA = {
             "dedupe_key": {"type": "string", "maxLength": 120, "description": "Re-file this key to update in place; also usable with resolve"},
             "dedupe_scope": {"type": "string", "enum": ["profile", "global"], "description": "Who shares dedupe_key: profile (default when your profile is known) keeps it private to your profile; global shares it across profiles. Pass the same dedupe_scope when you resolve by dedupe_key"},
             "id": {"type": "string", "description": "Previously returned item id, for resolve"},
-            "version": {"type": "string", "description": "The version returned when the item was filed. Required when resolving by id; a changed item is not resolved"},
+            "version": {"type": "string", "description": "The version returned when the item was filed. Required when resolving by id; a changed item is not resolved. Optional with dedupe_key: without it, the resolve clears whatever record currently holds the key, even one another agent refiled"},
         },
         "description": "file requires kind, title, body and act_where; resolve requires either id or dedupe_key",
         "additionalProperties": False,

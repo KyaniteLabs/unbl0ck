@@ -363,7 +363,11 @@ def _state_lock(home: Path | None):
     try:
         d = data_dir(home)
         # O_NOFOLLOW: a dangling or redirected link is never created through or locked.
-        fd = os.open(d / ".state.lock", os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
+        lock_path = d / ".state.lock"
+        # Where O_NOFOLLOW is absent (Windows) the open below would follow a link.
+        if lock_path.is_symlink():
+            raise OSError("the state lock is not a regular file")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError("the state lock is not a regular file")
@@ -401,29 +405,36 @@ class UnsafeStateFile(OSError):
         self.reason = reason
 
 
-def _names_open_file(fd: int, p: Path) -> bool:
+def _names_open_file(fd: int, p: Path, dir_fd: int | None = None) -> bool:
     """True when the path still names the very file *fd* is open on. This is what refuses a
     link on a platform that has no ``O_NOFOLLOW`` (the open follows it and ``fstat`` sees a
-    regular target) and a path that was swapped after the open."""
+    regular target) and a path that was swapped after the open. With *dir_fd* the name is
+    looked up in that directory, not through the path again."""
     try:
-        return os.path.samestat(os.fstat(fd), os.lstat(p))
+        now = os.lstat(p) if dir_fd is None else os.stat(p.name, dir_fd=dir_fd, follow_symlinks=False)
+        return os.path.samestat(os.fstat(fd), now)
     except OSError:
         return False
 
 
-def _read_plain_bytes_st(p: Path, limit: int | None = None) -> tuple[bytes, os.stat_result]:
+def _read_plain_bytes_st(
+    p: Path, limit: int | None = None, *, dir_fd: int | None = None
+) -> tuple[bytes, os.stat_result]:
     """Read a regular file's exact bytes without following a link or blocking on a FIFO or
     device, refusing one larger than *limit* (before reading when ``fstat`` already says so, and
     by the bytes actually read when it grew). Returns the bytes with the ``fstat`` of the very
     descriptor they were read from, so a caller that caches by file signature caches the
     signature of what it read, not of whatever a later path lookup finds."""
     limit = MAX_STATE_BYTES if limit is None else limit
-    fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
+    if dir_fd is None:
+        fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
+    else:  # the caller holds the verified directory: open the name inside it, never through the path
+        fd = os.open(p.name, os.O_RDONLY | _NOFOLLOW | _NONBLOCK, dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise UnsafeStateFile("not a regular file", "not_regular")
-        if not _names_open_file(fd, p):
+        if not _names_open_file(fd, p, dir_fd):
             raise UnsafeStateFile("not the file that was opened (a link or a swapped path)", "changed")
         if st.st_size > limit:
             raise UnsafeStateFile("too large to be a state file", "too_large")
@@ -633,6 +644,20 @@ def _fit_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
         hidden = dict(list(hidden.items())[-keep:])
     return hidden
 
+_ORDER_LOCK = threading.Lock()
+_last_order = 0
+
+
+def _dismissal_order() -> int:
+    """A number that grows with each dismissal this process commits (milliseconds, never repeated
+    or lowered by a clock that stands still or steps back). Taken while the state lock is held,
+    so it follows the order the server committed dismissals in, which the client cannot see from
+    the order of its clicks or of the responses."""
+    global _last_order
+    with _ORDER_LOCK:
+        _last_order = max(int(time.time() * 1000), _last_order + 1)
+        return _last_order
+
 
 class StaleHide(RuntimeError):
     """The dismissal names an older version than the card now has, and a newer one is already hidden."""
@@ -651,24 +676,37 @@ def _current_version(item_id: str, home: Path | None) -> str | None:
 
 def hide(item_id: str, version: str, home: Path | None = None) -> str:
     """Hide one version. Returns the token naming this dismissal, for ``unhide``."""
+    return hide_ordered(item_id, version, home)[0]
+
+
+def hide_ordered(item_id: str, version: str, home: Path | None = None) -> tuple[str, int]:
+    """``hide`` that also returns the commit order of the dismissal, so a caller holding two
+    replies can tell which dismissal the server holds now."""
     item_id, version = str(item_id or ""), str(version or "")
     if not item_id or len(item_id) > 300 or len(version) > 300 or "\x1f" in version:
         raise ValueError("item id and version must be short strings")
-    # An older tab's "Not for me" must not replace a newer dismissal. Checked outside the
-    # lock because the queue build takes it.
-    existing = load_hidden(home).get(item_id)
-    if existing and existing != version:
+    # An older tab's "Not for me" must not replace a newer dismissal. The queue lookup takes the
+    # state lock, so it runs outside it. Every dismissal is judged against the card's current
+    # version, whether or not an earlier dismissal exists: a hide for an older version hid
+    # nothing the operator saw. The stored value is re-read under the lock, and a dismissal for
+    # another version that appeared since the lookup is judged again, never overwritten blind.
+    judged: str | None = None
+    while True:
         current = _current_version(item_id, home)
         if current is not None and current != version:
             raise StaleHide("the card changed since this view; refresh before hiding it")
-    with _state_lock(home):
-        hidden = _load_hidden_raw(home, strict=True)
-        hidden.pop(item_id, None)
-        token = uuid.uuid4().hex
-        hidden[item_id] = f"{version}\x1f{token}"
-        hidden = _fit_hidden(_trim_hidden(hidden))  # oldest first out; the store never grows unbounded
-        _write_json(_hidden_path(home), hidden, ordered=True)
-        return token
+        with _state_lock(home):
+            hidden = _load_hidden_raw(home, strict=True)
+            existing = _split_hidden(hidden.get(item_id))[0] if item_id in hidden else None
+            if not existing or existing == version or existing == judged:
+                hidden.pop(item_id, None)
+                token = uuid.uuid4().hex
+                hidden[item_id] = f"{version}\x1f{token}"
+                hidden = _fit_hidden(_trim_hidden(hidden))  # oldest first out; never unbounded
+                order = _dismissal_order()
+                _write_json(_hidden_path(home), hidden, ordered=True)
+                return token, order
+            judged = existing
 
 
 def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:
@@ -729,14 +767,24 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
                 raise RuntimeError(
                     f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before undoing Done"
                 )
-        # Hidden marker first: if the second write fails the Done token still matches on retry.
+        # Hidden marker first. If the Done write then fails, the marker is put back so the
+        # same token still names a dismissal on retry (the undo is all or nothing).
+        before = dict(hidden)
         if clear_hidden:
             del hidden[item_id]
             _write_json(_hidden_path(home), hidden, ordered=True)
         if clear_done:
             rec.pop("done_at", None)
             rec.pop("done_token", None)
-            _write_json(f, rec)
+            try:
+                _write_json(f, rec)
+            except BaseException:
+                if clear_hidden:
+                    try:
+                        _write_json(_hidden_path(home), before, ordered=True)
+                    except Exception:  # noqa: BLE001 - the original failure is the one to report
+                        log.warning("unbl0ck: could not restore the dismissal after a failed undo", exc_info=True)
+                raise
         return True
 
 
@@ -814,12 +862,16 @@ BLUF_SYSTEM = (
 )
 
 
-def _bluf_path(home: Path | None) -> Path:
-    return data_dir(home) / "bluf.json"
+def _bluf_path(home: Path | None, *, create: bool = True) -> Path:
+    return data_dir(home, create=create) / "bluf.json"
 
 
-def load_blufs(home: Path | None = None, *, strict: bool = False) -> dict[str, dict[str, str]]:
-    return _read_json(_bluf_path(home), strict=strict)
+def load_blufs(
+    home: Path | None = None, *, strict: bool = False, create: bool = True
+) -> dict[str, dict[str, str]]:
+    return _read_json(
+        _bluf_path(home, create=create), strict=strict, entry_ok=lambda v: isinstance(v, dict)
+    )
 
 
 def summary_fingerprint(item: dict[str, Any]) -> str:
@@ -830,8 +882,11 @@ def summary_fingerprint(item: dict[str, Any]) -> str:
         str(item.get("ask") or ""),
         str(item.get("owner") or ""),
         str(item.get("comments_sig") or ""),
+        str(item.get("body_sig") or ""),
     ]
-    return hashlib.sha256("\x1f".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
+    # JSON, not a delimiter: a field that contains the delimiter would move text between fields.
+    blob = json.dumps(parts, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str, Any]:
@@ -861,8 +916,9 @@ def save_bluf(
     fp: str | None = None,
 ) -> None:
     """Cache one summary. ``started_at`` is when the model request began. A request that began
-    before the one behind the cached summary of a different version is superseded and dropped,
-    so a slow request for an old question cannot replace the newer question's summary. Start
+    before the one behind the cached summary is superseded and dropped, whether it is for another
+    version or for other text of the same version (a different fingerprint), so a slow request
+    for an old question cannot replace the newer question's summary. Start
     order decides, not completion order: the older request finishing first must not make the
     newer one look stale. A summary saved without a start time is never treated as newer."""
     with _state_lock(
@@ -873,7 +929,6 @@ def save_bluf(
         if (
             started_at is not None
             and isinstance(existing, dict)
-            and existing.get("version") != version
             and _num(existing.get("started_at")) > started_at
         ):
             return
@@ -1391,6 +1446,13 @@ _CLOSER = re.compile(
 _ANSWERED = re.compile(r"(?:because|answer:|a:|it was|the answer)\b", re.IGNORECASE)
 
 
+def chat_ask_text(text: str) -> str:
+    """The text ask detection reads: URLs carry "?" query strings and names, and a polite sign-off
+    ("Anything else you need?") asks nothing. A span from ``chat_ask_span`` indexes this text."""
+    text = _URL.sub(" ", text or "")
+    return _CLOSER.sub("", text.strip()).strip()
+
+
 def chat_ask_span(text: str) -> int:
     """How many trailing characters of a bot's final turn hold its ask (0 when it asks nothing).
 
@@ -1398,9 +1460,7 @@ def chat_ask_span(text: str) -> int:
     ("…Platform's, on your word.") is not an ask. Packet/option-list shapes are
     exempt from the question mark and may be long; other cues need a ``?`` after the cue.
     A name that must address you has to lie inside the same span."""
-    # URLs carry "?" query strings; a polite sign-off ("Anything else you need?") asks nothing.
-    text = _URL.sub(" ", text or "")
-    text = _CLOSER.sub("", text.strip()).strip()
+    text = chat_ask_text(text)
     tail = text[-900:]
     if not tail:
         return 0
@@ -1433,9 +1493,17 @@ FULL_TEXT_LIMIT = 20_000  # most characters one on-demand full-text read returns
 
 def _is_excerpted(text: str, n: int = EXCERPT_CHARS) -> bool:
     """True when ``_excerpt`` would change *text*: cut it, or flatten its line breaks and spacing."""
-    original = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
-    collapsed = re.sub(r"\s+", " ", original)
+    # Compared with what Full text shows: the first line's indentation is content there, and the
+    # excerpt removes it.
+    original, _ = _full_text(text)
+    collapsed = re.sub(r"\s+", " ", original).strip()
     return len(collapsed) > n or collapsed != original
+
+
+def _is_cut(text: str, n: int = EXCERPT_CHARS) -> bool:
+    """True when ``_excerpt`` drops the start of *text* (a literal leading ellipsis is not a cut)."""
+    original, _ = _full_text(text)
+    return len(re.sub(r"\s+", " ", original).strip()) > n
 
 
 def _full_text(text: str) -> tuple[str, bool]:
@@ -1523,17 +1591,32 @@ def _answered_since(
     the queue and by answer_card. Names compare in Python (casefold) on both paths: SQLite's
     LOWER() folds ASCII only, so "ZOË" and "Zoë" used to differ on the fast path alone.
 
-    Comment times have one-second resolution, so a comment made just before a re-block can
-    share the block's second. With the block's event id, a comment counts when it is strictly
-    later than the block or its ``commented`` event follows the block event; without it the
-    old same-second rule (>=) applies."""
+    Comment times have one-second resolution and a clock can step back. With the block's event
+    id, every comment that has its ``commented`` event is placed by that event alone (event ids
+    are ordered, clocks are not); only when some comment has no event (an import) does the
+    time rule apply, a comment counting when it is strictly later than the block. Without the
+    id the old same-second rule (>=) applies."""
     cut = since or 0
     strict = block_id is not None
     try:
-        rows = conn.execute(
-            "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
-            (task_id, cut + 1 if strict else cut),
-        ).fetchall()
+        by_event_only = False
+        if strict:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            logged = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
+                (task_id,),
+            ).fetchone()[0]
+            by_event_only = logged >= total
+        rows = (
+            []
+            if by_event_only
+            else conn.execute(
+                "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
+                (task_id, cut + 1 if strict else cut),
+            ).fetchall()
+        )
         if any(_same_author(r[0], author) for r in rows):
             return True
         if not strict:
@@ -1547,12 +1630,17 @@ def _answered_since(
         ]
         return _commented_after(events, block_id, author)
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        if any(
+        comments = list(kanban_db.list_comments(conn, task_id))
+        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
+        by_event_only = strict and (
+            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
+        )
+        if not by_event_only and any(
             _same_author(c.author, author) and c.created_at >= (cut + 1 if strict else cut)
-            for c in kanban_db.list_comments(conn, task_id)
+            for c in comments
         ):
             return True
-        return strict and _commented_after(kanban_db.list_events(conn, task_id), block_id, author)
+        return strict and _commented_after(all_events, block_id, author)
 
 
 class CardStatus(str, Enum):
@@ -1609,18 +1697,32 @@ def stuck_reason(reason: str, kind: str | None, block: Any) -> str:
     return "Blocked with no ask for you recorded; route to its owner"
 
 
+def _digest(*texts: Any) -> str:
+    """A short digest of card text: it moves when the text does and carries none of it."""
+    h = hashlib.sha256()
+    for text in texts:
+        data = str(text if text is not None else "").encode("utf-8", "replace")
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()[:12]
+
+
 def _comments_sig(conn: Any, kanban_db: Any, task_id: str) -> str:
-    """"count:newest id" of a card's comments: it changes when a comment is added, so a summary
-    written before the comment is not shown for the card as it is now."""
+    """"count:newest id:digest of the comment bodies": it changes when a comment is added and when an
+    existing one is rewritten, so advice or a summary written from the old text is not shown for the
+    card as it is now."""
     try:
-        n, newest = conn.execute(
-            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        return f"{n}:{newest}"
+        rows = conn.execute(
+            "SELECT id, author, body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+        comments = [(r[0], r[1], r[2]) for r in rows]
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments = kanban_db.list_comments(conn, task_id)
-        return f"{len(comments)}:{max((getattr(c, 'id', 0) or 0 for c in comments), default=0)}"
+        comments = [
+            (getattr(c, "id", 0) or 0, getattr(c, "author", ""), getattr(c, "body", ""))
+            for c in kanban_db.list_comments(conn, task_id)
+        ]
+    newest = max((c[0] or 0 for c in comments), default=0)
+    return f"{len(comments)}:{newest}:{_digest(*(part for c in comments for part in c))}"
 
 
 def kanban_items(
@@ -1711,6 +1813,7 @@ def kanban_items(
                             or getattr(task, "block_recurrences", 0),
                             "since": since,
                             "comments_sig": _comments_sig(conn, kanban_db, task.id),
+                            "body_sig": _digest(getattr(task, "body", "")),
                         }
                     )
         except Exception as exc:  # noqa: BLE001 - per-board failure must be visible
@@ -1922,10 +2025,71 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # Most characters of one chat message that are read from the database and processed. The ask
 # sits at the end of a turn, so a longer message is read from its end.
 CHAT_READ_CHARS = 100_000
+CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_CHARS characters
+CHAT_VERSION_BYTES = 16 * 1024 * 1024  # most bytes of one message hashed into its version
 
 
 def _text_digest(length: Any, text: str) -> str:
     return hashlib.sha256(f"{length}\0{text}".encode("utf-8", "replace")).hexdigest()[:12]
+
+
+_CUT_TOKEN = re.compile(r"\s*[A-Za-z0-9+/=_.\-]{32,}(?=\s|$)")
+_CUT_PEM_TAIL = re.compile(r"[A-Za-z0-9+/=\s]*(?=-----END )")
+
+
+def _drop_cut_prefix(text: str) -> str:
+    """A message read from its end starts in the middle of something. Whatever it began with, a
+    credential label, a key header, lies before the cut and cannot be seen, so the fragment that
+    follows cannot be judged: the partial first word and the run of long key-like words after it
+    are dropped, which leaves the readable ending where the ask is."""
+    rest = text[re.match(r"\S*", text).end() :]
+    while True:
+        hit = _CUT_TOKEN.match(rest)
+        if not hit:
+            break
+        rest = rest[hit.end() :]
+    pem = _CUT_PEM_TAIL.match(rest)
+    if pem:
+        rest = rest[pem.end() :]
+    return rest.lstrip()
+
+
+def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, over: bool) -> str:
+    """Names the whole message: the retained text alone cannot, when only its end was read, so a
+    cut message is hashed from the database in blocks (up to CHAT_VERSION_BYTES)."""
+    if not over:
+        return f"{mid}:{_text_digest(length, text)}"
+    digest = hashlib.sha256(f"{length}\0".encode())
+    step = 1 << 20
+    pos = 1
+    while pos <= min(length, CHAT_VERSION_BYTES):
+        block = conn.execute(
+            "SELECT SUBSTR(CAST(content AS BLOB), ?, ?) FROM messages WHERE id=?", (pos, step, mid)
+        ).fetchone()
+        digest.update(bytes(block[0] or b""))
+        pos += step
+    digest.update(text.encode("utf-8", "replace"))
+    return f"{mid}:{digest.hexdigest()[:12]}"
+
+
+def _open_chat_db(db: Path) -> sqlite3.Connection:
+    """Open *db* read-only, only if it is the regular file it was when the search began. The
+    check is made on the path itself (no link is followed) before and after the open, so a link
+    put in its place between the listing and the open is refused, not read."""
+    first = os.lstat(db)
+    if not stat.S_ISREG(first.st_mode):
+        raise OSError("state.db is not a regular file")
+    path = Path(os.path.abspath(db))
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)
+    try:
+        second = os.lstat(db)
+        same = (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+        if not (stat.S_ISREG(second.st_mode) and same):
+            raise OSError("state.db changed while it was opened")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
@@ -1939,21 +2103,40 @@ BACKFILL_FILE = "chat-backfill.json"
 BACKFILL_IDS_MAX = 1000
 
 
-def _backfill_state(home: Path | None) -> tuple[float | None, list[str], bool]:
-    """``(floor, ids, readable)``: the oldest time any earlier queue read reached back to, and the
-    chats first listed from before it (a widened ``chat_window_days`` found them). Nothing here is
-    chat text: a time and the ids the dismissal and summary stores already hold."""
+def _finite_time(value: Any) -> float | None:
+    """A stored time, or None when it is not a finite number (a JSON integer past the float
+    range raises OverflowError, which is damage to this record, not a reason to stop the read)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _backfill_state(
+    home: Path | None,
+) -> tuple[float | None, dict[str, float | None], float | None, bool]:
+    """``(floor, marks, before, readable)``: the oldest time any earlier queue read reached back to,
+    the chats first listed from before it (a widened ``chat_window_days`` found them) with the time
+    of the ask, and ``before``: every chat at or older than that time is backfill, because the
+    marks of the oldest ones had to be dropped to stay within ``BACKFILL_IDS_MAX``. Nothing here is
+    chat text: times and the ids the dismissal and summary stores already hold."""
     try:
         p = data_dir(home, create=False) / BACKFILL_FILE
         if not os.path.lexists(p):
-            return None, [], True
+            return None, {}, None, True
         data = json.loads(_read_plain_text(p))
-        floor = data.get("floor")
-        floor = float(floor) if isinstance(floor, (int, float)) and math.isfinite(floor) else None
-        ids = [i for i in data.get("ids", []) if isinstance(i, str)][-BACKFILL_IDS_MAX:]
-        return floor, ids, True
-    except (OSError, ValueError, AttributeError, TypeError, UnicodeError):
-        return None, [], False
+        times = data.get("id_ts")
+        times = times if isinstance(times, dict) else {}
+        marks: dict[str, float | None] = {}
+        for i in data.get("ids", []):
+            if isinstance(i, str):
+                marks[i] = _finite_time(times.get(i))
+        return _finite_time(data.get("floor")), marks, _finite_time(data.get("before")), True
+    except (OSError, ValueError, AttributeError, TypeError, UnicodeError, RecursionError):
+        return None, {}, None, False
 
 
 def _mark_backfill(
@@ -1962,42 +2145,58 @@ def _mark_backfill(
     since: float,
     *,
     record: bool,
-    complete: bool,
     errors: list[str] | None,
 ) -> None:
     """Flag chats that only a widened window reached (``backfilled``), so nothing is sent to a
     model for them automatically. A chat is backfill when it is older than the default window or
-    older than anything an earlier read looked at; the flag then stays with it, so a later
-    refresh cannot turn it back into an ordinary ask. Only ``record`` (the queue build) saves."""
+    older than anything an earlier read looked at; the flag then stays with it, so neither a later
+    refresh nor a narrower window can turn it back into an ordinary ask. Only ``record`` (the
+    queue build) saves, and it reads and rewrites the file under the shared state lock so two
+    builds cannot overwrite each other's marks. Marks beyond ``BACKFILL_IDS_MAX`` are not lost:
+    the oldest are dropped and ``before`` then flags everything as old as the newest dropped."""
     default_since = time.time() - CHAT_WINDOW_DAYS * 86400
-    floor, ids, readable = _backfill_state(home)
-    edge = floor if floor is not None else since
-    marked = dict.fromkeys(ids)
-    changed = False
-    for it in items:
-        ts = it.get("since") or 0
-        if it["id"] not in marked and (ts < edge or not readable) and ts < time.time() - 86400:
-            marked[it["id"]] = None
+
+    def apply(write: bool) -> None:
+        now = time.time()
+        floor, marks, before, readable = _backfill_state(home)
+        edge = floor if floor is not None else since
+        changed = False
+        for it in items:
+            ts = it.get("since") or 0
+            if it["id"] not in marks and (ts < edge or not readable) and ts < now - 86400:
+                marks[it["id"]] = ts
+                changed = True
+            if ts < default_since or it["id"] in marks or (before is not None and ts <= before):
+                it["backfilled"] = True
+        if len(marks) > BACKFILL_IDS_MAX:
+            oldest_first = sorted(marks, key=lambda i: (marks[i] is None, marks[i] or 0))
+            for dropped in oldest_first[: len(marks) - BACKFILL_IDS_MAX]:
+                when = marks.pop(dropped)
+                before = max(before if before is not None else 0, when if when is not None else now)
             changed = True
-        if ts < default_since or it["id"] in marked:
-            it["backfilled"] = True
-    if complete:  # a whole read: chats no longer listed need no flag
-        listed = {it["id"] for it in items}
-        kept = {i: None for i in marked if i in listed}
-        changed = changed or len(kept) != len(marked)
-        marked = kept
-    new_floor = min(edge, since)
-    if not record or not readable or (not changed and floor is not None and new_floor >= floor):
-        return
+        new_floor = min(edge, since)
+        if not write or not readable or (not changed and floor is not None and new_floor >= floor):
+            return
+        payload: dict[str, Any] = {
+            "floor": new_floor,
+            "ids": list(marks),
+            "id_ts": {i: t for i, t in marks.items() if t is not None},
+        }
+        if before is not None:
+            payload["before"] = before
+        _write_json(data_dir(home) / BACKFILL_FILE, payload, ordered=True)
+
     try:
-        _write_json(
-            data_dir(home) / BACKFILL_FILE,
-            {"floor": new_floor, "ids": list(marked)[-BACKFILL_IDS_MAX:]},
-            ordered=True,
-        )
-    except OSError as exc:
+        if record:
+            with _state_lock(home):
+                apply(True)
+        else:
+            apply(False)
+    except (OSError, TimeoutError, RuntimeError) as exc:
         if errors is not None:
             errors.append(f"chat: backfill marks could not be saved ({type(exc).__name__})")
+        if record:
+            apply(False)  # the flags still apply to what is listed now
 
 
 def chat_items(
@@ -2041,16 +2240,18 @@ def chat_items(
         """Whether a dismissal or a cached summary already exists under this profile's chat ids."""
         prefix = f"chat:{profile}:"
         try:
-            ids = list(load_hidden(home, create=False)) + list(load_blufs(home))
+            ids = list(load_hidden(home, create=False)) + list(load_blufs(home, create=False))
         except Exception:  # noqa: BLE001 - only a tie-break between aliases; the first one wins
             return False
         return any(str(i).startswith(prefix) for i in ids)
 
     for profile, db in _state_dbs(home, errors, only[0] if only else None, known):
         try:
-            conn = sqlite3.connect(
-                db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2
-            )
+            conn = _open_chat_db(db)
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"chat[{profile}]: {exc}; not searched")
+            continue
         except sqlite3.Error as exc:
             if errors is not None:
                 errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
@@ -2151,7 +2352,9 @@ def chat_items(
                 continue
             # Only the columns this profile's schema has: an old schema must not fail per session.
             last_sql = (
-                "SELECT id, role, SUBSTR(content, ?), LENGTH(content), timestamp FROM messages "
+                # Bytes, not text: SQLite's text functions stop at an embedded NUL.
+                "SELECT id, role, SUBSTR(CAST(content AS BLOB), ?), LENGTH(CAST(content AS BLOB)), "
+                "timestamp FROM messages "
                 "WHERE session_id=? "
                 "AND role IN ('user','assistant') AND content IS NOT NULL AND TRIM(content) != '' "
                 + (
@@ -2177,28 +2380,35 @@ def chat_items(
                     cov["skipped_other_owner"] += 1
                     continue
                 try:
-                    row = conn.execute(last_sql, (-CHAT_READ_CHARS, sid)).fetchone()
+                    row = conn.execute(last_sql, (-CHAT_READ_BYTES, sid)).fetchone()
                 except sqlite3.Error as exc:
                     failed(exc)
                     break  # same schema for every session: say it once
                 if not row:
                     continue
-                mid, role, content, length, ts = row
+                mid, role, raw, length, ts = row
                 ts = _num(ts)  # an infinite or NaN stored time is not a time (int() would raise)
-                content = str(content)
+                length = int(length or 0)
+                raw = bytes(raw or b"") if not isinstance(raw, str) else raw.encode("utf-8", "replace")
+                content = raw.decode("utf-8", "replace")
+                over = length > len(raw) or len(content) > CHAT_READ_CHARS
+                if over:  # only the end of a very long message was read
+                    content = content[-CHAT_READ_CHARS:]
+                    if length > len(raw):
+                        content = content.lstrip("\ufffd")  # a character cut in two
+                    content = _drop_cut_prefix(content)
+                version = _chat_version(conn, mid, length, content, over)
+                content = content.replace("\x00", " ")
                 span = chat_ask_span(content) if role == "assistant" and (ts or 0) >= since else 0
                 if not span:
                     continue
                 if str(chat_type or "").lower() in CHAT_GROUP_TYPES and not names.search(
-                    content[-span:]
+                    chat_ask_text(content)[-span:]
                 ):
                     cov["skipped_group_unnamed"] += 1
                     continue
-                if visible is not None and not visible(
-                    f"chat:{profile}:{sid}", f"{mid}:{_text_digest(length, content)}"
-                ):
+                if visible is not None and not visible(f"chat:{profile}:{sid}", version):
                     continue  # dismissed at this version: it must not use up a full-text budget
-                over = (length or 0) > len(content)  # only the end of a very long message was read
                 bot_chat = title in CHAT_TITLES
                 # Redact the whole turn before it is cut to an excerpt: the cut keeps the tail,
                 # so a long secret would otherwise leave a readable fragment.
@@ -2213,7 +2423,7 @@ def chat_items(
                         "id": f"chat:{profile}:{sid}",
                         # The message row id and a digest of the text: Hermes can rewrite a
                         # message in place, and the row id alone would not change.
-                        "version": f"{mid}:{_text_digest(length, content)}",
+                        "version": version,
                         "source": "chat",
                         "profile": profile,
                         "session_id": sid,
@@ -2224,6 +2434,7 @@ def chat_items(
                         "title": f"{_bot_name(home, profile)} is asking you",
                         "ask": _excerpt(shown),
                         "ask_truncated": over or _is_excerpted(shown),
+                        "ask_cut": over or _is_cut(shown),
                         # Only the first `full_limit` items pay for a full-text copy.
                         **(
                             _chat_full_fields(shown, over)
@@ -2242,7 +2453,6 @@ def chat_items(
         _mark_backfill(
             home, items, since,
             record=record_backfill,
-            complete=not cov.get("sessions_omitted") and not (errors or []) and not unread_profiles,
             errors=errors,
         )
     return items
@@ -2312,7 +2522,7 @@ def _pending_file_damage(path: Path) -> bool:
         return not isinstance(json.loads(raw.decode("utf-8-sig")), dict)
     except FileNotFoundError:
         return False
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):  # too deeply nested is damage, not a crash
         return True
 
 
@@ -2421,7 +2631,7 @@ WAIT_MAX_AGE = (
 def _num(value: Any) -> float:
     try:
         number = float(value or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: a JSON integer past the float range
         return 0.0
     return number if math.isfinite(number) else 0.0  # NaN/inf are not times
 
@@ -2491,34 +2701,124 @@ WAIT_FAULT_LIMIT = 50
 # (home, request id) -> (what failed, the record to write). The hooks run in the agent; when a
 # write or removal fails there, polling in the same process retries it and says so until it works.
 _WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
+# Faults dropped because the list was full, per home: never retried, so reported, not forgotten.
+_WAIT_FAULTS_LOST: dict[str, int] = {}
+# Hooks and polls in one process settle a prompt one at a time: a retry in flight must not
+# recreate a record that a clear has just removed.
+_WAIT_FAULT_LOCK = threading.RLock()
+_FAULT_LOST_KEY = "+lost"  # not a request id, so it never collides with one
+
+
+def _fault_path(home: Path) -> Path:
+    return data_dir(home) / "wait-faults.json"
+
+
+def _journal_fault(
+    home: Path, rid: str, what: str | None, *, lost: int = 0
+) -> None:
+    """Best effort: tell other processes that this one holds a prompt it could not record or
+    clear. It holds only the request id, what failed and this process's identity, never the
+    prompt, and it is removed when the fault is settled. ``what=None`` removes *rid*."""
+    try:
+        with _state_lock(home):
+            data = _read_json(_fault_path(home))
+            if what is None and not lost and rid not in data:
+                return
+            if what is not None:
+                pid = os.getpid()
+                data[rid] = {
+                    "what": what,
+                    "pid": pid,
+                    "proc_start": _proc_start(pid),
+                    "since": int(time.time()),
+                }
+            else:
+                data.pop(rid, None)
+            if lost:
+                pid = os.getpid()
+                old = data.get(_FAULT_LOST_KEY)
+                count = int(_num(old.get("count"))) if isinstance(old, dict) else 0
+                data[_FAULT_LOST_KEY] = {
+                    "count": count + lost,
+                    "pid": pid,
+                    "proc_start": _proc_start(pid),
+                }
+            if data:
+                _write_json(_fault_path(home), data, ordered=True)
+            else:
+                _fault_path(home).unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001 - the hooks must never break a human prompt
+        log.warning("unbl0ck: could not note a live-prompt fault: %s", type(exc).__name__)
 
 
 def _remember_wait_fault(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
-    _WAIT_FAULTS.pop((str(home), rid), None)
-    _WAIT_FAULTS[(str(home), rid)] = (what, rec)
-    while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
-        _WAIT_FAULTS.pop(next(iter(_WAIT_FAULTS)))
+    with _WAIT_FAULT_LOCK:
+        _WAIT_FAULTS.pop((str(home), rid), None)
+        _WAIT_FAULTS[(str(home), rid)] = (what, rec)
+        dropped: list[tuple[str, str]] = []
+        while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
+            dropped.append(next(iter(_WAIT_FAULTS)))
+            _WAIT_FAULTS.pop(dropped[-1])
+        for h, r in dropped:
+            _WAIT_FAULTS_LOST[h] = _WAIT_FAULTS_LOST.get(h, 0) + 1
+    _journal_fault(home, rid, what)
+    for h, r in dropped:
+        _journal_fault(Path(h), r, None, lost=1)
 
 
 def _unlink_wait(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-def _reconcile_waits(home: Path, errors: list[str]) -> None:
-    """Retry hook writes/removals that failed; what still fails is a reported source error."""
-    for (h, rid), (what, rec) in list(_WAIT_FAULTS.items()):
-        if h != str(home):
+def _other_process_faults(home: Path, errors: list[str]) -> None:
+    """Faults another live process (the agent running a hook) reported but could not retry here."""
+    try:
+        data = _read_json(_fault_path(home))
+    except Exception:  # noqa: BLE001
+        return
+    for rid, entry in data.items():
+        if not isinstance(entry, dict):
             continue
         try:
-            path = _waits_dir(home) / f"{rid}.json"
-            if what == "record" and rec is not None:
-                _write_json(path, rec)
-            else:
-                _unlink_wait(path)
-            _WAIT_FAULTS.pop((h, rid), None)
-        except Exception as exc:  # noqa: BLE001
-            verb = "record" if what == "record" else "clear"
-            errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
+            pid = int(entry.get("pid") or 0)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if pid <= 0 or pid == os.getpid():
+            continue
+        if not _alive(pid, entry.get("proc_start")):
+            _journal_fault(home, rid, None)  # its prompts died with it
+            continue
+        if rid == _FAULT_LOST_KEY:
+            errors.append(
+                f"prompt: {int(_num(entry.get('count')))} live prompts could not be recorded or cleared "
+                "and are no longer retried"
+            )
+        elif _SAFE_ID.match(rid):
+            verb = "record" if entry.get("what") == "record" else "clear"
+            errors.append(f"prompt: {rid}: could not {verb} a live prompt (reported by the agent)")
+
+
+def _reconcile_waits(home: Path, errors: list[str]) -> None:
+    """Retry hook writes/removals that failed; what still fails is a reported source error."""
+    _other_process_faults(home, errors)
+    lost = _WAIT_FAULTS_LOST.get(str(home), 0)
+    if lost:
+        errors.append(f"prompt: {lost} live prompts could not be recorded or cleared and are no longer retried")
+    with _WAIT_FAULT_LOCK:
+        for (h, rid), (what, rec) in list(_WAIT_FAULTS.items()):
+            if h != str(home) or _WAIT_FAULTS.get((h, rid)) != (what, rec):
+                continue
+            try:
+                path = _waits_dir(home) / f"{rid}.json"
+                if what == "record" and rec is not None:
+                    _write_json(path, rec)
+                else:
+                    _unlink_wait(path)
+                _WAIT_FAULTS.pop((h, rid), None)
+                _journal_fault(home, rid, None)
+            except Exception as exc:  # noqa: BLE001
+                verb = "record" if what == "record" else "clear"
+                errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
 
 
 def record_wait(home: Path | None = None, **payload: Any) -> None:
@@ -2548,12 +2848,15 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
             "proc_start": _proc_start(pid),
             "since": int(time.time()),
         }
-        _WAIT_FAULTS.pop((str(home), rid), None)
-        try:
-            _write_json(_waits_dir(home) / f"{rid}.json", rec)
-        except Exception:
-            _remember_wait_fault(home, rid, "record", rec)
-            raise
+        with _WAIT_FAULT_LOCK:
+            had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
+            try:
+                _write_json(_waits_dir(home) / f"{rid}.json", rec)
+            except Exception:
+                _remember_wait_fault(home, rid, "record", rec)
+                raise
+        if had_fault:
+            _journal_fault(home, rid, None)
     except Exception as exc:  # noqa: BLE001 - observability must never break a human prompt
         log.warning("unbl0ck: could not record wait: %s", type(exc).__name__)
 
@@ -2564,12 +2867,15 @@ def clear_wait(home: Path | None = None, **payload: Any) -> None:
         rid = str(payload.get("request_id") or "")
         if _SAFE_ID.match(rid):
             home = home or hermes_home()
-            _WAIT_FAULTS.pop((str(home), rid), None)
-            try:
-                _unlink_wait(_waits_dir(home) / f"{rid}.json")
-            except Exception:
-                _remember_wait_fault(home, rid, "clear", None)
-                raise
+            with _WAIT_FAULT_LOCK:
+                had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
+                try:
+                    _unlink_wait(_waits_dir(home) / f"{rid}.json")
+                except Exception:
+                    _remember_wait_fault(home, rid, "clear", None)
+                    raise
+            if had_fault:
+                _journal_fault(home, rid, None)
     except Exception as exc:  # noqa: BLE001
         log.warning("unbl0ck: could not clear wait: %s", type(exc).__name__)
 
@@ -2700,6 +3006,7 @@ def wait_items(
                 "ask": _excerpt(shown) or "(prompt text withheld by Hermes)",
                 # A password prompt is never expanded: its excerpt is all the queue ever shows.
                 "ask_truncated": kind != "sudo" and (cut or _is_excerpted(shown)),
+                "ask_cut": kind != "sudo" and (cut or _is_cut(shown)),
                 **(
                     {**fields, "text_cut": fields["text_cut"] or cut}
                     if expand
@@ -2885,6 +3192,23 @@ def search_text(query: Any) -> dict[str, Any]:
 # --- things waiting outside Hermes ----------------------------------------------------------
 
 _OUTSIDE_KINDS = ("draft", "notes", "approval", "other")
+
+
+def _is_filed_record(rec: Any, stem: str) -> bool:
+    """Whether *rec* is a record this plugin filed under ``<stem>.json``. One check for listing,
+    lookup, resolving and Done, so a foreign JSON file is never shown, read as ours or deleted."""
+    return (
+        isinstance(rec, dict)
+        and rec.get("id") == f"outside:filed:{stem}"
+        and bool(_FILED_ID.fullmatch(str(rec.get("id"))))
+        and rec.get("origin") == "filed"
+        and rec.get("kind") in _OUTSIDE_KINDS
+        and all(
+            isinstance(rec.get(key), str) and rec[key].strip()
+            for key in ("version", "title", "act_where")
+        )
+        and isinstance(rec.get("text"), str)
+    )
 _OUTSIDE_LIMIT = 200
 _OUTSIDE_READ_LIMIT = 256 * 1024
 # Recursive intake (outside_recursive) is bounded three ways: nesting depth, directory
@@ -2944,9 +3268,13 @@ def _done_at(rec: dict[str, Any]) -> float | None:
     """The Done time, or None when there is none or it is not a real finite time (a boolean is
     an int to Python, and NaN or infinity never compare as expired)."""
     value = rec.get("done_at")
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)  # OverflowError for a JSON integer past the float range
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _is_done(rec: dict[str, Any]) -> bool:
@@ -2958,7 +3286,6 @@ def _bad_done(rec: dict[str, Any]) -> bool:
     return rec.get("done_at") is not None and _done_at(rec) is None
 
 
-_FILED_NAME = re.compile(r"[a-f0-9]{32}\.json\Z")
 # One cleanup or listing reads at most this many entries and runs at most this long, so a folder
 # full of files cannot make every Done, filing or poll read all of them first.
 _PURGE_SCAN_LIMIT = 1000
@@ -2968,21 +3295,15 @@ _TOO_MANY_FILED = (
 )
 
 
-def _is_filed_record(f: Path, rec: dict[str, Any]) -> bool:
-    """One of our records: named for its id and filed by an agent (not any JSON file in the folder)."""
-    return (
-        bool(_FILED_NAME.fullmatch(f.name))
-        and rec.get("id") == f"outside:filed:{f.stem}"
-        and rec.get("origin") == "filed"
-    )
-
-
 def _filed_files(d: Path) -> tuple[list[Path], bool]:
     """At most ``_PURGE_SCAN_LIMIT`` filed-record paths of *d*, and whether there were more."""
     with os.scandir(d) as entries:
-        names = [Path(e.path) for e in itertools.islice((e for e in entries if e.name.endswith(".json")), _PURGE_SCAN_LIMIT + 1)]
+        # Every entry counts toward the bound, not just the JSON ones: a folder of other files
+        # must not be read to the end before the limit applies.
+        seen = list(itertools.islice(entries, _PURGE_SCAN_LIMIT + 1))
+    names = [Path(e.path) for e in seen[:_PURGE_SCAN_LIMIT] if e.name.endswith(".json")]
     names.sort(key=lambda p: p.name)
-    return names[:_PURGE_SCAN_LIMIT], len(names) > _PURGE_SCAN_LIMIT
+    return names, len(seen) > _PURGE_SCAN_LIMIT
 
 
 def _count_active(files: list[Path], skip: Path | None = None) -> int:
@@ -3021,17 +3342,17 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
         return 0
     with scan as entries:
         for entry in entries:
-            if not entry.name.endswith(".json"):
-                continue
             if scanned >= _PURGE_SCAN_LIMIT or time.monotonic() > deadline:
                 errors.append("outside: retention cleanup stopped early; some filed records were not checked")
                 break
-            scanned += 1
+            scanned += 1  # every entry counts, so non-JSON files cannot stretch the scan
+            if not entry.name.endswith(".json"):
+                continue
             f = Path(entry.path)
             if f.is_symlink():
                 continue
             rec = _read_json(f)
-            if not _is_filed_record(f, rec):
+            if not _is_filed_record(rec, f.stem):
                 continue
             if _bad_done(rec):
                 errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
@@ -3172,9 +3493,9 @@ def file_outside(
             candidates = [
                 (f, rec)
                 for f in files
-                if not f.is_symlink() and _FILED_NAME.fullmatch(f.name)
+                if not f.is_symlink() and _FILED_ID.fullmatch(f"outside:filed:{f.stem}")
                 for rec in (_read_json(f, errors=unreadable),)
-                if not rec or _is_filed_record(f, rec)
+                if not rec or _is_filed_record(rec, f.stem)
             ]
             found = [f for f, rec in candidates if _dedupe_matches(rec, key, scope, caller)]
             if scope == "profile" and caller and not found:
@@ -3209,11 +3530,16 @@ def file_outside(
         if action == "resolve":
             if match is None or not match.is_file() or match.is_symlink():
                 raise LookupError("No filed outside item matches that id or dedupe_key")
+            try:
+                found = _read_json(match, strict=True)
+            except RuntimeError as exc:
+                raise SourceUnavailable(str(exc)) from exc
+            if not found:
+                raise LookupError("No filed outside item matches that id or dedupe_key")
+            if not _is_filed_record(found, match.stem):
+                raise SourceUnavailable("filed outside record is invalid; repair it")
             if version is not None:
-                try:
-                    current = _read_json(match, strict=True).get("version")
-                except RuntimeError as exc:
-                    raise SourceUnavailable(str(exc)) from exc
+                current = found.get("version")
                 if current != version:
                     # Another agent refiled this item since: its newer text is not yours to delete.
                     raise StaleAnswer("the filed item changed since you filed it; re-read it first")
@@ -3224,7 +3550,8 @@ def file_outside(
             # hidden.json is left as it is for repair rather than overwritten.
             marker_failed = False
             try:
-                marks = load_hidden(home, errors=(bad := []))
+                # The raw view: it keeps every other dismissal's undo token intact.
+                marks = _load_hidden_raw(home, errors=(bad := []))
                 if not bad and resolved_id in marks:
                     marks.pop(resolved_id)
                     _write_json(_hidden_path(home), marks, ordered=True)
@@ -3319,6 +3646,8 @@ _HTML_CLOSES_P = frozenset(
     "address article aside blockquote center details dialog dir div dl fieldset figcaption figure footer "
     "form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre section table ul li dd dt".split()
 )
+# Format characters are dropped (they hide text), except the joiners that spell real words and emoji.
+_HTML_JOINERS = frozenset("\u200c\u200d")
 _HTML_SCOPE = frozenset("table td th caption html button object marquee applet template".split())
 _HTML_MAX_OPEN = 1000  # open elements tracked; deeper nesting ends the readable text, and is reported
 
@@ -3344,10 +3673,57 @@ _CSS_HIDINGISH = re.compile(
     r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|opacity\s*:\s*0|font-size\s*:\s*0|overflow", re.I
 )
 _CSS_MAX_RULES = 2000
+_CSS_MATCH_BUDGET = 300_000  # rule-against-element evaluations per message; past it styles stop being read
 _CSS_MAX_SELECTOR = 4  # compounds in a selector this converter evaluates
-_CSS_BIG_INT = re.compile(
-    r"&#(?:[0-9]{100,}|0*[1-9][0-9]{7,}|[xX](?:[0-9a-fA-F]{100,}|0*[1-9a-fA-F][0-9a-fA-F]{6,}));?"
+# A decimal reference of 100 or more digits makes the stdlib parser raise and end the conversion;
+# the hexadecimal form is already handled by it (U+FFFD), so only decimal is rewritten here.
+_CSS_BIG_INT = re.compile(r"&#(?:[0-9]{100,}|0*[1-9][0-9]{7,});?")
+_CSS_GLOBAL = frozenset(("initial", "inherit", "unset", "revert", "revert-layer"))
+_CSS_NUMBER = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?"
+_CSS_LENGTH = re.compile(rf"^{_CSS_NUMBER}(?:[a-z]+|%)?$")
+_CSS_FUNCTION = re.compile(r"^[a-z-]+\(.*\)$", re.S)
+_CSS_IDENT = re.compile(r"^-?[a-z_][a-z0-9_-]*$")
+_CSS_VALUES = {
+    "display": frozenset(
+        "none contents block inline inline-block flow flow-root list-item run-in table table-row "
+        "table-cell table-caption table-column table-column-group table-row-group table-header-group "
+        "table-footer-group inline-table flex inline-flex grid inline-grid ruby ruby-base ruby-text "
+        "ruby-base-container ruby-text-container math -webkit-box -webkit-inline-box -ms-flexbox "
+        "-ms-inline-flexbox -ms-grid".split()
+    ),
+    "visibility": frozenset(("visible", "hidden", "collapse")),
+    "overflow": frozenset(("visible", "hidden", "clip", "scroll", "auto", "overlay")),
+}
+_CSS_VALUES["overflow-x"] = _CSS_VALUES["overflow-y"] = _CSS_VALUES["overflow"]
+_CSS_SIZE_WORDS = frozenset(
+    "auto none min-content max-content fit-content stretch -webkit-fill-available -moz-available".split()
 )
+
+
+def _css_valid(name: str, value: str) -> bool:
+    """Whether *value* is a value CSS accepts for *name*; a declaration that is not is discarded
+    and so never overrides an earlier valid one. Functions (``calc``, ``var``) are accepted."""
+    if not value:
+        return False
+    if value in _CSS_GLOBAL or _CSS_FUNCTION.match(value):
+        return True
+    if name == "display":
+        return all(w in _CSS_VALUES["display"] for w in value.split())
+    if name in ("overflow", "overflow-x", "overflow-y"):
+        words = value.split()
+        return len(words) <= (2 if name == "overflow" else 1) and all(w in _CSS_VALUES["overflow"] for w in words)
+    if name == "visibility":
+        return value in _CSS_VALUES["visibility"]
+    if name == "opacity":
+        return bool(re.match(rf"^{_CSS_NUMBER}%?$", value))
+    if name == "font-size":
+        return (
+            value in _CSS_FONT_KEYWORDS
+            or value in ("larger", "smaller")
+            or bool(_CSS_LENGTH.match(value) and (re.search(r"[a-z%]$", value) or _css_zero(value)))
+        )
+    # width, height, max-width, max-height
+    return value in _CSS_SIZE_WORDS or bool(_CSS_LENGTH.match(value) and (re.search(r"[a-z%]$", value) or _css_zero(value)))
 
 
 def _css_declarations(block: str) -> dict[str, tuple[str, bool]]:
@@ -3362,6 +3738,8 @@ def _css_declarations(block: str) -> dict[str, tuple[str, bool]]:
         value = value.strip().lower()
         important = bool(_CSS_IMPORTANT.search(value))
         value = _CSS_IMPORTANT.sub("", value).strip()
+        if name in _CSS_HIDING and not _css_valid(name, value):
+            continue  # an invalid declaration is dropped; it never overrides a valid one
         if name in out and out[name][1] and not important:
             continue
         out[name] = (value, important)
@@ -3403,9 +3781,13 @@ class _CssRule:
         self.chain, self.spec, self.order, self.decls = chain, spec, order, decls
 
 
+_CSS_NEVER: list = []  # a selector that can match no element
+
+
 def _css_selector(text: str):
     """``[(combinator, tag, classes, id)]`` for a selector of tags, classes, ids and the
-    descendant and child combinators, or None when it uses anything else."""
+    descendant and child combinators, ``_CSS_NEVER`` for one that cannot match, or None when it
+    uses anything else."""
     text = text.strip()
     if not text or len(text) > 200 or "\\" in text:
         return None
@@ -3425,6 +3807,8 @@ def _css_selector(text: str):
         for kind, name in _CSS_PART.findall(m.group("rest")):
             if kind == ".":
                 classes.append(name)
+            elif ident and ident != name:
+                return _CSS_NEVER  # two different ids on one element: the selector matches nothing
             else:
                 ident = name
         chain.append((comb, tag, tuple(classes), ident))
@@ -3468,6 +3852,8 @@ def _css_parse(css: str, conditional: bool, rules: list, state: dict) -> None:
         can_hide = _css_can_hide(decls)
         for sel in prelude.split(","):
             chain = None if conditional else _css_selector(sel)
+            if chain is _CSS_NEVER:
+                continue
             if chain is None:
                 if can_hide:
                     state["uncertain"] = True
@@ -3491,9 +3877,12 @@ class _StyleCollector(html.parser.HTMLParser):
         self._size = 0
         self.capped = False  # a stylesheet was longer than is read: its rules are not all known
         self._conditional = False
+        self._templates = 0  # a <style> inside a <template> is inert: it styles nothing
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
-        if tag == "style":
+        if tag == "template":
+            self._templates += 1
+        elif tag == "style" and not self._templates:
             a = {k: (v or "") for k, v in attrs}
             media = a.get("media", "").strip().lower()
             self._conditional = media not in ("", "all", "screen")
@@ -3502,7 +3891,9 @@ class _StyleCollector(html.parser.HTMLParser):
     handle_startendtag = handle_starttag
 
     def handle_endtag(self, tag: str) -> None:
-        if tag == "style" and self._open is not None:
+        if tag == "template" and self._templates:
+            self._templates -= 1
+        elif tag == "style" and self._open is not None:
             self.blocks.append(("".join(self._open), self._conditional))
             self._open = None
 
@@ -3517,11 +3908,12 @@ class _StyleCollector(html.parser.HTMLParser):
 
 
 class _Frame:
-    __slots__ = ("tag", "classes", "ident", "gone", "vis_hidden", "font_zero", "own")
+    __slots__ = ("tag", "classes", "ident", "gone", "vis_hidden", "font_zero", "own", "styled")
 
-    def __init__(self, tag, classes, ident, gone, vis_hidden, font_zero, own):
+    def __init__(self, tag, classes, ident, gone, vis_hidden, font_zero, own, styled=False):
         self.tag, self.classes, self.ident = tag, classes, ident
         self.gone, self.vis_hidden, self.font_zero, self.own = gone, vis_hidden, font_zero, own
+        self.styled = styled  # hidden by the author (attribute or style), here or in an ancestor
 
 
 class _InertText(html.parser.HTMLParser):
@@ -3540,6 +3932,12 @@ class _InertText(html.parser.HTMLParser):
         self.stack: list[_Frame] = []
         self.open_count: collections.Counter[str] = collections.Counter()
         self._head: tuple[int, _Frame] | None = None
+        self.match_budget = _CSS_MATCH_BUDGET
+        self.spent = False  # the budget ran out: later elements were not checked against every rule
+        self.suppressed = False  # readable text was hidden by the author, whether or not it closed
+        self.truncated = False  # readable text did not fit in the limit
+        self._tail = "\n"  # last character kept, so leading and repeated whitespace is not stored
+        self._newlines = 2
         self.by_tag: dict[str, list[_CssRule]] = {}
         self.by_class: dict[str, list[_CssRule]] = {}
         self.by_id: dict[str, list[_CssRule]] = {}
@@ -3558,9 +3956,35 @@ class _InertText(html.parser.HTMLParser):
         return any(f.own for f in self.stack if f.tag != "head")
 
     def _emit(self, text: str) -> None:
-        if self.size < self.limit:
-            self.out.append(text)
-            self.size += len(text)
+        """Keep *text* the way it will be cleaned up (whitespace runs become one space, format
+        characters go), so what fills the limit is what the reader would see."""
+        kept: list[str] = []
+        tail, newlines = self._tail, self._newlines
+        for ch in text:
+            if unicodedata.category(ch) == "Cf" and ch not in _HTML_JOINERS:
+                continue
+            if ch == "\n":
+                if newlines >= 2:
+                    continue
+                newlines += 1
+            elif ch.isspace():
+                if tail.isspace():
+                    continue
+                ch, newlines = " ", 0
+            else:
+                newlines = 0
+            kept.append(ch)
+            tail = ch
+        self._tail, self._newlines = tail, newlines
+        chunk = "".join(kept)
+        room = self.limit - self.size
+        if len(chunk) > room:
+            if chunk[max(room, 0):].strip():
+                self.truncated = True
+            chunk = chunk[: max(room, 0)]
+        if chunk:
+            self.out.append(chunk)
+            self.size += len(chunk)
 
     def _visible(self) -> bool:
         if not self.stack:
@@ -3577,25 +4001,35 @@ class _InertText(html.parser.HTMLParser):
             return False
         if any(c not in classes for c in rclasses):
             return False
-        idx = len(self.stack) - 1  # the candidate element is not on the stack yet
-        # walk the chain right to left: each earlier compound sits above the later one
         want = rule.chain
-        pos = len(want) - 1
-        while pos > 0:
-            link = want[pos][0]  # combinator between want[pos-1] and want[pos]
-            _, ptag, pclasses, pid = want[pos - 1]
-            if link == ">":
-                if idx < 0 or not self._frame_is(self.stack[idx], ptag, pclasses, pid):
-                    return False
-                idx -= 1
+        failed: set[tuple[int, int]] = set()
+
+        def above(pos: int, idx: int) -> bool:
+            """Whether want[pos] and everything before it match at or above stack index *idx*;
+            a descendant link may skip any number of ancestors, so every choice is tried."""
+            if pos < 0:
+                return True
+            if (pos, idx) in failed:
+                return False
+            _, ptag, pclasses, pid = want[pos]
+            if want[pos + 1][0] == ">":
+                ok = idx >= 0 and self._frame_is(self.stack[idx], ptag, pclasses, pid) and above(pos - 1, idx - 1)
             else:
-                while idx >= 0 and not self._frame_is(self.stack[idx], ptag, pclasses, pid):
-                    idx -= 1
-                if idx < 0:
-                    return False
-                idx -= 1
-            pos -= 1
-        return True
+                ok = False
+                for j in range(idx, -1, -1):
+                    self.match_budget -= 1  # every ancestor looked at is work, however few rules there are
+                    if self.match_budget <= 0:
+                        self.spent = True
+                        break
+                    if self._frame_is(self.stack[j], ptag, pclasses, pid) and above(pos - 1, j - 1):
+                        ok = True
+                        break
+            if not ok:
+                failed.add((pos, idx))
+            return ok
+
+        # the candidate element is not on the stack yet; the ancestors are
+        return above(len(want) - 2, len(self.stack) - 1)
 
     @staticmethod
     def _frame_is(f: _Frame, tag: str, classes: tuple, ident: str) -> bool:
@@ -3609,7 +4043,13 @@ class _InertText(html.parser.HTMLParser):
             (r for c in classes for r in self.by_class.get(c, ())),
             self.by_id.get(ident, ()) if ident else (),
         ):
-            if rule.order not in found and self._matches(rule, tag, classes, ident):
+            if rule.order in found:
+                continue
+            if self.match_budget <= 0:
+                self.spent = True
+                break
+            self.match_budget -= 1
+            if self._matches(rule, tag, classes, ident):
                 found[rule.order] = rule
         layers: list[tuple[int, int, tuple, int, str, str]] = []
         for rule in found.values():
@@ -3637,15 +4077,12 @@ class _InertText(html.parser.HTMLParser):
                 return False
         return False
 
-    def _implied_ends(self, tag: str) -> None:
+    def _head_open(self) -> bool:
         h = self._head
-        if (
-            h is not None
-            and tag not in _HTML_HEAD_OK
-            and tag != "head"
-            and len(self.stack) > h[0]
-            and self.stack[h[0]] is h[1]
-        ):
+        return h is not None and len(self.stack) > h[0] and self.stack[h[0]] is h[1]
+
+    def _implied_ends(self, tag: str) -> None:
+        if tag not in _HTML_HEAD_OK and tag != "head" and self._head_open():
             self._close_to("head")  # the omitted </head>
         if tag in _HTML_CLOSES_P:
             self._close_to("p", _HTML_SCOPE)
@@ -3657,9 +4094,13 @@ class _InertText(html.parser.HTMLParser):
         elif tag in ("td", "th"):
             for t in ("td", "th"):
                 self._close_to(t, frozenset(("tr", "table")))
-        elif tag in ("tr", "tbody", "thead", "tfoot"):
+        elif tag in ("tr", "tbody", "thead", "tfoot", "caption", "colgroup"):
+            table = frozenset(("table",))
             for t in ("td", "th", "tr"):
-                self._close_to(t, frozenset(("table",)))
+                self._close_to(t, table)
+            if tag != "tr":  # a new section, caption or column group ends the open one (optional end tags)
+                for t in ("tbody", "thead", "tfoot", "caption", "colgroup"):
+                    self._close_to(t, table)
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
         self._implied_ends(tag)
@@ -3671,21 +4112,23 @@ class _InertText(html.parser.HTMLParser):
         vis_hidden = parent.vis_hidden if parent else False
         font_zero = parent.font_zero if parent else False
         own = False
+        styled = parent.styled if parent else False
         if not gone:
             c = self._computed(tag, classes, ident, a.get("style", ""))
             if tag in _HTML_DROP or "hidden" in a or _css_hides(c):
                 gone = own = True
+                styled = styled or tag not in _HTML_DROP
             else:
                 vis = c.get("visibility")
                 if vis in ("hidden", "collapse"):
-                    vis_hidden = own = True
-                elif vis == "visible":
-                    vis_hidden = False
+                    vis_hidden = own = styled = True
+                elif vis in ("visible", "initial", "revert", "revert-layer"):
+                    vis_hidden = False  # inherit and unset keep what the parent has
                 fs = c.get("font-size")
                 if fs is not None:
                     if _css_zero(fs):
-                        font_zero = own = True
-                    elif _CSS_ABS_LENGTH.match(fs) or fs in _CSS_FONT_KEYWORDS:
+                        font_zero = own = styled = True
+                    elif _CSS_ABS_LENGTH.match(fs) or fs in _CSS_FONT_KEYWORDS or fs in ("initial", "revert", "revert-layer"):
                         font_zero = False
         if tag in _HTML_VOID:
             if not (gone or vis_hidden or font_zero) and tag == "br":
@@ -3693,7 +4136,7 @@ class _InertText(html.parser.HTMLParser):
             return
         if len(self.stack) >= _HTML_MAX_OPEN:
             raise _HtmlStop
-        frame = _Frame(tag, classes, ident, gone, vis_hidden, font_zero, own)
+        frame = _Frame(tag, classes, ident, gone, vis_hidden, font_zero, own, styled)
         if tag == "head":
             self._head = (len(self.stack), frame)
         self.stack.append(frame)
@@ -3723,8 +4166,12 @@ class _InertText(html.parser.HTMLParser):
                 self._emit(" ")
 
     def handle_data(self, data: str) -> None:
+        if data.strip() and self.stack and self.stack[-1].tag == "head" and self._head_open():
+            self._close_to("head")  # text directly in the head ends it: the omitted </head>
         if self._visible():
             self._emit(data)
+        elif data.strip() and self.stack and self.stack[-1].styled:
+            self.suppressed = True
 
 
 def html_to_text(markup: str, limit: int) -> str:
@@ -3761,14 +4208,21 @@ def _html_convert(markup: str, limit: int) -> tuple[str, list[str]]:
         incomplete = True
     except Exception:  # noqa: BLE001 - hostile or broken markup: keep what was read, and say so
         incomplete = True
+    if parser.spent:
+        state["uncertain"] = True
     text = "".join(parser.out)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf" or ch in _HTML_JOINERS)
     lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in text.split("\n")]
-    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()[:limit]
-    if parser.hidden:
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    if len(cleaned) > limit:
+        parser.truncated = True
+    cleaned = cleaned[:limit]
+    if parser.hidden or parser.suppressed:
         notes.append(_HTML_SWALLOWED)
     if incomplete:
         notes.append(_HTML_INCOMPLETE)
+    if parser.truncated:
+        notes.append(_HTML_TRUNCATED)
     if state["uncertain"]:
         notes.append(_HTML_STYLE_NOTE)
     return cleaned, notes
@@ -3782,6 +4236,7 @@ _HTML_SWALLOWED = (
 _HTML_INCOMPLETE = (
     "(Part of this HTML body is not shown: it is nested too deeply, is malformed or could not be read.)"
 )
+_HTML_TRUNCATED = "(This HTML body is longer than is shown; the rest was left out.)"
 _HTML_STYLE_NOTE = (
     "(Some styles in this HTML body were not evaluated, so text they hide may appear here.)"
 )
@@ -3937,13 +4392,30 @@ def _folder_outside_item(
 
 
 def _stat_hidden(hidden: dict[str, Any], f: Path, st: os.stat_result) -> bool:
-    """Whether a folder file is already dismissed at its current mtime and size.
+    """Whether a folder file is still dismissed at its current mtime, size and content.
 
-    The stored version also names the content, which only reading the file can tell; a
-    stat-identical match counts as dismissed here and is verified when the file is read."""
+    A stored version names the content digest too. Time and size alone repeat after an in-place
+    edit with a restored timestamp, so a stat match is confirmed by reading the file (the same
+    bounded read that makes its version); a file that cannot be read or differs is not
+    dismissed. A version stored without a digest can only be matched on time and size."""
     stored = hidden.get("outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest())
+    if not isinstance(stored, str):
+        return False
     key = f"{st.st_mtime_ns}:{st.st_size}"
-    return isinstance(stored, str) and (stored == key or stored.startswith(key + ":"))
+    if stored == key:
+        return True
+    if not stored.startswith(key + ":"):
+        return False
+    try:
+        fd = os.open(f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            now = os.fstat(fh.fileno())
+            if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                return False
+            raw = fh.read(_OUTSIDE_READ_LIMIT)
+    except OSError:
+        return False
+    return stored == f"{key}:{hashlib.sha256(raw).hexdigest()[:16]}"
 
 
 def _scan_outside_folder(
@@ -4141,28 +4613,27 @@ def outside_items(
     except OSError as exc:
         errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
         filed = []
-    for f in filed:
+    tried = 0
+    for index, f in enumerate(filed):
         if f.is_symlink():
             continue
+        if read_budget is not None and tried >= read_budget:
+            # The budget is spent before the next record is read, and what is left is reported.
+            if unread is not None:
+                unread[0] += sum(1 for rest in filed[index:] if not rest.is_symlink())
+            break
+        tried += 1
         before = len(errors)
         rec = _read_json(f, errors=errors, source="outside")
         if _is_done(rec):
             done_seen = True  # locally Done, waiting out its undo window; not in the queue
-            if retained is not None and _is_filed_record(f, rec) and isinstance(rec.get("version"), str):
+            if retained is not None and _is_filed_record(rec, f.stem) and isinstance(rec.get("version"), str):
                 retained[rec["id"]] = rec["version"]
             continue
         if _bad_done(rec):
             errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
             continue
-        if (
-            rec.get("id") == f"outside:filed:{f.stem}"
-            and _FILED_ID.fullmatch(rec["id"])
-            and rec.get("origin") == "filed"
-            and rec.get("kind") in _OUTSIDE_KINDS
-            and all(isinstance(rec.get(key), str) and rec[key].strip()
-                    for key in ("version", "title", "act_where"))
-            and isinstance(rec.get("text"), str)
-        ):
+        if _is_filed_record(rec, f.stem):
             if visible is None or visible(rec["id"], rec["version"]):
                 items.append(rec)
         elif len(errors) == before and os.path.lexists(f):
@@ -4195,7 +4666,7 @@ def outside_items(
     claimed: set[Path] = set()
     omitted: set[Path] = set()  # files never read, and dismissed ones never listed: each counted once
     hidden_omitted: set[Path] = set()
-    attempts = [max(0, read_budget - len(items))] if read_budget is not None else None
+    attempts = [max(0, read_budget - tried)] if read_budget is not None else None
     for name in str(raw).split(","):
         if not name.strip():
             continue
@@ -4276,7 +4747,7 @@ def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
             raise SourceUnavailable(str(exc)) from exc
         if not rec:
             raise LookupError("outside item is no longer available")
-        if rec.get("id") != item_id or rec.get("origin") != "filed" or not isinstance(rec.get("text"), str):
+        if not _is_filed_record(rec, match.group(1)):
             raise SourceUnavailable("filed outside record is invalid; repair it")
         return rec
     if not _FOLDER_ID.fullmatch(item_id or ""):
@@ -4345,6 +4816,8 @@ def done_outside(
                 raise SourceUnavailable(str(exc)) from exc
             if not rec:
                 raise LookupError("Filed outside item no longer exists")
+            if not _is_filed_record(rec, match.group(1)):
+                raise SourceUnavailable("filed outside record is invalid; repair it")
             if rec.get("version") != version:
                 raise RuntimeError(
                     "Outside item changed; refresh before marking it Done"
@@ -4352,19 +4825,26 @@ def done_outside(
             if not _is_done(rec):
                 rec["done_at"] = time.time()
                 rec["done_token"] = uuid.uuid4().hex
+                rec["done_order"] = _dismissal_order()
                 _write_json(f, rec)
                 # The Done is committed. Enforcing the keep limit is best effort: a failure there
                 # is reported in the reply, never as a failed Done the client could not undo.
                 cleanup_failed += _purge_logged(d)
             token = _done_token(rec)
-        reply = {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS, "token": token}
+        order = rec.get("done_order")
+        if isinstance(order, bool) or not isinstance(order, int):
+            order = int((_done_at(rec) or 0) * 1000)  # a Done written before orders existed
+        reply = {
+            "ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS,
+            "token": token, "order": order,
+        }
         if cleanup_failed:
             reply["cleanup_failed"] = cleanup_failed
         return reply
     if not _FOLDER_ID.fullmatch(item_id):
         raise ValueError("id must identify an outside item")
-    token = hide(item_id, version, home)
-    return {"ok": True, "hidden": True, "local_only": True, "token": token}
+    token, order = hide_ordered(item_id, version, home)
+    return {"ok": True, "hidden": True, "local_only": True, "token": token, "order": order}
 
 
 # --- the queue -----------------------------------------------------------------------------
@@ -4754,18 +5234,33 @@ def _comments_since_block(
 ) -> list[tuple[str, str]]:
     """``(author, body)`` of the comments made since the current block began, oldest first.
 
-    With the block's event id a comment counts when its ``commented`` event follows the block
-    (event ids keep their order within one second) or its time is strictly later; without it,
-    when it is at or after the block's second. Older blocks' comments never count."""
+    With the block's event id a comment is placed by its ``commented`` event when every comment
+    has one (event ids are ordered, clocks are not); when some comment has none, its time
+    decides as well, a comment counting when strictly later than the block. Without the id, a
+    comment counts when it is at or after the block's second. Older blocks' comments never count."""
     strict = block_id is not None
     cut = (since or 0) + 1 if strict else (since or 0)
     try:
+        by_event_only = False
+        if strict:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            logged = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
+                (task_id,),
+            ).fetchone()[0]
+            by_event_only = logged >= total
         rows = {
             r[0]: (r[1], r[2])
-            for r in conn.execute(
-                "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-                (task_id, cut),
-            ).fetchall()
+            for r in (
+                []
+                if by_event_only
+                else conn.execute(
+                    "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+                    (task_id, cut),
+                ).fetchall()
+            )
         }
         if strict:
             n = conn.execute(
@@ -4782,17 +5277,47 @@ def _comments_since_block(
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
         comments = list(kanban_db.list_comments(conn, task_id))
         keyed = [(getattr(c, "id", None) or i, c) for i, c in enumerate(comments, 1)]
-        rows = {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
+        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
+        by_event_only = strict and (
+            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
+        )
+        rows = {} if by_event_only else {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
         if strict:
             n = sum(
                 1
-                for e in kanban_db.list_events(conn, task_id)
+                for e in all_events
                 if getattr(e, "kind", None) == "commented"
                 and int(getattr(e, "id", 0) or 0) > block_id
             )
             for k, c in keyed[len(keyed) - n :] if n else []:
                 rows[k] = (c.author, c.body)
     return [rows[k] for k in sorted(rows)]
+
+
+# Callers in this process that rely on one recovery marker (data folder, card, block version):
+# {"users": callers still inside answer_card, "ours": one of them recorded it, "keep": one of
+# them posted an answer whose release failed, so the marker is that answer's only recovery}.
+_MARKER_USERS: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+_MARKER_LOCK = threading.Lock()
+
+
+def _marker_join(key: tuple[str, str, str | None]) -> dict[str, Any]:
+    with _MARKER_LOCK:
+        entry = _MARKER_USERS.setdefault(key, {"users": 0, "ours": False, "keep": False})
+        entry["users"] += 1
+        return entry
+
+
+def _marker_leave(key: tuple[str, str, str | None], entry: dict[str, Any], *, keep: bool) -> bool:
+    """Leave the marker's user list. True only for the last user out when the marker was
+    recorded for this block and nobody needs it for a failed release: it is then safe to drop."""
+    with _MARKER_LOCK:
+        entry["keep"] = entry["keep"] or keep
+        entry["users"] -= 1
+        if entry["users"] > 0:
+            return False
+        _MARKER_USERS.pop(key, None)
+        return bool(entry["ours"] and not entry["keep"])
 
 
 def answer_card(
@@ -4846,8 +5371,9 @@ def answer_card(
     comment_id: int | None = None
     post_answer = False
     marker_reserved = False  # the recovery marker for this block is recorded
-    marker_ours = False  # ... and this call recorded it (a refused call removes only its own)
     marker_full = False
+    marker_key = (str(data_dir(home)), item_id, version_s)
+    marker_entry = _marker_join(marker_key) if release else None
     if release:
         # Reserve the failed-release marker BEFORE anything is written: a marker that cannot
         # be stored after the answer was posted would leave an answered card with no recovery
@@ -4857,9 +5383,13 @@ def answer_card(
         else:
             try:
                 _set_pending_release(item_id, version_s, home)
-                marker_reserved = marker_ours = True
+                marker_reserved = True
+                marker_entry["ours"] = True
             except PendingReleaseFull:
                 marker_full = True
+            except BaseException:
+                _marker_leave(marker_key, marker_entry, keep=False)
+                raise
     released = False
     release_failed = False
     release_error: BaseException | None = None
@@ -4942,7 +5472,14 @@ def answer_card(
                         )
             committed = True
     finally:
-        if not committed and marker_ours:
+        # The marker is dropped only by the last caller out, and only when none of them wrote an
+        # answer whose release failed: another caller may rely on the marker this one reserved.
+        last_out = (
+            _marker_leave(marker_key, marker_entry, keep=release_failed)
+            if marker_entry is not None
+            else False
+        )
+        if not committed and last_out:
             # Nothing was written (stale, refused, unreadable): drop the marker reserved for it.
             try:
                 _set_pending_release(item_id, None, home, expected=version_s)
@@ -5272,7 +5809,7 @@ _ASK_SECRET_PATTERNS = (
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[redacted]"),
     (
         re.compile(
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
         ),
         "[redacted]",
     ),
@@ -5528,6 +6065,10 @@ _ASK_NUMERIC_SECRET_WORDS = frozenset(
         "private_key",
         "credential",
         "storepass",
+        "token",
+        "auth",
+        "authentication",
+        "oauth",
     }
 )
 
@@ -5543,6 +6084,8 @@ def _ask_numeric_credential(key: str, value: Any, word: str) -> bool:
         digits = bool(re.fullmatch(r"\d+", value.strip().strip("\"' ")))
     else:
         return False
+    if str(key).strip().strip("\"' ").casefold().endswith("tokens"):
+        return False  # a count of tokens (``tokens: 12``), not a token
     return digits and word in _ASK_NUMERIC_SECRET_WORDS and _ask_secret_key_is_exact(key)
 
 
@@ -6101,6 +6644,11 @@ def _ask_withhold_unscanned(rest: str) -> str:
                 out.append("[redacted: too much structured text to scan]" if risky(rest[i:]) else rest[i:])
                 break
             end = _ask_json_container_end(rest, i)
+            if end is None and risky(rest[i:]):
+                # A container that cannot be delimited (an escaped or unclosed JSON string) cannot
+                # be judged piece by piece: the remainder is withheld rather than copied.
+                out.append("[redacted: too much structured text to scan]")
+                break
             if end is not None and risky(rest[i:end]):
                 out.append("[redacted]")
                 i = end
@@ -6262,7 +6810,18 @@ def _ask_card_view(
                 done[k] = "[redacted]"
             else:
                 done[k] = _ask_card_view(v, key, _text_budget, _scrub)
-        return {k: done[k] for k in value if k in done}
+        shown: dict[Any, Any] = {}
+        for k in value:
+            if k not in done:
+                continue
+            name = k
+            if isinstance(k, str):
+                for path in _scrub:
+                    name = name.replace(path, "[workspace]")
+                while name != k and name in shown:  # two keys that scrub alike both survive
+                    name += "#"
+            shown[name] = done[k]
+        return shown
     if isinstance(value, (list, tuple)):
         if _text_budget is None:
             return [_ask_card_view(v, _key, None, _scrub) for v in value]
@@ -6371,13 +6930,35 @@ POCKET_TOTAL_PROMPT_CHARS = 20000  # all prompts in one pack
 # source could not be read: some say a listing was cut at its limit, and some are about cleanup or
 # stored state. Only a read failure is an "unread source".
 _READ_SOURCES = ("kanban", "chat", "prompt", "pairing", "outside")
-_CAPACITY_NOTICES = ("agent-filed items are waiting (limit",)  # every record was read
-_LISTING_CUT_NOTICES = (  # records exist that the list does not show
-    "folder limit, showing the newest",
-    "filed entries; only the first",
-    "hidden files are not listed",
+
+# Each notice is matched as a whole message built from its own template. A file name or an exception
+# message can contain any of these words, so a substring match would turn a failed read into a
+# "cleanup" notice and an empty pack would claim to be complete.
+def _notice(*patterns: str) -> tuple[re.Pattern[str], ...]:
+    return tuple(re.compile(p, re.DOTALL) for p in patterns)
+
+
+_CAPACITY_NOTICES = _notice(  # every record was read
+    r"outside: \d+ agent-filed items are waiting \(limit \d+\); agents cannot file more until you finish some",
 )
-_STATE_NOTICES = ("could not remove", "retention cleanup", "invalid done_at")
+_LISTING_CUT_NOTICES = _notice(  # records exist that the list does not show
+    r"outside: .*: folder limit, showing the newest \d+; \d+ older files are waiting\. "
+    r"Finish or hide items to bring them into view",
+    r"outside: more than \d+ filed entries; only the first \d+ are read",
+    r"outside: \d+ hidden files are not listed \(at most the newest \d+ per folder are shown\)",
+)
+_STATE_NOTICES = _notice(
+    r"outside: could not remove \d+ expired done record\(s\); their text stays until a later cleanup succeeds",
+    r"outside: retention cleanup stopped early; some filed records were not checked",
+    r"outside: retention cleanup failed: \w+",
+    r"outside: retention cleanup did not run: \w+; it retries on the next poll",
+    r"outside: .*: invalid done_at; kept for repair",
+    r"prompt: .*: \w+; could not remove stale record",
+)
+
+
+def _is_notice(text: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    return any(p.fullmatch(text) for p in patterns)
 
 
 def unread_sources(errors: list[str] | None) -> int:
@@ -6390,7 +6971,7 @@ def unread_sources(errors: list[str] | None) -> int:
         head = text.split(":", 1)[0]
         if head.split("[", 1)[0] not in _READ_SOURCES:
             continue
-        if any(m in text for m in _CAPACITY_NOTICES + _LISTING_CUT_NOTICES + _STATE_NOTICES):
+        if _is_notice(text, _CAPACITY_NOTICES + _LISTING_CUT_NOTICES + _STATE_NOTICES):
             continue
         sources.add(head)
     return len(sources)
@@ -6398,7 +6979,7 @@ def unread_sources(errors: list[str] | None) -> int:
 
 def listing_cut(errors: list[str] | None) -> bool:
     """True when a source says some of its records are not in the list."""
-    return any(m in str(e) for e in errors or () for m in _LISTING_CUT_NOTICES)
+    return any(_is_notice(str(e), _LISTING_CUT_NOTICES) for e in errors or ())
 
 
 def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
@@ -6506,7 +7087,13 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         cut = bool(it.get("ask_truncated") or it.get("truncated"))
         room = min(POCKET_PROMPT_CHARS, max(0, POCKET_TOTAL_PROMPT_CHARS - spent))
         if len(prompt) > room:
-            prompt = prompt[: max(0, room - len(_ASK_CUT))] + _ASK_CUT
+            # The marker is part of the budget: with no room left for it, the card carries no
+            # prompt text and says it was cut through its flag and warning.
+            prompt = (
+                prompt[: room - len(_ASK_CUT)] + _ASK_CUT
+                if room > len(_ASK_CUT)
+                else prompt[:room]
+            )
             cut = True
         spent += len(prompt)
         cards.append(
@@ -6538,7 +7125,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         "cards": cards,
         # False when a source could not be read or a card was cut or left out: an empty pack is
         # then not "nothing needs you".
-        "complete": not unread_sources(queue.get("errors")) and not listing_cut(queue.get("errors")) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
+        "complete": not unread_sources(queue.get("errors")) and not listing_cut(queue.get("errors")) and not coverage_gaps(queue) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
         # What this pack leaves out, as counts only; the original surface has the rest.
         "omitted": {
             "unread_sources": unread_sources(queue.get("errors")),

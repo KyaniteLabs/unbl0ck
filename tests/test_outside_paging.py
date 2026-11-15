@@ -143,6 +143,7 @@ class NestedFolders(FolderPaging):
         self.assertTrue({"old0.txt", "old1.txt"} <= {p.split("/")[-1] for p in paths} or
                         {"child/old0.txt", "child/old1.txt"} <= paths, paths)
 
+    @patch.object(needs, "_current_version", lambda *a, **kw: None)  # this test is about the store, not staleness
     def test_paging_survives_a_backlog_larger_than_the_dismissal_store(self):
         self.watch()
         total = needs._HIDDEN_KEEP + needs._OUTSIDE_LIMIT + 100  # 1,300 with production limits
@@ -292,6 +293,7 @@ class FiledCap(OutsideFixture):
 class RetentionEvictsOldestNotAlphabetical(unittest.TestCase):
     """The keep limits drop the OLDEST entries, also after the file was written and read back."""
 
+    @patch.object(needs, "_current_version", lambda *a, **kw: None)  # this test is about the store, not staleness
     def test_hidden_cap_evicts_the_oldest_dismissal_even_when_its_name_sorts_last(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)

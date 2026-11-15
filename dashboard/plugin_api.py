@@ -8,7 +8,7 @@ GET  /search?q=                  explicit bounded full-content search; ids, vers
 GET  /card/ask/{job}         poll a running Ask
 POST /card/ask               ask the configured model about one card (multi-turn)
 POST /kanban/answer          {board, task_id, text, release, version}: comment as the principal, optionally unblock
-POST /hide                   {id, version}: "Not for me" until the source changes; returns the Undo token
+POST /hide                   {id, version}: "Not for me" until the source changes; returns the Undo token and its commit order
 POST /unhide                 {id, token?}: undo "Not for me" or a local Done
 POST /outside/done           {id, version}: local, undoable Done for a filed record or a watched file version; returns the Undo token
 GET  /pack                   the queue as a Pocket-format card pack (read-only)
@@ -132,7 +132,10 @@ class CardAsk(BaseModel):
     id: str = Field(default="", max_length=MAX_ID)
     board: str = Field(default="", max_length=MAX_ID)
     task_id: str = Field(default="", max_length=MAX_ID)
-    messages: list[AskMessage] = Field(default_factory=list, max_length=MAX_MESSAGES)
+    # validate_default: a body that leaves "messages" out is judged like one that sends [].
+    messages: list[AskMessage] = Field(
+        default_factory=list, max_length=MAX_MESSAGES, validate_default=True
+    )
     # The queue version the human read; an Ask about an older question is refused (409).
     version: Optional[str] = Field(default=None, max_length=MAX_ID)
     # Client-chosen job id: re-sending the same id returns the same job instead of a second
@@ -418,16 +421,26 @@ def card_ask(body: CardAsk):
         job = body.request_id or uuid.uuid4().hex
         try:
             # The canonical card identity from the validated board/task pair, never the optional raw id.
-            _ASK_JOBS.create(job, card=f"kanban:{board}:{task_id}")
+            ticket = _ASK_JOBS.create(job, card=f"kanban:{board}:{task_id}")
         except jobs.IllegalTransition:
-            return {"ok": True, "pending": True, "job": job}   # a concurrent twin got there first
+            # A concurrent twin got there first. It answers only for its own card, like a retry.
+            twin = _ASK_JOBS.get(job)
+            if twin is not None and twin.get("unavailable"):
+                raise HTTPException(status_code=503, detail="the saved state for this request cannot be read right now. Retry in a moment.")
+            if twin is not None and twin.get("card") != f"kanban:{board}:{task_id}":
+                raise HTTPException(status_code=409, detail="this request id belongs to a different card")
+            return {"ok": True, "pending": True, "job": job}
+        except jobs.JournalUnavailable:
+            raise HTTPException(status_code=503, detail="Ask cannot tell which profile this request belongs to right now. Retry in a moment.")
         try:
-            _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, job, ctx, messages)
+            # The worker completes the job through its ticket, never by id alone: a job deleted
+            # and re-created under the same id is a different job.
+            _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, ticket, ctx, messages)
             submitted = True
         except Exception as exc:
-            _ASK_JOBS.fail(job, "could not start Ask")
+            _ASK_JOBS.fail(ticket, "could not start Ask")
             try:
-                _ASK_JOBS.consume(job)
+                _ASK_JOBS.consume(ticket)
             except jobs.DiscardFailed:
                 pass  # the settled record expires on its own; the caller still gets the 503 below
             log.warning("unbl0ck: could not submit Ask: %s", type(exc).__name__)
@@ -598,14 +611,14 @@ def answer(body: Answer, response: Response):
 def hide(body: Hide):
     _bounded(id=body.id, version=body.version)
     try:
-        token = _needs().hide(body.id, body.version)
+        token, order = _needs().hide_ordered(body.id, body.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except TimeoutError:
         raise HTTPException(status_code=409, detail="busy, retry")
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return {"ok": True, "token": token}
+    return {"ok": True, "token": token, "order": order}
 
 
 @router.post("/outside/done")
