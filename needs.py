@@ -1896,6 +1896,75 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
     }
 
 
+# Full-content search is an explicit action over the same readers the queue uses. It is
+# bounded three ways (items per source, characters per item, terms in the query), reports
+# what it did not cover, never calls a model and writes nothing.
+SEARCH_MAX_ITEMS = 200
+SEARCH_MAX_CHARS = FULL_TEXT_LIMIT
+SEARCH_MAX_QUERY = 200
+SEARCH_MAX_TERMS = 8
+
+
+def search_text(query: Any) -> dict[str, Any]:
+    """Which current outside, chat and live-prompt items contain every term in `query`.
+
+    Returns ids, versions and sources only (never the matching text) plus coverage: items
+    searched and not searched per source, items whose text was cut at SEARCH_MAX_CHARS,
+    password prompts skipped, and per-source failures. Raises ValueError for a bad query."""
+    if not isinstance(query, str) or not query.strip() or len(query) > SEARCH_MAX_QUERY:
+        raise ValueError(f"query must be 1 to {SEARCH_MAX_QUERY} characters")
+    terms = query.casefold().split()
+    if len(terms) > SEARCH_MAX_TERMS:
+        raise ValueError(f"use at most {SEARCH_MAX_TERMS} search terms")
+    home = hermes_home()
+    readers = (
+        ("outside", lambda errs: outside_items(errors=errs)),
+        ("chat", lambda errs: chat_items(home, errors=errs, full=True)),
+        ("prompt", lambda errs: wait_items(home, errors=errs, full=True)),
+    )
+    matches: list[dict[str, str]] = []
+    searched: dict[str, int] = {}
+    not_searched: dict[str, int] = {}
+    errors: list[str] = []
+    cut = 0
+    private = 0
+    for source, read in readers:
+        source_errors: list[str] = []
+        try:
+            items = read(source_errors)
+        except Exception:  # noqa: BLE001
+            errors.append(f"{source}: could not be read, so it was not searched")
+            continue
+        if source_errors:
+            errors.append(f"{source}: some records could not be read")
+        window = items[:SEARCH_MAX_ITEMS]
+        if len(items) > len(window):
+            not_searched[source] = len(items) - len(window)
+        searched[source] = len(window)
+        for item in window:
+            if item.get("kind") == "sudo":
+                private += 1  # password prompts are never expanded, searched or returned
+                continue
+            text = str(item.get("text") or item.get("ask") or "")
+            if len(text) > SEARCH_MAX_CHARS:
+                cut += 1
+                text = text[:SEARCH_MAX_CHARS]
+            hay = f"{item.get('title') or ''}\n{text}".casefold()
+            if all(term in hay for term in terms):
+                matches.append({"id": str(item.get("id")), "version": str(item.get("version")), "source": source})
+    return {
+        "query": query.strip(),
+        "matches": matches,
+        "searched": searched,
+        "not_searched": not_searched,
+        "items_cut": cut,
+        "skipped_private": private,
+        "errors": errors,
+        "partial": bool(not_searched or cut or errors),
+        "limits": {"items_per_source": SEARCH_MAX_ITEMS, "chars_per_item": SEARCH_MAX_CHARS},
+    }
+
+
 # --- things waiting outside Hermes ----------------------------------------------------------
 
 _OUTSIDE_KINDS = ("draft", "notes", "approval", "other")

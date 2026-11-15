@@ -4,6 +4,7 @@ GET  /queue                  the queue (Kanban, outside items, chats, live promp
 GET  /card?id=               read-only context for one Kanban card
 GET  /outside/text?id=&version=  full text for one current outside item, fetched on demand
 GET  /source/text?id=&version=   full text for one current chat or live-prompt item, fetched on demand
+GET  /search?q=                  explicit bounded full-content search; ids, versions and coverage only
 GET  /card/ask/{job}         poll a running Ask
 POST /card/ask               ask the configured model about one card (multi-turn)
 POST /kanban/answer          {board, task_id, text, release, version}: comment as the principal, optionally unblock
@@ -307,6 +308,17 @@ def source_text(id: str = "", version: str = ""):
         raise HTTPException(status_code=409, detail=str(exc))
     except n.SourceUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.get("/search")
+def search(q: str = ""):
+    """Explicit full-content search over current outside, chat and live-prompt items."""
+    if _CONTROL.search(q):
+        raise HTTPException(status_code=400, detail="invalid query")
+    try:
+        return _needs().search_text(q)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/card/ask")

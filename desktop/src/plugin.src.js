@@ -1451,6 +1451,10 @@ function Page({ ctx, refresh }) {
   const q = useValue($queue)
   const [query, setQuery] = useState('')
   const [source, setSource] = useState('all')
+  // Full-text results belong to the query that produced them; editing the query drops them.
+  const [fullHits, setFullHits] = useState(null)
+  const [fullBusy, setFullBusy] = useState(false)
+  const [fullError, setFullError] = useState('')
   useEffect(() => { if (Date.now() - (q.at || 0) > 10000) refresh() }, [])   // opening the page shows fresh data
   const fx = useValue($fxOn)
   const undoList = useValue($undo) || []
@@ -1492,10 +1496,12 @@ function Page({ ctx, refresh }) {
   const terms = query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean)
   const filtered = source !== 'all' || terms.length > 0
   // Search the text already in the queue; typing never fetches files or calls the model.
+  // A full-text hit counts only for the exact item version it was found in.
+  const fullKeys = new Set(fullHits && fullHits.query === query.trim() ? fullHits.matches.map(m => `${m.id}@${m.version}`) : [])
   const visible = q.items.filter(i => {
     if (source !== 'all' && i.source !== source) return false
     const text = [i.title, i.ask, i.bluf, i.why, i.act_where, i.ref, i.to, i.task_id, i.board, i.owner, i.profile, i.chat_title, i.chat_with].filter(Boolean).join(' ').toLocaleLowerCase()
-    return terms.every(term => text.includes(term))
+    return terms.every(term => text.includes(term)) || fullKeys.has(`${i.id}@${i.version}`)
   })
   const visibleIds = new Set(visible.map(i => i.id))
   // Hide filtered cards without unmounting them: drafts and open conversations survive.
@@ -1507,7 +1513,33 @@ function Page({ ctx, refresh }) {
   const outside = q.items.filter(i => i.source === 'outside')
   const prompts = q.items.filter(i => i.source === 'prompt')
   const pairing = q.items.filter(i => i.source === 'pairing')
-  const clearFilters = () => { setQuery(''); setSource('all') }
+  const clearFilters = () => { setQuery(''); setSource('all'); setFullHits(null); setFullError('') }
+  const changeQuery = value => { setQuery(value); setFullHits(null); setFullError('') }
+  // Explicit, one request per click: never from typing, an effect or a timer, and never a model call.
+  const runFullSearch = async () => {
+    const asked = query.trim()
+    if (!asked || fullBusy) return
+    setFullBusy(true)
+    setFullError('')
+    try {
+      const d = await ctx.rest(`/search?q=${encodeURIComponent(asked)}`)
+      setFullHits({ ...d, query: asked })
+    } catch (e) {
+      setFullHits(null)
+      setFullError(String(e?.message || e))
+    } finally {
+      setFullBusy(false)
+    }
+  }
+  const fullSummary = h => {
+    const parts = [`full text searched ${Object.entries(h.searched || {}).map(([s, n]) => `${n} ${s}`).join(', ') || 'nothing'}`]
+    const miss = Object.entries(h.not_searched || {}).map(([s, n]) => `${n} ${s} not searched (limit ${h.limits.items_per_source} per source)`)
+    if (miss.length) parts.push(miss.join(', '))
+    if (h.items_cut) parts.push(`${h.items_cut} long item(s) searched only to ${h.limits.chars_per_item} characters`)
+    if (h.skipped_private) parts.push(`${h.skipped_private} password prompt(s) never searched`)
+    for (const e of h.errors || []) parts.push(e)
+    return parts.join(' · ') + (h.partial ? ' · results may be incomplete' : '')
+  }
   const oldest = oldestAskSince(q.items)
   const oldestH = oldest ? (Date.now() / 1000 - oldest) / 3600 : 0
   let n = 0
@@ -1609,13 +1641,15 @@ function Page({ ctx, refresh }) {
           q.fault ? jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'LINK FAULT \\\\ ' }), q.fault] }) : null,
           ...(q.errors || []).map(err => jsxs('div', { className: 'ub-err', role: 'alert', children: [jsx('b', { children: 'SOURCE FAULT \\\\ ' }), err] }, err)),
           jsxs('div', { className: 'ub-filter', role: 'search', 'aria-label': 'Filter the queue', children: [
-            jsx('input', { type: 'search', value: query, placeholder: 'Find a card by title, preview, app or reference…', 'aria-label': 'Search queue', onChange: e => setQuery(e.target.value), onKeyDown: e => { if (e.key === 'Escape') { setQuery(''); e.stopPropagation() } } }),
+            jsx('input', { type: 'search', value: query, placeholder: 'Find a card by title, preview, app or reference…', 'aria-label': 'Search queue', onChange: e => changeQuery(e.target.value), onKeyDown: e => { if (e.key === 'Escape') { changeQuery(''); e.stopPropagation() } } }),
             jsx('select', { value: source, 'aria-label': 'Source', onChange: e => setSource(e.target.value), children: [
               ['all', 'All sources'], ['prompt', 'Live prompts'], ['pairing', 'Access requests'], ['kanban', 'Kanban'], ['outside', 'Outside Hermes'], ['chat', 'Chats']
             ].map(([value, label]) => jsx('option', { value, children: label }, value)) }),
+            terms.length ? button({ kind: 'ghost', disabled: fullBusy, onClick: runFullSearch, children: fullBusy ? 'Searching…' : 'Search full text' }) : null,
             filtered ? button({ kind: 'ghost', onClick: clearFilters, children: 'Clear filters' }) : null
           ] }),
-          filtered ? jsx('div', { className: 'ub-filter-status', role: 'status', children: `${visible.length} of ${q.items.length} cards shown · search uses titles and previews` }) : null,
+          filtered ? jsx('div', { className: 'ub-filter-status', role: 'status', children: `${visible.length} of ${q.items.length} cards shown · this box searches titles and previews of the cards loaded here` + (fullHits && fullHits.query === query.trim() ? ` · ${fullSummary(fullHits)}` : '') }) : null,
+          fullError ? jsx('div', { className: 'ub-err', role: 'alert', children: `Full-text search failed: ${fullError}. The filter above still works on titles and previews.` }) : null,
           filtered && !visible.length && !q.loading ? jsx('div', { className: 'ub-clear', children: jsx('span', { children: 'No cards match these filters. Clear filters to see the queue.' }) }) : null,
           ended.length
             ? jsxs('div', {

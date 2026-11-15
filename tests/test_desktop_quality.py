@@ -75,7 +75,7 @@ let cards = all(tree).filter(n => n?.type === Item);
 assert.equal(cards.length,2,'filtering must retain mounted cards');
 assert.equal(cards.find(n => n.key === kanban.id).props.hidden,true);
 assert.equal(cards.find(n => n.key === draft.id).props.hidden,false);
-assert.ok(all(tree).includes('1 of 2 cards shown · search uses titles and previews'));
+assert.ok(all(tree).includes('1 of 2 cards shown · this box searches titles and previews of the cards loaded here'));
 all(tree).find(n => n?.type === 'button' && n.props.children === 'Clear filters').props.onClick();
 tree = page();
 assert.equal(all(tree).filter(n => n?.type === Item && !n.props.hidden).length,2);
