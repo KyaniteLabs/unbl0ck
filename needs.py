@@ -3367,15 +3367,24 @@ _TOO_MANY_FILED = (
 )
 
 
-def _filed_files(d: Path) -> tuple[list[Path], bool]:
-    """At most ``_PURGE_SCAN_LIMIT`` filed-record paths of *d*, and whether there were more."""
+def _bounded_scandir(d: Path, *, limit: int, deadline: float | None = None) -> tuple[list[Path], bool]:
+    """At most *limit* entries of *d*, and whether the listing was cut (more entries, or the
+    monotonic *deadline* passed). Every entry is charged before any caller filters it, so a
+    folder of other files cannot stretch the scan. A folder that cannot be listed raises."""
+    out: list[Path] = []
     with os.scandir(d) as entries:
-        # Every entry counts toward the bound, not just the JSON ones: a folder of other files
-        # must not be read to the end before the limit applies.
-        seen = list(itertools.islice(entries, _PURGE_SCAN_LIMIT + 1))
-    names = [Path(e.path) for e in seen[:_PURGE_SCAN_LIMIT] if e.name.endswith(".json")]
-    names.sort(key=lambda p: p.name)
-    return names, len(seen) > _PURGE_SCAN_LIMIT
+        for entry in entries:
+            if len(out) >= limit or (deadline is not None and time.monotonic() > deadline):
+                return out, True
+            out.append(Path(entry.path))
+    return out, False
+
+
+def _filed_files(d: Path) -> tuple[list[Path], bool]:
+    """The filed-record paths among the first ``_PURGE_SCAN_LIMIT`` entries of *d*, by name,
+    and whether the listing was cut."""
+    entries, cut = _bounded_scandir(d, limit=_PURGE_SCAN_LIMIT)
+    return sorted((p for p in entries if p.name.endswith(".json")), key=lambda p: p.name), cut
 
 
 def _count_active(files: list[Path], skip: Path | None = None) -> int:
@@ -3397,7 +3406,7 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
     errors = [] if errors is None else errors
     deadline = time.monotonic() + _PURGE_SECONDS
     done: list[tuple[float, Path]] = []
-    removed = failed = scanned = 0
+    removed = failed = 0
 
     def remove(f: Path) -> None:
         nonlocal removed, failed
@@ -3408,43 +3417,40 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
             failed += 1
 
     try:
-        scan = os.scandir(d)
+        entries, cut = _bounded_scandir(d, limit=_PURGE_SCAN_LIMIT, deadline=deadline)
     except OSError as exc:
         errors.append(f"outside: could not list filed records: {type(exc).__name__}")
         return 0
-    with scan as entries:
-        for entry in entries:
-            if scanned >= _PURGE_SCAN_LIMIT or time.monotonic() > deadline:
-                errors.append(Notice("outside: retention cleanup stopped early; some filed records were not checked", "state"))
-                break
-            scanned += 1  # every entry counts, so non-JSON files cannot stretch the scan
-            if not entry.name.endswith(".json"):
-                continue
-            f = Path(entry.path)
-            if f.is_symlink():
-                continue
-            rec = _read_json(f)
-            if not _is_filed_record(rec, f.stem):
-                continue
-            if _bad_done(rec):
-                errors.append(Notice(f"outside: {f.name}: invalid done_at; kept for repair", "state"))
-                continue
-            done_at = _done_at(rec)
-            if done_at is None:
-                continue
-            if done_at > now:
-                # The clock stepped back since this Done: keep the record and restart its window.
-                try:
-                    rec["done_token"] = _done_token(rec)
-                    rec["done_at"] = now
-                    _write_json(f, rec)
-                except OSError:
-                    failed += 1
-                done_at = now
-            if now - done_at > OUTSIDE_UNDO_SECONDS:
-                remove(f)
-            else:
-                done.append((done_at, f))
+    for f in entries:
+        if time.monotonic() > deadline:
+            cut = True
+            break
+        if not f.name.endswith(".json") or f.is_symlink():
+            continue
+        rec = _read_json(f)
+        if not _is_filed_record(rec, f.stem):
+            continue
+        if _bad_done(rec):
+            errors.append(Notice(f"outside: {f.name}: invalid done_at; kept for repair", "state"))
+            continue
+        done_at = _done_at(rec)
+        if done_at is None:
+            continue
+        if done_at > now:
+            # The clock stepped back since this Done: keep the record and restart its window.
+            try:
+                rec["done_token"] = _done_token(rec)
+                rec["done_at"] = now
+                _write_json(f, rec)
+            except OSError:
+                failed += 1
+            done_at = now
+        if now - done_at > OUTSIDE_UNDO_SECONDS:
+            remove(f)
+        else:
+            done.append((done_at, f))
+    if cut:
+        errors.append(Notice("outside: retention cleanup stopped early; some filed records were not checked", "state"))
     done.sort()
     for _, f in done[: max(0, len(done) - _OUTSIDE_DONE_KEEP)]:
         remove(f)
@@ -4552,7 +4558,11 @@ def outside_items(
     except OSError as exc:
         errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
         filed = []
-    for f in filed:
+    for tried, f in enumerate(filed):
+        if read_budget is not None and tried >= read_budget:
+            if unread is not None:
+                unread[0] += len(filed) - tried
+            break
         if f.is_symlink():
             continue
         before = len(errors)
@@ -4601,7 +4611,7 @@ def outside_items(
     claimed: set[Path] = set()
     omitted: set[Path] = set()  # files never read, and dismissed ones never listed: each counted once
     hidden_omitted: set[Path] = set()
-    attempts = [max(0, read_budget - len(items))] if read_budget is not None else None
+    attempts = [max(0, read_budget - min(len(filed), read_budget))] if read_budget is not None else None
     for name in str(raw).split(","):
         if not name.strip():
             continue
@@ -6707,6 +6717,15 @@ def _ask_redact(text: str) -> str:
 ASK_CARD_CONTEXT_LIMIT = 24000
 _ASK_FIELD_CAP = 8000  # one field never takes more than this of the card budget
 _ASK_CUT = "…[truncated]"
+
+
+def _fit(text: str, room: int) -> str:
+    """*text* within *room* characters. A cut ends with ``_ASK_CUT``, counted in *room*; when
+    not even the marker fits, the text is cut bare and the caller's own flag says so."""
+    room = max(0, room)
+    if len(text) <= room:
+        return text
+    return text[: room - len(_ASK_CUT)] + _ASK_CUT if room > len(_ASK_CUT) else text[:room]
 # The decision comes first when the budget runs out; the description comes last.
 _ASK_VIEW_PRIORITY = {
     "title": 0,
@@ -6792,9 +6811,7 @@ def _ask_card_view(
         # is replaced as a whole instead of being left as a readable fragment.
         value = _ask_redact(value)
         if remaining is not None:
-            cap = min(remaining, _ASK_FIELD_CAP)
-            if len(value) > cap:
-                value = value[: max(0, cap - len(_ASK_CUT))] + _ASK_CUT
+            value = _fit(value, min(remaining, _ASK_FIELD_CAP))
             _text_budget[0] = remaining - len(value)
         return value
     return value
@@ -6866,7 +6883,7 @@ def build_ask_messages(
         if len(content) > room:
             if kept or room <= 0:
                 break
-            content = content[: max(0, room - len(_ASK_CUT))] + _ASK_CUT  # never silent
+            content = _fit(content, room)
         kept.append({"role": role, "content": content})
         used += len(content)
     messages.extend(reversed(kept))
@@ -7014,13 +7031,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         cut = bool(it.get("ask_truncated") or it.get("truncated"))
         room = min(POCKET_PROMPT_CHARS, max(0, POCKET_TOTAL_PROMPT_CHARS - spent))
         if len(prompt) > room:
-            # The marker is part of the budget: with no room left for it, the card carries no
-            # prompt text and says it was cut through its flag and warning.
-            prompt = (
-                prompt[: room - len(_ASK_CUT)] + _ASK_CUT
-                if room > len(_ASK_CUT)
-                else prompt[:room]
-            )
+            prompt = _fit(prompt, room)  # with no room for the marker, the flag says it was cut
             cut = True
         spent += len(prompt)
         cards.append(
