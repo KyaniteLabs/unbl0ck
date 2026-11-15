@@ -783,17 +783,28 @@ def _dismissal_order(home: Path | None) -> int:
     """A number that grows with each dismissal any process commits (milliseconds, never repeated
     or lowered by a clock that stands still or steps back). The last one is kept in ORDER_FILE
     and taken under the state lock, so it follows the order dismissals were committed in, which
-    the client cannot see from the order of its clicks or of the responses."""
+    the client cannot see from the order of its clicks or of the responses. A malformed counter,
+    or a missing one while stored dismissals already carry orders, refuses the dismissal."""
     out: dict[str, int] = {}
 
     def bump(data: dict[str, Any]) -> dict[str, Any]:
-        last = data.get("last")
-        last = last if isinstance(last, int) and not isinstance(last, bool) else 0
-        out["order"] = max(int(time.time() * 1000), last + 1)
+        if "last" not in data and _orders_issued(home):
+            raise RuntimeError(f"{ORDER_FILE} is missing; restore it before dismissing")
+        out["order"] = max(int(time.time() * 1000), data.get("last", 0) + 1)
         return {"last": out["order"]}
 
-    _update_state(home, data_dir(home) / ORDER_FILE, bump)
+    _update_state(home, data_dir(home) / ORDER_FILE, bump, entry_ok=lambda v: type(v) is int and v >= 0)
     return out["order"]
+
+
+def _orders_issued(home: Path | None) -> bool:
+    """Whether a stored dismissal carries an order (a token, or a Done); a record that cannot be
+    read, or a filed folder too large to check, counts as one."""
+    if any(_split_hidden(v)[1] for v in _load_hidden_raw(home, strict=True).values()):
+        return True
+    d, errors = _outside_dir(home, create=False), []
+    files, cut = _filed_files(d) if d.is_dir() else ([], False)
+    return cut or any("done_order" in _read_json(f, errors=errors) for f in files) or bool(errors)
 
 
 class StaleHide(RuntimeError):
