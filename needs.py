@@ -1702,17 +1702,6 @@ def _same_author(a: Any, b: Any) -> bool:
     return str(a or "").casefold() == str(b or "").casefold()
 
 
-def _commented_after(events: Iterable[Any], block_id: int, author: str) -> bool:
-    """Did *author* comment after the block event? Kanban appends a ``commented`` event, with
-    the author in its payload, for every comment; event ids keep their order within one second."""
-    for e in events:
-        if getattr(e, "kind", None) != "commented" or int(getattr(e, "id", 0) or 0) <= block_id:
-            continue
-        if _same_author(_event_payload(e).get("author"), author):
-            return True
-    return False
-
-
 def _answered_since(
     conn: Any,
     kanban_db: Any,
@@ -1721,60 +1710,12 @@ def _answered_since(
     since: int,
     block_id: int | None = None,
 ) -> bool:
-    """Has *author* commented since the block began? The one test for "answered", used by
-    the queue and by answer_card. Names compare in Python (casefold) on both paths: SQLite's
-    LOWER() folds ASCII only, so "ZOË" and "Zoë" used to differ on the fast path alone.
-
-    Comment times have one-second resolution and a clock can step back. With the block's event
-    id, every comment that has its ``commented`` event is placed by that event alone (event ids
-    are ordered, clocks are not); only when some comment has no event (an import) does the
-    time rule apply, a comment counting when it is strictly later than the block. Without the
-    id the old same-second rule (>=) applies."""
-    cut = since or 0
-    strict = block_id is not None
-    try:
-        by_event_only = False
-        if strict:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
-            ).fetchone()[0]
-            logged = conn.execute(
-                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
-                (task_id,),
-            ).fetchone()[0]
-            by_event_only = logged >= total
-        rows = (
-            []
-            if by_event_only
-            else conn.execute(
-                "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
-                (task_id, cut + 1 if strict else cut),
-            ).fetchall()
-        )
-        if any(_same_author(r[0], author) for r in rows):
-            return True
-        if not strict:
-            return False
-        events = [
-            kanban_db.Event.from_row(r)
-            for r in conn.execute(
-                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
-                (task_id, block_id),
-            ).fetchall()
-        ]
-        return _commented_after(events, block_id, author)
-    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments = list(kanban_db.list_comments(conn, task_id))
-        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
-        by_event_only = strict and (
-            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
-        )
-        if not by_event_only and any(
-            _same_author(c.author, author) and c.created_at >= (cut + 1 if strict else cut)
-            for c in comments
-        ):
-            return True
-        return strict and _commented_after(all_events, block_id, author)
+    """Has *author* commented since the block began? The one test for "answered", used by the
+    queue and by answer_card: an author among :func:`_comments_since_block`. Names compare in
+    Python (casefold) on every path; SQLite's LOWER() folds ASCII only."""
+    return any(
+        _same_author(a, author) for a, _ in _comments_since_block(conn, kanban_db, task_id, since, block_id)
+    )
 
 
 class CardStatus(str, Enum):
@@ -4336,28 +4277,23 @@ def _folder_outside_item(
 def _stat_hidden(hidden: dict[str, Any], f: Path, st: os.stat_result) -> bool:
     """Whether a folder file is still dismissed at its current mtime, size and content.
 
-    A stored version names the content digest too. Time and size alone repeat after an in-place
-    edit with a restored timestamp, so a stat match is confirmed by reading the file (the same
-    bounded read that makes its version); a file that cannot be read or differs is not
-    dismissed. A version stored without a digest can only be matched on time and size."""
+    Time and size alone repeat after an in-place edit with a restored timestamp, so they only
+    pick the candidates: a dismissal holds only when the stored content digest matches the same
+    bounded read that makes the file's version. A version stored without a digest, a file that
+    cannot be read or one that differs is not dismissed."""
     stored = hidden.get("outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest())
-    if not isinstance(stored, str):
-        return False
-    key = f"{st.st_mtime_ns}:{st.st_size}"
-    if stored == key:
-        return True
-    if not stored.startswith(key + ":"):
+    key = f"{st.st_mtime_ns}:{st.st_size}:"
+    if not isinstance(stored, str) or not stored.startswith(key):
         return False
     try:
-        fd = os.open(f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        fd, now = _pinned_open(f, os.O_RDONLY)
         with os.fdopen(fd, "rb") as fh:
-            now = os.fstat(fh.fileno())
-            if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+            if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
                 return False
             raw = fh.read(_OUTSIDE_READ_LIMIT)
     except OSError:
         return False
-    return stored == f"{key}:{hashlib.sha256(raw).hexdigest()[:16]}"
+    return stored == f"{key}{hashlib.sha256(raw).hexdigest()[:16]}"
 
 
 def _scan_outside_folder(
