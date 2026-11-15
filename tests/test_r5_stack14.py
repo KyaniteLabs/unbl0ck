@@ -172,6 +172,44 @@ class Notices(unittest.TestCase):
         self.assertEqual(notes, [needs._HTML_TRUNCATED])
 
 
+class StyleWorkIsBudgeted(unittest.TestCase):
+    def test_many_rules_against_many_elements_stop_at_a_budget_and_say_so(self):
+        from unittest.mock import patch
+
+        calls = []
+        real = needs._InertText._matches
+
+        def counting(self, *args):
+            calls.append(1)
+            return real(self, *args)
+
+        css = "p{display:block}" * 2000
+        with patch.object(needs._InertText, "_matches", counting):
+            text, notes = convert("<style>" + css + "</style>" + "<p>x" * 1500)
+        self.assertLessEqual(len(calls), 400_000)
+        self.assertIn("x", text)
+        self.assertIn(needs._HTML_STYLE_NOTE, notes)
+
+    def test_deep_ancestor_walks_count_against_the_same_budget(self):
+        from unittest.mock import patch
+
+        calls = []
+        real = needs._InertText._frame_is
+
+        def counting(*args):
+            calls.append(1)
+            return real(*args)
+
+        css = ".a .b .c .d{display:none}" * 100
+        with patch.object(needs._InertText, "_frame_is", staticmethod(counting)):
+            _, notes = convert("<style>" + css + "</style>" + "<div class=a>" * 200 + "<p class=d>x</p>" * 200)
+        self.assertLessEqual(len(calls), 400_000)
+        self.assertIn(needs._HTML_STYLE_NOTE, notes)
+
+    def test_a_small_stylesheet_is_not_reported(self):
+        self.assertEqual(convert("<style>p{display:block}</style><p>x</p>"), ("x", []))
+
+
 class EndToEnd(OutsideFixture):
     def text(self, html):
         self.watch()

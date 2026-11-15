@@ -3671,6 +3671,7 @@ _CSS_HIDINGISH = re.compile(
     r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|opacity\s*:\s*0|font-size\s*:\s*0|overflow", re.I
 )
 _CSS_MAX_RULES = 2000
+_CSS_MATCH_BUDGET = 300_000  # rule-against-element evaluations per message; past it styles stop being read
 _CSS_MAX_SELECTOR = 4  # compounds in a selector this converter evaluates
 # A decimal reference of 100 or more digits makes the stdlib parser raise and end the conversion;
 # the hexadecimal form is already handled by it (U+FFFD), so only decimal is rewritten here.
@@ -3929,6 +3930,8 @@ class _InertText(html.parser.HTMLParser):
         self.stack: list[_Frame] = []
         self.open_count: collections.Counter[str] = collections.Counter()
         self._head: tuple[int, _Frame] | None = None
+        self.match_budget = _CSS_MATCH_BUDGET
+        self.spent = False  # the budget ran out: later elements were not checked against every rule
         self.suppressed = False  # readable text was hidden by the author, whether or not it closed
         self.truncated = False  # readable text did not fit in the limit
         self._tail = "\n"  # last character kept, so leading and repeated whitespace is not stored
@@ -4010,10 +4013,15 @@ class _InertText(html.parser.HTMLParser):
             if want[pos + 1][0] == ">":
                 ok = idx >= 0 and self._frame_is(self.stack[idx], ptag, pclasses, pid) and above(pos - 1, idx - 1)
             else:
-                ok = any(
-                    self._frame_is(self.stack[j], ptag, pclasses, pid) and above(pos - 1, j - 1)
-                    for j in range(idx, -1, -1)
-                )
+                ok = False
+                for j in range(idx, -1, -1):
+                    self.match_budget -= 1  # every ancestor looked at is work, however few rules there are
+                    if self.match_budget <= 0:
+                        self.spent = True
+                        break
+                    if self._frame_is(self.stack[j], ptag, pclasses, pid) and above(pos - 1, j - 1):
+                        ok = True
+                        break
             if not ok:
                 failed.add((pos, idx))
             return ok
@@ -4033,7 +4041,13 @@ class _InertText(html.parser.HTMLParser):
             (r for c in classes for r in self.by_class.get(c, ())),
             self.by_id.get(ident, ()) if ident else (),
         ):
-            if rule.order not in found and self._matches(rule, tag, classes, ident):
+            if rule.order in found:
+                continue
+            if self.match_budget <= 0:
+                self.spent = True
+                break
+            self.match_budget -= 1
+            if self._matches(rule, tag, classes, ident):
                 found[rule.order] = rule
         layers: list[tuple[int, int, tuple, int, str, str]] = []
         for rule in found.values():
@@ -4192,6 +4206,8 @@ def _html_convert(markup: str, limit: int) -> tuple[str, list[str]]:
         incomplete = True
     except Exception:  # noqa: BLE001 - hostile or broken markup: keep what was read, and say so
         incomplete = True
+    if parser.spent:
+        state["uncertain"] = True
     text = "".join(parser.out)
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in text.split("\n")]
