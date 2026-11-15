@@ -2159,32 +2159,22 @@ def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, ov
     return f"{mid}:{digest.hexdigest()[:12]}"
 
 
-def _other_fd_on(fd: int, st: os.stat_result) -> bool | None:
-    """Whether a descriptor other than *fd* is open on the file *st* describes, or None where
-    descriptors cannot be listed (Windows, whose open descriptor already keeps the path from
-    being replaced)."""
-    try:
-        names = os.listdir("/dev/fd")
-    except OSError:
-        return None
-    for name in names:
-        try:
-            if int(name) != fd and os.path.samestat(os.fstat(int(name)), st):
-                return True
-        except (OSError, ValueError):
-            continue
-    return False
-
-
 def _open_chat_db(db: Path) -> sqlite3.Connection:
-    """Open *db* read-only, only if it is the regular file it was when the search began. SQLite
-    opens the path again, so the open is accepted only when the path still names the pinned
-    file and a descriptor besides the pin (SQLite's) is open on that same file."""
-    fd, st = _pinned_open(db, os.O_RDONLY)
+    """Open *db* read-only by the pinned descriptor's own name (Linux's descriptor link, macOS's
+    ``F_GETPATH``; Windows cannot rename an open file), while that name still names the pin."""
+    fd, _ = _pinned_open(db, os.O_RDONLY)
     try:
-        conn = sqlite3.connect(Path(os.path.abspath(db)).as_uri() + "?mode=ro", uri=True, timeout=2)
+        if os.path.isdir("/proc/self/fd"):
+            name = f"/proc/self/fd/{fd}"  # SQLite resolves it to the file's name as it opens it
+        elif hasattr(fcntl, "F_GETPATH"):
+            name = os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+        elif msvcrt is not None:
+            name = os.path.abspath(db)
+        else:
+            raise UnsafeStateFile("state.db cannot be opened by descriptor on this platform", "changed")
+        conn = sqlite3.connect(Path(name).as_uri() + "?mode=ro", uri=True, timeout=2)
         try:
-            if not _names_open_file(fd, db) or _other_fd_on(fd, st) is False:
+            if not _names_open_file(fd, Path(conn.execute("PRAGMA database_list").fetchone()[2])):
                 raise UnsafeStateFile("state.db changed while it was opened", "changed")
         except BaseException:
             conn.close()
