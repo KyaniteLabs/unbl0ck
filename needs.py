@@ -1986,7 +1986,8 @@ def search_text(query: Any) -> dict[str, Any]:
     if len(terms) > SEARCH_MAX_TERMS:
         raise ValueError(f"use at most {SEARCH_MAX_TERMS} search terms")
     home = hermes_home()
-    hidden = load_hidden(home)
+    hidden_errors: list[str] = []
+    hidden = load_hidden(home, errors=hidden_errors)
 
     def visible(item_id: str, version: str) -> bool:
         # The queue's own rule: dismissed at this version means not a card, so not searchable
@@ -2020,6 +2021,9 @@ def search_text(query: Any) -> dict[str, Any]:
     errors: list[str] = []
     cut = 0
     private = 0
+    if hidden_errors:
+        # Same rule as the queue: an unreadable dismissal list shows everything, and says so.
+        errors.append("dismissals could not be read, so dismissed items may be searched")
     for source, read in readers:
         source_errors: list[str] = []
         try:
@@ -2541,6 +2545,8 @@ def outside_items(
                     f"{len(candidates) - _OUTSIDE_LIMIT} older files are waiting. "
                     "Finish or hide items to bring them into view"
                 )
+                if unread is not None:
+                    unread[0] += len(candidates) - _OUTSIDE_LIMIT  # waiting, never read
             # Hidden files never use up the waiting window; callers that count or show them
             # (build_queue) ask for them separately, bounded by the same limit.
             window = candidates[:_OUTSIDE_LIMIT]
