@@ -379,10 +379,16 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
 
 
 def unhide(item_id: str, home: Path | None = None) -> bool:
-    """Undo "Not for me" or a local Done. Returns whether anything was restored."""
+    """Undo "Not for me" or a local Done. Returns whether anything was restored.
+
+    One filed item can be both marked done and hidden (Done and Not for me). The queue
+    stays empty until both are cleared, so one Undo clears both and only then reports
+    success. Clearing just the done mark used to return True while the hide kept the card out.
+    """
+    restored = False
     filed = _FILED_ID.fullmatch(str(item_id))
-    if filed:
-        with _state_lock(home):
+    with _state_lock(home):
+        if filed:
             d = _outside_dir(home)
             _purge_done(d)
             f = d / (filed.group(1) + ".json")
@@ -391,16 +397,14 @@ def unhide(item_id: str, home: Path | None = None) -> bool:
                 if _is_done(rec):
                     rec.pop("done_at")
                     _write_json(f, rec)
-                    return True
-        # Not locally done: it may have been hidden with "Not for me"; restore that below.
-    with _state_lock(home):
+                    restored = True
         hidden = load_hidden(home, strict=True)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
-        if item_id not in hidden:
-            return False
-        del hidden[item_id]
-        _write_json(_hidden_path(home), hidden)
-        return True
+        if item_id in hidden:
+            del hidden[item_id]
+            _write_json(_hidden_path(home), hidden)
+            restored = True
+    return restored
 
 
 # --- Releases that failed after the answer was posted ---------------------------------------
