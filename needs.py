@@ -145,14 +145,18 @@ def bluf_enabled(settings: dict[str, Any] | None = None) -> bool:
 def chat_window_days(settings: dict[str, Any] | None = None) -> int:
     """How many days back chats are read (setting ``chat_window_days``): 14 by default, 1 to 90.
 
-    Anything else (zero, negative, fractional, boolean, text) falls back to the default so a bad
-    value can neither disable the source nor widen it past the cap."""
+    Anything else (zero, negative, above 90, fractional, boolean, text, digits that are not a
+    number this reader can convert) uses the default, exactly as the setting's description says,
+    so a bad value can neither disable the source, widen it, nor fail the queue build."""
     raw = (settings if settings is not None else _settings()).get("chat_window_days")
-    if isinstance(raw, str) and raw.strip().isdigit():
-        raw = int(raw.strip())
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+    if isinstance(raw, str):
+        text = raw.strip()
+        # ASCII digits only, and short: ``"²".isdigit()`` is true but ``int("²")`` raises, and a
+        # digit string past the interpreter's conversion limit raises too.
+        raw = int(text) if text.isascii() and text.isdigit() and len(text) <= 6 else None
+    if isinstance(raw, bool) or not isinstance(raw, int) or not 1 <= raw <= CHAT_WINDOW_MAX_DAYS:
         return CHAT_WINDOW_DAYS
-    return min(raw, CHAT_WINDOW_MAX_DAYS)
+    return raw
 
 
 def outside_recursive(settings: dict[str, Any] | None = None) -> bool:
@@ -364,12 +368,16 @@ def _state_lock(home: Path | None):
 
 # No state file is legitimately larger; a bigger one is damage or abuse, refused before it is read.
 MAX_STATE_BYTES = 16 * 1024 * 1024
-_PROFILE_YAML_BYTES = 256 * 1024
+_PROFILE_YAML_BYTES = 64 * 1024
 
 
-def _read_plain_text(p: Path, limit: int | None = None, errors: str = "strict") -> str:
+def _read_plain_text_st(
+    p: Path, limit: int | None = None, errors: str = "strict"
+) -> tuple[str, os.stat_result]:
     """Read a regular file without following a link or blocking on a FIFO or device, and refuse
-    one larger than *limit* before reading it."""
+    one larger than *limit* before reading it. Returns the text with the ``fstat`` of the very
+    descriptor it was read from, so a caller that caches by file signature caches the signature
+    of what it read, not of whatever a later path lookup finds."""
     limit = MAX_STATE_BYTES if limit is None else limit
     fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
     try:
@@ -382,9 +390,13 @@ def _read_plain_text(p: Path, limit: int | None = None, errors: str = "strict") 
             raw = fh.read(limit + 1)
         if len(raw) > limit:
             raise OSError("too large to be a state file")
-        return raw.decode("utf-8", errors)
+        return raw.decode("utf-8", errors), st
     finally:
         os.close(fd)
+
+
+def _read_plain_text(p: Path, limit: int | None = None, errors: str = "strict") -> str:
+    return _read_plain_text_st(p, limit, errors)[0]
 
 
 def _read_json(
@@ -775,7 +787,7 @@ def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str,
     def saved_at(entry: Any) -> int:
         try:
             return int(entry.get("at") or 0) if isinstance(entry, dict) else 0
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
 
     ranked = sorted(
@@ -1656,63 +1668,73 @@ def kanban_items(
 # --- Chat source ---------------------------------------------------------------------------
 
 
-def _keep(
-    out: list[tuple[str, Path]], seen: set[tuple[int, int]], name: str, db: Path
-) -> None:
-    try:
-        st = db.stat()
-    except OSError:
-        out.append((name, db))  # not provably a duplicate: let the open report the failure
-        return
-    if (st.st_dev, st.st_ino) in seen:
-        return
-    seen.add((st.st_dev, st.st_ino))
-    out.append((name, db))
-
-
 def _state_dbs(
-    home: Path, errors: list[str] | None = None, only: str | None = None
+    home: Path,
+    errors: list[str] | None = None,
+    only: str | None = None,
+    known: Callable[[str], bool] | None = None,
 ) -> list[tuple[str, Path]]:
     """Every profile's chat database that lies inside *home*. A link (to a profile folder or to the
     database itself) could aim the search at another Hermes home, so a linked one is reported and
-    skipped, and a profiles folder that cannot be listed is a failed source, not an empty one."""
-    out: list[tuple[str, Path]] = []
-    seen: set[tuple[int, int]] = set()  # one database file is one profile's, whatever names reach it
+    skipped; so is anything that is not a plain file (opening a FIFO or a device could block the
+    whole refresh), and a database that cannot be inspected or a profiles folder that cannot be
+    listed is a failed source, not an empty one. Only a genuinely absent database is optional.
+
+    One database file is one profile's, whatever names reach it. When several profile names reach
+    the same file, the one for which *known* says state already exists (a dismissal or a cached
+    summary keyed by that name) keeps it, so adding an alias never renames an existing chat;
+    otherwise the first in listing order does."""
+    groups: dict[tuple[int, int], list[tuple[str, Path]]] = {}
 
     def refuse(profile: str, why: str) -> None:
         if errors is not None:
             errors.append(f"chat[{profile}]: {why}; not searched")
 
-    root = home / "state.db"
-    if only in (None, "default") and os.path.lexists(root):
-        if root.is_symlink():
-            refuse("default", "state.db is a symbolic link")
+    def consider(profile: str, db: Path) -> bool:
+        """Whether *db* is present and a plain file; every other case but absence is reported."""
+        try:
+            st = os.lstat(db)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as exc:
+            refuse(profile, f"state.db could not be inspected ({type(exc).__name__})")
+            return False
+        if stat.S_ISLNK(st.st_mode):
+            refuse(profile, "state.db is a symbolic link")
+        elif not stat.S_ISREG(st.st_mode):
+            refuse(profile, "state.db is not a regular file")
         else:
-            _keep(out, seen, "default", root)
-    if only == "default":
-        return out
-    try:
-        entries = [home / "profiles" / only] if only else _list_files(home / "profiles")
-    except FileNotFoundError:
-        return out
-    except OSError as exc:
-        if errors is not None:
-            errors.append(f"chat: profiles folder: {type(exc).__name__}; could not list profiles")
-        return out
-    base = home.resolve()
-    for prof in entries:
-        db = prof / "state.db"
-        if not os.path.lexists(db):
-            continue
-        if prof.is_symlink():
-            refuse(prof.name, "profile folder is a symbolic link")
-        elif db.is_symlink():
-            refuse(prof.name, "state.db is a symbolic link")
-        elif not db.resolve().is_relative_to(base):
-            refuse(prof.name, "state.db lies outside the Hermes home")
-        else:
-            _keep(out, seen, prof.name, db)
-    return out
+            groups.setdefault((st.st_dev, st.st_ino), []).append((profile, db))
+        return True
+
+    if only in (None, "default"):
+        consider("default", home / "state.db")
+    if only != "default":
+        try:
+            entries = [home / "profiles" / only] if only else _list_files(home / "profiles")
+        except FileNotFoundError:
+            entries = []
+        except OSError as exc:
+            entries = []
+            if errors is not None:
+                errors.append(f"chat: profiles folder: {type(exc).__name__}; could not list profiles")
+        base = home.resolve()
+        for prof in entries:
+            db = prof / "state.db"
+            if prof.is_symlink():
+                if os.path.lexists(db):
+                    refuse(prof.name, "profile folder is a symbolic link")
+            elif os.path.lexists(db) and not db.is_symlink() and not db.resolve().is_relative_to(base):
+                refuse(prof.name, "state.db lies outside the Hermes home")
+            else:
+                consider(prof.name, db)
+    out: list[tuple[str, Path]] = []
+    for names in groups.values():
+        keep = names[0]
+        if len(names) > 1 and known is not None:
+            keep = next((n for n in names if known(n[0])), keep)
+        out.append(keep)
+    return sorted(out, key=lambda n: (n[0] != "default", n[0]))
 
 
 # Hermes has no public board-slug validator, so this mirrors kanban_db._normalize_board_slug (the
@@ -1749,15 +1771,17 @@ def _bot_name(home: Path, profile: str) -> str:
     key = str(path)
     try:
         st = path.lstat()
-        if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _PROFILE_YAML_BYTES:
             raise OSError("not a plain, small profile.yaml")  # a link or a huge file is not read
         sig = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
         hit = _BOT_NAME_CACHE.get(key)
         if hit and hit[0] == sig:
             return hit[1] or fallback
-        lines = _read_plain_text(
-            path, limit=_PROFILE_YAML_BYTES, errors="replace"
-        ).splitlines()
+        # The checks above only decide whether to look; what is read is checked on the opened
+        # descriptor (no link, regular, bounded), and the cache keeps that descriptor's signature.
+        text, fst = _read_plain_text_st(path, limit=_PROFILE_YAML_BYTES, errors="replace")
+        sig = (fst.st_mtime_ns, fst.st_size, fst.st_ino, fst.st_ctime_ns)
+        lines = text.splitlines()
     except (OSError, ValueError):
         _BOT_NAME_CACHE.pop(key, None)
         return fallback
@@ -1890,7 +1914,16 @@ def chat_items(
     names = _patterns(principal_names(settings), role_words(settings))["_NAMES"]
     owners = chat_owner_ids(settings)
     me = {n.lower() for n in principal_names(settings)}
-    for profile, db in _state_dbs(home, errors, only[0] if only else None):
+    def known(profile: str) -> bool:
+        """Whether a dismissal or a cached summary already exists under this profile's chat ids."""
+        prefix = f"chat:{profile}:"
+        try:
+            ids = list(load_hidden(home, create=False)) + list(load_blufs(home))
+        except Exception:  # noqa: BLE001 - only a tie-break between aliases; the first one wins
+            return False
+        return any(str(i).startswith(prefix) for i in ids)
+
+    for profile, db in _state_dbs(home, errors, only[0] if only else None, known):
         try:
             conn = sqlite3.connect(
                 db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2
@@ -1995,6 +2028,7 @@ def chat_items(
                 if not row:
                     continue
                 mid, role, content, length, ts = row
+                ts = _num(ts)  # an infinite or NaN stored time is not a time (int() would raise)
                 content = str(content)
                 span = chat_ask_span(content) if role == "assistant" and (ts or 0) >= since else 0
                 if not span:
@@ -2411,7 +2445,7 @@ def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitSt
     now = time.time() if now is None else now
     try:
         pid = int(rec.get("pid") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pid = 0
     rid = str(rec.get("request_id") or "")
     if (
@@ -5497,7 +5531,7 @@ def ask_history_turns(settings: dict[str, Any] | None = None) -> int:
     raw = (settings if settings is not None else _settings()).get("ask_history_turns")
     try:
         n = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return ASK_HISTORY_TURNS
     return n if n > 0 else ASK_HISTORY_TURNS
 
