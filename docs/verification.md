@@ -38,7 +38,7 @@ does not prove focus, accessible controls or the operator journey in a browser.
 | Full text / Context / search / keys | `test_desktop_quality`, `test_desktop_contract`, rendered operator checks | Retry controls work; filters preserve mounted state; Escape and focus follow the documented order |
 | Typed answer recovery | `test_operator_recovery`, rendered partial-source checks | Card disappears and returns with draft intact; changed question keeps recovered draft disabled |
 | Surface contract | `test_surface_contract` | Same item order and identity on the CLI list and Pocket pack; every surface agrees on the ask count; remote output carries counts only (no title, text, name, id or command) yet discloses stuck and answered counts; limited output states what it omits; unknown platforms are remote; docs matrix lists every surface and dimension |
-| Capability matrix | `test_capability_matrix` | Every source classified (supported, by design, not yet) with a reason; docs table equals the code; Desktop explains missing model help; non-Kanban ids never reach Ask or the provider; the set of write routes is pinned; password prompts, pairing secrets and Pocket packs carry no inline action or secret; disabled/unreachable provider fails closed |
+| Capability matrix | `test_capability_matrix` | Every source classified (supported, by design, not yet) with a reason; docs table equals the code; Desktop explains missing model help; non-Kanban ids are refused by the interactive Ask route (automatic one-line summaries are separate and covered by the summary rows); the set of write routes is pinned; password prompts, pairing secrets and Pocket packs carry no inline action or secret; disabled/unreachable provider fails closed |
 | Ask restart recovery | `test_ask_job_recovery`, `test_desktop_ask_recovery` | Restart before send, after send, after completion (with and without answer persistence) and after failure; repeated polling; TTL, cap and settled eviction; corrupt, foreign and symlinked markers; 0600/0700 modes; no answer text on disk by default; card isolation; delete; the provider is never called by recovery |
 | Summary / Ask | `test_bluf*`, `test_ask_job`, `test_ask_privacy`, `test_state_machines`, rendered operator checks | Bounded admission; reasoning stripped; lost terminal response can be collected with no second model POST |
 | Config read failure and repair | `test_failure_quality`, independent actual Hermes parser probes | Raised, marked-dictionary and import failures fail closed, both cold and after a good config; concurrent refresh shares one settled read; another caller's repair cannot erase an in-flight fault |
@@ -114,10 +114,11 @@ restored after unmount from the same bounded session memory, without a second mo
 call; transport retry is implemented and verified.
 
 Bounded folder selection discloses older omissions instead of silently scanning an
-unbounded directory. Folder pagination and automatic export archiving were not adopted;
-the latter would change the read-only source contract. Filed dedupe keys are
-profile-scoped by default, with an explicit global scope; existing records are adopted
-in place by their own profile.
+unbounded directory. Folders are paged by completion rather than by a cursor: each poll
+shows the newest 200 waiting files, and Done or Not for me on a file brings an older one
+into view. Automatic export archiving was not adopted; it would change the read-only
+source contract. Filed dedupe keys are profile-scoped by default, with an explicit global
+scope; existing records are adopted in place by their own profile.
 
 The review link reuses native signed ingress and verifies GitHub review identity rather
 than adding a listener, executing PR code with secrets, or treating duplicate responses

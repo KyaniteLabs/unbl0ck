@@ -324,7 +324,7 @@ class Summary(unittest.TestCase):
                 },
             ],
         }
-        pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q)
+        pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q, _clean=needs._clean)
         out = pkg._summary()
         self.assertIn("[chat discord with Mallory]", out)
         self.assertIn(f"  approve: hermes pairing approve telegram {RID}", out)
@@ -351,7 +351,7 @@ class Summary(unittest.TestCase):
                 }
             ],
         }
-        pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q)
+        pkg._needs = lambda: types.SimpleNamespace(build_queue=lambda: q, _clean=needs._clean)
         for surface in ("cli", "tui", "desktop", "local", "CLI"):
             self.assertIn("rm -rf", pkg.slash_unbl0ck("", platform=surface))
         for surface in (

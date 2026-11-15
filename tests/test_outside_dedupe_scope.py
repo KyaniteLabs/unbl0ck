@@ -210,7 +210,7 @@ class DedupeScope(OutsideFixture):
     def test_resolve_by_id_is_unambiguous_across_profiles(self):
         a = self.call("work", dedupe_key="k")
         b = self.call("home", dedupe_key="k")
-        self.assertTrue(self.call("home", action="resolve", id=a["id"])["resolved"])
+        self.assertTrue(self.call("home", action="resolve", id=a["id"], version=a["version"])["resolved"])
         self.assertEqual([r["id"] for r in self.records()], [b["id"]])
 
     def test_scope_is_provenance_on_the_queue_item(self):
@@ -228,9 +228,11 @@ class DedupeScope(OutsideFixture):
 
     def test_update_then_resolve_race_resolves_the_updated_record_once(self):
         a = self.call("work", dedupe_key="k", body="one")
-        self.call("work", dedupe_key="k", body="two")
-        self.assertTrue(self.call("work", action="resolve", id=a["id"])["resolved"])
-        self.assertFalse(self.call("work", action="resolve", id=a["id"])["ok"])
+        b = self.call("work", dedupe_key="k", body="two")
+        # the version from before the update no longer matches: the updated record survives
+        self.assertFalse(self.call("work", action="resolve", id=a["id"], version=a["version"])["ok"])
+        self.assertTrue(self.call("work", action="resolve", id=a["id"], version=b["version"])["resolved"])
+        self.assertFalse(self.call("work", action="resolve", id=a["id"], version=b["version"])["ok"])
         # a late update after resolve files a fresh item rather than reviving a stale id
         fresh = self.call("work", dedupe_key="k", body="three")
         self.assertNotEqual(fresh["id"], a["id"])
@@ -241,21 +243,21 @@ class DedupeScope(OutsideFixture):
         a = self.call("work", dedupe_key="k")
         needs.hide(a["id"], a["version"], self.home)
         self.assertIn(a["id"], needs.load_hidden(self.home))
-        self.assertTrue(self.call("work", action="resolve", id=a["id"])["resolved"])
+        self.assertTrue(self.call("work", action="resolve", id=a["id"], version=a["version"])["resolved"])
         self.assertNotIn(a["id"], needs.load_hidden(self.home))
 
     def test_resolve_leaves_other_dismissals_alone(self):
         a = self.call("work", dedupe_key="k")
         needs.hide(a["id"], a["version"], self.home)
         needs.hide("outside:folder:" + "a" * 64, "v", self.home)
-        self.call("work", action="resolve", id=a["id"])
+        self.call("work", action="resolve", id=a["id"], version=a["version"])
         self.assertEqual(list(needs.load_hidden(self.home)), ["outside:folder:" + "a" * 64])
 
     def test_resolve_with_a_corrupt_hidden_file_still_resolves_and_keeps_the_file(self):
         a = self.call("work", dedupe_key="k")
         path = needs._hidden_path(self.home)
         path.write_text("{not json")
-        self.assertTrue(self.call("work", action="resolve", id=a["id"])["resolved"])
+        self.assertTrue(self.call("work", action="resolve", id=a["id"], version=a["version"])["resolved"])
         self.assertEqual(path.read_text(), "{not json")
 
     def test_two_long_keys_that_share_a_prefix_are_refused_not_merged(self):
