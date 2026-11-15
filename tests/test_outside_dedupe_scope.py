@@ -57,6 +57,47 @@ class DedupeScope(OutsideFixture):
         self.assertNotEqual(g["id"], p["id"])
         self.assertEqual(len(self.records()), 2)
 
+    def test_legacy_record_with_no_stored_profile_is_adopted_once(self):
+        old = self.call("work", dedupe_key="k", title="Old")
+        path = self.record(old)
+        rec = json.loads(path.read_text())
+        rec.pop("dedupe_scope")
+        rec["profile"] = ""  # tool calls before profile resolution stored nothing
+        path.write_text(json.dumps(rec))
+        again = self.call("work", dedupe_key="k", title="Updated")
+        self.assertTrue(again["ok"], again)
+        self.assertEqual(again["id"], old["id"])
+        saved = json.loads(path.read_text())
+        self.assertEqual((saved["profile"], saved["dedupe_scope"], saved["title"]), ("work", "profile", "Updated"))
+        other = self.call("home", dedupe_key="k", title="Home")
+        self.assertNotEqual(other["id"], old["id"])
+        self.assertEqual({r["title"] for r in self.records()}, {"Updated", "Home"})
+
+    def test_runtime_profile_adopts_a_profileless_legacy_key(self):
+        old = self.call(None, dedupe_key="k", title="Old")
+        path = self.record(old)
+        rec = json.loads(path.read_text())
+        rec.pop("dedupe_scope")
+        rec["profile"] = ""
+        path.write_text(json.dumps(rec))
+        again = self.call(None, dedupe_key="k", title="Updated")
+        self.assertEqual(again["id"], old["id"])
+        self.assertEqual(json.loads(path.read_text())["profile"], "default")
+
+    def test_two_profileless_legacy_records_are_not_guessed(self):
+        first = self.call("work", dedupe_key="k", title="One")
+        second = self.call("home", dedupe_key="k", title="Two")
+        for item in (first, second):
+            path = self.record(item)
+            rec = json.loads(path.read_text())
+            rec.pop("dedupe_scope")
+            rec["profile"] = ""
+            path.write_text(json.dumps(rec))
+        out = self.call("work", dedupe_key="k", title="Nope")
+        self.assertFalse(out["ok"])
+        self.assertIn("legacy", out["error"])
+        self.assertEqual({r["title"] for r in self.records()}, {"One", "Two"})
+
     def test_legacy_record_is_adopted_by_its_own_profile_without_resurfacing(self):
         old = self.call("work", dedupe_key="k")
         path = self.record(old)
