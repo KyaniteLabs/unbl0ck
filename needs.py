@@ -2023,6 +2023,41 @@ def _profile_of(home: Path) -> str:
     return own.name if own.parent.name == "profiles" else "default"
 
 
+WAIT_TAIL_CHARS = 2000
+WAIT_FAULT_LIMIT = 50
+# (home, request id) -> (what failed, the record to write). The hooks run in the agent; when a
+# write or removal fails there, polling in the same process retries it and says so until it works.
+_WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
+
+
+def _remember_wait_fault(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
+    _WAIT_FAULTS.pop((str(home), rid), None)
+    _WAIT_FAULTS[(str(home), rid)] = (what, rec)
+    while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
+        _WAIT_FAULTS.pop(next(iter(_WAIT_FAULTS)))
+
+
+def _unlink_wait(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+def _reconcile_waits(home: Path, errors: list[str]) -> None:
+    """Retry hook writes/removals that failed; what still fails is a reported source error."""
+    for (h, rid), (what, rec) in list(_WAIT_FAULTS.items()):
+        if h != str(home):
+            continue
+        try:
+            path = _waits_dir(home) / f"{rid}.json"
+            if what == "record" and rec is not None:
+                _write_json(path, rec)
+            else:
+                _unlink_wait(path)
+            _WAIT_FAULTS.pop((h, rid), None)
+        except Exception as exc:  # noqa: BLE001
+            verb = "record" if what == "record" else "clear"
+            errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
+
+
 def record_wait(home: Path | None = None, **payload: Any) -> None:
     """``on_human_input_request``: remember an open wait. Never raises (observer contract)."""
     try:
@@ -2041,6 +2076,8 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
             "kind": kind,
             "prompt": prompt[:keep],
             "prompt_cut": len(prompt) > keep,
+            # The question is at the end: a cut prompt also keeps its real tail for the excerpt.
+            **({"prompt_tail": prompt[-WAIT_TAIL_CHARS:]} if len(prompt) > keep else {}),
             "session_id": str(payload.get("session_id") or ""),
             "platform": str(payload.get("platform") or ""),
             "profile": _profile_of(home),
@@ -2048,7 +2085,12 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
             "proc_start": _proc_start(pid),
             "since": int(time.time()),
         }
-        _write_json(_waits_dir(home) / f"{rid}.json", rec)
+        _WAIT_FAULTS.pop((str(home), rid), None)
+        try:
+            _write_json(_waits_dir(home) / f"{rid}.json", rec)
+        except Exception:
+            _remember_wait_fault(home, rid, "record", rec)
+            raise
     except Exception as exc:  # noqa: BLE001 - observability must never break a human prompt
         log.warning("unbl0ck: could not record wait: %s", type(exc).__name__)
 
@@ -2058,7 +2100,13 @@ def clear_wait(home: Path | None = None, **payload: Any) -> None:
     try:
         rid = str(payload.get("request_id") or "")
         if _SAFE_ID.match(rid):
-            (_waits_dir(home or hermes_home()) / f"{rid}.json").unlink(missing_ok=True)
+            home = home or hermes_home()
+            _WAIT_FAULTS.pop((str(home), rid), None)
+            try:
+                _unlink_wait(_waits_dir(home) / f"{rid}.json")
+            except Exception:
+                _remember_wait_fault(home, rid, "clear", None)
+                raise
     except Exception as exc:  # noqa: BLE001
         log.warning("unbl0ck: could not clear wait: %s", type(exc).__name__)
 
@@ -2124,6 +2172,7 @@ def wait_items(
     errors = errors if errors is not None else []
     items: list[dict[str, Any]] = []
     waits = _waits_dir(home)
+    _reconcile_waits(home, errors)
     try:
         records = _list_files(waits, ".json")
     except OSError as exc:
@@ -2150,25 +2199,35 @@ def wait_items(
         profile = str(rec.get("profile") or "default")
         who = _bot_name(home, profile) if profile != "default" else "An agent"
         platform = str(rec.get("platform") or "")
+        prompt = str(rec.get("prompt") or "")
+        # Cut by the store: new records say so; an older record (no flag) holding a full 4,000
+        # character prefix was cut too.
+        cut = bool(rec["prompt_cut"]) if "prompt_cut" in rec else len(prompt) >= 4000
+        shown = str(rec.get("prompt_tail") or "") if cut and rec.get("prompt_tail") else prompt
+        digest = hashlib.sha256(
+            json.dumps(
+                [rid, kind, prompt, rec.get("prompt_tail"), profile, rec.get("session_id"),
+                 platform, rec.get("pid"), rec.get("proc_start"), rec.get("since")],
+                default=str,
+            ).encode("utf-8", "replace")
+        ).hexdigest()[:12]
         items.append(
             {
                 "id": f"prompt:{rid}",
-                "version": rid,
+                "version": f"{rid}:{digest}",
                 "source": "prompt",
                 "kind": kind,
                 "profile": profile,
                 "session_id": str(rec.get("session_id") or ""),
                 "platform": platform,
                 "title": f"{who} {_WAIT_KINDS.get(kind, 'is waiting on you')}",
-                "ask": _excerpt(str(rec.get("prompt") or ""))
-                or "(prompt text withheld by Hermes)",
+                "ask": _excerpt(shown) or "(prompt text withheld by Hermes)",
                 # A password prompt is never expanded: its excerpt is all the queue ever shows.
-                "ask_truncated": kind != "sudo" and _is_excerpted(str(rec.get("prompt") or "")),
+                "ask_truncated": kind != "sudo" and (cut or _is_excerpted(shown)),
                 **(
                     {
-                        **_full_fields(str(rec.get("prompt") or "")),
-                        "text_cut": _full_fields(str(rec.get("prompt") or ""))["text_cut"]
-                        or bool(rec.get("prompt_cut")),
+                        **_full_fields(prompt),
+                        "text_cut": _full_fields(prompt)["text_cut"] or cut,
                     }
                     if full and kind != "sudo"
                     else {}

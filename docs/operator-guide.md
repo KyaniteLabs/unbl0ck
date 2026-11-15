@@ -41,7 +41,10 @@ Queue polling carries only the last 480 characters of a chat message or live pro
 marked with a note. **Full text** then reads the whole record (up to 20,000 characters)
 from its source for that item version, and never sends it to a model. A changed or
 vanished record, or an unreadable source, reports an error with Retry and leaves the
-excerpt labelled as an excerpt. Password prompts are never expanded.
+excerpt labelled as an excerpt. Password prompts are never expanded. A live prompt over
+20,000 characters is stored cut, with its last 2,000 characters kept beside it in the same
+wait record, so the excerpt is the true end of the prompt; a chat message is read from its
+last 100,000 characters.
 
 **TL;DR** starts a read-only model job. **Use as answer** copies a suggestion into the
 answer box; the human still submits it. **Discuss in chat** asks the host composer to
