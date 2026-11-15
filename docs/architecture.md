@@ -77,6 +77,7 @@ as private. Settings and source files remain owned by their original application
 | `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is always recoverable |
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; shared across profiles |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
+| `wait-faults.json` | Only while an agent process could not record or clear a live prompt: request ids, what failed and that process's identity (never prompt text), removed when the fault settles or the process is gone; it lets the dashboard report the missing prompt |
 | `bluf.json` | Summary cache capped at 2,000, bound to the item version and to a hash of its title, text, owner and comment count (an edit or a new comment is summarized again); failed-source entries retained subject to cap |
 | `pocket-pack.json` | Written only on explicit pack request |
 | Summary/Ask jobs | Process memory; restart loses pending work and results |
