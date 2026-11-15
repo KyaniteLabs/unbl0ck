@@ -90,6 +90,7 @@ class Local:
     acted_revision: str | None = None  # the revision the human dismissed or answered
     pending_edit: bool = False  # the human has an unsent change in flight
     held: bool | str = False  # ACCESS or LEFT_VIEW (True: legacy ACCESS); keeps the open or done state underneath
+    gone: str | None = None  # a "gone" row: the provider state that ended it, DELETED or LEFT_VIEW (None: unknown)
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,7 @@ class Action:
     revision: str | None = None
     evidence: str | None = None  # for completion actions
     hold: str | None = None  # for ``hold``: ACCESS or LEFT_VIEW
+    gone: str | None = None  # for an action that leaves a "gone" row: DELETED or LEFT_VIEW
 
 
 @dataclass
@@ -238,7 +240,7 @@ def _same_seq_conflict(item: ExternalItem, cur: Local) -> bool:
     if item.revision != cur.revision:
         return True
     if cur.state == "gone":
-        return item.state not in (DELETED, LEFT_VIEW)
+        return item.state not in ((cur.gone,) if cur.gone else (DELETED, LEFT_VIEW))
     if _hold(cur) == LEFT_VIEW:
         return item.state != LEFT_VIEW
     state, ev = _view(cur)
@@ -253,9 +255,10 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
     ev = HEURISTIC if guessed else VERIFIED
     if cur is None:
         if not known or item.state == LEFT_VIEW:  # no card, but a later older event must stay stale
-            return [Action("watermark", k, "no card: only the sequence is kept", seq=s, revision=r if known else None)]
+            return [Action("watermark", k, "no card: only the sequence is kept", seq=s, revision=r if known else None,
+                           gone=LEFT_VIEW if known else None)]
         if item.state == DELETED:
-            return [Action("tombstone", k, "deleted at the provider; the sequence is kept", seq=s, revision=r)]
+            return [Action("tombstone", k, "deleted at the provider; the sequence is kept", seq=s, revision=r, gone=DELETED)]
         if item.state == DONE:
             return [Action("track_done", k, "already done at the provider; no card", seq=s, revision=r, evidence=ev)]
         return [Action("add", k, seq=s, revision=r)]
@@ -272,7 +275,7 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
     conflict = Action("conflict", k, "changed at the provider while a local edit is unsent; nothing was written")
     if cur.state == "gone":
         if item.state in (DELETED, LEFT_VIEW):
-            return newer
+            return [replace(a, gone=item.state) for a in newer]
         out.append(Action("restore", k, "back at the provider", seq=s, revision=r))
         if item.state == DONE:
             out.append(Action("complete_unconfirmed" if guessed else "complete_verified", k, seq=s, revision=r, evidence=ev))
@@ -280,7 +283,7 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
     if item.state == DELETED:
         if edit:
             out.append(conflict)
-        return out + [Action("remove", k, "deleted at the provider", seq=s, revision=r)]
+        return out + [Action("remove", k, "deleted at the provider", seq=s, revision=r, gone=DELETED)]
     if item.state == LEFT_VIEW:
         if _hold(cur) == LEFT_VIEW:
             return newer
@@ -329,7 +332,7 @@ def apply(local: Mapping[Key, Local], plan: Plan) -> dict[Key, Local]:
     for a in plan.actions:
         cur = out.get(a.key) if a.key else None
         if a.op in _NEW and cur is None:
-            out[a.key] = Local(a.seq, a.revision or "", _NEW[a.op], a.evidence if a.op == "track_done" else None)
+            out[a.key] = Local(a.seq, a.revision or "", _NEW[a.op], a.evidence if a.op == "track_done" else None, gone=a.gone)
             continue
         if cur is None:
             continue
@@ -345,6 +348,8 @@ def apply(local: Mapping[Key, Local], plan: Plan) -> dict[Key, Local]:
             cur = replace(cur, state="gone", held=False, evidence=None, pending_edit=False)
         elif a.op == "resurface":
             cur = replace(cur, acted_revision=None)
+        if a.gone and cur.state == "gone":
+            cur = replace(cur, gone=a.gone)
         out[a.key] = _advance(cur, a)
     return out
 
