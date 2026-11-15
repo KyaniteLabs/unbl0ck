@@ -2169,6 +2169,9 @@ def _scan_outside_folder(
     too_deep = False
     while stack and not stopped:
         d, depth = stack.pop()
+        if time.monotonic() > deadline:
+            stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
+            break  # queued directories count against the budget even when they hold no entries
         try:
             # A queued directory may have been swapped for a symlink since it was listed.
             if d != root and d.resolve() != d:
