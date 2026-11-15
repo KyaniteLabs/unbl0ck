@@ -3770,18 +3770,24 @@ def _css_font_kind(value: str) -> str | None:
     return None
 
 
+# CSS Display 3: one keyword, or one word from each of outside, inside and list-item (list-item
+# only with a flow inside); any other combination is invalid and does not override ``hidden``.
+_CSS_DISPLAY_GROUPS = ({"block", "inline", "run-in"}, {"flow", "flow-root", "table", "flex", "grid", "ruby", "math"}, {"list-item"})
 _CSS_DISPLAY_WORDS = frozenset(
-    "block inline run-in flow flow-root table flex grid ruby list-item contents math inline-block "
-    "inline-table inline-flex inline-grid table-row-group table-header-group table-footer-group "
-    "table-row table-cell table-column-group table-column table-caption ruby-base ruby-text "
-    "ruby-base-container ruby-text-container".split()
-)
+    "contents inline-block inline-table inline-flex inline-grid table-row-group table-header-group "
+    "table-footer-group table-row table-cell table-column-group table-column table-caption ruby-base "
+    "ruby-text ruby-base-container ruby-text-container initial unset inherit".split()
+).union(*_CSS_DISPLAY_GROUPS)
 
 
 def _css_display_shows(value: str) -> bool:
     """Whether an inline ``display`` value is a real one that overrides the ``hidden`` attribute."""
     words = value.split()
-    return value in ("initial", "unset", "inherit") or 0 < len(words) <= 3 and all(w in _CSS_DISPLAY_WORDS for w in words)
+    picks = [g.intersection(words) for g in _CSS_DISPLAY_GROUPS]
+    if len(words) == 1:
+        return words[0] in _CSS_DISPLAY_WORDS
+    return len(set(words)) == len(words) == sum(map(len, picks)) and max(map(len, picks)) == 1 and not (
+        picks[2] and picks[1] - {"flow", "flow-root"})
 
 
 def _css_could_hide(name: str, value: str) -> bool:
