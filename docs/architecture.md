@@ -61,8 +61,9 @@ control and are not a standalone public API.
 
 POST Answer/Ask models bound card identifiers to 300 characters, answers/message text
 to 20,000, and Ask history to 50 messages. Outside-text checks also bound its ID/version
-to 300; GET Card does not apply the same length limit. Invalid/stale/missing references fail instead of targeting a
-different item. Ask capacity returns 429; unavailable model infrastructure returns 503;
+to 300; GET Card applies the same 300-character limit to its ID and board/task reference (400).
+Oversized identifiers in a POST body fail validation with 422. Invalid/stale/missing references fail instead of
+targeting a different item. Ask capacity returns 429; unavailable model infrastructure returns 503;
 unknown/expired jobs return 404. Not every error is retryable without refreshing.
 
 ## State lifecycle

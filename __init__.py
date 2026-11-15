@@ -15,27 +15,33 @@ def _needs():
 
 
 def _summary(limit: int = 12) -> str:
-    q = _needs().build_queue()
-    if not q["count"] and not q["errors"]:
+    n = _needs()
+    q = n.build_queue()
+    c = lambda value, size=200: n._clean(value, size)  # noqa: E731  (display sanitizer)
+    if not q["count"] and not q["errors"] and not q["items"]:
         return "Nothing is blocked on you."
     asks = [it for it in q["items"] if it.get("tier") not in ("stuck", "answered")]
+    held = len(q["items"]) - len(asks)
     lines = [f"{q['count']} thing(s) waiting on you:" if q["count"]
-             else "No asks detected; the queue is incomplete."]
+             else "No asks detected; the queue is incomplete." if q["errors"]
+             else "No asks, but listed cards are stuck or answered:"]
     for it in asks[:limit]:
-        where = (f"{it['board']}:{it['task_id']}" if it["source"] == "kanban"
-                 else f"{it.get('kind') or 'prompt'} {it['profile']}" if it["source"] == "prompt"
-                 else f"pairing {it.get('platform')}" if it["source"] == "pairing"
-                 else f"outside {it['kind']} · {it['act_where']}" if it["source"] == "outside"
-                 else f"chat {it.get('platform') or it['profile']}"
-                 + (f" with {it['chat_with']}" if it.get("chat_with") else ""))
-        lead = it.get("bluf") or " ".join(str(it.get("ask") or "").split())[:140]
-        lines.append(f"- [{where}] {it['title']}: {lead}")
+        where = (f"{c(it['board'], 80)}:{c(it['task_id'], 80)}" if it["source"] == "kanban"
+                 else f"{c(it.get('kind') or 'prompt', 40)} {c(it.get('profile'), 80)}" if it["source"] == "prompt"
+                 else f"pairing {c(it.get('platform'), 40)}" if it["source"] == "pairing"
+                 else f"outside {c(it.get('kind'), 40)} · {c(it.get('act_where'), 120)}" if it["source"] == "outside"
+                 else f"chat {c(it.get('platform') or it.get('profile'), 80)}"
+                 + (f" with {c(it['chat_with'], 120)}" if it.get("chat_with") else ""))
+        lead = c(it.get("bluf") or it.get("ask"), 140)
+        lines.append(f"- [{where}] {c(it.get('title'), 160)}: {lead}")
         if it.get("approve_command"):
-            lines.append(f"  approve: {it['approve_command']}")
+            lines.append(f"  approve: {c(it['approve_command'], 300)}")
     if q["count"] > limit:
         lines.append(f"…and {q['count'] - limit} more. Open /unblock in Desktop.")
+    if held:
+        lines.append(f"{held} stuck or answered card(s) are also listed in Desktop.")
     for err in q["errors"]:
-        lines.append(f"(source error: {err})")
+        lines.append(f"(source error: {c(err, 300)})")
     return "\n".join(lines)
 
 
@@ -47,9 +53,12 @@ LOCAL_SURFACES = frozenset({"cli", "tui", "desktop", "local"})
 
 def _count_only() -> str:
     q = _needs().build_queue()
-    if not q["count"] and not q["errors"]:
+    held = any(it.get("tier") in ("stuck", "answered") for it in q["items"])
+    if not q["count"] and not q["errors"] and not held:
         return "Nothing is blocked on you."
     lead = f"{q['count']} thing(s) waiting on you. " if q["count"] else ""
+    if not q["count"] and held and not q["errors"]:
+        lead = "No asks, but stuck or answered cards are listed. "
     if q["errors"]:
         lead += "The queue is incomplete. "
     return (lead + "Open UNBL0CK in Hermes Desktop or run "

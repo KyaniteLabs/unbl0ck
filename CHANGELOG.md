@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Summaries stop when switched off, terminal output is cleaned, and an empty ask list no longer reads as all clear (#32 round 4).** A cached summary is no longer attached to cards once summaries are disabled, the CLI and slash output strip control characters from every field, and the CLI, slash command and Desktop say that stuck or answered cards are listed instead of "Nothing is blocked on you" or ALL CLEAR. The README now describes the real queue order, and GET Card applies the same 300-character limit as the POST models (documented in the architecture guide).
 - **Full text shows the whole chat message or live prompt (#32).** Polling still carries a 480-character tail, now labelled; opening Full text reads the complete record (up to 20,000 characters) for that version via `GET /source/text`. Stale, missing and unreadable sources report errors with retry; password prompts are never expanded and nothing is sent to a model.
 
 ## 0.5.1 (2026-11-14)

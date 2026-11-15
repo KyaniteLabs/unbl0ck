@@ -146,6 +146,8 @@ def _card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
 
 
 def _checked_card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
+    if max(len(id_ or ""), len(board or ""), len(task_id or "")) > MAX_ID:
+        raise HTTPException(status_code=400, detail="card reference is too long")
     from hermes_cli import kanban_db  # type: ignore
 
     board, task_id = _card_ref(id_, board, task_id)

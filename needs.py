@@ -2203,7 +2203,8 @@ def build_queue(
             -(_num(i.get("since"))),
         )
     )
-    attach_blufs(shown, home)
+    if bluf_enabled():
+        attach_blufs(shown, home)
     counts = {
         "asks": sum(1 for i in shown if i.get("tier") not in ("stuck", "answered")),
         "answered": sum(1 for i in shown if i.get("tier") == "answered"),

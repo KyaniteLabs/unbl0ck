@@ -1422,6 +1422,8 @@ function Page({ ctx, refresh }) {
   const kanbanAsks = kanban.filter(i => i.tier !== 'stuck' && i.tier !== 'answered')
   const kanbanStuck = kanban.filter(i => i.tier === 'stuck')
   const kanbanAnswered = kanban.filter(i => i.tier === 'answered')
+  // Stuck and answered cards are listed but are not asks; they still mean the queue is not empty.
+  const held = q.items.filter(i => i.tier === 'stuck' || i.tier === 'answered').length
   const chats = q.items.filter(i => i.source === 'chat')
   const outside = q.items.filter(i => i.source === 'outside')
   const prompts = q.items.filter(i => i.source === 'prompt')
@@ -1498,7 +1500,9 @@ function Page({ ctx, refresh }) {
                                 ? 'A source failed to load; the list may be incomplete.'
                                 : askCount(q)
                                 ? 'Everything that is waiting on your word.'
-                                : 'Nothing is blocked on you.',
+                                : held
+                                  ? 'No asks, but stuck or answered cards are listed.'
+                                  : 'Nothing is blocked on you.',
                           jsx('i', { className: 'ub-cursor' })
                         ]
                       })
@@ -1554,7 +1558,7 @@ function Page({ ctx, refresh }) {
           ...group('KANBAN.ANSWERED', kanbanAnswered, true),
           ...group('OUTSIDE.HERMES', outside),
           ...group('CHATS', chats),
-          !q.loading && !askCount(q) && !q.fault && !(q.errors || []).length
+          !q.loading && !askCount(q) && !held && !q.fault && !(q.errors || []).length
             ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, outside item, chat, prompt or pairing request is waiting on you.' })] })
             : null
         ]
