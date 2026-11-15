@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Context and full-text caches follow the card text (#34 round 5).** The Context panel and the loaded full question text were reused whenever the block version matched, so a description or comment edited in place showed stale text; they now reload when the version, title, question, owner, description or comments change.
 - **Ask timers are pinned to stop on unmount (#34 round 5).** A test now unmounts a card while its request is still pending and checks that the recovery and expiry timers are cleared, so a leaked interval cannot go unnoticed.
 - **A long model reply no longer breaks the conversation (#34 round 5).** A stored reply is kept to the per-message limit, so a very long answer cannot make every later request in that conversation refused, and the conversation character budget now holds even when one message is the whole history.
 - **Retry resends what was lost (#34 round 5).** Retry after a conversation was dropped while answering, or after a refused first or follow-up question, now sends a request again (only the lost message, never evicted history), and the button is hidden when there is nothing to resend.

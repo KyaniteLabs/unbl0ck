@@ -1039,28 +1039,28 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
 
   useEffect(() => {
     if (!detailOpen) return
-    if (detail && detail.__version === item.version) return
+    if (detail && detail.__ctx === ctxNow) return
     let alive = true
     setDetailLoading(true)
     setDetailError('')
     ctx.rest(`/card?id=${encodeURIComponent(item.id)}`)
-      .then(d => { if (alive) setDetail({ ...d, __version: item.version }) })
+      .then(d => { if (alive) setDetail({ ...d, __ctx: ctxNow }) })
       .catch(e => { if (alive) setDetailError(String(e?.message || e)) })
       .finally(() => { if (alive) setDetailLoading(false) })
     return () => { alive = false }
-  }, [item.version, detailOpen])
+  }, [ctxNow, detailOpen])
   useEffect(() => {
-    if (!hasFull || !open || outsideText?.__version === item.version) return
+    if (!hasFull || !open || outsideText?.__ctx === ctxNow) return
     let alive = true
     setOutsideTextLoading(true)
     setOutsideTextError('')
     const id = encodeURIComponent(item.id), version = encodeURIComponent(item.version)
     ctx.rest(isOutside ? `/outside/text?id=${id}&version=${version}` : `/source/text?id=${id}&version=${version}`)
-      .then(d => { if (alive) setOutsideText({ text: d.text, truncated: d.truncated === true, __version: item.version }) })
+      .then(d => { if (alive) setOutsideText({ text: d.text, truncated: d.truncated === true, __ctx: ctxNow }) })
       .catch(e => { if (alive) setOutsideTextError(String(e?.message || e)) })
       .finally(() => { if (alive) setOutsideTextLoading(false) })
     return () => { alive = false }
-  }, [item.id, item.version, hasFull, open, outsideTextRetry])
+  }, [item.id, ctxNow, hasFull, open, outsideTextRetry])
   useEffect(() => {
     if (askEnd.current) askEnd.current.scrollIntoView({ block: 'nearest' })
   }, [askMsgs, askBusy])
@@ -1096,13 +1096,13 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
   }, [askBusy, askId, askMsgs.length, askError])
 
   const loadDetail = async () => {
-    if (detail && detail.__version === item.version) return detail
+    if (detail && detail.__ctx === ctxNow) return detail
     if (detailLoading) return null
     setDetailLoading(true)
     setDetailError('')
     try {
       const d = await ctx.rest(`/card?id=${encodeURIComponent(item.id)}`)
-      const full = { ...d, __version: item.version }
+      const full = { ...d, __ctx: ctxNow }
       setDetail(full)
       return full
     } catch (e) {
@@ -1192,10 +1192,10 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
   }
   const ready = !busy && answer.trim().length > 0 && !answerStale
   const saysKeep = !triage && KEEP_BLOCKED.test(answer)
-  const outsideBody = outsideText?.__version === item.version ? outsideText.text : item.ask
+  const outsideBody = outsideText?.__ctx === ctxNow ? outsideText.text : item.ask
   // The note says so whenever the text on screen is the excerpt: before Full text is opened,
   // after it is closed again, and while a different version is cached.
-  const showingFull = open && outsideText?.__version === item.version
+  const showingFull = open && outsideText?.__ctx === ctxNow
   const cutNote = item.ask_cut === true
   const excerptNote = hasFull && !isOutside && !showingFull
     ? jsx('div', {
@@ -1367,7 +1367,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
   }
   const discussInChat = async () => {
     try {
-      const d = detail?.__version === item.version ? detail : await loadDetail()
+      const d = detail?.__ctx === ctxNow ? detail : await loadDetail()
       const draft = seedDraft(item, d)
       host.newChat(null)
       await new Promise(res => setTimeout(res, reducedMotion() ? 0 : 200))
@@ -1626,7 +1626,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
               jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' }),
               item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null
             ]),
-        !isOutside && hasFull && open && outsideText?.__version === item.version && outsideText.truncated
+        !isOutside && hasFull && open && outsideText?.__ctx === ctxNow && outsideText.truncated
           ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This message is longer than 20,000 characters. Only the beginning is shown; the end, which may hold the question, is in the original chat.' })
           : null,
         isOutside && item.truncated ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This export exceeds 256 KiB. Only the beginning is shown; read the complete text in the original app.' }) : null,

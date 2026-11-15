@@ -448,6 +448,29 @@ const it={...item,id:'kanban:default:rb2',version:'1'};
 """)
 
 
+class DetailCacheToken(NodeCase):
+    def test_context_detail_reloads_when_the_card_text_changes_without_a_new_version(self):
+        """Sweep (class A): the Context cache was keyed by the block version, which an edit in place keeps."""
+        self.run_views(r"""
+let loads=0;
+const ctx={rest:async(url)=>{if(url.startsWith('/card?'))loads++;return{comments:[]}}};
+const it={...item,id:'kanban:default:dc1',version:'4',title:'Launch',comments_sig:'1:a:x',body_sig:'b1'};
+(async()=>{
+ mount(ctx,it);
+ await find(mount(ctx,it),'Context').onClick();
+ mount(ctx,it);
+ await new Promise(r=>setTimeout(r,5));
+ assert.equal(loads,1,'the first open loads the detail once');
+ mount(ctx,{...it,comments_sig:'2:b:y'});
+ await new Promise(r=>setTimeout(r,5));
+ assert.equal(loads,2,'an edited comment with the same version must load the context again');
+ mount(ctx,{...it,comments_sig:'2:b:y',body_sig:'b2'});
+ await new Promise(r=>setTimeout(r,5));
+ assert.equal(loads,3,'an edited description with the same version must load the context again');
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
 class Stack06Docs(unittest.TestCase):
     def test_docs_name_the_text_that_makes_advice_stale_and_the_retry_id(self):
         text = " ".join((ROOT / "docs/operator-guide.md").read_text().split())
