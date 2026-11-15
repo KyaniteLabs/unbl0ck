@@ -8,7 +8,8 @@ and performs explicit human-selected actions; it does not run a separate service
 | --- | --- |
 | `plugin.yaml` | Plugin manifest, feature settings and host entry points |
 | `__init__.py` | Registration, local/messaging slash command, CLI, filing tool and prompt hooks |
-| `needs.py` | Settings, five source collectors, detection, versioned mutations, redaction, persisted state and Pocket pack |
+| `needs.py` | Settings, five source collectors, detection, versioned mutations, the Ask payload, persisted state and Pocket pack |
+| `redact.py` | Second-line secret redaction of text and of JSON inside text (pure; loaded by `needs.py`) |
 | `jobs.py` | Summary and Ask lifecycle tables (in memory), the Ask restart journal (one small file per job), locks, expiry and bounded result retention |
 | `dashboard/plugin_api.py` | Validated HTTP inputs, background execution, capacity admission and explicit HTTP failure contracts |
 | `desktop/src/plugin.src.js` | Desktop queue, local drafts, actions, recovery controls and host SDK integration |
