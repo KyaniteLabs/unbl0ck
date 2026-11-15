@@ -21,7 +21,7 @@ restoration is pending, and renews its window after a failed restoration request
 "could not restore, try again". When an entry expires the page announces
 "Undo window ended". If the item changed or its record is already gone, Undo says nothing
 was restored. A filed record is kept on disk for 15 minutes after Done (at most 25 such
-records), then deleted; the agent's own `resolve` action removes a record permanently and
+records), then deleted on the next poll, filing or action while UNBL0CK runs (there is no background timer, so records can remain on disk while UNBL0CK is not running); the agent's own `resolve` action removes a record permanently and
 is the only action that means the work is finished. Re-filing identical content keeps a
 Done item hidden; changed content brings it back.
 

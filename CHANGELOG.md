@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **The README and operator guide now describe Done as recoverable (#36 round 4).** A filed record is kept for 15 minutes (at most 25), Undo is offered for both kinds, the disk bound is 200 active plus 25 retained, and cleanup runs on the next poll, filing or action while UNBL0CK runs, with no background timer.
 - **A late summary or a late refresh can no longer act on newer state (#36 sweep).** Desktop's queue refresh after an answer or Done now waits for any load already in flight and reads again, so a response read before the action cannot put the card back. A summary request for an older question no longer replaces the summary of a newer one, and pruning the summary cache keeps summaries saved after the queue it judged was read.
 - **Undo no longer clears a newer Done, and a failed write stays retryable (#36 review).** A Not for me token for an older version cannot remove a Done recorded for a newer one, and when both markers exist the hidden marker is cleared first so a failed second write leaves the Done token valid for a retry.
 - **Undo names the dismissal it undoes (#36 review).** A Done now returns a `token` and Desktop sends it (or the hidden version) with `/unhide`; an old Undo can no longer clear a newer Done or hide, and a filed item dismissed twice (Done in one tab, Not for me in another) is restored by either Undo clearing both markers. Callers without a token behave as before.
