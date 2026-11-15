@@ -257,14 +257,21 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
    the state lock (`lock_check` says when this filesystem cannot report it). Records
    written by older releases with a null or empty version are valid and count as healthy.
    `recovery_dir` is `absent`, `ok` or `unsafe` (a file or link where the directory
-   belongs; the command exits 1). A diagnosis lists at most 100 backups, newest label
-   first, and reads at most 64 MiB of them; the rest are counted in `backups_omitted` or
-   marked `not_checked`. A link anywhere in `plugin-data/unbl0ck` makes every command
-   refuse.
+   belongs; the command exits 1). A diagnosis looks at no more than 10,000 directory entries
+   and 5 seconds of listing, lists at most 100 backups, newest label first, and reads at
+   most 64 MiB of them (the budget is enforced on the bytes actually read); the rest are
+   counted in `backups_omitted` or marked `not_checked`. When the listing stopped early,
+   `backups_complete` is `false` and the counts are lower bounds. A backup that cannot be
+   opened is listed as `unsafe`, never dropped. A link at `plugin-data`, at
+   `plugin-data/unbl0ck` or at the recovery directory, or in place of a store, a backup or
+   the lock file, makes the command that uses it refuse; links elsewhere under the data
+   directory (for example in `waits/`) are not inspected. A directory that passes the check
+   is the one every later step uses: if it is swapped for a link or another directory
+   afterwards, the command refuses instead of reading or writing there.
 2. **Preserve.** `preserve` copies the exact current bytes, readable or not, into
    `plugin-data/unbl0ck/recovery/` (it creates the recovery directory, mode 700, on first
-   use), checks the copy and syncs it and its directory to disk; a sync that fails is
-   reported as a failure. The store itself is not changed. These backups
+   use; an existing directory keeps its mode), checks the copy and syncs it and its directory
+   to disk; a sync that fails is reported as a failure that names the copy it created. The store itself is not changed. These backups
    hold the same private content as the store and are never deleted by the plugin or this
    tool; remove them yourself when you no longer need them.
 3. **Restore.** Put a backup you trust in that directory as `<store>-<label>.bak` with mode
@@ -276,9 +283,12 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
    copies the current bytes aside first, writes the backup beside the store, verifies it and
    swaps it in atomically, then reads the installed file back and syncs the directory.
    A failure before the swap leaves the store as it was. A failure after it (the directory
-   sync or the readback) is reported as `failed` with `store_unchanged` false and the
-   preserved copy of the previous bytes in `preserved_current`; the tool does not roll
-   back. The reported entry counts and warnings are those of the backup and store actually
+   sync or the readback) is reported as `failed` with the preserved copy of the previous
+   bytes in `preserved_current` (also when only that copy's directory sync failed), and
+   `store_unchanged` says what the store holds now: `false` when it differs from before the
+   restore began, `true` when it is byte-for-byte what it was (for example a backup
+   identical to the current file) and `null` when it cannot be read back to say; the tool
+   does not roll back. The reported entry counts and warnings are those of the backup and store actually
    replaced, rebuilt after the lock is held.
 
 Consequences to expect: everything changed after the backup was made is lost (dismissals,

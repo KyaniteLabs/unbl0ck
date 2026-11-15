@@ -390,29 +390,36 @@ class UnsafeStateFile(OSError):
         self.reason = reason
 
 
-def _names_open_file(fd: int, p: Path) -> bool:
+def _names_open_file(fd: int, p: Path, dir_fd: int | None = None) -> bool:
     """True when the path still names the very file *fd* is open on. This is what refuses a
     link on a platform that has no ``O_NOFOLLOW`` (the open follows it and ``fstat`` sees a
-    regular target) and a path that was swapped after the open."""
+    regular target) and a path that was swapped after the open. With *dir_fd* the name is
+    looked up in that directory, not through the path again."""
     try:
-        return os.path.samestat(os.fstat(fd), os.lstat(p))
+        now = os.lstat(p) if dir_fd is None else os.stat(p.name, dir_fd=dir_fd, follow_symlinks=False)
+        return os.path.samestat(os.fstat(fd), now)
     except OSError:
         return False
 
 
-def _read_plain_bytes_st(p: Path, limit: int | None = None) -> tuple[bytes, os.stat_result]:
+def _read_plain_bytes_st(
+    p: Path, limit: int | None = None, *, dir_fd: int | None = None
+) -> tuple[bytes, os.stat_result]:
     """Read a regular file's exact bytes without following a link or blocking on a FIFO or
     device, refusing one larger than *limit* (before reading when ``fstat`` already says so, and
     by the bytes actually read when it grew). Returns the bytes with the ``fstat`` of the very
     descriptor they were read from, so a caller that caches by file signature caches the
     signature of what it read, not of whatever a later path lookup finds."""
     limit = MAX_STATE_BYTES if limit is None else limit
-    fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
+    if dir_fd is None:
+        fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
+    else:  # the caller holds the verified directory: open the name inside it, never through the path
+        fd = os.open(p.name, os.O_RDONLY | _NOFOLLOW | _NONBLOCK, dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise UnsafeStateFile("not a regular file", "not_regular")
-        if not _names_open_file(fd, p):
+        if not _names_open_file(fd, p, dir_fd):
             raise UnsafeStateFile("not the file that was opened (a link or a swapped path)", "changed")
         if st.st_size > limit:
             raise UnsafeStateFile("too large to be a state file", "too_large")
