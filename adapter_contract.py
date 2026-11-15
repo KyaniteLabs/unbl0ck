@@ -286,6 +286,13 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
     return out
 
 
+def _advance(cur: Local, a: Action) -> Local:
+    """Move the watermark: seq and revision always together, for every action that carries a newer seq."""
+    if a.seq is None or a.seq <= cur.seq:
+        return cur
+    return replace(cur, seq=a.seq, revision=cur.revision if a.revision is None else a.revision)
+
+
 def apply(local: Mapping[Key, Local], plan: Plan) -> dict[Key, Local]:
     """Reference model of what a store does with a plan. Pure; tests use it to replay batches."""
     out = dict(local)
@@ -309,12 +316,7 @@ def apply(local: Mapping[Key, Local], plan: Plan) -> dict[Key, Local]:
             cur = replace(cur, state="gone", held=False, evidence=None, pending_edit=False)
         elif a.op == "resurface":
             cur = replace(cur, acted_revision=None)
-        if a.seq is not None and a.seq > cur.seq:
-            cur = replace(cur, seq=a.seq)
-        if a.revision is not None and a.op in ("update", "restore", "complete_verified", "complete_unconfirmed", "reopen",
-                                               "contradicted", "remove", "advance"):
-            cur = replace(cur, revision=a.revision)
-        out[a.key] = cur
+        out[a.key] = _advance(cur, a)
     return out
 
 
