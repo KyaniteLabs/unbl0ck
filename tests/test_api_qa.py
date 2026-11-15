@@ -49,9 +49,10 @@ class ApiQA(unittest.TestCase):
             NO_BLUF_SOURCES=real.NO_BLUF_SOURCES,
             hide=hide,
             StaleAnswer=real.StaleAnswer,
+            VersionRequired=real.VersionRequired,
             normalize_board_slug=real.normalize_board_slug,
             pocket_pack=lambda q: {"cards": len(q["items"])},
-            write_pocket_pack=lambda q: self.written.append(q),
+            write_pocket_pack=lambda q, pack=None: self.written.append(q),
             answer_card=self._answer,
             build_queue=lambda: {
                 "items": [dict(i) for i in items],

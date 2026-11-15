@@ -51,18 +51,19 @@ control and are not a standalone public API.
 | `GET /card` | Kanban context by validated ID or board/task reference |
 | `GET /outside/text` | Current bounded outside text; matching item version required |
 | `GET /source/text` | Full text of one current chat or live-prompt record, read on demand; version required (409 if stale, 404 if gone, 503 if the source cannot be read, 403 for password prompts) |
-| `POST /card/ask` | Validated question history; returns a job ID immediately or an explicit admission error |
+| `POST /card/ask` | Strictly validated question history (user and assistant turns only, ending with a user question), optional card `version` (409 if the card was blocked again) and optional `request_id` (a repeat returns the same job); returns a job ID immediately or an explicit admission error. Admission (429) is decided before the card is read |
 | `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502 |
 | `GET /card/ask/{job}?poll=true` | Same job, with terminal model failures encoded as `{ok:false,detail}` for the client |
-| `POST /kanban/answer` | Versioned native comment and optional release; stale version 409 with no comment or release; empty version 400; unversioned comment-only answers still work for older callers (response `versioned:false`, `Warning: 299` header) unless `require_answer_version` is on (428, nothing written); the response reports the block `version` applied; settings uncertainty prevents writes |
-| `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID (also restores a filed record marked done; `restored:false` when nothing was restorable). Identifiers (and `board`/`task_id` on `/card`, `/kanban/answer`, `/outside/done`) are limited to 300 characters with no control characters (400); a malformed or non-Kanban `id`, or one that disagrees with `board`/`task_id`, is rejected instead of retargeted |
+| `POST /kanban/answer` | Versioned native comment and optional release; stale version 409 with no comment or release; empty version 400; unversioned comment-only answers still work for older callers (response `versioned:false`, `Warning: 299` header) unless `require_answer_version` is on (428, nothing written, decided on the same settings snapshot the write uses; a release without a version stays 400); the response reports the block `version` applied; settings uncertainty prevents writes |
+| `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID (also restores a filed record marked done; `restored:false` when nothing was restorable). Identifiers (and `board`/`task_id` on `/card`, `/kanban/answer`, `/outside/done`) are limited to 300 characters with no control characters, including the C1 range and line/paragraph separators (400); a malformed or non-Kanban `id`, or one that disagrees with `board`/`task_id` (the same board spelled differently, such as `DEFAULT`, agrees), is rejected instead of retargeted |
 | `POST /outside/done` | Local, reversible Done: mark a filed record done (kept up to 15 minutes, at most 25) or hide a folder item version; `local_only:true`; nothing is sent or completed externally |
 | `GET /pack`, `POST /pack` | Read pack representation, or explicitly write it |
 
 POST Answer/Ask models bound card identifiers to 300 characters, answers/message text
 to 20,000, and Ask history to 50 messages. Outside-text checks also bound its ID/version
-to 300; GET Card does not apply the same length limit. Invalid/stale/missing references fail instead of targeting a
-different item. Ask capacity returns 429; unavailable model infrastructure returns 503;
+to 300; GET Card applies the same 300-character limit to its ID and board/task reference (400).
+Oversized identifiers in a POST body fail validation with 422. Invalid/stale/missing references fail instead of
+targeting a different item. Ask capacity returns 429; unavailable model infrastructure returns 503;
 unknown/expired jobs return 404. Not every error is retryable without refreshing.
 
 ## State lifecycle
@@ -72,21 +73,30 @@ as private. Settings and source files remain owned by their original application
 
 | State | Lifetime and ownership |
 | --- | --- |
-| `hidden.json` | Version-specific hides, capped at 1,000; shared by local operator surfaces |
-| `pending-release.json` | Recovery state for comments whose release remains unfinished |
+| `hidden.json` | Version-specific hides, capped at 1,000 (the oldest dismissal goes first); a hide for a version older than the card's current one is refused; shared by local operator surfaces |
+| `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is always recoverable |
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; shared across profiles |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
-| `bluf.json` | Summary cache capped at 2,000, version-bound; failed-source entries retained subject to cap |
+| `bluf.json` | Summary cache capped at 2,000, bound to the item version and to a hash of its title, text, owner and comment count (an edit or a new comment is summarized again); failed-source entries retained subject to cap |
 | `pocket-pack.json` | Written only on explicit pack request |
 | Summary/Ask jobs | Process memory; restart loses pending work and results |
 | Answer drafts | Desktop session memory, 100 entries, 30 minutes after last edit; original question version retained |
 | Display preferences | Effects and sound only, in Desktop localStorage |
+
+An answer with release is one Kanban write transaction: a stale version is refused (409) with no comment
+written, and a release that fails after the answer is written (false or an error) leaves the comment and a
+recovery marker for the retry. Duplicate detection looks only at comments made since the current block.
 
 Shared read-modify-write stores for hidden, summary, pending-release and filed state
 use thread locks and atomic replacement. macOS/Linux additionally use `fcntl`
 cross-process locking with a five-second timeout. Live prompt files and Pocket pack
 use per-file atomic replacement without those shared-store locks. Windows lacks that
 cross-process guarantee. Never repair corruption by silently replacing it with defaults.
+
+State reads and writes never follow a link: a symbolic link in place of `plugin-data/unbl0ck`,
+its subfolders, the lock file, a state file or a temporary file is refused, and a state file
+that is not a regular file or is over 16 MiB is treated as unreadable. A state file whose
+entries are not in the shape this version writes is likewise left untouched until repaired.
 
 Summary admission is bounded to two workers; Ask admission to four. Failed submission
 must release its slot and settle/remove its pending job. Settled Ask eviction follows
