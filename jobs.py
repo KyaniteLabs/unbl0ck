@@ -554,6 +554,9 @@ class AskJournal:
                 while view:
                     view = view[os.write(tfd, view):]
                 os.fsync(tfd)
+                # The name must still be the file just written, or the rename installs a stranger.
+                if not os.path.samestat(os.fstat(tfd), os.stat(tmp, dir_fd=fd, follow_symlinks=False)):
+                    raise OSError("the temporary record was replaced before it was installed")
             finally:
                 os.close(tfd)
             os.rename(tmp, f"{job}.json", src_dir_fd=fd, dst_dir_fd=fd)

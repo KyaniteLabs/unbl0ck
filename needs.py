@@ -352,6 +352,8 @@ def _state_lock(home: Path | None):
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise OSError("the state lock is not a regular file")
+            if not _names_open_file(fd, d / ".state.lock"):
+                raise OSError("the state lock is a link; refusing to lock through it")
             if fcntl is not None:
                 while True:
                     try:
@@ -375,28 +377,56 @@ MAX_STATE_BYTES = 16 * 1024 * 1024
 _PROFILE_YAML_BYTES = 64 * 1024
 
 
-def _read_plain_text_st(
-    p: Path, limit: int | None = None, errors: str = "strict"
-) -> tuple[str, os.stat_result]:
-    """Read a regular file without following a link or blocking on a FIFO or device, and refuse
-    one larger than *limit* before reading it. Returns the text with the ``fstat`` of the very
-    descriptor it was read from, so a caller that caches by file signature caches the signature
-    of what it read, not of whatever a later path lookup finds."""
+class UnsafeStateFile(OSError):
+    """A state path that is not a plain regular file of a sane size (a link, FIFO, device,
+    oversized or swapped file). ``reason`` is one of ``not_regular``, ``too_large``, ``changed``."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _names_open_file(fd: int, p: Path) -> bool:
+    """True when the path still names the very file *fd* is open on. This is what refuses a
+    link on a platform that has no ``O_NOFOLLOW`` (the open follows it and ``fstat`` sees a
+    regular target) and a path that was swapped after the open."""
+    try:
+        return os.path.samestat(os.fstat(fd), os.lstat(p))
+    except OSError:
+        return False
+
+
+def _read_plain_bytes_st(p: Path, limit: int | None = None) -> tuple[bytes, os.stat_result]:
+    """Read a regular file's exact bytes without following a link or blocking on a FIFO or
+    device, refusing one larger than *limit* (before reading when ``fstat`` already says so, and
+    by the bytes actually read when it grew). Returns the bytes with the ``fstat`` of the very
+    descriptor they were read from, so a caller that caches by file signature caches the
+    signature of what it read, not of whatever a later path lookup finds."""
     limit = MAX_STATE_BYTES if limit is None else limit
     fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise OSError("not a regular file")
+            raise UnsafeStateFile("not a regular file", "not_regular")
+        if not _names_open_file(fd, p):
+            raise UnsafeStateFile("not the file that was opened (a link or a swapped path)", "changed")
         if st.st_size > limit:
-            raise OSError("too large to be a state file")
+            raise UnsafeStateFile("too large to be a state file", "too_large")
         with os.fdopen(fd, "rb", closefd=False) as fh:
             raw = fh.read(limit + 1)
         if len(raw) > limit:
-            raise OSError("too large to be a state file")
-        return raw.decode("utf-8", errors), st
+            raise UnsafeStateFile("too large to be a state file", "too_large")
+        return raw, st
     finally:
         os.close(fd)
+
+
+def _read_plain_text_st(
+    p: Path, limit: int | None = None, errors: str = "strict"
+) -> tuple[str, os.stat_result]:
+    """:func:`_read_plain_bytes_st`, decoded as UTF-8."""
+    raw, st = _read_plain_bytes_st(p, limit)
+    return raw.decode("utf-8", errors), st
 
 
 def _read_plain_text(p: Path, limit: int | None = None, errors: str = "strict") -> str:
@@ -458,6 +488,11 @@ def _write_json(p: Path, data: dict[str, Any], *, ordered: bool = False) -> None
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(payload)
+            fh.flush()
+            # The pathname must still be the file just written: a swapped temporary name would
+            # otherwise be installed as the state file.
+            if not _names_open_file(fh.fileno(), tmp):
+                raise OSError(f"{p.name}: the temporary file was replaced before it was installed")
         for attempt in range(_REPLACE_ATTEMPTS):
             try:
                 tmp.replace(p)
