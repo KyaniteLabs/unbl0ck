@@ -128,8 +128,10 @@ class Outside(OutsideFixture):
             body="b" * 9000,
             act_where="a" * 150,
             ref="r" * 400,
-            dedupe_key="d" * 150,
+            dedupe_key="d" * 120,
         )
+        # An identifier is never shortened (round 4, 01-068): a longer key is refused instead.
+        self.assertIn("error", self.file(dedupe_key="d" * 150))
         (it,) = needs.build_queue()["items"]
         self.assertEqual(len(it["title"]), 160)
         self.assertEqual(len(it["text"]), 8000)
@@ -160,9 +162,13 @@ class Outside(OutsideFixture):
             result = self.file(dedupe_key=key)
             args = {
                 "action": "resolve",
-                **({"id": result["id"]} if key == "one" else {"dedupe_key": key}),
+                **(
+                    {"id": result["id"], "version": result["version"]}
+                    if key == "one"
+                    else {"dedupe_key": key}
+                ),
             }
-            reply = json.loads(self.tools["unbl0ck_file"][2](args))
+            reply = json.loads(self.tools["unbl0ck_file"][2](args, profile="work"))
             self.assertTrue(reply["ok"])
             self.assertFalse(self.record(result).exists())
         self.assertEqual(needs.build_queue()["count"], 0)
@@ -244,7 +250,7 @@ class Outside(OutsideFixture):
         (it,) = needs.build_queue()["items"]
         self.assertEqual(it["text"].strip(), "Reuni\u00f3n ma\u00f1ana en el caf\u00e9")
 
-    def test_html_only_mail_never_displays_html(self):
+    def test_html_only_mail_shows_inert_text_never_markup(self):
         self.watch()
         msg = EmailMessage()
         msg.set_content(
@@ -252,8 +258,9 @@ class Outside(OutsideFixture):
         )
         (self.folder / "html.eml").write_bytes(msg.as_bytes())
         (it,) = needs.build_queue()["items"]
-        self.assertNotIn("secret HTML", it["text"])
+        self.assertIn("secret HTML", it["text"])
         self.assertNotIn("<img", it["text"])
+        self.assertNotIn("example.com", json.dumps(it))
 
     def test_notes_use_first_nonempty_line_and_decode_replacement(self):
         self.watch()
@@ -324,7 +331,7 @@ class Outside(OutsideFixture):
         f = self.folder / "note.txt"
         f.write_text("Before")
         (it,) = needs.build_queue()["items"]
-        self.assertEqual(it["version"], f"{f.stat().st_mtime_ns}:{f.stat().st_size}")
+        self.assertRegex(it["version"], rf"\A{f.stat().st_mtime_ns}:{f.stat().st_size}:[0-9a-f]{{16}}\Z")
         needs.hide(it["id"], it["version"], self.home)
         self.assertEqual(needs.build_queue()["count"], 0)
         f.write_text("After, a longer note")
@@ -351,14 +358,14 @@ class Outside(OutsideFixture):
             any(e.startswith("outside:") for e in needs.build_queue()["errors"])
         )
         self.watch()
-        iterdir = Path.iterdir
+        scandir = os.scandir
 
         def unreadable(path):
-            if path == self.folder:
+            if Path(path) == self.folder:
                 raise PermissionError("denied")
-            return iterdir(path)
+            return scandir(path)
 
-        with patch.object(Path, "iterdir", unreadable):
+        with patch.object(os, "scandir", unreadable):
             q = needs.build_queue()
         self.assertEqual(q["count"], 1)
         self.assertTrue(any(e.startswith("outside:") for e in q["errors"]))
@@ -474,14 +481,14 @@ class OutsideAPI(OutsideFixture):
         self.client = TestClient(app)
         self.addCleanup(self.client.close)
 
-    def test_done_deletes_filed_record(self):
+    def test_done_hides_filed_record_without_deleting_it(self):
         result = self.file()
         (it,) = needs.build_queue()["items"]
         reply = self.client.post(
             "/outside/done", json={"id": it["id"], "version": it["version"]}
         )
         self.assertEqual(reply.status_code, 200)
-        self.assertFalse(self.record(result).exists())
+        self.assertTrue(self.record(result).exists())  # kept for Undo; see test_outside_done_undo
         self.assertEqual(needs.build_queue()["count"], 0)
 
     def test_queue_sends_only_an_excerpt_and_full_text_is_fetched_lazily(self):

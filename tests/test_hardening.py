@@ -82,16 +82,19 @@ class FastPaths(unittest.TestCase):
         self.assertIs(needs._latest_block(BrokenConn(), kdb, "t1"), old)
         self.assertEqual(kdb.calls, ["list_events"])
 
-    def test_answered_since_is_case_insensitive_and_time_bound(self):
+    def test_answered_since_is_case_insensitive_and_placed_by_event(self):
+        conn = board_db()
+        conn.execute("UPDATE task_events SET payload = '{\"author\": \"Ada\"}' WHERE kind = 'commented'")
         kdb = FakeKdb()
-        self.assertTrue(needs._answered_since(board_db(), kdb, "t1", "ada", 8))
-        self.assertFalse(needs._answered_since(board_db(), kdb, "t1", "ada", 9))
-        self.assertFalse(needs._answered_since(board_db(), kdb, "t1", "someone", 0))
+        self.assertTrue(needs._answered_since(conn, kdb, "t1", "ada", 2))  # comment event 3 follows block 2
+        self.assertFalse(needs._answered_since(conn, kdb, "t1", "ada", 4))
+        self.assertFalse(needs._answered_since(conn, kdb, "t1", "someone", None))
 
     def test_answered_since_falls_back(self):
-        kdb = FakeKdb(comments=[types.SimpleNamespace(author="ADA", created_at=10)])
-        self.assertTrue(needs._answered_since(BrokenConn(), kdb, "t1", "ada", 9))
-        self.assertEqual(kdb.calls, ["list_comments"])
+        event = types.SimpleNamespace(id=12, kind="commented", payload={"author": "ADA"}, created_at=10)
+        kdb = FakeKdb(events=[event])
+        self.assertTrue(needs._answered_since(BrokenConn(), kdb, "t1", "ada", 11))
+        self.assertEqual(kdb.calls, ["list_events"])
 
 
 class Settings(unittest.TestCase):

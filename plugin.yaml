@@ -1,6 +1,6 @@
 name: unbl0ck
 label: UNBL0CK
-version: "0.5.1"
+version: "0.6.0"
 description: >
   UNBL0CK clears whatever is blocked on you. One queue of everything waiting on you: blocked Kanban cards that need your
   answer, chats on any platform whose last turn is a bot asking you something, agents paused right now on a
@@ -33,6 +33,10 @@ config_schema:
     type: int
     default: 6
     description: "How many earlier chat turns an Ask sends along with the card, newest first. The whole prompt also stays under a 40,000-character budget."
+  ask_persist_replies:
+    type: bool
+    default: false
+    description: "Keep finished Ask answers on disk (owner-only, 15 minutes, at most 256 files) so a gateway restart can still show them. Off by default: an answer is private text derived from the card. Restart markers without any text are always kept so a restart never resends a request."
   comment_author:
     type: str
     default: ""
@@ -49,7 +53,23 @@ config_schema:
     type: bool
     default: true
     description: "Lead each card with a one-line model-written summary. Each new or changed Kanban card's, chat's, agent-filed item's or watched-folder file's title and text are sent once to the model provider configured in Hermes (through its plugin LLM API) and the summary is cached in plugin-data. Keys, tokens and home-directory paths are scrubbed from that text before it leaves your machine. Set false to send nothing automatically."
+  require_answer_version:
+    type: bool
+    default: false
+    description: "Refuse Kanban answers that omit the queue item version (HTTP 428). Off keeps older clients working; their answers are accepted against the current block and flagged with a Warning header. Desktop always sends the version."
+  outside_recursive:
+    type: bool
+    default: false
+    description: "Also read .eml/.md/.txt files in nested folders under each watched folder, read-only. Bounded to 3 levels, 5,000 directory entries and 2 seconds per folder; symlinks, dotfolders and anything resolving outside the watched folder are skipped. Off reads direct files only."
+  outside_eml_kind:
+    type: str
+    default: draft
+    description: "What a watched-folder .eml is called when its own headers do not say: draft (default), notes, approval or other. A message marked unsent by its mail client is always a draft, even with received-mail headers; otherwise one with received-mail headers is not called a draft. Only changes the label; the text is read the same way."
+  chat_window_days:
+    type: int
+    default: 14
+    description: "How many days back chats are read for unanswered asks (1 to 90; anything else uses 14). Widening it is a read-only backfill of the same local chat database: nothing is sent to a model, and a chat that is older than 14 days or older than any earlier read is listed but never summarized automatically, even when summaries are on (a small file, chat-backfill.json, remembers the oldest time read and the ids of such chats; no chat text), chats are read in place, at most 500 sessions per profile per refresh, and hidden or answered items stay hidden. The queue reports the window it actually used."
   outside_dirs:
     type: str
     default: ""
-    description: "Comma-separated absolute folders (~ expanded) to watch read-only for .eml drafts and .md/.txt notes. Empty means off. Direct regular files only; up to 200 newest files per folder, 256 KiB per file. Fallback: UNBL0CK_OUTSIDE_DIRS."
+    description: "Comma-separated absolute folders (~ expanded) to watch read-only for .eml mail and .md/.txt notes. Empty means off. Other known export formats (.msg, .mbox, documents, audio) are not read and are reported by count. Regular files only (nested folders only when outside_recursive is on); newest 200 waiting files per folder, 256 KiB per file. Fallback: UNBL0CK_OUTSIDE_DIRS."

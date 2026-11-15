@@ -13,6 +13,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
+from conftest import ask_gen
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -104,7 +105,13 @@ class VisibilityMachine(unittest.TestCase):
     def test_format_is_unchanged(self):
         needs.hide("kanban:b:t", "7", self.home)
         p = needs.data_dir(self.home) / "hidden.json"
-        self.assertEqual(json.loads(p.read_text()), {"kanban:b:t": "7"})
+        # id -> "<version>\x1f<dismissal token>"; a plain version (older files) still loads.
+        raw = json.loads(p.read_text())
+        self.assertEqual(list(raw), ["kanban:b:t"])
+        self.assertTrue(raw["kanban:b:t"].startswith("7\x1f"))
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "7"})
+        p.write_text(json.dumps({"kanban:b:t": "7"}))
+        self.assertEqual(needs.load_hidden(self.home), {"kanban:b:t": "7"})
 
     def test_random_walk_matches_model(self):
         rng = random.Random(7)
@@ -170,21 +177,13 @@ class CardStatusMachine(unittest.TestCase):
         # Bug: the queue's SQL path used LOWER(), which folds ASCII only, while answer_card
         # used str.lower(): "ZOË" counted as answered for one and not the other.
         conn = sqlite3.connect(":memory:")
-        conn.execute(
-            "CREATE TABLE task_comments(id INTEGER PRIMARY KEY, task_id TEXT, author TEXT, body TEXT, created_at INT)"
-        )
-        conn.execute(
-            "INSERT INTO task_comments(task_id, author, body, created_at) VALUES('t','ZOË','ok',10)"
-        )
+        conn.execute("CREATE TABLE task_events(id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT)")
+        conn.execute("""INSERT INTO task_events VALUES(10, 't', 'commented', '{"author": "ZOË"}')""")
         fallback = types.SimpleNamespace(
-            list_comments=lambda c, t: [
-                types.SimpleNamespace(author="ZOË", created_at=10)
-            ]
+            list_events=lambda c, t: [types.SimpleNamespace(id=10, kind="commented", payload={"author": "ZOË"})]
         )
         self.assertTrue(needs._answered_since(conn, fallback, "t", "zoë", 5))
-        self.assertTrue(
-            needs._answered_since(object(), fallback, "t", "zoë", 5)
-        )  # fallback path agrees
+        self.assertTrue(needs._answered_since(object(), fallback, "t", "zoë", 5))  # fallback path agrees
         self.assertFalse(needs._answered_since(conn, fallback, "t", "zoë", 11))
 
 
@@ -420,6 +419,27 @@ class BlufJobsMachine(unittest.TestCase):
         self.clock.t += jobs.BlufJobs.STUCK_S
         self.assertTrue(self.j.start(K))  # really stuck: one retry
 
+    def test_failed_entries_past_their_retries_do_not_grow_the_table_forever(self):
+        # Bug: a version that failed MAX_ATTEMPTS times could never start again, so the
+        # prune (which only drops entries that can start) never removed it.
+        with mock.patch.object(jobs.BlufJobs, "HARD_CAP", 20), mock.patch.object(jobs.BlufJobs, "PRUNE_OVER", 10):
+            for i in range(60):
+                key = (f"item{i}", "v")
+                for _ in range(jobs.BlufJobs.MAX_ATTEMPTS):
+                    self.j.start(key)
+                    self.j.fail(key, "boom")
+                    self.clock.t += jobs.BlufJobs.RETRY_S * 8
+                self.clock.t += 1
+            self.assertLessEqual(len(self.j), 20)
+        self.assertIsNone(self.j.state(("item0", "v")))  # the oldest went first
+        self.assertIsNotNone(self.j.state(("item59", "v")))
+
+    def test_the_cap_never_drops_a_pending_job(self):
+        with mock.patch.object(jobs.BlufJobs, "HARD_CAP", 5), mock.patch.object(jobs.BlufJobs, "PRUNE_OVER", 2):
+            for i in range(8):
+                self.assertTrue(self.j.start((f"p{i}", "v")))
+            self.assertTrue(all(self.j.is_pending((f"p{i}", "v")) for i in range(8)))
+
     def test_illegal_transitions_are_refused(self):
         self.j.start(K)
         self.j.fail(K, "x")
@@ -437,7 +457,8 @@ class BlufJobsMachine(unittest.TestCase):
         self.clock.t += jobs.BlufJobs.RETRY_S + 1
         self.assertTrue(self.j.start(("new", "1")))
         self.assertIs(self.j.state(K), jobs.BlufState.PENDING)
-        self.assertLess(len(self.j), 10)
+        # cooled failures keep their attempt count (round 4: pruning them reset the cap)
+        self.assertEqual(self.j.attempts(("x0", "1")), 1)
 
     def test_random_walk_invariants(self):
         rng = random.Random(11)
@@ -497,13 +518,14 @@ class AskJobsMachine(unittest.TestCase):
         self.j = jobs.AskJobs(clock=self.clock)
 
     def test_states_are_named(self):
-        self.assertEqual({s.value for s in jobs.AskState}, {"pending", "done", "error"})
-        self.assertEqual(jobs.ASK_SETTLED, set(jobs.AskState) - {jobs.AskState.PENDING})
+        # unknown and not_submitted exist only for jobs recovered from the restart journal
+        self.assertEqual({s.value for s in jobs.AskState}, {"pending", "done", "error", "unknown", "not_submitted"})
+        self.assertEqual(jobs.ASK_SETTLED, {jobs.AskState.DONE, jobs.AskState.ERROR})
 
     def test_done_path(self):
         self.j.create("a")
         self.assertIs(self.j.get("a")["status"], jobs.AskState.PENDING)
-        self.assertTrue(self.j.finish("a", "Pick A", "p", "m"))
+        self.assertTrue(self.j.finish("a", "Pick A", "p", "m", gen=ask_gen(self.j, "a")))
         st = self.j.consume("a")
         self.assertEqual(
             (st["status"], st["reply"], st["provider"], st["model"]),
@@ -513,7 +535,7 @@ class AskJobsMachine(unittest.TestCase):
 
     def test_error_path(self):
         self.j.create("a")
-        self.assertTrue(self.j.fail("a", "model call failed"))
+        self.assertTrue(self.j.fail("a", "model call failed", gen=ask_gen(self.j, "a")))
         st = self.j.consume("a")
         self.assertEqual(
             (st["status"], st["ok"], st["detail"]),
@@ -526,8 +548,8 @@ class AskJobsMachine(unittest.TestCase):
             self.j.consume("a")  # still pending
         with self.assertRaises(jobs.IllegalTransition):
             self.j.create("a")  # duplicate
-        self.j.finish("a", "x")
-        for move in (lambda: self.j.finish("a", "y"), lambda: self.j.fail("a", "z")):
+        self.j.finish("a", "x", gen=ask_gen(self.j, "a"))
+        for move in (lambda: self.j.finish("a", "y", gen=ask_gen(self.j, "a")), lambda: self.j.fail("a", "z", gen=ask_gen(self.j, "a"))):
             with self.assertRaises(jobs.IllegalTransition):
                 move()  # already settled
         with self.assertRaises(KeyError):
@@ -538,12 +560,12 @@ class AskJobsMachine(unittest.TestCase):
         self.clock.t += jobs.AskJobs.TTL_S + 1
         self.j.create("new")  # expires "old"
         self.assertIsNone(self.j.get("old"))
-        self.assertFalse(self.j.finish("old", "late"))  # never resurrected
+        self.assertFalse(self.j.finish("old", "late", gen=ask_gen(self.j, "old")))  # never resurrected
         self.assertIsNone(self.j.get("old"))
 
     def test_settled_record_is_complete_when_seen(self):
         self.j.create("a")
-        self.j.finish("a", "r")
+        self.j.finish("a", "r", gen=ask_gen(self.j, "a"))
         st = self.j.get("a")
         self.assertTrue(
             {"status", "ok", "reply", "provider", "model", "started"} <= set(st)
@@ -576,9 +598,9 @@ class AskJobsMachine(unittest.TestCase):
                     model[job] = ("pending", self.clock.t)
             elif op in ("finish", "fail"):
                 fn = (
-                    (lambda job=job: self.j.finish(job, "r"))
+                    (lambda job=job: self.j.finish(job, "r", gen=ask_gen(self.j, job)))
                     if op == "finish"
-                    else (lambda job=job: self.j.fail(job, "d"))
+                    else (lambda job=job: self.j.fail(job, "d", gen=ask_gen(self.j, job)))
                 )
                 if job not in model:
                     self.assertFalse(fn())

@@ -35,8 +35,14 @@ does not prove focus, accessible controls or the operator journey in a browser.
 | Local CLI/slash and pack | `test_inbox_quality`, `test_outside`, `test_qa` | Messaging sees counts only; JSON stdout remains parseable while writing a pack |
 | Answer / keep blocked / release / triage | `test_needs_hermes`, `test_api_qa`, `test_hardening`, rendered operator checks | One comment; partial release retries without another comment; stale versions never submit |
 | Hide / folder Done / Undo | `test_outside`, `test_failure_quality`, `test_operator_recovery`, rendered operator checks | Failed Undo retains retry; corrupt state is preserved; folder source is untouched |
+| Disclosure matrix, redaction and cache partitions | `test_disclosure_matrix`, `test_r4_stack12` | Matrix equals code and docs, and each search and cross-profile flag equals what the real readers and search do; the state inventory lists every persistent file the code names; one settings snapshot per queue response; a settings fault sends nothing end to end; synthetic secrets never reach summary or Ask input; pairing and prompt never summarized; settings fault disables model paths; caches partitioned and concurrent-safe |
+| Ask detection corpus, window and coverage | `test_ask_corpus`, `test_ask_coverage`, `test_desktop_coverage`, `test_r4_stack11` | Known false positives and negatives pinned exactly (named cases carry the configured name); window, skipped counts, read budget and snapshot, and backfill marks reported; no duplicates; coverage is counts and fixed text |
+| Full-text search scope and bounds | `test_search_scope`, `test_desktop_quality` | Matches beyond excerpts, 200-item cap, failed sources, Unicode, no model call, never automatic; executed checks: the profile boundary (`SearchProfileBoundary`), a real home that search must leave untouched (`SearchRealHome`), the shared read budget (`SearchFolderBudget`), and the page itself run under node (`DesktopSearchExecuted`: button click, rendered hits and coverage, stale versions, late answers). Only the draft-preservation and never-automatic checks read the source text rather than run it |
 | Full text / Context / search / keys | `test_desktop_quality`, `test_desktop_contract`, rendered operator checks | Retry controls work; filters preserve mounted state; Escape and focus follow the documented order |
 | Typed answer recovery | `test_operator_recovery`, rendered partial-source checks | Card disappears and returns with draft intact; changed question keeps recovered draft disabled |
+| Surface contract | `test_surface_contract` | Same item order and identity on the CLI list and Pocket pack; every surface agrees on the ask count; remote output carries counts only (no title, text, name, id or command) yet discloses stuck and answered counts; limited output states what it omits; unknown platforms are remote; docs matrix lists every surface and dimension |
+| Capability matrix | `test_capability_matrix` | Every source classified (supported, by design, not yet) with a reason; docs table equals the code; Desktop explains missing model help; non-Kanban ids are refused by the interactive Ask route (automatic one-line summaries are separate and covered by the summary rows); the set of write routes is pinned; password prompts, pairing secrets and Pocket packs carry no inline action or secret; disabled/unreachable provider fails closed |
+| Ask restart recovery | `test_ask_job_recovery`, `test_desktop_ask_recovery` | Restart before send, after send, after completion (with and without answer persistence) and after failure; repeated polling; TTL, cap and settled eviction; corrupt, foreign and symlinked markers; 0600/0700 modes; no answer text on disk by default; card isolation; delete; the provider is never called by recovery |
 | Summary / Ask | `test_bluf*`, `test_ask_job`, `test_ask_privacy`, `test_state_machines`, rendered operator checks | Bounded admission; reasoning stripped; lost terminal response can be collected with no second model POST |
 | Config read failure and repair | `test_failure_quality`, independent actual Hermes parser probes | Raised, marked-dictionary and import failures fail closed, both cold and after a good config; concurrent refresh shares one settled read; another caller's repair cannot erase an in-flight fault |
 | Security relay / installer | `test_security_review`, workflow lint | Native signature/limiter compatibility; pending stays non-green; exact authenticated current review required; foreign routes preserved |
@@ -88,11 +94,46 @@ and relay paths are unchanged by this correction; their earlier execution eviden
 reused, not represented as a new rendered run. The
 397-test run above is historical evidence and does not cover this later correction.
 
+## Acceptance matrix
+
+Reproducible record of what was checked, on which host, and what was not. Fill one row per
+run; leave a row "not run" until someone runs it on the real host. Source CI, packaged-host
+runs, provider runs, Security acceptance, publishing and deployment are separate receipts: a
+missing live run is a missing receipt, not a source defect.
+
+To record a host, run `python scripts/host_compat.py` with the Python that runs Hermes. It
+prints one JSON record (UTC time, plugin version, Hermes runtime version and release date from
+`hermes_cli`, OS, state-lock mode and the Hermes interface names it needs, with any missing)
+and exits 1 if an interface is missing. It reads no settings, chats, cards or credentials. A
+row is filled only from such a record plus the source commit that was tested: a row that cannot
+name the source commit, the Hermes version and release date, and the UTC time stays "not run".
+
+Interfaces taken from Hermes that are not documented plugin APIs are listed in
+`needs.HOST_API` (six of them are private helpers: four in `kanban_db`, two in the webhook
+module the installer script uses; the gateway pairing store and its `list_pending` method are
+listed too) and a test reads the syntax tree of every shipped file and keeps that list equal to
+what the source imports and calls. A name that appears only in a comment is not a dependency. If an upgrade removes one and
+a Kanban board then fails to read, the queue adds a single
+`host: this Hermes lacks N of the M interfaces UNBL0CK uses (...)` line to its errors instead
+of failing deep in a card read.
+
+A row that was run fills the revision cell as `source <commit> / Hermes <version> released <YYYY.M.D>` and the time as `YYYY-MM-DDTHH:MM:SSZ`; `scripts/host_compat.py` (`matrix_row_problems`) rejects any other run row.
+
+| Receipt | Host and OS | Plugin / Hermes revision | Recorded at (UTC) | Result |
+| --- | --- | --- | --- | --- |
+| Source tests and interface check (`pytest`, `scripts/host_compat.py`) | not run | not recorded | not recorded | not run |
+| Packaged Desktop, full operator and recovery flows | not run | not recorded | not recorded | not run |
+| Real permitted export fixtures (mail, notes) | not run | not recorded | not recorded | not run |
+| Configured model and chat providers | not run | not recorded | not recorded | not run |
+| Clean install, upgrade, isolated rollback | not run | not recorded | not recorded | not run |
+| Windows cross-process state lock | not run | not recorded | not recorded | not run |
+| Independent Security acceptance for the exact head | not run | not recorded | not recorded | not run |
+
 ## Acceptance still requiring live evidence
 
 The rendered harness exercises host SDK contracts, not a complete packaged Electron
 application. Live external chat providers, production mail applications, real model
-providers, Windows cross-process concurrency, and every Hermes version are not covered
+providers, Windows cross-process concurrency (the lock is only simulated), and every Hermes version are not covered
 by these results. Use the actual supported host for release acceptance.
 
 The Security bridge is built and locally tested but not activated. At this observation
@@ -105,14 +146,17 @@ automerge, deployment or production end-to-end success is claimed here.
 
 The review compared in-memory draft recovery with disk/localStorage persistence;
 session memory preserves short fault recovery without adding private draft storage.
-Losing drafts on full reload remains explicit. Ask conversation restoration after
-unmount remains a separate possible enhancement; transport retry within a mounted card
-is implemented and verified.
+Losing drafts and Ask conversations on full reload remains explicit and by policy: no
+private text is persisted. Ask conversations, running requests and job selection are
+restored after unmount from the same bounded session memory, without a second model
+call; transport retry is implemented and verified.
 
 Bounded folder selection discloses older omissions instead of silently scanning an
-unbounded directory. Folder pagination and automatic export archiving were not adopted;
-the latter would change the read-only source contract. Filed dedupe keys remain shared
-across profiles; callers can namespace them without migrating existing records.
+unbounded directory. Folders are paged by completion rather than by a cursor: each poll
+shows the newest 200 waiting files, and Done or Not for me on a file brings an older one
+into view. Automatic export archiving was not adopted; it would change the read-only
+source contract. Filed dedupe keys are profile-scoped by default, with an explicit global
+scope; existing records are adopted in place by their own profile.
 
 The review link reuses native signed ingress and verifies GitHub review identity rather
 than adding a listener, executing PR code with secrets, or treating duplicate responses

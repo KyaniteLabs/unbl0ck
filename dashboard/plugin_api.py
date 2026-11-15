@@ -3,12 +3,14 @@
 GET  /queue                  the queue (Kanban, outside items, chats, live prompts, pairing requests)
 GET  /card?id=               read-only context for one Kanban card
 GET  /outside/text?id=&version=  full text for one current outside item, fetched on demand
+GET  /source/text?id=&version=   full text for one current chat or live-prompt item, fetched on demand
+GET  /search?q=                  explicit bounded full-content search; ids, versions and coverage only
 GET  /card/ask/{job}         poll a running Ask
 POST /card/ask               ask the configured model about one card (multi-turn)
 POST /kanban/answer          {board, task_id, text, release, version}: comment as the principal, optionally unblock
-POST /hide                   {id, version}: "Not for me" until the source changes
-POST /unhide                 {id}: undo "Not for me"
-POST /outside/done           {id, version}: delete a filed record or hide a watched file version
+POST /hide                   {id, version}: "Not for me" until the source changes; returns the Undo token and its commit order
+POST /unhide                 {id, token?}: undo "Not for me" or a local Done
+POST /outside/done           {id, version}: local, undoable Done for a filed record or a watched file version; returns the Undo token
 GET  /pack                   the queue as a Pocket-format card pack (read-only)
 POST /pack                   the same pack, also written to plugin-data/unbl0ck/pocket-pack.json
 """
@@ -24,10 +26,10 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from fastapi import APIRouter, HTTPException, Response
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 log = logging.getLogger("unbl0ck")
@@ -81,18 +83,31 @@ def _loaded_ctx():
     """
     target = (PLUGIN_DIR / "__init__.py").resolve()
     for module in list(sys.modules.values()):
-        filename = getattr(module, "__file__", None)
+        filename = _safe_attr(module, "__file__")
         if not filename:
             continue
         try:
             if Path(filename).resolve() != target:
                 continue
-        except OSError:
+        except (OSError, TypeError, ValueError):
             continue
-        ctx = getattr(module, "_PLUGIN_CTX", None)
+        ctx = _safe_attr(module, "_PLUGIN_CTX")
         if ctx is not None:
             return ctx
     return None
+
+
+def _safe_attr(obj: Any, name: str) -> Any:
+    """``getattr`` that treats any failure to resolve the name as absent. A lazily resolved
+    attribute of a host object can raise ImportError, not only AttributeError."""
+    try:
+        return getattr(obj, name, None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _has_llm(ctx: Any) -> bool:
+    return ctx is not None and _safe_attr(ctx, "llm") is not None
 
 
 router = APIRouter()
@@ -100,7 +115,7 @@ router = APIRouter()
 
 MAX_ID = 300            # matches the hide-id limit in needs.hide
 MAX_TEXT = 20_000       # one typed answer or one chat message, in characters
-MAX_MESSAGES = 50       # Ask only uses the last 20; this is the most a client may send
+MAX_MESSAGES = 50       # Ask sends the last few turns (6 by default, configurable); this is the most a client may send
 
 
 class Answer(BaseModel):
@@ -116,37 +131,90 @@ class Hide(BaseModel):
     version: str
 
 
+class AskMessage(BaseModel):
+    """One chat turn. Anything else (a tool turn, a stray key, non-text content) is an error,
+    never silently dropped: the human must see that their message was not understood."""
+
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=MAX_TEXT)
+
+
 class CardAsk(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     id: str = Field(default="", max_length=MAX_ID)
     board: str = Field(default="", max_length=MAX_ID)
     task_id: str = Field(default="", max_length=MAX_ID)
-    messages: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_MESSAGES)
+    # validate_default: a body that leaves "messages" out is judged like one that sends [].
+    messages: list[AskMessage] = Field(
+        default_factory=list, max_length=MAX_MESSAGES, validate_default=True
+    )
+    # The queue version the human read; an Ask about an older question is refused (409).
+    version: Optional[str] = Field(default=None, max_length=MAX_ID)
+    # Client-chosen job id: re-sending the same id returns the same job instead of a second
+    # model call, so a lost response can be retried safely.
+    request_id: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
     @field_validator("messages")
     @classmethod
-    def _message_content_is_bounded(cls, msgs):
-        for m in msgs:
-            c = m.get("content") if isinstance(m, dict) else None
-            if isinstance(c, str) and len(c) > MAX_TEXT:
-                raise ValueError(f"message content is over {MAX_TEXT} characters")
+    def _ends_with_a_question(cls, msgs):
+        if not msgs or msgs[-1].role != "user" or not msgs[-1].content.strip():
+            raise ValueError("the last message must be a non-empty user question")
         return msgs
 
 
+# C0 and C1 controls plus the line/paragraph separators: str.strip() would otherwise fold some
+# of them away and silently address a different card.
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_OTHER_SOURCES = ("chat:", "prompt:", "pairing:", "outside:")
+
+
+def _bounded(**fields: str) -> None:
+    """Reject over-long or control-character identifiers; never truncate or retarget them."""
+    for name, value in fields.items():
+        if len(value) > MAX_ID:
+            raise HTTPException(status_code=400, detail=f"{name} is over {MAX_ID} characters")
+        if _CONTROL.search(value):
+            raise HTTPException(status_code=400, detail=f"{name} contains control characters")
+
+
+def _same_board(a: str, b: str) -> bool:
+    """Two spellings of one board (case, surrounding space) are the same board."""
+    try:
+        n = _needs()
+        return n.normalize_board_slug(a) == n.normalize_board_slug(b)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 def _card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
-    """Accept either the queue id (``kanban:<board>:<task>``) or board + task_id."""
+    """Accept either the queue id (``kanban:<board>:<task>``) or board + task_id.
+
+    An id and explicit fields must agree; a malformed or non-Kanban id is an error rather
+    than a silent fallback to other fields (which could target a different card).
+    """
     if id_:
+        if id_.startswith(_OTHER_SOURCES):
+            raise HTTPException(status_code=400, detail="id is not a Kanban card")
         if id_.startswith("kanban:"):
             parts = id_.split(":", 2)
-            if len(parts) == 3:
-                return parts[1], parts[2]
-        elif not task_id:
-            task_id = id_
+            if len(parts) != 3 or not parts[1] or not parts[2]:
+                raise HTTPException(status_code=400, detail="malformed Kanban card id")
+            if (board and not _same_board(board, parts[1])) or (task_id and task_id != parts[2]):
+                raise HTTPException(status_code=400, detail="id conflicts with board/task_id")
+            return parts[1], parts[2]
+        if task_id and task_id != id_:
+            raise HTTPException(status_code=400, detail="id conflicts with task_id")
+        task_id = id_
     return board, task_id
 
 
 def _checked_card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
+    if max(len(id_ or ""), len(board or ""), len(task_id or "")) > MAX_ID:
+        raise HTTPException(status_code=400, detail="card reference is too long")
     from hermes_cli import kanban_db  # type: ignore
 
+    _bounded(id=id_, board=board, task_id=task_id)
     board, task_id = _card_ref(id_, board, task_id)
     board = str(board or "").strip()
     task_id = str(task_id or "").strip()
@@ -164,13 +232,15 @@ def _checked_card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
 @router.get("/queue")
 def queue():
     n = _needs()
+    _ASK_JOBS.housekeeping()   # saved Ask records expire even when nobody asks again
     q = n.build_queue()
     ctx = _loaded_ctx()
     if q.get("bluf_enabled"):
         for it in q["items"]:
             if (not it.get("bluf") and it.get("source") not in getattr(n, "NO_BLUF_SOURCES", ())
+                    and not it.get("backfilled")   # older than the default window: no automatic model call
                     and it.get("tier") not in ("stuck", "answered")):   # not asks: no model call each
-                if ctx is not None and hasattr(ctx, "llm"):
+                if _has_llm(ctx):
                     _queue_bluf(n, ctx, it)
                 else:
                     it["bluf_status"] = "unavailable"
@@ -198,8 +268,19 @@ def _run_with_slot(slots, worker, *args):
         slots.release()
 
 
+def _fingerprint(n: Any, item: dict[str, Any]) -> str | None:
+    fn = getattr(n, "summary_fingerprint", None)
+    return fn(item) if callable(fn) else None
+
+
+def _bluf_key(n: Any, item: dict[str, Any]) -> tuple[str, str]:
+    """One job per item version AND card text: a changed title or a new comment is a new job."""
+    fp = _fingerprint(n, item)
+    return (item["id"], item["version"] if fp is None else f"{item['version']}|{fp}")
+
+
 def _queue_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
-    key = (item["id"], item["version"])
+    key = _bluf_key(n, item)
     if _BLUF_JOBS.is_pending(key) and not _BLUF_JOBS.can_start(key):
         item["bluf_pending"] = True   # still running: keep saying so on every poll
         return
@@ -223,18 +304,29 @@ def _queue_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
 
 
 def _run_bluf(n: Any, ctx: Any, item: dict[str, Any]) -> None:
-    key = (item["id"], item["version"])
+    key = _bluf_key(n, item)
+    started = time.time()
     try:
         try:
             comments = n.recent_comments(item)
         except Exception as exc:  # noqa: BLE001 - the summary still works from the card text
             log.info("unbl0ck: comments for %s unavailable: %s", item["id"], exc)
             comments = []
+        if not n.bluf_enabled():   # turned off while queued: nothing leaves the machine
+            _BLUF_JOBS.fail(key, "summaries were turned off before the model was called")
+            return
         result = ctx.llm.complete(
             n.bluf_messages(item, comments), purpose="unbl0ck.bluf", temperature=0.1, max_tokens=BLUF_MAX_TOKENS, timeout=90
         )
         bluf, why = n.parse_bluf(result.text)
-        n.save_bluf(item["id"], item["version"], bluf, why)
+        if not n.bluf_enabled():   # turned off during the call: do not cache the reply
+            _BLUF_JOBS.fail(key, "summaries were turned off during the model call")
+            return
+        fp = _fingerprint(n, item)
+        if fp is None:
+            n.save_bluf(item["id"], item["version"], bluf, why, started_at=started)
+        else:
+            n.save_bluf(item["id"], item["version"], bluf, why, started_at=started, fp=fp)
         _BLUF_JOBS.succeed(key)
     except Exception as exc:  # noqa: BLE001 - logged; the card keeps its raw text and retries later
         log.warning("unbl0ck: summary for %s failed: %s: %s", item["id"], type(exc).__name__, exc)
@@ -254,15 +346,50 @@ def card(id: str = "", board: str = "", task_id: str = ""):
 
 @router.get("/outside/text")
 def outside_text(id: str = "", version: str = ""):
-    if len(id) > MAX_ID or not id.startswith("outside:") or len(version) > MAX_ID:
+    if len(id) > MAX_ID or not id.startswith("outside:") or len(version) > MAX_ID or _CONTROL.search(id + version):
         raise HTTPException(status_code=400, detail="invalid outside item reference")
-    items = _needs().outside_items()
-    item = next((candidate for candidate in items if candidate.get("id") == id), None)
-    if item is None:
-        raise HTTPException(status_code=404, detail="outside item is no longer available")
+    n = _needs()
+    try:
+        item = n.outside_lookup(id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except n.SourceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     if item.get("version") != version:
         raise HTTPException(status_code=409, detail="outside item changed; refresh the queue")
     return {"id": id, "version": version, "text": item.get("text") or "(No text supplied.)"}
+
+
+@router.get("/source/text")
+def source_text(id: str = "", version: str = ""):
+    n = _needs()
+    if not id or len(id) > MAX_ID or len(version) > MAX_ID or _CONTROL.search(id + version):
+        raise HTTPException(status_code=400, detail="invalid item reference")
+    try:
+        return n.source_text(id, version)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except n.StaleAnswer as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except n.SourceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.get("/search")
+def search(q: str = ""):
+    """Explicit full-content search over current outside, chat and live-prompt items."""
+    if _CONTROL.search(q):
+        raise HTTPException(status_code=400, detail="invalid query")
+    try:
+        return _needs().search_text(q)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/card/ask")
@@ -271,49 +398,112 @@ def card_ask(body: CardAsk):
     if not n.ask_enabled():
         raise HTTPException(status_code=403, detail="Ask is disabled in UNBL0CK settings")
     board, task_id = _checked_card_ref(body.id, body.board, body.task_id)
-    history = [m for m in body.messages if isinstance(m, dict)]
-    if not any(
-        m.get("role") == "user" and str(m.get("content") or "").strip() for m in history
-    ):
-        raise HTTPException(status_code=400, detail="messages must include a user question")
-    try:
-        card_data = n.card_context(board, task_id)
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except RuntimeError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    messages = n.build_ask_messages(card_data, history)
     ctx = _loaded_ctx()
-    if ctx is None or not hasattr(ctx, "llm"):
+    if not _has_llm(ctx):
         raise HTTPException(
             status_code=503,
             detail="Ask is unavailable: the plugin host LLM is not reachable",
         )
-    # The model often needs longer than the desktop's 30 s request limit, so run it in the
-    # background and let the client poll GET /card/ask/{job}.
-    job = uuid.uuid4().hex
+    card = f"kanban:{board}:{task_id}"  # the canonical identity from the validated pair, never the raw id
+    # A retry of the same request returns the same job; no second model call.
+    bound = _bind_existing(body.request_id, card) if body.request_id else None
+    if bound is not None:
+        return bound
+    # Admission comes before any card read or prompt build, so a busy server does no work.
     if not _ASK_SLOTS.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Ask is busy. Retry when an active answer finishes.", headers={"Retry-After": "15"})
+    submitted = False
     try:
-        _ASK_JOBS.create(job)
-        _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, job, ctx, messages)
-    except Exception as exc:
-        _ASK_SLOTS.release()
-        _ASK_JOBS.fail(job, "could not start Ask")
-        _ASK_JOBS.consume(job)
-        log.warning("unbl0ck: could not submit Ask: %s", type(exc).__name__)
-        raise HTTPException(status_code=503, detail="Ask could not start. Retry in a moment.") from exc
+        try:
+            card_data = n.card_context(board, task_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        current = card_data.get("version") if isinstance(card_data, dict) else None
+        if body.version is not None and current is not None and str(current) != body.version:
+            raise HTTPException(status_code=409, detail="the card was blocked again after you read it; refresh to see the new question")
+        messages = n.build_ask_messages(card_data, [m.model_dump() for m in body.messages])
+        # The model often needs longer than the desktop's 30 s request limit, so run it in the
+        # background and let the client poll GET /card/ask/{job}.
+        job = body.request_id or uuid.uuid4().hex
+        try:
+            gen = _ASK_JOBS.create(job, card=card)
+        except jobs.ScopeUnavailable:
+            raise HTTPException(status_code=503, detail=_UNREADABLE)
+        except jobs.IllegalTransition:
+            # A concurrent twin got there first: the same card checks apply to it.
+            bound = _bind_existing(job, card)
+            if bound is None:
+                raise HTTPException(status_code=409, detail="this request id is already in use")
+            return bound
+        try:
+            _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, job, gen, ctx, messages)
+            submitted = True
+        except Exception as exc:
+            _ASK_JOBS.fail(job, "could not start Ask", gen=gen)
+            try:
+                _ASK_JOBS.consume(job)
+            except jobs.DiscardFailed:
+                pass  # the settled record expires on its own; the caller still gets the 503 below
+            log.warning("unbl0ck: could not submit Ask: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail="Ask could not start. Retry in a moment.") from exc
+    finally:
+        if not submitted:
+            _ASK_SLOTS.release()
     return {"ok": True, "pending": True, "job": job}
+
+
+_UNREADABLE = "the saved state for this request cannot be read right now. Retry in a moment."
+
+
+def _bind_existing(request_id: str, card: str) -> Optional[dict[str, Any]]:
+    """The pending reply for a request id naming a job the caller can see, else None (409 for
+    another card, 503 for unreadable storage)."""
+    st = _ASK_JOBS.get(request_id)
+    if st is None:
+        return None
+    if st.get("unavailable"):
+        raise HTTPException(status_code=503, detail=_UNREADABLE)
+    if st.get("card") != card:
+        raise HTTPException(status_code=409, detail="this request id belongs to a different card")
+    return {"ok": True, "pending": True, "job": request_id}
 
 
 # Lifecycle and bounded retention of repeatably readable results are jobs.AskJobs.
 _ASK_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="unbl0ck-ask")
-_ASK_JOBS = jobs.AskJobs()
+def _ask_journal_dir():
+    """The restart journal directory for the current profile.
+
+    A failure to resolve it is raised, not turned into "no journal": the journal reports
+    storage it cannot find as unavailable (outcome unknown), never as an empty directory."""
+    return _needs().ask_journal_dir()
+
+
+def _ask_keep_replies() -> bool:
+    try:
+        return bool(_needs().ask_persist_replies())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_ASK_JOBS = jobs.AskJobs(journal=jobs.AskJournal(_ask_journal_dir, _ask_keep_replies))
+_ASK_JOBS.start_background()
 _ASK_SLOTS = threading.BoundedSemaphore(4)
 
 
-def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
+def _run_ask(job: str, gen: str, ctx: Any, messages: list[dict[str, str]]) -> None:
+    """The worker for one Ask job, named by its id and the generation ``create`` returned."""
+    # Durable marker first: after a crash from here on the outcome is unknown, never "resend".
+    if not _ASK_JOBS.mark_sent(job, gen=gen):
+        _ASK_JOBS.fail(job, "could not record the request, so it was not sent", gen=gen)
+        return
     try:
+        # Settings may have changed while this waited for a worker: disclosure follows the
+        # setting at the moment of the model call, not at admission.
+        if not _needs().ask_enabled():
+            _ASK_JOBS.fail(job, "Ask was turned off before the model was called", gen=gen)
+            return
         result = ctx.llm.complete(
             messages,
             purpose="unbl0ck.card_ask",
@@ -325,14 +515,14 @@ def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - surface the host error honestly
         log.warning("unbl0ck: ask model call failed: %s: %s", type(exc).__name__, exc)   # detail stays in the log
-        _ASK_JOBS.fail(job, f"model call failed: {type(exc).__name__}")
+        _ASK_JOBS.fail(job, f"model call failed: {type(exc).__name__}", gen=gen)
         return
     reply = ask_reply_text(getattr(result, "text", ""))
     if not reply:
         model = getattr(result, "model", None) or "the model"
-        _ASK_JOBS.fail(job, f"{model} returned no answer text (it may have used its whole budget thinking). Retry, or pick a non-reasoning model for plugins.")
+        _ASK_JOBS.fail(job, f"{model} returned no answer text (it may have used its whole budget thinking). Retry, or pick a non-reasoning model for plugins.", gen=gen)
         return
-    _ASK_JOBS.finish(job, reply, getattr(result, "provider", None), getattr(result, "model", None))
+    _ASK_JOBS.finish(job, reply, getattr(result, "provider", None), getattr(result, "model", None), gen=gen)
 
 
 ASK_MAX_TOKENS = 4000
@@ -346,77 +536,139 @@ def ask_reply_text(text: Any) -> str:
     return _THINK_RE.sub("", text if isinstance(text, str) else "").strip()
 
 
+def _ask_wire(st: dict[str, Any]) -> str:
+    return jobs.ASK_WIRE[st["status"]]
+
+
 @router.get("/card/ask/{job}")
-def card_ask_result(job: str, poll: bool = False):
+def card_ask_result(job: str, poll: bool = False, card: str = ""):
+    if not card:
+        raise HTTPException(status_code=400, detail="the card this answer belongs to is required")
     st = _ASK_JOBS.get(job)
     if st is None:
         raise HTTPException(status_code=404, detail="unknown or expired ask job")
+    # A job id only answers for the card it was created for; a record with no card answers nobody.
+    # (Unreadable storage reports "unknown" for any id: it carries no card text or answer.)
+    if not st.get("unavailable") and st.get("card") != card:
+        raise HTTPException(status_code=404, detail="unknown or expired ask job")
     if st["status"] is jobs.AskState.PENDING:
-        return {"ok": True, "pending": True, "job": job, "elapsed": round(time.time() - st["started"], 1)}
+        return {"ok": True, "pending": True, "state": "pending", "job": job, "elapsed": round(time.time() - st["started"], 1)}
     # A GET must remain repeatable: a lost HTTP response must not destroy model work.
     # Results expire through the job table's bounded lifetime instead of being consumed.
+    if st["status"] in (jobs.AskState.UNKNOWN, jobs.AskState.NOT_SUBMITTED):
+        # Recovered after a restart. The plugin never resends: only the human can ask again.
+        out = {"ok": False, "state": _ask_wire(st), "detail": st["detail"],
+               "resubmit_safe": st["status"] is jobs.AskState.NOT_SUBMITTED}
+        if poll:
+            return out
+        raise HTTPException(status_code=409, detail=st["detail"])
     if st["status"] is jobs.AskState.ERROR:
         if poll:
-            return {"ok": False, "detail": st["detail"]}
+            return {"ok": False, "state": "failed", "detail": st["detail"]}
         raise HTTPException(status_code=502, detail=st["detail"])
-    return {k: st[k] for k in ("ok", "reply", "provider", "model")}
+    return {"ok": True, "state": "complete", **{k: st[k] for k in ("reply", "provider", "model")}}
+
+
+@router.delete("/card/ask/{job}")
+def card_ask_discard(job: str, card: str = ""):
+    """Delete a job and its saved record now, whatever its state."""
+    if not card:
+        raise HTTPException(status_code=400, detail="the card this answer belongs to is required")
+    st = _ASK_JOBS.get(job)
+    if st is not None and not st.get("unavailable") and st.get("card") != card:
+        raise HTTPException(status_code=404, detail="unknown or expired ask job")
+    try:
+        return {"ok": True, "deleted": _ASK_JOBS.discard(job)}
+    except jobs.DiscardFailed:
+        # The saved record is still there and the job is still readable: say so, never "deleted".
+        # No expiry is promised: cleanup retries, but only works once the storage is writable again.
+        raise HTTPException(status_code=500, detail="the saved answer was not deleted; it stays on disk until the plugin's storage is writable again and cleanup retries")
+
+
+UNVERSIONED_WARNING = (
+    '299 unbl0ck "answers without version are deprecated; send the queue item version"'
+)
 
 
 @router.post("/kanban/answer")
-def answer(body: Answer):
+def answer(body: Answer, response: Response):
     from hermes_cli import kanban_db  # type: ignore
 
+    _bounded(board=body.board, task_id=body.task_id)
+    if body.version is not None:
+        _bounded(version=body.version)
+        if not body.version.strip():
+            raise HTTPException(status_code=400, detail="version must not be empty; omit it or send the queue version")
     try:
         board = _needs().normalize_board_slug(body.board)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    if not board or not body.task_id.strip():
+        raise HTTPException(status_code=400, detail="board and task_id are required")
+    from hermes_cli import kanban_db  # type: ignore
+
     if not kanban_db.board_exists(board):
         raise HTTPException(status_code=404, detail=f"board {board!r} does not exist")
     try:
-        return _needs().answer_card(board, body.task_id, body.text, release=body.release, version=body.version)
+        result = _needs().answer_card(board, body.task_id, body.text, release=body.release, version=body.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except _needs().VersionRequired as exc:   # before RuntimeError: it is a subclass
+        raise HTTPException(status_code=428, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    if body.version is None:
+        # Legacy caller: accepted against the card's current block, and told how to migrate.
+        response.headers["Warning"] = UNVERSIONED_WARNING
+    if isinstance(result, dict):
+        result.setdefault("versioned", body.version is not None)
+    return result
 
 
 @router.post("/hide")
 def hide(body: Hide):
+    _bounded(id=body.id, version=body.version)
     try:
-        _needs().hide(body.id, body.version)
+        token, order = _needs().hide_ordered(body.id, body.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except TimeoutError:
         raise HTTPException(status_code=409, detail="busy, retry")
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    return {"ok": True}
+    return {"ok": True, "token": token, "order": order}
 
 
 @router.post("/outside/done")
 def outside_done(body: Hide):
+    n = _needs()
+    _bounded(id=body.id, version=body.version)
     try:
-        return _needs().done_outside(body.id, body.version)
+        return n.done_outside(body.id, body.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except TimeoutError:
         raise HTTPException(status_code=409, detail="busy, retry")
+    except n.SourceUnavailable as exc:   # before RuntimeError: it is a RuntimeError subclass
+        raise HTTPException(status_code=503, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
 
 class Unhide(BaseModel):
     id: str
+    token: str | None = None
 
 
 @router.post("/unhide")
 def unhide(body: Unhide):
+    _bounded(id=body.id, token=body.token or "")
     try:
-        return {"ok": True, "restored": _needs().unhide(body.id)}
+        return {"ok": True, "restored": _needs().unhide(body.id, token=body.token)}
     except TimeoutError:
         raise HTTPException(status_code=409, detail="busy, retry")
     except RuntimeError as exc:
@@ -433,5 +685,6 @@ def pack():
 def write_pack():
     n = _needs()
     q = n.build_queue()
-    n.write_pocket_pack(q)
-    return n.pocket_pack(q)
+    pack = n.pocket_pack(q)
+    n.write_pocket_pack(q, pack=pack)   # the file and the response are the same pack
+    return pack

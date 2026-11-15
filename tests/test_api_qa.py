@@ -44,14 +44,16 @@ class ApiQA(unittest.TestCase):
         def hide(i, v):
             if not i or len(i) > 300:
                 raise ValueError("bad id")
+            return "tok", 1
 
         self.needs = types.SimpleNamespace(
             NO_BLUF_SOURCES=real.NO_BLUF_SOURCES,
-            hide=hide,
+            hide_ordered=hide,
             StaleAnswer=real.StaleAnswer,
+            VersionRequired=real.VersionRequired,
             normalize_board_slug=real.normalize_board_slug,
             pocket_pack=lambda q: {"cards": len(q["items"])},
-            write_pocket_pack=lambda q: self.written.append(q),
+            write_pocket_pack=lambda q, pack=None: self.written.append(q),
             answer_card=self._answer,
             build_queue=lambda: {
                 "items": [dict(i) for i in items],
@@ -124,8 +126,8 @@ class ApiQA(unittest.TestCase):
             self.c.post("/hide", json={"id": "", "version": "1"}).status_code, 400
         )
         self.assertEqual(
-            self.c.post("/hide", json={"id": "chat:p:s", "version": "1"}).json(),
-            {"ok": True},
+            self.c.post("/hide", json={"id": "chat:p:s", "version": "1"}).json()["ok"],
+            True,
         )
 
 

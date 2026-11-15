@@ -6,6 +6,9 @@ import time
 import types
 import unittest
 from pathlib import Path
+from conftest import ask_gen
+
+CARD = "kanban:factory:t_1"  # what the mocked board/task pair canonicalises to
 
 try:
     import fastapi
@@ -27,6 +30,8 @@ class AskJobTest(unittest.TestCase):
             ask_enabled=lambda: True,
             card_context=lambda b, t: {"id": t},
             build_ask_messages=lambda c, h: list(h),
+            ask_journal_dir=lambda: None,
+            ask_persist_replies=lambda: False,
         )
         self.api._needs = lambda: needs
         self.api._checked_card_ref = lambda i, b, t: ("factory", "t_1")
@@ -50,12 +55,12 @@ class AskJobTest(unittest.TestCase):
         self.assertTrue(r["pending"])
         job = r["job"]
         for _ in range(40):
-            p = self.c.get(f"/card/ask/{job}").json()
+            p = self.c.get(f"/card/ask/{job}?card={CARD}").json()
             if not p.get("pending"):
                 break
             time.sleep(0.05)
         self.assertEqual(p["reply"], "Pick A")
-        self.assertEqual(self.c.get(f"/card/ask/{job}").json(), p)  # safe to retry a lost response
+        self.assertEqual(self.c.get(f"/card/ask/{job}?card={CARD}").json(), p)  # safe to retry a lost response
 
     def _ask_with(self, text):
         seen = {}
@@ -74,7 +79,7 @@ class AskJobTest(unittest.TestCase):
             json={"id": "x", "messages": [{"role": "user", "content": "TL;DR"}]},
         ).json()["job"]
         for _ in range(40):
-            r = self.c.get(f"/card/ask/{job}")
+            r = self.c.get(f"/card/ask/{job}?card={CARD}")
             if not r.json().get("pending"):
                 break
             time.sleep(0.05)
@@ -97,20 +102,20 @@ class AskJobTest(unittest.TestCase):
             self.assertIn("returned no answer text", r.json()["detail"])
 
     def test_poll_envelope_distinguishes_model_failure_from_transport_failure(self):
-        self.api._ASK_JOBS.create("failed")
-        self.api._ASK_JOBS.fail("failed", "model call failed: ValueError")
-        self.assertEqual(self.c.get("/card/ask/failed").status_code, 502)
-        first = self.c.get("/card/ask/failed?poll=true")
+        self.api._ASK_JOBS.create("failed", card=CARD)
+        self.api._ASK_JOBS.fail("failed", "model call failed: ValueError", gen=ask_gen(self.api._ASK_JOBS, "failed"))
+        self.assertEqual(self.c.get(f"/card/ask/failed?card={CARD}").status_code, 502)
+        first = self.c.get(f"/card/ask/failed?poll=true&card={CARD}")
         self.assertEqual(first.status_code, 200)
         self.assertFalse(first.json()["ok"])
-        self.assertEqual(self.c.get("/card/ask/failed?poll=true").json(), first.json())
+        self.assertEqual(self.c.get(f"/card/ask/failed?poll=true&card={CARD}").json(), first.json())
 
     def test_retention_is_bounded_without_evicting_pending_work(self):
         table = self.api._ASK_JOBS
         table.create("pending")
         for i in range(table.MAX_SETTLED + 5):
             table.create(str(i))
-            table.finish(str(i), "A")
+            table.finish(str(i), "A", gen=ask_gen(table, str(i)))
         self.assertEqual(len(table), table.MAX_SETTLED + 1)
         self.assertIsNotNone(table.get("pending"))
         self.assertIsNone(table.get("0"))
@@ -121,8 +126,8 @@ class AskJobTest(unittest.TestCase):
         table.create("slow")
         for i in range(table.MAX_SETTLED):
             table.create(str(i))
-            table.finish(str(i), "fast")
-        self.assertTrue(table.finish("slow", "finally"))
+            table.finish(str(i), "fast", gen=ask_gen(table, str(i)))
+        self.assertTrue(table.finish("slow", "finally", gen=ask_gen(table, "slow")))
         self.assertEqual(table.get("slow")["reply"], "finally")
         self.assertIsNone(table.get("0"))
         self.assertEqual(len(table), table.MAX_SETTLED)

@@ -90,6 +90,8 @@ def api(tmp_path):
     spec.loader.exec_module(mod)
     ns = types.SimpleNamespace(
         ask_enabled=lambda: True,
+        ask_journal_dir=lambda: None,
+        ask_persist_replies=lambda: False,
         card_context=lambda b, t: {"id": t},
         build_ask_messages=lambda c, h: list(h),
     )
@@ -118,7 +120,7 @@ def test_u6_failed_ask_keeps_exception_detail_out_of_the_response(api, caplog):
         "/card/ask", json={"id": "x", "messages": [{"role": "user", "content": "q"}]}
     ).json()["job"]
     for _ in range(60):
-        r = c.get(f"/card/ask/{job}")
+        r = c.get(f"/card/ask/{job}?card=kanban:factory:t_1")
         if not r.json().get("pending"):
             break
         time.sleep(0.05)

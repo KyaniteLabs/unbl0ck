@@ -2,6 +2,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -27,6 +28,9 @@ class BlufTest(unittest.TestCase):
             def post(self, *args, **kwargs):
                 return lambda fn: fn
 
+            def delete(self, *args, **kwargs):
+                return lambda fn: fn
+
         fastapi = types.ModuleType("fastapi")
         fastapi.APIRouter = Router
 
@@ -35,10 +39,12 @@ class BlufTest(unittest.TestCase):
                 self.status_code, self.detail = status_code, detail
 
         fastapi.HTTPException = HTTPException
+        fastapi.Response = type("Response", (), {})
         pydantic = types.ModuleType("pydantic")
         pydantic.BaseModel = type("BaseModel", (), {})
         pydantic.Field = lambda *a, **k: None
         pydantic.field_validator = lambda *a, **k: lambda fn: fn
+        pydantic.ConfigDict = dict
         with mock.patch.dict(sys.modules, {"fastapi": fastapi, "pydantic": pydantic}):
             spec.loader.exec_module(api := importlib.util.module_from_spec(spec))
         return api
@@ -218,13 +224,18 @@ class BlufTest(unittest.TestCase):
             def post(self, *args, **kwargs):
                 return lambda fn: fn
 
+            def delete(self, *args, **kwargs):
+                return lambda fn: fn
+
         fastapi = types.ModuleType("fastapi")
         fastapi.APIRouter = Router
         fastapi.HTTPException = type("HTTPException", (Exception,), {})
+        fastapi.Response = type("Response", (), {})
         pydantic = types.ModuleType("pydantic")
         pydantic.BaseModel = type("BaseModel", (), {})
         pydantic.Field = lambda *a, **k: None
         pydantic.field_validator = lambda *a, **k: lambda fn: fn
+        pydantic.ConfigDict = dict
         with mock.patch.dict(sys.modules, {"fastapi": fastapi, "pydantic": pydantic}):
             spec.loader.exec_module(api)
         calls = {}
@@ -250,7 +261,8 @@ class BlufTest(unittest.TestCase):
                 recent_comments=lambda item: [],
                 bluf_messages=lambda item, comments: [],
                 parse_bluf=needs.parse_bluf,
-                save_bluf=lambda *args: None,
+                save_bluf=lambda *args, **kw: None,
+                bluf_enabled=lambda: True,
             )
             api._run_bluf(
                 n, types.SimpleNamespace(llm=LLM()), {"id": "x", "version": "1"}
@@ -526,7 +538,7 @@ class BlufTest(unittest.TestCase):
     def test_outside_full_text_route_returns_only_the_requested_current_version(self):
         api = self.load_api_without_fastapi()
         item = {"id": "outside:folder:abc", "version": "3:10", "text": "Full body"}
-        api._needs = lambda: types.SimpleNamespace(outside_items=lambda: [item])
+        api._needs = lambda: types.SimpleNamespace(outside_lookup=lambda i: item)
         self.assertEqual(
             api.outside_text(item["id"], item["version"])["text"], "Full body"
         )
@@ -540,6 +552,35 @@ class BlufTest(unittest.TestCase):
         )
         self.assertEqual(msgs[0]["role"], "system")
         self.assertIn("untrusted", msgs[1]["content"])
+
+
+class StaleSummaryWrites(unittest.TestCase):
+    """A summary request that was overtaken must not act on the newer state."""
+
+    def test_a_slow_request_for_an_old_version_cannot_replace_the_newer_summary(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            started_old = time.time() - 5
+            needs.save_bluf("kanban:b:t", "v2", "New question.", "Waits.", home, started_at=time.time() - 1)
+            needs.save_bluf("kanban:b:t", "v1", "Old question.", "Waits.", home, started_at=started_old)
+            self.assertEqual(needs.load_blufs(home)["kanban:b:t"]["version"], "v2")
+
+    def test_a_request_that_began_after_the_stored_summary_still_replaces_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            needs.save_bluf("kanban:b:t", "v1", "Old.", "Waits.", home)
+            needs.save_bluf("kanban:b:t", "v2", "New.", "Waits.", home, started_at=time.time() + 1)
+            self.assertEqual(needs.load_blufs(home)["kanban:b:t"]["version"], "v2")
+
+    def test_a_prune_does_not_delete_a_summary_saved_after_its_queue_was_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            observed = time.time() - 1
+            needs.save_bluf("kanban:b:new", "1", "Arrived meanwhile.", "Waits.", home)
+            needs.prune_blufs([{"id": "kanban:b:old", "version": "1"}], home, observed_at=observed)
+            self.assertIn("kanban:b:new", needs.load_blufs(home))
+            needs.prune_blufs([{"id": "kanban:b:old", "version": "1"}], home, observed_at=time.time() + 1)
+            self.assertEqual(needs.load_blufs(home), {})
 
 
 if __name__ == "__main__":
