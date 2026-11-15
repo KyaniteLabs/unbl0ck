@@ -1,0 +1,46 @@
+name: Reconcile Security Hermes review
+on:
+  workflow_run:
+    workflows: [Plugin gate]
+    types: [completed]
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number (empty reconciles all open PRs)
+        required: false
+        type: string
+      include_drafts:
+        description: Also request review of draft PRs
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: security-review-reconciliation
+  cancel-in-progress: false
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # Always trusted default-branch code. Never check out a PR, read its artifacts,
+      # or interpolate its title/body/branch into a shell with these secrets.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.14'
+      - name: Request review and verify authenticated exact-commit verdict
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HERMES_SECURITY_WEBHOOK_URL: ${{ secrets.HERMES_SECURITY_WEBHOOK_URL }}
+          HERMES_SECURITY_WEBHOOK_SECRET: ${{ secrets.HERMES_SECURITY_WEBHOOK_SECRET }}
+          HERMES_SECURITY_GITHUB_USER_ID: ${{ vars.HERMES_SECURITY_GITHUB_USER_ID }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          INCLUDE_DRAFTS: ${{ inputs.include_drafts }}
+        run: python scripts/security_review.py

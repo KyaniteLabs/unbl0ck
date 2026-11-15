@@ -61,29 +61,44 @@ log = logging.getLogger("unbl0ck")
 
 _SETTINGS_TTL = 5.0
 _SETTINGS_CACHE: list[Any] = [0.0, {}]
+_SETTINGS_ERROR: str | None = None
+_SETTINGS_LOCK = threading.RLock()
 
 
 def _load_settings() -> dict[str, Any]:
+    global _SETTINGS_ERROR
     try:
         from hermes_cli.config import load_config_readonly  # type: ignore
-    except ImportError:  # unit tests and bare installs run without Hermes
-        return {}
-    try:
-        entries = (load_config_readonly().get("plugins") or {}).get("entries") or {}
-        return dict((entries.get("unbl0ck") or {}).get("settings") or {})
+        config = load_config_readonly()
+        if getattr(config, "read_error", None) is not None:
+            raise RuntimeError("Hermes configuration could not be read")
+        entries = (config.get("plugins") or {}).get("entries") or {}
+        settings = dict((entries.get("unbl0ck") or {}).get("settings") or {})
     except Exception as exc:  # noqa: BLE001 - a broken config must not take the queue down
+        _SETTINGS_ERROR = f"settings: {type(exc).__name__}; could not read plugin settings; model features disabled until repaired"
         log.warning(
-            "unbl0ck: could not read plugin settings: %s: %s", type(exc).__name__, exc
+            "unbl0ck: could not read plugin settings: %s", type(exc).__name__
         )
-        return {}
+        # Identity and disclosure settings must never silently widen after a read fault.
+        # Preserve the last known configuration, and suspend all model calls until repair.
+        return {**_SETTINGS_CACHE[1], "bluf_enabled": False, "ask_enabled": False}
+    _SETTINGS_ERROR = None
+    return settings
 
 
 def _settings() -> dict[str, Any]:
     """Plugin settings, cached for a few seconds: one queue build checks them per card."""
-    now = time.monotonic()
-    if now - _SETTINGS_CACHE[0] > _SETTINGS_TTL:
-        _SETTINGS_CACHE[:] = [now, _load_settings()]
-    return _SETTINGS_CACHE[1]
+    with _SETTINGS_LOCK:
+        if time.monotonic() - _SETTINGS_CACHE[0] > _SETTINGS_TTL:
+            settings = _load_settings()
+            _SETTINGS_CACHE[:] = [time.monotonic(), settings]
+        return _SETTINGS_CACHE[1]
+
+
+def _settings_state() -> tuple[dict[str, Any], str | None]:
+    """Bind identity/disclosure settings to the fault from that same refresh."""
+    with _SETTINGS_LOCK:
+        return _settings(), _SETTINGS_ERROR
 
 
 def principal_names(settings: dict[str, Any] | None = None) -> list[str]:
@@ -269,17 +284,23 @@ def _state_lock(home: Path | None):
         _STATE_LOCK.release()
 
 
-def _read_json(p: Path) -> dict[str, Any]:
+def _read_json(p: Path, *, errors: list[str] | None = None, source: str = "state", strict: bool = False) -> dict[str, Any]:
     try:
         data = json.loads(p.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
     except FileNotFoundError:
         return {}
     except Exception as exc:  # noqa: BLE001 - a corrupt file must not break the queue, but say so
         log.warning(
             "unbl0ck: ignoring unreadable %s: %s: %s", p.name, type(exc).__name__, exc
         )
+        if errors is not None:
+            errors.append(f"{source}: {p.name}: {type(exc).__name__}; could not read record")
+        if strict:
+            raise RuntimeError(f"could not read {p.name}; repair the record before changing it") from exc
         return {}
-    return data if isinstance(data, dict) else {}
+    return data
 
 
 def _write_json(p: Path, data: dict[str, Any]) -> None:
@@ -297,8 +318,8 @@ def _write_json(p: Path, data: dict[str, Any]) -> None:
         )  # gone after a successful replace; removed after a failed write
 
 
-def load_hidden(home: Path | None = None) -> dict[str, str]:
-    return _read_json(_hidden_path(home))
+def load_hidden(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, str]:
+    return _read_json(_hidden_path(home), errors=errors, strict=strict)
 
 
 class Visibility(str, Enum):
@@ -333,7 +354,7 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
     if not item_id or len(item_id) > 300 or len(version) > 200:
         raise ValueError("item id and version must be short strings")
     with _state_lock(home):
-        hidden = load_hidden(home)
+        hidden = load_hidden(home, strict=True)
         hidden.pop(item_id, None)
         hidden[item_id] = version
         if (
@@ -346,7 +367,7 @@ def hide(item_id: str, version: str, home: Path | None = None) -> None:
 def unhide(item_id: str, home: Path | None = None) -> bool:
     """Undo "Not for me". Returns whether the item was hidden."""
     with _state_lock(home):
-        hidden = load_hidden(home)
+        hidden = load_hidden(home, strict=True)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
         if item_id not in hidden:
             return False
@@ -365,15 +386,15 @@ def _pending_path(home: Path | None) -> Path:
     return data_dir(home) / "pending-release.json"
 
 
-def load_pending_releases(home: Path | None = None) -> dict[str, str]:
-    return _read_json(_pending_path(home))
+def load_pending_releases(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, str]:
+    return _read_json(_pending_path(home), errors=errors, strict=strict)
 
 
 def _set_pending_release(
     item_id: str, version: str | None, home: Path | None = None
 ) -> None:
     with _state_lock(home):
-        data = load_pending_releases(home)
+        data = load_pending_releases(home, strict=True)
         if version is None:
             if data.pop(item_id, None) is None:
                 return
@@ -1127,7 +1148,7 @@ def kanban_items(
                     version = str(block.id if block else since)
                     if _answered_since(conn, kanban_db, task.id, author, since):
                         if pending is None:
-                            pending = load_pending_releases()
+                            pending = load_pending_releases(errors=errors)
                         if pending.get(f"kanban:{board}:{task.id}") == version:
                             # Your answer is posted but releasing the card failed: keep it in
                             # front of you so the release can be retried.
@@ -1307,9 +1328,14 @@ def chat_items(
     home = home or hermes_home()
     since = time.time() - days * 86400
     items: list[dict[str, Any]] = []
-    names = _patterns()["_NAMES"]
-    owners = chat_owner_ids()
-    me = {n.lower() for n in principal_names()}
+    settings, settings_error = _settings_state()
+    if settings_error:
+        if errors is not None:
+            errors.append("chat: unavailable until plugin settings can be read")
+        return []
+    names = _patterns(principal_names(settings), role_words(settings))["_NAMES"]
+    owners = chat_owner_ids(settings)
+    me = {n.lower() for n in principal_names(settings)}
     for profile, db in _state_dbs(home):
         try:
             conn = sqlite3.connect(
@@ -1362,7 +1388,7 @@ def chat_items(
                     args,
                 ).fetchall()
             except sqlite3.Error as exc:
-                if errors is not None and "no such" not in str(exc):
+                if errors is not None:
                     errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
                 continue
             # Only the columns this profile's schema has: an old schema must not fail per session.
@@ -1642,7 +1668,7 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
         }
         _write_json(_waits_dir(home) / f"{rid}.json", rec)
     except Exception as exc:  # noqa: BLE001 - observability must never break a human prompt
-        log.debug("unbl0ck: could not record wait: %s", exc)
+        log.warning("unbl0ck: could not record wait: %s", type(exc).__name__)
 
 
 def clear_wait(home: Path | None = None, **payload: Any) -> None:
@@ -1652,7 +1678,7 @@ def clear_wait(home: Path | None = None, **payload: Any) -> None:
         if _SAFE_ID.match(rid):
             (_waits_dir(home or hermes_home()) / f"{rid}.json").unlink(missing_ok=True)
     except Exception as exc:  # noqa: BLE001
-        log.debug("unbl0ck: could not clear wait: %s", exc)
+        log.warning("unbl0ck: could not clear wait: %s", type(exc).__name__)
 
 
 _PLATFORM_LABELS = {
@@ -1708,13 +1734,20 @@ def wait_items(
 ) -> list[dict[str, Any]]:
     """Open live prompts. A wait whose process is gone is deleted, not shown."""
     home = home or hermes_home()
+    errors = errors if errors is not None else []
     items: list[dict[str, Any]] = []
     for f in sorted(_waits_dir(home).glob("*.json")):
-        rec = _read_json(f)
+        before = len(errors)
+        rec = _read_json(f, errors=errors, source="prompt")
+        if len(errors) != before:
+            continue  # preserve unreadable evidence; never mistake a read failure for a dead waiter
         if wait_state(f, rec) is WaitState.STALE:
             # Dead waiter, malformed record, or a wait so old its resolved hook must have been
             # missed: never show a prompt nobody is waiting on.
-            f.unlink(missing_ok=True)
+            try:
+                f.unlink(missing_ok=True)
+            except OSError as exc:
+                errors.append(f"prompt: {f.name}: {type(exc).__name__}; could not remove stale record")
             continue
         rid = str(rec["request_id"])
         kind = str(rec.get("kind") or "")
@@ -1874,15 +1907,25 @@ def _folder_outside_item(
         title = str(msg.get("Subject") or f.name).strip()[:160]
         to = str(msg.get("To") or "")[:2000]
         text = "(No text/plain body; HTML is not displayed.)"
-        for part in msg.walk():
-            if not part.is_multipart() and part.get_content_type() == "text/plain":
-                payload = part.get_payload(decode=True) or b""
-                charset = part.get_content_charset() or "utf-8"
-                try:
-                    text = payload.decode(charset, errors="replace")
-                except (LookupError, UnicodeError):
-                    text = payload.decode("utf-8", errors="replace")
-                break
+        # MIME body selection skips attachments, including attached messages. Walking
+        # every plain-text part can otherwise present an appendix as an HTML draft.
+        # An exported file may instead be labelled inline; a filename still makes it
+        # a separate document. Exclude those subtrees before native body selection,
+        # preserving multipart/alternative and multipart/related root semantics.
+        for candidate in msg.walk():
+            if candidate.get_filename() is not None:
+                if "Content-Disposition" in candidate:
+                    candidate.replace_header("Content-Disposition", "attachment")
+                else:
+                    candidate["Content-Disposition"] = "attachment"
+        part = msg.get_body(preferencelist=("plain",))
+        if part is not None:
+            payload = part.get_payload(decode=True) or b""
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                text = payload.decode(charset, errors="replace")
+            except (LookupError, UnicodeError):
+                text = payload.decode("utf-8", errors="replace")
         kind, where = "draft", "Your mail app → Drafts"
     else:
         text = raw.decode("utf-8", errors="replace")
@@ -1900,6 +1943,7 @@ def _folder_outside_item(
         "kind": kind,
         "title": title,
         "text": text,
+        "truncated": st.st_size > len(raw),
         "to": to,
         "since": st.st_mtime,
         "act_where": where,
@@ -1917,14 +1961,20 @@ def outside_items(
     for f in _outside_dir(home).glob("*.json"):
         if f.is_symlink():
             continue
-        rec = _read_json(f)
+        before = len(errors)
+        rec = _read_json(f, errors=errors, source="outside")
         if (
             rec.get("id") == f"outside:filed:{f.stem}"
             and _FILED_ID.fullmatch(rec["id"])
             and rec.get("origin") == "filed"
             and rec.get("kind") in _OUTSIDE_KINDS
+            and all(isinstance(rec.get(key), str) and rec[key].strip()
+                    for key in ("version", "title", "act_where"))
+            and isinstance(rec.get("text"), str)
         ):
             items.append(rec)
+        elif len(errors) == before:
+            errors.append(f"outside: {f.name}: invalid filed record")
     raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
     seen: set[Path] = set()
     for name in str(raw).split(","):
@@ -1953,6 +2003,8 @@ def outside_items(
                 except OSError as exc:
                     errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
             candidates.sort(key=lambda pair: (-pair[1].st_mtime_ns, pair[0].name))
+            if len(candidates) > _OUTSIDE_LIMIT:
+                errors.append(f"outside: {root.name}: folder limit {_OUTSIDE_LIMIT} of {len(candidates)} files; only the newest are shown")
             for f, st in candidates[:_OUTSIDE_LIMIT]:
                 try:
                     item = _folder_outside_item(f, root, st)
@@ -2036,7 +2088,9 @@ def build_queue(
     except Exception as exc:  # noqa: BLE001
         outside_source_failed = True
         errors.append(f"outside: {type(exc).__name__}: {exc}")
-    hidden = load_hidden(home)
+    if _SETTINGS_ERROR:
+        errors.append(_SETTINGS_ERROR)
+    hidden = load_hidden(home, errors=errors)
     failed_sources = {error.split(":", 1)[0].split("[", 1)[0] for error in errors}
     preserve_prefixes = tuple(
         f"{source}:"
@@ -2202,7 +2256,14 @@ def answer_card(
         raise ValueError("answer text is required")
     if release and version is None:
         raise ValueError("queue version is required to release a card")
-    author = principal_author()
+    if release:
+        # Check recovery state before posting or releasing, so a damaged record cannot
+        # turn a successful action into a late, misleading failure or be overwritten.
+        load_pending_releases(home, strict=True)
+    settings, settings_error = _settings_state()
+    if settings_error:
+        raise RuntimeError("could not read plugin settings; repair them before answering")
+    author = principal_author(settings)
     item_id = f"kanban:{board}:{task_id}"
     comment_id: int | None = None
     post_answer = False

@@ -558,6 +558,9 @@ class AskJobsMachine(unittest.TestCase):
             if op == "tick":
                 self.clock.t += rng.choice([10, 500, 1000])
                 continue
+            # Every read or transition expires old work, even when no new Ask arrives.
+            for k in [k for k, (_, t) in model.items() if t < self.clock.t - jobs.AskJobs.TTL_S]:
+                model.pop(k)
             if op == "create":
                 for k in [
                     k
