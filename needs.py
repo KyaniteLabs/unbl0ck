@@ -652,14 +652,24 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
                 raise RuntimeError(
                     f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before undoing Done"
                 )
-        # Hidden marker first: if the second write fails the Done token still matches on retry.
+        # Hidden marker first. If the Done write then fails, the marker is put back so the
+        # same token still names a dismissal on retry (the undo is all or nothing).
+        before = dict(hidden)
         if clear_hidden:
             del hidden[item_id]
             _write_json(_hidden_path(home), hidden, ordered=True)
         if clear_done:
             rec.pop("done_at", None)
             rec.pop("done_token", None)
-            _write_json(f, rec)
+            try:
+                _write_json(f, rec)
+            except BaseException:
+                if clear_hidden:
+                    try:
+                        _write_json(_hidden_path(home), before, ordered=True)
+                    except Exception:  # noqa: BLE001 - the original failure is the one to report
+                        log.warning("unbl0ck: could not restore the dismissal after a failed undo", exc_info=True)
+                raise
         return True
 
 
