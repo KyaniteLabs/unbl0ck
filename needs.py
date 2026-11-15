@@ -1264,17 +1264,32 @@ def _answered_since(
     the queue and by answer_card. Names compare in Python (casefold) on both paths: SQLite's
     LOWER() folds ASCII only, so "ZOË" and "Zoë" used to differ on the fast path alone.
 
-    Comment times have one-second resolution, so a comment made just before a re-block can
-    share the block's second. With the block's event id, a comment counts when it is strictly
-    later than the block or its ``commented`` event follows the block event; without it the
-    old same-second rule (>=) applies."""
+    Comment times have one-second resolution and a clock can step back. With the block's event
+    id, every comment that has its ``commented`` event is placed by that event alone (event ids
+    are ordered, clocks are not); only when some comment has no event (an import) does the
+    time rule apply, a comment counting when it is strictly later than the block. Without the
+    id the old same-second rule (>=) applies."""
     cut = since or 0
     strict = block_id is not None
     try:
-        rows = conn.execute(
-            "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
-            (task_id, cut + 1 if strict else cut),
-        ).fetchall()
+        by_event_only = False
+        if strict:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            logged = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
+                (task_id,),
+            ).fetchone()[0]
+            by_event_only = logged >= total
+        rows = (
+            []
+            if by_event_only
+            else conn.execute(
+                "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
+                (task_id, cut + 1 if strict else cut),
+            ).fetchall()
+        )
         if any(_same_author(r[0], author) for r in rows):
             return True
         if not strict:
@@ -1288,12 +1303,17 @@ def _answered_since(
         ]
         return _commented_after(events, block_id, author)
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        if any(
+        comments = list(kanban_db.list_comments(conn, task_id))
+        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
+        by_event_only = strict and (
+            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
+        )
+        if not by_event_only and any(
             _same_author(c.author, author) and c.created_at >= (cut + 1 if strict else cut)
-            for c in kanban_db.list_comments(conn, task_id)
+            for c in comments
         ):
             return True
-        return strict and _commented_after(kanban_db.list_events(conn, task_id), block_id, author)
+        return strict and _commented_after(all_events, block_id, author)
 
 
 class CardStatus(str, Enum):
@@ -3023,18 +3043,33 @@ def _comments_since_block(
 ) -> list[tuple[str, str]]:
     """``(author, body)`` of the comments made since the current block began, oldest first.
 
-    With the block's event id a comment counts when its ``commented`` event follows the block
-    (event ids keep their order within one second) or its time is strictly later; without it,
-    when it is at or after the block's second. Older blocks' comments never count."""
+    With the block's event id a comment is placed by its ``commented`` event when every comment
+    has one (event ids are ordered, clocks are not); when some comment has none, its time
+    decides as well, a comment counting when strictly later than the block. Without the id, a
+    comment counts when it is at or after the block's second. Older blocks' comments never count."""
     strict = block_id is not None
     cut = (since or 0) + 1 if strict else (since or 0)
     try:
+        by_event_only = False
+        if strict:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)
+            ).fetchone()[0]
+            logged = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented'",
+                (task_id,),
+            ).fetchone()[0]
+            by_event_only = logged >= total
         rows = {
             r[0]: (r[1], r[2])
-            for r in conn.execute(
-                "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-                (task_id, cut),
-            ).fetchall()
+            for r in (
+                []
+                if by_event_only
+                else conn.execute(
+                    "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+                    (task_id, cut),
+                ).fetchall()
+            )
         }
         if strict:
             n = conn.execute(
@@ -3051,17 +3086,47 @@ def _comments_since_block(
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
         comments = list(kanban_db.list_comments(conn, task_id))
         keyed = [(getattr(c, "id", None) or i, c) for i, c in enumerate(comments, 1)]
-        rows = {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
+        all_events = list(kanban_db.list_events(conn, task_id)) if strict else []
+        by_event_only = strict and (
+            sum(1 for e in all_events if getattr(e, "kind", None) == "commented") >= len(comments)
+        )
+        rows = {} if by_event_only else {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
         if strict:
             n = sum(
                 1
-                for e in kanban_db.list_events(conn, task_id)
+                for e in all_events
                 if getattr(e, "kind", None) == "commented"
                 and int(getattr(e, "id", 0) or 0) > block_id
             )
             for k, c in keyed[len(keyed) - n :] if n else []:
                 rows[k] = (c.author, c.body)
     return [rows[k] for k in sorted(rows)]
+
+
+# Callers in this process that rely on one recovery marker (data folder, card, block version):
+# {"users": callers still inside answer_card, "ours": one of them recorded it, "keep": one of
+# them posted an answer whose release failed, so the marker is that answer's only recovery}.
+_MARKER_USERS: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+_MARKER_LOCK = threading.Lock()
+
+
+def _marker_join(key: tuple[str, str, str | None]) -> dict[str, Any]:
+    with _MARKER_LOCK:
+        entry = _MARKER_USERS.setdefault(key, {"users": 0, "ours": False, "keep": False})
+        entry["users"] += 1
+        return entry
+
+
+def _marker_leave(key: tuple[str, str, str | None], entry: dict[str, Any], *, keep: bool) -> bool:
+    """Leave the marker's user list. True only for the last user out when the marker was
+    recorded for this block and nobody needs it for a failed release: it is then safe to drop."""
+    with _MARKER_LOCK:
+        entry["keep"] = entry["keep"] or keep
+        entry["users"] -= 1
+        if entry["users"] > 0:
+            return False
+        _MARKER_USERS.pop(key, None)
+        return bool(entry["ours"] and not entry["keep"])
 
 
 def answer_card(
@@ -3110,8 +3175,9 @@ def answer_card(
     comment_id: int | None = None
     post_answer = False
     marker_reserved = False  # the recovery marker for this block is recorded
-    marker_ours = False  # ... and this call recorded it (a refused call removes only its own)
     marker_full = False
+    marker_key = (str(data_dir(home)), item_id, version_s)
+    marker_entry = _marker_join(marker_key) if release else None
     if release:
         # Reserve the failed-release marker BEFORE anything is written: a marker that cannot
         # be stored after the answer was posted would leave an answered card with no recovery
@@ -3121,9 +3187,13 @@ def answer_card(
         else:
             try:
                 _set_pending_release(item_id, version_s, home)
-                marker_reserved = marker_ours = True
+                marker_reserved = True
+                marker_entry["ours"] = True
             except PendingReleaseFull:
                 marker_full = True
+            except BaseException:
+                _marker_leave(marker_key, marker_entry, keep=False)
+                raise
     released = False
     release_failed = False
     release_error: BaseException | None = None
@@ -3206,7 +3276,14 @@ def answer_card(
                         )
             committed = True
     finally:
-        if not committed and marker_ours:
+        # The marker is dropped only by the last caller out, and only when none of them wrote an
+        # answer whose release failed: another caller may rely on the marker this one reserved.
+        last_out = (
+            _marker_leave(marker_key, marker_entry, keep=release_failed)
+            if marker_entry is not None
+            else False
+        )
+        if not committed and last_out:
             # Nothing was written (stale, refused, unreadable): drop the marker reserved for it.
             try:
                 _set_pending_release(item_id, None, home, expected=version_s)
