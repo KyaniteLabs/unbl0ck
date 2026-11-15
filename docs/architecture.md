@@ -73,7 +73,7 @@ as private. Settings and source files remain owned by their original application
 
 | State | Lifetime and ownership |
 | --- | --- |
-| `hidden.json` | Version-specific hides, capped at 1,000 (the oldest dismissal goes first), plus watched-folder Done records capped separately at 5,000 (the per-folder scan bound) so paging progress is not evicted; a hide for a version older than the card's current one is refused; shared by local operator surfaces |
+| `hidden.json` | Version-specific hides, capped at 1,000 (the oldest dismissal goes first), plus Not for me and Done on watched-folder files, capped separately at 5,000 per watched folder (the per-folder scan bound; up to 8 folders) so paging progress is not evicted, and always kept under the 16 MiB state limit by dropping the oldest; a hide for a version older than the card's current one is refused; shared by local operator surfaces |
 | `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is always recoverable |
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; shared across profiles |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |

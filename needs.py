@@ -384,6 +384,15 @@ _REPLACE_ATTEMPTS = 25  # about half a second: a reader on Windows holds the fil
 
 def _write_json(p: Path, data: dict[str, Any], *, ordered: bool = False) -> None:
     """Atomic JSON write. ``ordered`` keeps insertion order (stores that evict the oldest entry)."""
+    # UTF-8 as written, so a compact file restored from a backup is not inflated by escapes on
+    # the next write; text that cannot be encoded (a lone surrogate) falls back to escapes.
+    try:
+        payload = json.dumps(data, indent=1, sort_keys=not ordered, ensure_ascii=False).encode()
+    except UnicodeEncodeError:
+        payload = json.dumps(data, indent=1, sort_keys=not ordered).encode()
+    if len(payload) > MAX_STATE_BYTES:
+        # The reader refuses a file this large: never write what could not be read back.
+        raise OSError(f"{p.name} would exceed the {MAX_STATE_BYTES}-byte state limit; nothing was written")
     tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
     # A leftover or planted file at this name is removed, never written through: O_EXCL and
     # O_NOFOLLOW make a link there fail instead of clobbering its target, and a new file
@@ -393,8 +402,8 @@ def _write_json(p: Path, data: dict[str, Any], *, ordered: bool = False) -> None
         tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600
     )  # waits hold prompt text
     try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps(data, indent=1, sort_keys=not ordered))
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
         for attempt in range(_REPLACE_ATTEMPTS):
             try:
                 tmp.replace(p)
@@ -471,15 +480,50 @@ _HIDDEN_KEEP = 1000
 # most OUTSIDE_SCAN_ENTRIES files per folder, so finishing that many must not evict the earliest
 # completions (they would outrank the files still waiting). They keep their own, larger bound.
 _HIDDEN_FOLDER_KEEP = 5000
+# Each watched folder has its own scan bound, so the folder dismissals scale with the number of
+# watched folders (up to a ceiling that keeps the store far below the state-file size limit).
+_HIDDEN_MAX_ROOTS = 8
+
+
+def _watched_root_count(settings: dict[str, Any] | None = None) -> int:
+    raw = (settings if settings is not None else _settings()).get("outside_dirs") or os.environ.get(
+        "UNBL0CK_OUTSIDE_DIRS", ""
+    )
+    return len({name.strip() for name in str(raw).split(",") if name.strip()})
+
+
+def _hidden_folder_cap() -> int:
+    """How many folder dismissals are kept: 5,000 per watched folder, at most 8 folders' worth."""
+    return _HIDDEN_FOLDER_KEEP * min(max(_watched_root_count(), 1), _HIDDEN_MAX_ROOTS)
 
 
 def _trim_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
-    """Oldest-first eviction, separately for folder Done records and every other dismissal."""
+    """Oldest-first eviction, separately for folder dismissals and every other dismissal."""
     folder = [k for k in hidden if k.startswith("outside:folder:")]
     other = [k for k in hidden if not k.startswith("outside:folder:")]
-    drop = set(folder[:-_HIDDEN_FOLDER_KEEP] if len(folder) > _HIDDEN_FOLDER_KEEP else [])
+    cap = _hidden_folder_cap()
+    drop = set(folder[:-cap] if len(folder) > cap else [])
     drop |= set(other[:-_HIDDEN_KEEP] if len(other) > _HIDDEN_KEEP else [])
     return {k: v for k, v in hidden.items() if k not in drop} if drop else hidden
+
+
+def _fit_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
+    """Drop the oldest dismissals until the store, as it will be written, fits the read limit.
+
+    The count caps alone do not bound the size (a version string can be long). A single
+    dismissal that alone exceeds the limit is refused."""
+    def size(data: dict[str, Any]) -> int:
+        try:
+            return len(json.dumps(data, indent=1, ensure_ascii=False).encode())
+        except UnicodeEncodeError:
+            return len(json.dumps(data, indent=1).encode())
+
+    while size(hidden) > MAX_STATE_BYTES:
+        if len(hidden) <= 1:
+            raise ValueError("that dismissal is too large to store")
+        keep = max(1, len(hidden) - max(1, len(hidden) // 10))
+        hidden = dict(list(hidden.items())[-keep:])
+    return hidden
 
 
 class StaleHide(RuntimeError):
@@ -514,7 +558,7 @@ def hide(item_id: str, version: str, home: Path | None = None) -> str:
         hidden.pop(item_id, None)
         token = uuid.uuid4().hex
         hidden[item_id] = f"{version}\x1f{token}"
-        hidden = _trim_hidden(hidden)  # oldest first out; the store never grows unbounded
+        hidden = _fit_hidden(_trim_hidden(hidden))  # oldest first out; the store never grows unbounded
         _write_json(_hidden_path(home), hidden, ordered=True)
         return token
 
@@ -2836,16 +2880,45 @@ def _folder_outside_item(
     }
 
 
+def _stat_hidden(hidden: dict[str, Any], f: Path, st: os.stat_result) -> bool:
+    """Whether a folder file is already dismissed at its current mtime and size.
+
+    The stored version also names the content, which only reading the file can tell; a
+    stat-identical match counts as dismissed here and is verified when the file is read."""
+    stored = hidden.get("outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest())
+    key = f"{st.st_mtime_ns}:{st.st_size}"
+    return isinstance(stored, str) and (stored == key or stored.startswith(key + ":"))
+
+
 def _scan_outside_folder(
-    root: Path, recursive: bool, errors: list[str]
-) -> list[tuple[Path, os.stat_result]]:
-    """Eligible regular files under *root*, never following symlinks, within the scan bounds."""
-    out: list[tuple[Path, os.stat_result]] = []
+    root: Path,
+    recursive: bool,
+    errors: list[str],
+    hidden: dict[str, Any] | None = None,
+) -> tuple[list[tuple[Path, os.stat_result]], list[tuple[Path, os.stat_result]]]:
+    """``(waiting, dismissed)`` eligible regular files under *root*, never following symlinks.
+
+    The entry budget is spent on files that still wait (and on everything that is not a
+    file): files already dismissed at their current version are the progress made through a
+    large folder, so they cost time but not budget, and finishing a page always reaches the
+    next one. The time budget covers every step, including the last directory opened."""
+    waiting: list[tuple[Path, os.stat_result]] = []
+    dismissed: list[tuple[Path, os.stat_result]] = []
     stack: list[tuple[Path, int]] = [(root, 0)]
     examined = 0
     deadline = time.monotonic() + OUTSIDE_SCAN_SECONDS
     stopped = ""
     too_deep = False
+    hidden = hidden or {}
+
+    def charge() -> bool:
+        nonlocal examined, stopped
+        examined += 1
+        if examined > OUTSIDE_SCAN_ENTRIES:
+            stopped = f"examined {OUTSIDE_SCAN_ENTRIES} entries"
+            return False
+        return True
+
     while stack and not stopped:
         d, depth = stack.pop()
         if time.monotonic() > deadline:
@@ -2861,38 +2934,99 @@ def _scan_outside_folder(
             errors.append(f"outside: {d.name}: {type(exc).__name__}: {exc}")
             continue
         # Entries are consumed one at a time so the entry and time budgets apply before a
-        # huge directory is read into memory.
-        with scan as entries:
-            for entry in entries:
-                examined += 1
-                if examined > OUTSIDE_SCAN_ENTRIES:
-                    stopped = f"examined {OUTSIDE_SCAN_ENTRIES} entries"
-                    break
-                if time.monotonic() > deadline:
-                    stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
-                    break
-                if entry.name.startswith("."):
-                    continue
-                f = d / entry.name
-                try:
-                    st = entry.stat(follow_symlinks=False)
-                    if stat.S_ISDIR(st.st_mode):
-                        if recursive and depth < OUTSIDE_MAX_DEPTH:
-                            stack.append((f, depth + 1))
-                        elif recursive:
-                            too_deep = True
+        # huge directory is read into memory. A listing that fails midway keeps what it gave.
+        try:
+            with scan as entries:
+                for entry in entries:
+                    if time.monotonic() > deadline:
+                        stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
+                        break
+                    if entry.name.startswith("."):
+                        if not charge():
+                            break
                         continue
-                    if f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
-                        out.append((f, st))
-                except OSError as exc:
-                    errors.append(f"outside: {entry.name}: {type(exc).__name__}: {exc}")
+                    f = d / entry.name
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        if stat.S_ISDIR(st.st_mode):
+                            if not charge():
+                                break
+                            if recursive and depth < OUTSIDE_MAX_DEPTH:
+                                stack.append((f, depth + 1))
+                            elif recursive:
+                                too_deep = True
+                        elif f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
+                            if _stat_hidden(hidden, f, st):
+                                dismissed.append((f, st))
+                            elif charge():
+                                waiting.append((f, st))
+                            else:
+                                break
+                        elif not charge():
+                            break
+                    except OSError as exc:
+                        errors.append(f"outside: {entry.name}: {type(exc).__name__}: {exc}")
+        except OSError as exc:
+            errors.append(f"outside: {d.name}: {type(exc).__name__}: {exc}; the rest of it was not listed")
+    if not stopped and time.monotonic() > deadline:
+        stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"  # the last step overran
     if stopped:
-        errors.append(f"outside: {root.name}: scan {stopped}; some files may not be listed")
+        errors.append(
+            f"outside: {root.name}: scan {stopped}; some files may not be listed, and the newest-first "
+            "order covers only the files that were examined"
+        )
     if too_deep:
         errors.append(
             f"outside: {root.name}: folders deeper than {OUTSIDE_MAX_DEPTH} levels were not scanned"
         )
-    return out
+    return waiting, dismissed
+
+
+_READ_ERRORS_LISTED = 5
+
+
+def _read_folder_window(
+    pairs: list[tuple[Path, os.stat_result]],
+    root: Path,
+    dfd: int | None,
+    limit: int,
+    deadline: float,
+    errors: list[str],
+) -> tuple[list[dict[str, Any]], int]:
+    """Read files in order until *limit* are read, backfilling past files that cannot be.
+
+    Returns ``(items, not_attempted)``. The read budget is checked before every file after the
+    first, so a poll always makes progress and never reads without bound."""
+    out: list[dict[str, Any]] = []
+    failed = 0
+    attempted = 0
+    for f, st in pairs:
+        if len(out) >= limit:
+            break
+        if attempted and time.monotonic() > deadline:
+            errors.append(
+                f"outside: {root.name}: reading stopped after {OUTSIDE_SCAN_SECONDS:g} seconds; "
+                f"{len(pairs) - attempted} files were not read this poll"
+            )
+            break
+        attempted += 1
+        try:
+            item = _folder_outside_item(f, root, st, dfd)
+            if item is not None:
+                out.append(item)
+                continue
+            problem = "changed while it was read or is no longer a plain file; retry"
+        except Exception as exc:  # one hostile file must not hide the rest of the folder
+            problem = f"{type(exc).__name__}: {exc}"
+        failed += 1
+        if failed <= _READ_ERRORS_LISTED:
+            errors.append(f"outside: {f.name}: {problem}")
+    if failed > _READ_ERRORS_LISTED:
+        errors.append(
+            f"outside: {root.name}: {failed} files could not be read "
+            f"(the first {_READ_ERRORS_LISTED} are listed)"
+        )
+    return out, len(pairs) - attempted
 
 
 def outside_items(
@@ -2901,11 +3035,13 @@ def outside_items(
     retained: dict[str, str] | None = None,
     *,
     with_hidden: bool = False,
+    stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Our filed records plus bounded, non-recursive reads of explicitly watched folders.
+    """Our filed records plus bounded reads of explicitly watched folders.
 
     ``retained``, when given, receives ``{id: version}`` of the records kept only for Undo, so
-    the caller can keep their cached summaries instead of treating them as gone."""
+    the caller can keep their cached summaries instead of treating them as gone. ``stats``
+    receives ``hidden_unread``: dismissed folder files that were counted but not listed."""
     errors = errors if errors is not None else []
     items = []
     done_seen = False
@@ -2959,8 +3095,9 @@ def outside_items(
         except (OSError, TimeoutError, RuntimeError) as exc:
             # Reported, not swallowed: the text stays on disk until a later poll succeeds.
             errors.append(f"outside: retention cleanup did not run: {type(exc).__name__}; it retries on the next poll")
-    raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
-    recursive = outside_recursive()
+    settings = _settings()  # one snapshot: the folders and the recursion flag cannot disagree
+    raw = settings.get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
+    recursive = outside_recursive(settings)
     hidden = load_hidden(home, errors=errors) if str(raw).strip() else {}
     seen: set[Path] = set()
     claimed: set[Path] = set()  # a file under two overlapping roots is listed once, where it is shown
@@ -2975,49 +3112,36 @@ def outside_items(
             if root in seen:
                 continue
             seen.add(root)
-            candidates = []
-            hidden_pairs = []
-            for pair in _scan_outside_folder(root, recursive, errors):
-                if pair[0] in claimed:
-                    continue
-                # The stored version also names the content, which is only known by reading the
-                # file; a stat-identical match is sorted as hidden here and verified when read.
-                stored = hidden.get(
-                    "outside:folder:" + hashlib.sha256(str(pair[0]).encode()).hexdigest()
-                )
-                stat_key = f"{pair[1].st_mtime_ns}:{pair[1].st_size}"
-                is_hidden = isinstance(stored, str) and (
-                    stored == stat_key or stored.startswith(stat_key + ":")
-                )
-                (hidden_pairs if is_hidden else candidates).append(pair)
-            # Files already marked Done at their current version do not use up the window, so
-            # finishing a page always exposes the next one. Ties break on path, so order is stable.
-            candidates.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
-            if len(candidates) > _OUTSIDE_LIMIT:
-                errors.append(
-                    f"outside: {root.name}: folder limit, showing the newest {_OUTSIDE_LIMIT}; "
-                    f"{len(candidates) - _OUTSIDE_LIMIT} older files are waiting. "
-                    "Finish or hide items to bring them into view"
-                )
-            # Hidden files never use up the waiting window; callers that count or show them
-            # (build_queue) ask for them separately, bounded by the same limit.
-            window = candidates[:_OUTSIDE_LIMIT]
-            if with_hidden:
-                hidden_pairs.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
-                window = window + hidden_pairs[:_OUTSIDE_LIMIT]
+            waiting, dismissed = _scan_outside_folder(root, recursive, errors, hidden)
+            # A file under two overlapping roots is listed once, where it is shown first.
+            waiting = [pair for pair in waiting if pair[0] not in claimed]
+            dismissed = [pair for pair in dismissed if pair[0] not in claimed]
+            # Dismissed files never use up the waiting window; callers that count or show them
+            # (build_queue) ask for them separately, bounded by the same limit. Ties break on
+            # path, so the order is stable.
+            waiting.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
+            read_deadline = time.monotonic() + OUTSIDE_SCAN_SECONDS
             with _watched_dir(root) as dfd:
-                for f, st in window:
-                    try:
-                        item = _folder_outside_item(f, root, st, dfd)
-                        if item is not None:
-                            items.append(item)
-                            claimed.add(f)
-                        else:
-                            errors.append(
-                                f"outside: {f.name}: changed while it was read or is no longer a plain file; retry"
-                            )
-                    except Exception as exc:  # one hostile file must not hide the rest of the folder
-                        errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
+                shown, unattempted = _read_folder_window(
+                    waiting, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors
+                )
+                if unattempted and len(shown) >= _OUTSIDE_LIMIT:
+                    errors.append(
+                        f"outside: {root.name}: folder limit, showing the newest {_OUTSIDE_LIMIT}; "
+                        f"{unattempted} older files are waiting. "
+                        "Finish or hide items to bring them into view"
+                    )
+                read_hidden: list[dict[str, Any]] = []
+                if with_hidden:
+                    dismissed.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
+                    read_hidden, _ = _read_folder_window(
+                        dismissed, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors
+                    )
+            if stats is not None:
+                stats["hidden_unread"] = stats.get("hidden_unread", 0) + len(dismissed) - len(read_hidden)
+            for item in shown + read_hidden:
+                items.append(item)
+                claimed.add(Path(item["ref"]))
         except (OSError, ValueError, RuntimeError) as exc:
             errors.append(f"outside: {name.strip()}: {type(exc).__name__}: {exc}")
     for it in items:
@@ -3053,7 +3177,9 @@ def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
         return rec
     if not _FOLDER_ID.fullmatch(item_id or ""):
         raise ValueError("id must identify an outside item")
-    raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
+    settings = _settings()  # one snapshot: the folders and the recursion flag cannot disagree
+    raw = settings.get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
+    recursive = outside_recursive(settings)
     unreadable: list[str] = []
     seen: set[Path] = set()
     for name in str(raw).split(","):
@@ -3069,7 +3195,8 @@ def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
             seen.add(root)
             scan_errors: list[str] = []
             with _watched_dir(root) as dfd:
-                for f, st in _scan_outside_folder(root, outside_recursive(), scan_errors):
+                found, _ = _scan_outside_folder(root, recursive, scan_errors)
+                for f, st in found:
                     if "outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest() != item_id:
                         continue
                     try:
@@ -3154,6 +3281,7 @@ def build_queue(
     errors: list[str] = []
     items: list[dict[str, Any]] = []
     outside_source_failed = False
+    outside_stats: dict[str, int] = {}
     outside_retained: dict[str, str] = {}  # Done records waiting out Undo: not shown, still known
     # One broken source must not hide the other; one broken board must not hide the
     # rest of Kanban (kanban_items records ``kanban[board]: …`` itself).
@@ -3175,7 +3303,9 @@ def build_queue(
         errors.append(f"pairing: {type(exc).__name__}: {exc}")
     try:
         items.extend(
-            outside_items(home, errors=errors, retained=outside_retained, with_hidden=True)
+            outside_items(
+                home, errors=errors, retained=outside_retained, with_hidden=True, stats=outside_stats
+            )
         )
     except Exception as exc:  # noqa: BLE001
         outside_source_failed = True
@@ -3222,6 +3352,11 @@ def build_queue(
             -(_num(i.get("since"))),
         )
     )
+    if include_hidden and outside_stats.get("hidden_unread"):
+        errors.append(
+            f"outside: {outside_stats['hidden_unread']} hidden files are not listed "
+            f"(at most the newest {_OUTSIDE_LIMIT} per folder are shown)"
+        )
     if bluf_enabled():
         attach_blufs(shown, home)
     counts = {
@@ -3236,7 +3371,7 @@ def build_queue(
         "generated_at": int(time.time()),
         "count": counts["asks"],
         "counts": counts,
-        "hidden": len(items) - len(shown),
+        "hidden": len(items) - len(shown) + outside_stats.get("hidden_unread", 0),
         "items": shown,
         "errors": errors,
         "ask_enabled": ask_enabled(),
