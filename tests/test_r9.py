@@ -46,6 +46,8 @@ class SingleQuoteBackslashIsLiteral(unittest.TestCase):
             "curl -b 'sid=pre\\'PARTSECRET https://example.test",
             "curl -u 'alice:pre\\'password=\"PARTSECRET\" x",  # Sol r9d: the word runs on through quotes
             "curl -u 'alice:pre\\'password=\"PART SECRET\" x",
+            "curl -u 'alice:pre\\';\"curl\" -u bob:PARTSECRET",  # Sol r9e: ; ends the shell word
+            "curl -u 'alice:pre\\'|curl -u bob:PARTSECRET x",
         ):
             self.assertNotIn("PARTSECRET", needs._ask_redact(text), text)
 

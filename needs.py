@@ -5512,8 +5512,8 @@ _ASK_CREDENTIAL_NAME = rf"(?:{_ASK_SECRET_KEY}|{_ASK_CODE_KEY})"
 
 
 # Last resort for a single-quoted value no other reading closes: the shell reads a backslash inside single
-# quotes literally, and joins the quote to the rest of its word (`'pass\'word="x y"` is one value).
-_SQ = r"""'[^']*'(?:"(?:\\.|[^"\\])*"|'[^']*'|\S)*+"""
+# quotes literally and joins the quote to the rest of its word, which ends at a space or ;|&<>().
+_SQ = r"""'[^']*'(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s'";|&<>()])*+"""
 
 
 _ASK_SECRET_PATTERNS = (
