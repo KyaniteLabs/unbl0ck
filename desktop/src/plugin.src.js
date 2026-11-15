@@ -887,9 +887,9 @@ function readAnswerDraft(id) {
   for (const [key, draft] of answerDrafts) if (draft.at < cutoff) answerDrafts.delete(key)
   return answerDrafts.get(id)
 }
-function rememberAnswerDraft(id, text, version) {
+function rememberAnswerDraft(id, text, version, ask) {
   answerDrafts.delete(id)
-  if (text.trim()) answerDrafts.set(id, { text, version, at: Date.now() })
+  if (text.trim()) answerDrafts.set(id, { text, version, ask, at: Date.now() })
   while (answerDrafts.size > 100) answerDrafts.delete(answerDrafts.keys().next().value)
 }
 
@@ -897,10 +897,14 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const savedDraft = readAnswerDraft(item.id)
   const [answer, setAnswer] = useState(savedDraft?.text || '')
   const [answerVersion, setAnswerVersion] = useState(savedDraft?.version ?? item.version)
-  const updateAnswer = (text, version) => {
-    rememberAnswerDraft(item.id, text, version)
+  // The question text the draft answers: an edit in place keeps the block version, so the text
+  // is part of what the draft is bound to.
+  const [answerAsk, setAnswerAsk] = useState(savedDraft?.ask ?? item.ask)
+  const updateAnswer = (text, version, ask = item.ask) => {
+    rememberAnswerDraft(item.id, text, version, ask)
     setAnswer(text)
     setAnswerVersion(version)
+    setAnswerAsk(ask)
   }
   const [busy, setBusy] = useState(false)
   const [open, setOpen] = useState(false)
@@ -928,7 +932,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   const isOutside = item.source === 'outside'
   // Chats and live prompts poll only a 480-character tail; the whole record is fetched on demand.
   const hasFull = isOutside || (item.ask_truncated === true && (item.source === 'chat' || item.source === 'prompt'))
-  const answerStale = isKanban && !!answer.trim() && answerVersion !== item.version
+  const answerStale = isKanban && !!answer.trim() && (answerVersion !== item.version || answerAsk !== item.ask)
   const askStale = askVersion !== item.version
   const platformName = platformLabel(item.platform)
   // Desktop can open its own sessions (and CLI/TUI ones, which share the store). A Telegram or
@@ -1063,7 +1067,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
   // The note says so whenever the text on screen is the excerpt: before Full text is opened,
   // after it is closed again, and while a different version is cached.
   const showingFull = open && outsideText?.__version === item.version
-  const cutNote = String(item.ask || '').startsWith('…')
+  const cutNote = item.ask_cut === true
   const excerptNote = hasFull && !isOutside && !showingFull
     ? jsx('div', {
         className: 'ub-hint', role: 'note',
@@ -1127,6 +1131,8 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
         const left = ASK_DEADLINE_MS - (Date.now() - t0)
         if (left <= 0) throw tooSlow()
         await new Promise(res => setTimeout(res, Math.min(1500, left)))
+        // The sleep can use up the last of the budget: no poll starts at or after the limit.
+        if (Date.now() - t0 >= ASK_DEADLINE_MS) throw tooSlow()
         r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true')
         if (over() && !(r && r.pending && r.job)) { setAskJob(null); setAskReq(null); throw tooSlow() }
       }
@@ -1252,7 +1258,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false }) {
           'aria-label': `Answer for ${item.task_id}`,
           onChange: e => {
             const text = e.target.value
-            updateAnswer(text, !answerStale || !text.trim() ? item.version : answerVersion)
+            updateAnswer(text, !answerStale || !text.trim() ? item.version : answerVersion, !answerStale || !text.trim() ? item.ask : answerAsk)
           },
           onKeyDown: e => {
             if (e.key === 'Enter' && !e.nativeEvent?.isComposing && (e.metaKey || e.ctrlKey) && ready) { e.preventDefault(); saysKeep ? send(false) : sendPrimary() }

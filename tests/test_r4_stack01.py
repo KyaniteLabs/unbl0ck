@@ -506,7 +506,7 @@ class DesktopExcerptLabel(unittest.TestCase):
 const ctx = {rest: async () => ({text: 'FIRST\nSECOND', truncated: false})};
 function render(item) { cursor = 0; effects = []; effectCursor = 0; return Item({ctx, item, n: 1, refresh: async () => {}, askEnabled: false}); }
 (async () => {
-  const item = {id: 'chat:p:s1', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, since: 1};
+  const item = {id: 'chat:p:s1', version: '9', source: 'chat', title: 't', ask: '…tail', ask_truncated: true, ask_cut: true, since: 1};
   let tree = render(item);
   assert.ok(text(tree).includes('last 480 characters'));
   fullButton(tree).props.onClick(); tree = render(item); await flush(); tree = render(item);
@@ -713,7 +713,7 @@ const render = mount(ctx);
   btn(render(), 'TL;DR').props.onClick(); await tick(); await tick();
   assert.ok(!text(render()).includes('late answer'), 'an answer after 150 s is not accepted');
   assert.ok(text(render()).includes('over 150 s'));
-  assert.ok(now <= 150000 + 30000 + 1500, 'no sleep runs past the limit: ' + now);
+  assert.ok(now <= 150000 + 30000, 'at most one request runs past the limit: ' + now);
 })().catch(e => { console.error(e); process.exitCode = 1 });
 """)
 

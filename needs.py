@@ -1179,6 +1179,12 @@ def _is_excerpted(text: str, n: int = EXCERPT_CHARS) -> bool:
     return len(collapsed) > n or collapsed != original
 
 
+def _is_cut(text: str, n: int = EXCERPT_CHARS) -> bool:
+    """True when ``_excerpt`` drops the start of *text* (a literal leading ellipsis is not a cut)."""
+    original, _ = _full_text(text)
+    return len(re.sub(r"\s+", " ", original).strip()) > n
+
+
 def _full_text(text: str) -> tuple[str, bool]:
     """The permitted full text of one record: original newlines, bounded; second value is truncation."""
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -1890,6 +1896,7 @@ def chat_items(
                         "title": f"{_bot_name(home, profile)} is asking you",
                         "ask": _excerpt(shown),
                         "ask_truncated": over or _is_excerpted(shown),
+                        "ask_cut": over or _is_cut(shown),
                         **(_chat_full_fields(shown, over) if full else {}),
                         "why": f"Last turn in this {where_} is a question for you",
                         "owner": profile,
@@ -2434,6 +2441,7 @@ def wait_items(
                 "ask": _excerpt(shown) or "(prompt text withheld by Hermes)",
                 # A password prompt is never expanded: its excerpt is all the queue ever shows.
                 "ask_truncated": kind != "sudo" and (cut or _is_excerpted(shown)),
+                "ask_cut": kind != "sudo" and (cut or _is_cut(shown)),
                 **(
                     {
                         **_full_fields(prompt),
