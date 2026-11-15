@@ -421,12 +421,20 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
                 return False
         if not done and not is_hidden:
             return False
-        if done:
-            rec.pop("done_at")
-            _write_json(f, rec)
-        if is_hidden:
+        clear_done, clear_hidden = done, is_hidden
+        if token is not None and done and is_hidden and hidden[item_id] != str(rec.get("version")):
+            # The two markers belong to different versions of the item (hidden at v1, Done at v2).
+            # A token for one never authorizes removing the other's newer dismissal.
+            if token == hidden[item_id]:
+                return False
+            clear_hidden = False
+        # Hidden marker first: if the second write fails the Done token still matches on retry.
+        if clear_hidden:
             del hidden[item_id]
             _write_json(_hidden_path(home), hidden)
+        if clear_done:
+            rec.pop("done_at")
+            _write_json(f, rec)
         return True
 
 
@@ -2241,6 +2249,9 @@ def _scan_outside_folder(
     too_deep = False
     while stack and not stopped:
         d, depth = stack.pop()
+        if time.monotonic() > deadline:
+            stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
+            break  # queued directories count against the budget even when they hold no entries
         try:
             # A queued directory may have been swapped for a symlink since it was listed.
             if d != root and d.resolve() != d:
