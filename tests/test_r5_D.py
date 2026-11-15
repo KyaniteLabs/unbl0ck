@@ -2,11 +2,13 @@
 
 Each test drives the real Item or Page component (source and built) through the shared view
 harness, so it fails on the old code for the behaviour the finding names."""
+import re
 import subprocess
 import unittest
 from pathlib import Path
 
 from test_operator_recovery import HARNESS
+from test_outside import needs
 from test_r4_stack06 import STORE
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +49,42 @@ const ask={source:'kanban',id:'kanban:default:v1',version:'1',title:'T',ask:'Q?'
 s=page({...base,items:[ask],count:1});
 assert.ok(s.includes('NOT ALL CLEAR'),'asks on the list do not prove the unread sessions hold none: '+s);
 """)
+
+
+class FullTextOffer(NodeCase):
+    def test_password_prompts_and_pairing_requests_offer_no_full_text(self):
+        """R5-desk-026: the guide says password prompts never offer Full text and pairing requests show neither."""
+        self.run_views(r"""
+const ctx={rest:async()=>({})};
+const full=t=>all(t).some(n=>n?.type==='button'&&String(n.props.children).includes('FULL TEXT'));
+const sudo={source:'prompt',kind:'sudo',id:'prompt:s1',version:'1',title:'sudo',ask:'[sudo] password for the operator:',since:1};
+const pair={source:'pairing',id:'pairing:telegram:p1',version:'1',title:'Pairing request',ask:'A person asks to pair',platform:'telegram',since:1};
+const chat={source:'chat',id:'chat:c1',version:'1',title:'Chat',ask:'Short question?',platform:'cli',since:1};
+for(const it of [sudo,pair]){state=[];assert.ok(!full(mount(ctx,it)),it.source+' must not offer Full text')}
+state=[];assert.ok(full(mount(ctx,chat)),'a chat still unfolds its text');
+""")
+
+
+def pack_choices(item):
+    """The Pocket choices for one Kanban card, with the task named as the guide names it."""
+    pack = needs.pocket_pack({"items": [item], "errors": []})
+    where = re.escape(item["task_id"]) + r" on board \S+ \(block [^)]*\)"
+    return [re.sub(where, "<task>", o["send"]) for o in pack["cards"][0]["options"]]
+
+
+class PocketRowMatchesPack(unittest.TestCase):
+    def test_the_guide_names_every_kanban_pocket_choice(self):
+        """R5-desk-027: the surface matrix and the Pocket bullet name the choices pocket_pack gives a Kanban card."""
+        text = (ROOT / "docs/operator-guide.md").read_text()
+        row = next(l for l in text.splitlines() if l.startswith("| Pocket pack"))
+        flat = " ".join(text.split())
+        base = {"source": "kanban", "id": "kanban:default:t1", "task_id": "t1", "board": "default", "version": "7", "title": "T",
+                "ask": "Q?", "why": "blocked", "profile": "default", "tier": "ask", "since": 1}
+        for status in ("blocked", "triage"):
+            for choice in pack_choices({**base, "status": status}):
+                self.assertIn(choice, row, status)
+                self.assertIn(choice, flat, status)
+        self.assertNotIn("inline action", row)
 
 
 if __name__ == "__main__":

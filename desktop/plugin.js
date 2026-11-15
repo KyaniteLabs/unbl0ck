@@ -1038,6 +1038,10 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       : null
   // Chats and live prompts poll only a 480-character tail; the whole record is fetched on demand.
   const hasFull = isOutside || (item.ask_truncated === true && (item.source === 'chat' || item.source === 'prompt'))
+  // A password prompt and a pairing request show only their excerpt: no Full text, not even unfolded.
+  const fullButton = hasFull || !(isPairing || item.kind === 'sudo')
+    ? jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' })
+    : null
   const answerStale = isKanban && !!answer.trim() && (answerVersion !== item.version || answerAsk !== item.ask)
   const askStale = askVersion !== item.version || askCtx !== ctxNow
   const platformName = platformLabel(item.platform)
@@ -1629,15 +1633,15 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
               open ? jsx('p', { className: 'ub-ask open', children: hasFull ? outsideBody : item.ask }) : null,
               fullTextStatus,
               excerptNote,
-              jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' })
+              fullButton
             ]
           : [
               item.bluf_pending ? jsx('div', { className: 'ub-pending', children: '◇ SUMMARIZING' }) : null,
               item.bluf_status ? jsx('div', { className: 'ub-hint', role: 'note', children: item.bluf_status === 'waiting' ? 'Summary waiting for capacity; showing original text.' : 'Summary unavailable; showing original text.' }) : null,
-              jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open ? undefined : 'Click to read all', onClick: () => setOpen(true), children: hasFull ? (open ? outsideBody : item.ask) : item.ask }),
+              jsx('p', { className: open ? 'ub-ask open' : 'ub-ask', title: open || !fullButton ? undefined : 'Click to read all', onClick: fullButton ? () => setOpen(true) : undefined, children: hasFull && open ? outsideBody : item.ask }),
               fullTextStatus,
               excerptNote,
-              jsx('button', { type: 'button', className: 'ub-full', 'aria-expanded': open, onClick: () => setOpen(!open), children: open ? '− HIDE FULL TEXT' : '+ FULL TEXT' }),
+              fullButton,
               item.why && item.why !== item.ask ? jsxs('div', { className: 'ub-why', children: [jsx('b', { children: 'WHY' }), item.why] }) : null
             ]),
         !isOutside && hasFull && open && outsideText?.__ctx === ctxNow && outsideText.truncated
