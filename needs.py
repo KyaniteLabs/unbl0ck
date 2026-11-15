@@ -2481,6 +2481,12 @@ class _InertText(html.parser.HTMLParser):
 
 def html_to_text(markup: str, limit: int) -> str:
     """Readable, inert text from HTML, at most about *limit* characters. Never raises."""
+    return _html_convert(markup, limit)[0]
+
+
+def _html_convert(markup: str, limit: int) -> tuple[str, bool]:
+    """Inert text, and whether the markup ended inside a hidden or never-closed element, so
+    that whatever followed it was left out."""
     parser = _InertText(limit)
     try:
         # The trailing tag flushes text the parser holds back; an unterminated comment or style
@@ -2491,11 +2497,15 @@ def html_to_text(markup: str, limit: int) -> str:
     text = "".join(parser.out)
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in text.split("\n")]
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()[:limit]
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()[:limit]
+    return cleaned, bool(parser.hidden)
 
 
 _HTML_NOTE = "(Converted from HTML; formatting, images and links are not shown.)\n\n"
 _NO_BODY = "(No readable text body; this message has only attachments or parts that are not read.)"
+_HTML_SWALLOWED = (
+    "(Part of this HTML body is not shown: it sits inside an element that is hidden or never closed.)"
+)
 # Headers a mail client writes when it saves an unsent message, and headers a receiving server adds.
 _DRAFT_MARKERS = (("x-unsent", lambda v: v.strip() == "1"), ("x-mozilla-draft-info", lambda v: True),
                   ("x-uniform-type-identifier", lambda v: "mail-draft" in v.lower()))
@@ -2521,9 +2531,11 @@ def _eml_body(msg: Any) -> str:
             return text
     html_part = msg.get_body(preferencelist=("html",))
     if html_part is not None:
-        text = html_to_text(_decode_part(html_part), _OUTSIDE_READ_LIMIT)
+        text, swallowed = _html_convert(_decode_part(html_part), _OUTSIDE_READ_LIMIT)
         if text:
-            return _HTML_NOTE + text
+            return _HTML_NOTE + text + (f"\n\n{_HTML_SWALLOWED}" if swallowed else "")
+        if swallowed:
+            return _HTML_SWALLOWED
     return _NO_BODY
 
 
