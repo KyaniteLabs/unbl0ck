@@ -330,8 +330,17 @@ def _refuse_link(d: Path) -> None:
 
 
 class Notice(str):
-    """A message in a reader's ``errors`` list that reports a state, not a failure: the queue
-    shows it like any other, but a caller that counts failures (full-text search) does not."""
+    """A message in a reader's ``errors`` list that reports a state, not a read failure. The
+    queue shows it like any other; consumers classify it by *kind*, never by its wording:
+    ``capacity`` (every record was read, more cannot be filed), ``listing_cut`` (records exist
+    that the list does not show) or ``state`` (cleanup or stored state needs attention)."""
+
+    kind: str
+
+    def __new__(cls, text: str, kind: str) -> "Notice":
+        notice = super().__new__(cls, text)
+        notice.kind = kind
+        return notice
 
 
 def _list_files(d: Path, suffix: str = "") -> list[Path]:
@@ -3024,7 +3033,7 @@ def wait_items(
             try:
                 f.unlink(missing_ok=True)
             except OSError as exc:
-                errors.append(f"prompt: {f.name}: {type(exc).__name__}; could not remove stale record")
+                errors.append(Notice(f"prompt: {f.name}: {type(exc).__name__}; could not remove stale record", "state"))
             continue
         rid = str(rec["request_id"])
         kind = str(rec.get("kind") or "")
@@ -3205,7 +3214,7 @@ def search_text(query: Any) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             errors.append(f"{source}: could not be read, so it was not searched")
             continue
-        if any(not isinstance(e, Notice) for e in source_errors):
+        if any(getattr(e, "kind", None) != "capacity" for e in source_errors):
             errors.append(f"{source}: some records could not be read")
         window = items[:SEARCH_MAX_ITEMS]
         skipped = len(items) - len(window) + (unread[0] if source == "outside" else 0)
@@ -3406,7 +3415,7 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
     with scan as entries:
         for entry in entries:
             if scanned >= _PURGE_SCAN_LIMIT or time.monotonic() > deadline:
-                errors.append("outside: retention cleanup stopped early; some filed records were not checked")
+                errors.append(Notice("outside: retention cleanup stopped early; some filed records were not checked", "state"))
                 break
             scanned += 1  # every entry counts, so non-JSON files cannot stretch the scan
             if not entry.name.endswith(".json"):
@@ -3418,7 +3427,7 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
             if not _is_filed_record(rec, f.stem):
                 continue
             if _bad_done(rec):
-                errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
+                errors.append(Notice(f"outside: {f.name}: invalid done_at; kept for repair", "state"))
                 continue
             done_at = _done_at(rec)
             if done_at is None:
@@ -3440,9 +3449,10 @@ def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = No
     for _, f in done[: max(0, len(done) - _OUTSIDE_DONE_KEEP)]:
         remove(f)
     if failed:
-        errors.append(
-            f"outside: could not remove {failed} expired done record(s); their text stays until a later cleanup succeeds"
-        )
+        errors.append(Notice(
+            f"outside: could not remove {failed} expired done record(s); their text stays until a later cleanup succeeds",
+            "state",
+        ))
     return removed
 
 
@@ -3485,7 +3495,7 @@ def _purge_logged(d: Path) -> int:
     try:
         _purge_done(d, errors=errors)
     except OSError as exc:
-        errors.append(f"outside: retention cleanup failed: {type(exc).__name__}")
+        errors.append(Notice(f"outside: retention cleanup failed: {type(exc).__name__}", "state"))
     for error in errors:
         log.warning("unbl0ck: %s", error)
     return len(errors)
@@ -4535,7 +4545,10 @@ def outside_items(
         else:
             filed, over = _filed_files(outside)
         if over:
-            errors.append(f"outside: more than {_PURGE_SCAN_LIMIT} filed entries; only the first {_PURGE_SCAN_LIMIT} are read")
+            errors.append(Notice(
+                f"outside: more than {_PURGE_SCAN_LIMIT} filed entries; only the first {_PURGE_SCAN_LIMIT} are read",
+                "listing_cut",
+            ))
     except OSError as exc:
         errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
         filed = []
@@ -4550,7 +4563,7 @@ def outside_items(
                 retained[rec["id"]] = rec["version"]
             continue
         if _bad_done(rec):
-            errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
+            errors.append(Notice(f"outside: {f.name}: invalid done_at; kept for repair", "state"))
             continue
         if _is_filed_record(rec, f.stem):
             if visible is None or visible(rec["id"], rec["version"]):
@@ -4563,7 +4576,8 @@ def outside_items(
         errors.append(
             Notice(
                 f"outside: {filed_waiting} agent-filed items are waiting (limit {_OUTSIDE_LIMIT}); "
-                "agents cannot file more until you finish some"
+                "agents cannot file more until you finish some",
+                "capacity",
             )
         )
     if done_seen and not readonly:
@@ -4575,7 +4589,9 @@ def outside_items(
                     del retained[item_id]
         except (OSError, TimeoutError, RuntimeError) as exc:
             # Reported, not swallowed: the text stays on disk until a later poll succeeds.
-            errors.append(f"outside: retention cleanup did not run: {type(exc).__name__}; it retries on the next poll")
+            errors.append(Notice(
+                f"outside: retention cleanup did not run: {type(exc).__name__}; it retries on the next poll", "state"
+            ))
     settings = _settings()  # one snapshot: the folders and the recursion flag cannot disagree
     raw = settings.get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
     recursive = outside_recursive(settings)
@@ -4611,11 +4627,12 @@ def outside_items(
                     waiting, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors, attempts
                 )
                 if unattempted and len(shown) >= _OUTSIDE_LIMIT:
-                    errors.append(
+                    errors.append(Notice(
                         f"outside: {root.name}: folder limit, showing the newest {_OUTSIDE_LIMIT}; "
                         f"{len(unattempted)} older files are waiting. "
-                        "Finish or hide items to bring them into view"
-                    )
+                        "Finish or hide items to bring them into view",
+                        "listing_cut",
+                    ))
                 omitted.update(f for f, _ in unattempted)
                 # Every file tried here (read or failed) belongs to this root, so an overlapping
                 # root neither lists it again nor spends the read budget on it again.
@@ -5064,10 +5081,11 @@ def build_queue(
         )
     )
     if include_hidden and outside_stats.get("hidden_unread"):
-        errors.append(
+        errors.append(Notice(
             f"outside: {outside_stats['hidden_unread']} hidden files are not listed "
-            f"(at most the newest {_OUTSIDE_LIMIT} per folder are shown)"
-        )
+            f"(at most the newest {_OUTSIDE_LIMIT} per folder are shown)",
+            "listing_cut",
+        ))
     summaries_on = bluf_enabled(settings)
     if summaries_on:
         attach_blufs(shown, home)
@@ -6863,38 +6881,32 @@ POCKET_PROMPT_CHARS = 4000  # one card's prompt
 POCKET_TOTAL_PROMPT_CHARS = 20000  # all prompts in one pack
 
 
-# Queue errors are plain strings that start with the source they came from. Not every one means a
-# source could not be read: some say a listing was cut at its limit, and some are about cleanup or
-# stored state. Only a read failure is an "unread source".
 _READ_SOURCES = ("kanban", "chat", "prompt", "pairing", "outside")
-_CAPACITY_NOTICES = ("agent-filed items are waiting (limit",)  # every record was read
-_LISTING_CUT_NOTICES = (  # records exist that the list does not show
-    "folder limit, showing the newest",
-    "filed entries; only the first",
-    "hidden files are not listed",
-)
-_STATE_NOTICES = ("could not remove", "retention cleanup", "invalid done_at")
 
 
 def unread_sources(errors: list[str] | None) -> int:
     """How many sources (a Kanban board, a profile's chats, pairing, prompts, outside) could not be
-    read, counted once per source however many messages it produced. A capacity warning, a
-    cleanup problem or a cut listing is not an unread source."""
+    read, counted once per source however many messages it produced. A :class:`Notice` (a
+    capacity warning, a cut listing, a cleanup problem) is not an unread source."""
     sources = set()
     for error in errors or ():
-        text = str(error)
-        head = text.split(":", 1)[0]
-        if head.split("[", 1)[0] not in _READ_SOURCES:
-            continue
-        if any(m in text for m in _CAPACITY_NOTICES + _LISTING_CUT_NOTICES + _STATE_NOTICES):
-            continue
-        sources.add(head)
+        head = str(error).split(":", 1)[0]
+        if head.split("[", 1)[0] in _READ_SOURCES and not isinstance(error, Notice):
+            sources.add(head)
     return len(sources)
 
 
 def listing_cut(errors: list[str] | None) -> bool:
     """True when a source says some of its records are not in the list."""
-    return any(m in str(e) for e in errors or () for m in _LISTING_CUT_NOTICES)
+    return any(getattr(e, "kind", None) == "listing_cut" for e in errors or ())
+
+
+def queue_complete(queue: dict[str, Any]) -> bool:
+    """The one completeness predicate: every source was read, no listing was cut and no
+    coverage gap (such as unread older chat sessions) exists. Only then may a surface say
+    "nothing needs you" over an empty list."""
+    errors = queue.get("errors")
+    return not unread_sources(errors) and not listing_cut(errors) and not coverage_gaps(queue)
 
 
 def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
@@ -7040,7 +7052,7 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         "cards": cards,
         # False when a source could not be read or a card was cut or left out: an empty pack is
         # then not "nothing needs you".
-        "complete": not unread_sources(queue.get("errors")) and not listing_cut(queue.get("errors")) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
+        "complete": queue_complete(queue) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
         # What this pack leaves out, as counts only; the original surface has the rest.
         "omitted": {
             "unread_sources": unread_sources(queue.get("errors")),
