@@ -102,7 +102,7 @@ router = APIRouter()
 
 MAX_ID = 300            # matches the hide-id limit in needs.hide
 MAX_TEXT = 20_000       # one typed answer or one chat message, in characters
-MAX_MESSAGES = 50       # Ask only uses the last 20; this is the most a client may send
+MAX_MESSAGES = 50       # Ask sends the last few turns (6 by default, configurable); this is the most a client may send
 
 
 class Answer(BaseModel):
