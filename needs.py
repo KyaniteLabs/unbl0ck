@@ -1885,6 +1885,71 @@ def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
     return {"text": full, "text_cut": True}
 
 
+BACKFILL_FILE = "chat-backfill.json"
+BACKFILL_IDS_MAX = 1000
+
+
+def _backfill_state(home: Path | None) -> tuple[float | None, list[str], bool]:
+    """``(floor, ids, readable)``: the oldest time any earlier queue read reached back to, and the
+    chats first listed from before it (a widened ``chat_window_days`` found them). Nothing here is
+    chat text: a time and the ids the dismissal and summary stores already hold."""
+    try:
+        p = data_dir(home, create=False) / BACKFILL_FILE
+        if not os.path.lexists(p):
+            return None, [], True
+        data = json.loads(_read_plain_text(p))
+        floor = data.get("floor")
+        floor = float(floor) if isinstance(floor, (int, float)) and math.isfinite(floor) else None
+        ids = [i for i in data.get("ids", []) if isinstance(i, str)][-BACKFILL_IDS_MAX:]
+        return floor, ids, True
+    except (OSError, ValueError, AttributeError, TypeError, UnicodeError):
+        return None, [], False
+
+
+def _mark_backfill(
+    home: Path | None,
+    items: list[dict[str, Any]],
+    since: float,
+    *,
+    record: bool,
+    complete: bool,
+    errors: list[str] | None,
+) -> None:
+    """Flag chats that only a widened window reached (``backfilled``), so nothing is sent to a
+    model for them automatically. A chat is backfill when it is older than the default window or
+    older than anything an earlier read looked at; the flag then stays with it, so a later
+    refresh cannot turn it back into an ordinary ask. Only ``record`` (the queue build) saves."""
+    default_since = time.time() - CHAT_WINDOW_DAYS * 86400
+    floor, ids, readable = _backfill_state(home)
+    edge = floor if floor is not None else since
+    marked = dict.fromkeys(ids)
+    changed = False
+    for it in items:
+        ts = it.get("since") or 0
+        if it["id"] not in marked and (ts < edge or not readable) and ts < time.time() - 86400:
+            marked[it["id"]] = None
+            changed = True
+        if ts < default_since or it["id"] in marked:
+            it["backfilled"] = True
+    if complete:  # a whole read: chats no longer listed need no flag
+        listed = {it["id"] for it in items}
+        kept = {i: None for i in marked if i in listed}
+        changed = changed or len(kept) != len(marked)
+        marked = kept
+    new_floor = min(edge, since)
+    if not record or not readable or (not changed and floor is not None and new_floor >= floor):
+        return
+    try:
+        _write_json(
+            data_dir(home) / BACKFILL_FILE,
+            {"floor": new_floor, "ids": list(marked)[-BACKFILL_IDS_MAX:]},
+            ordered=True,
+        )
+    except OSError as exc:
+        if errors is not None:
+            errors.append(f"chat: backfill marks could not be saved ({type(exc).__name__})")
+
+
 def chat_items(
     home: Path | None = None,
     days: int | None = None,
@@ -1896,6 +1961,7 @@ def chat_items(
     visible: Callable[[str, str], bool] | None = None,
     only: tuple[str, str] | None = None,
     unread_profiles: set[str] | None = None,
+    record_backfill: bool = False,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
     last visible turn is the bot asking you something you have not answered. ``only`` =
@@ -2118,11 +2184,17 @@ def chat_items(
                         "owner": profile,
                         "priority": 0,
                         "since": int(ts or 0),
-                        # Found only because chat_window_days reaches past the default window:
-                        # listed, but never sent to a model without a deliberate action.
-                        **({"backfilled": True} if (ts or 0) < time.time() - CHAT_WINDOW_DAYS * 86400 else {}),
                     }
                 )
+    # Found only because chat_window_days reaches further back than an earlier read did (or past
+    # the default window): listed, but never sent to a model without a deliberate action.
+    if only is None:
+        _mark_backfill(
+            home, items, since,
+            record=record_backfill,
+            complete=not cov.get("sessions_omitted") and not (errors or []) and not unread_profiles,
+            errors=errors,
+        )
     return items
 
 
@@ -3808,7 +3880,10 @@ def build_queue(
     unread_profiles: set[str] = set()
     try:
         items.extend(
-            chat_items(home, errors=errors, coverage=chat_coverage, unread_profiles=unread_profiles)
+            chat_items(
+                home, errors=errors, coverage=chat_coverage, unread_profiles=unread_profiles,
+                record_backfill=True,
+            )
         )
     except Exception as exc:  # noqa: BLE001
         chat_coverage = None  # a failed source is not "covered"

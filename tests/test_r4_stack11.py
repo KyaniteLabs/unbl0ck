@@ -3,9 +3,12 @@ chat reader will open, which profile name a shared database keeps, and what is r
 profile.yaml. Every test that builds the queue isolates HERMES_KANBAN_HOME."""
 
 import os
+import json
 import sqlite3
+import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -567,3 +570,93 @@ assert.equal(Chip(), null);
         for name, code, err in run_views(script):
             with self.subTest(file=name):
                 self.assertEqual(code, 0, err)
+
+
+class WidenedWindowIsBackfill(QueueCase):
+    """11-007 (class I/G, a promise the code did not keep): an ask found only because the window was
+    widened is backfill, even when it is younger than the default 14 days."""
+
+    def _home(self, rows):
+        from test_ask_coverage import make_chats
+
+        return make_chats(Path(tempfile.mkdtemp(dir=self.home)), rows)
+
+    def _queue(self, home, days):
+        from test_ask_coverage import settings
+
+        with patch.object(needs, "_settings", settings(chat_window_days=days)):
+            return {i["session_id"]: i for i in needs.build_queue(home)["items"] if i["source"] == "chat"}
+
+    def test_an_ask_a_widened_window_reaches_is_flagged_and_stays_flagged(self):
+        home = self._home([("recent", "cli", "dm", "u", 0.2, ASK), ("three", "cli", "dm", "u", 3, ASK)])
+        first = self._queue(home, 1)
+        self.assertEqual(sorted(first), ["recent"])
+        self.assertFalse(first["recent"].get("backfilled"))
+        wide = self._queue(home, 7)
+        self.assertTrue(wide["three"].get("backfilled"), "reached only by the wider window")
+        self.assertFalse(wide["recent"].get("backfilled"))
+        again = self._queue(home, 7)
+        self.assertTrue(again["three"].get("backfilled"), "the flag survives the next refresh")
+        wider = self._queue(home, 30)
+        self.assertTrue(wider["three"].get("backfilled"), "and a further widening")
+
+    def test_a_window_that_was_always_wide_is_not_backfill(self):
+        home = self._home([("three", "cli", "dm", "u", 3, ASK)])
+        self.assertFalse(self._queue(home, 7)["three"].get("backfilled"))
+        self.assertFalse(self._queue(home, 7)["three"].get("backfilled"))
+
+    def test_narrowing_and_widening_back_does_not_flag_what_was_already_read(self):
+        home = self._home([("three", "cli", "dm", "u", 3, ASK)])
+        self._queue(home, 7)
+        self._queue(home, 1)
+        self.assertFalse(self._queue(home, 7)["three"].get("backfilled"))
+
+    def test_a_flagged_chat_is_not_sent_to_a_model_by_the_dashboard(self):
+        import test_bluf
+
+        api = test_bluf.BlufTest().load_api_without_fastapi()
+        home = self._home([("three", "cli", "dm", "u", 3, ASK)])
+        self._queue(home, 1)
+        sent = []
+        real = needs.build_queue
+
+        def build(*a, **k):
+            from test_ask_coverage import settings
+
+            with patch.object(needs, "_settings", settings(chat_window_days=7)):
+                q = real(home)
+            q["bluf_enabled"] = True
+            return q
+
+        n = types.SimpleNamespace(build_queue=build, NO_BLUF_SOURCES=())
+        with patch.object(api, "_needs", lambda: n), patch.object(
+            api, "_loaded_ctx", lambda: types.SimpleNamespace(llm=object())
+        ), patch.object(api, "_queue_bluf", lambda n_, ctx, it: sent.append(it["id"])), patch.object(
+            api._ASK_JOBS, "housekeeping", lambda: None
+        ):
+            api.queue()
+        self.assertEqual(sent, [])
+
+    def test_searching_reads_the_marks_but_never_writes_them(self):
+        home = self._home([("three", "cli", "dm", "u", 3, ASK)])
+        needs.chat_items(home)
+        self.assertFalse((home / "plugin-data" / "unbl0ck" / needs.BACKFILL_FILE).exists())
+
+    def test_the_marks_hold_a_time_and_ids_only_and_are_bounded(self):
+        home = self._home([("three", "cli", "dm", "u", 3, ASK)])
+        self._queue(home, 1)
+        self._queue(home, 7)
+        data = json.loads((home / "plugin-data" / "unbl0ck" / needs.BACKFILL_FILE).read_text())
+        self.assertEqual(sorted(data), ["floor", "ids"])
+        self.assertEqual(data["ids"], ["chat:work:three"])
+        self.assertNotIn("Should I open", json.dumps(data))
+        self.assertLessEqual(needs.BACKFILL_IDS_MAX, 1000)
+
+    def test_the_documented_promise_matches_the_behavior(self):
+        root = Path(__file__).resolve().parents[1]
+        yaml_text = " ".join((root / "plugin.yaml").read_text().split())
+        guide = " ".join((root / "docs" / "operator-guide.md").read_text().split())
+        self.assertIn("1 to 90; anything else uses 14", yaml_text)
+        self.assertIn("older than any earlier read", yaml_text)
+        self.assertIn("older than any earlier read", guide)
+        self.assertIn(needs.BACKFILL_FILE, guide)

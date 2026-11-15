@@ -208,9 +208,12 @@ unread past the 500-per-profile scan limit, and fixed notes on what detection ca
 Group-chat requests that never name you, requests written in languages other than English
 and anything in Kanban comments rather than the block reason can be missed. Raising
 `chat_window_days` is a read-only backfill of the same local chat database: it sends nothing
-to a model, adds no duplicates, and keeps cards you hid or answered hidden. Chats older than
-14 days that this finds are listed but never summarized automatically, even when summaries are
-on. If a chat database cannot be read, the coverage note says so instead of naming a window. The labeled
+to a model, adds no duplicates, and keeps cards you hid or answered hidden. A chat this finds
+that is older than 14 days, or older than any earlier read (widening 1 to 7 days reaches
+three-day-old asks), is listed but never summarized automatically, even when summaries are
+on; the Summarize action still works on it. To keep that flag across refreshes the queue keeps a
+small `chat-backfill.json` in the plugin data folder: the oldest time any read reached and the
+ids of such chats (at most 1000), never chat text. If a chat database cannot be read, the coverage note says so instead of naming a window. The labeled
 corpus in `tests/ask_corpus.py` lists the known misses (`KNOWN_GAPS`); run
 `python tests/test_ask_corpus.py --report` to print the false-positive and false-negative
 report.
