@@ -82,9 +82,10 @@ dropped, and the card says so. A conversation that expires while its card stays 
 leaves the screen too. If a request's conversation is evicted or expires while the model
 is still answering, the card reports that it was dropped from session memory and offers
 Retry; the late answer is not shown. The recovered conversation stays bound to the card it
-was asked about: if the block version or the title, question, owner or comments changed,
-it is marked as out of date and its suggestion cannot be used as an answer until you ask
-again. A late response from an older request
+was asked about: if the block version or the title, question, owner, description or comments
+(including a comment rewritten in place) changed, it is marked as out of date and its suggestion
+cannot be used as an answer until you ask again. A Retry after leaving and returning to the
+page reuses the request's id, so a response lost in transit never starts a second model call. A late response from an older request
 never replaces a newer one.
 
 ## Recover from a fault

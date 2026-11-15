@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Ask requests and advice stay tied to what they were made from (#34 round 5).** The request id survives a remount, so Retry after a lost response never starts a second model call. An older evicted request can no longer reclaim a conversation a newer one owns. Advice goes stale when the description or an existing comment is rewritten (the card carries digests, not text), and the context fingerprints no longer collide when text contains the separator.
 - **Answer drafts are kept per backend connection too (#34 round 4).** A draft typed for a card on one backend no longer shows up, or gets submitted, on another backend that has the same card id and version.
 - **One Ask conversation is bounded and expires on a mounted card (#34 round 4).** A conversation keeps at most 100 messages and 200,000 characters and says when older ones were dropped; an expired conversation leaves the screen and is never resent.
 - **An Ask request whose conversation is evicted or expires now reports it (#34 round 4).** The card shows that the conversation was dropped from session memory and offers Retry, instead of clearing Thinking and discarding the reply without a word.

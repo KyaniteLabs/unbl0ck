@@ -765,8 +765,11 @@ def summary_fingerprint(item: dict[str, Any]) -> str:
         str(item.get("ask") or ""),
         str(item.get("owner") or ""),
         str(item.get("comments_sig") or ""),
+        str(item.get("body_sig") or ""),
     ]
-    return hashlib.sha256("\x1f".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
+    # JSON, not a delimiter: a field that contains the delimiter would move text between fields.
+    blob = json.dumps(parts, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str, Any]:
@@ -1577,18 +1580,32 @@ def stuck_reason(reason: str, kind: str | None, block: Any) -> str:
     return "Blocked with no ask for you recorded; route to its owner"
 
 
+def _digest(*texts: Any) -> str:
+    """A short digest of card text: it moves when the text does and carries none of it."""
+    h = hashlib.sha256()
+    for text in texts:
+        data = str(text if text is not None else "").encode("utf-8", "replace")
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()[:12]
+
+
 def _comments_sig(conn: Any, kanban_db: Any, task_id: str) -> str:
-    """"count:newest id" of a card's comments: it changes when a comment is added, so a summary
-    written before the comment is not shown for the card as it is now."""
+    """"count:newest id:digest of the comment bodies": it changes when a comment is added and when an
+    existing one is rewritten, so advice or a summary written from the old text is not shown for the
+    card as it is now."""
     try:
-        n, newest = conn.execute(
-            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        return f"{n}:{newest}"
+        rows = conn.execute(
+            "SELECT id, author, body FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+        comments = [(r[0], r[1], r[2]) for r in rows]
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        comments = kanban_db.list_comments(conn, task_id)
-        return f"{len(comments)}:{max((getattr(c, 'id', 0) or 0 for c in comments), default=0)}"
+        comments = [
+            (getattr(c, "id", 0) or 0, getattr(c, "author", ""), getattr(c, "body", ""))
+            for c in kanban_db.list_comments(conn, task_id)
+        ]
+    newest = max((c[0] or 0 for c in comments), default=0)
+    return f"{len(comments)}:{newest}:{_digest(*(part for c in comments for part in c))}"
 
 
 def kanban_items(
@@ -1679,6 +1696,7 @@ def kanban_items(
                             or getattr(task, "block_recurrences", 0),
                             "since": since,
                             "comments_sig": _comments_sig(conn, kanban_db, task.id),
+                            "body_sig": _digest(getattr(task, "body", "")),
                         }
                     )
         except Exception as exc:  # noqa: BLE001 - per-board failure must be visible

@@ -940,16 +940,23 @@ function clearAskSession(id) { askSessions.delete(id) }
 // a remount under another backend never finds, shows or resends this one's conversation.
 let askScopeSeq = 0
 const askClosed = new Set()
+// The newest request started for each card, whether or not its session still exists. An evicted
+// request may only report its loss while it is still the newest one: an older one that finishes
+// later must not recreate the entry under its own, older token.
+const askLatest = new Map()
 function askKey(scope, id) { return scope ? `${scope}|${id}` : id }
 function endAskScope(scope) {
   askClosed.add(scope)
   for (const key of [...askSessions.keys()]) if (key.startsWith(`${scope}|`)) askSessions.delete(key)
   for (const key of [...answerDrafts.keys()]) if (key.startsWith(`${scope}|`)) answerDrafts.delete(key)
+  for (const key of [...askLatest.keys()]) if (key.startsWith(`${scope}|`)) askLatest.delete(key)
 }
-// What an Ask answer was written from: the block version plus the visible card text. The version
-// alone does not move when the title, the question or the comments change.
+// What an Ask answer was written from: the block version plus the card text the model reads. The
+// version alone does not move when the title, the question, the description or a comment changes
+// (body_sig and comments_sig are digests of those). JSON, not a delimiter: a field that contains
+// the delimiter would move text between fields and look unchanged.
 function askContext(item) {
-  return [item.version, item.title, item.ask, item.owner, item.comments_sig].map(v => String(v ?? '')).join('\u001f')
+  return JSON.stringify([item.version, item.title, item.ask, item.owner, item.comments_sig, item.body_sig].map(v => String(v ?? '')))
 }
 // The 100-conversation cap does not bound one conversation, and every update refreshes its expiry:
 // keep the newest messages within a message and character budget and say when older ones were dropped.
@@ -1001,7 +1008,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
   const [askBusy, setAskBusy] = useState(!!savedAsk?.running)
   const [askError, setAskError] = useState(savedAsk?.error || '')
   const [askJob, setAskJob] = useState(savedAsk?.job || null)
-  const [askReq, setAskReq] = useState(null)
+  const [askReq, setAskReq] = useState(savedAsk?.req ?? null)
   const askEnd = useRef(null)
   const isKanban = item.source === 'kanban'
   const isPrompt = item.source === 'prompt'
@@ -1055,7 +1062,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
       setAskBusy(false)
       if (s) {
         setAskMsgs(s.msgs); setAskVersion(s.version ?? item.version); setAskCtx(s.ctx ?? ctxNow)
-        setAskError(s.error || ''); setAskJob(s.job || null); setAskTrimmed(!!s.trimmed)
+        setAskError(s.error || ''); setAskJob(s.job || null); setAskTrimmed(!!s.trimmed); setAskReq(s.req ?? null)
       } else {
         // The conversation left session memory while its request was outstanding: say so.
         setAskError(ASK_DROPPED)
@@ -1226,18 +1233,24 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
     setAskBusy(true)
     setAskError('')
     const gen = ++askGenSeq
+    askLatest.delete(askId)
+    askLatest.set(askId, gen)
+    while (askLatest.size > 500) askLatest.delete(askLatest.keys().next().value)
     const mine = () => readAskSession(askId)?.gen === gen
+    // The request id lives in the session too: a card that remounts while the response is lost
+    // must retry with the same id, or the server would run the model a second time.
+    const dropReq = () => { setAskReq(null); if (mine()) updateAskSession(askId, { req: null }) }
     // Stop when a newer request owns the conversation. When the entry was instead evicted or
     // expired, nothing replaced it: report the lost work with a Retry rather than going quiet.
     const abandon = () => {
       if (mine()) return false
-      if (readAskSession(askId) === undefined && !askClosed.has(scope)) {
+      if (readAskSession(askId) === undefined && !askClosed.has(scope) && askLatest.get(askId) === gen) {
         updateAskSession(askId, { msgs: next, version: item.version, ctx: ctxNow, trimmed, running: false, error: ASK_DROPPED, job: null, gen })
         setAskBusy(false); setAskError(ASK_DROPPED); setAskJob(null)
       }
       return true
     }
-    updateAskSession(askId, { msgs: next, version: item.version, ctx: ctxNow, trimmed, running: true, error: '', gen,
+    updateAskSession(askId, { msgs: next, version: item.version, ctx: ctxNow, trimmed, running: true, error: '', gen, req: { id: reqId, version: item.version },
       job: retry && !askStale && askJob?.version === item.version ? askJob : null })
     let admitted = false
     try {
@@ -1269,13 +1282,13 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
         // The sleep can use up the last of the budget: no poll starts at or after the limit.
         if (Date.now() - t0 >= ASK_DEADLINE_MS) throw tooSlow()
         r = await ctx.rest('/card/ask/' + encodeURIComponent(r.job) + '?poll=true')
-        if (over() && !(r && r.pending && r.job)) { setAskJob(null); setAskReq(null); throw tooSlow() }
+        if (over() && !(r && r.pending && r.job)) { setAskJob(null); dropReq(); throw tooSlow() }
       }
       if (abandon()) return
-      if (over()) { setAskJob(null); setAskReq(null); throw tooSlow() }
+      if (over()) { setAskJob(null); dropReq(); throw tooSlow() }
       updateAskSession(askId, { job: null })
       setAskJob(null)
-      setAskReq(null)
+      dropReq()
       if (r?.ok === false) throw new Error(String(r.detail || 'The model could not answer'))
       const reply = String(r?.reply || '').trim()
       if (!reply) throw new Error('The model returned an empty answer')
@@ -1294,7 +1307,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
       sfx.play('err')
       const msg = String(e?.message || e)
       const unknownJob = /unknown or expired ask job/.test(msg)
-      if (unknownJob) { setAskJob(null); setAskReq(null) }
+      if (unknownJob) { setAskJob(null); dropReq() }
       const status = Number(e?.status ?? e?.response?.status ?? (/\b(4\d\d)\b/.exec(msg) || [])[1])
       if (!admitted && status >= 400 && status < 500 && status !== 408 && status !== 429) {
         // The server refused the request outright: nothing was stored, so the refused message must
@@ -1303,7 +1316,7 @@ function Item({ ctx, item, n, refresh, askEnabled, hidden = false, scope = '' })
         setAskVersion(before.version)
         setAskCtx(before.ctx)
         setAskTrimmed(before.trimmed)
-        setAskReq(null)
+        dropReq()
         if (!retry && !preset) setAskInput(q)
         updateAskSession(askId, { msgs: before.msgs, version: before.version, ctx: before.ctx, trimmed: before.trimmed })
       }

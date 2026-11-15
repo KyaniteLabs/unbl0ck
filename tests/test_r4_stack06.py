@@ -280,7 +280,7 @@ class Stack06Docs(unittest.TestCase):
             "at most 100 messages and 200,000 characters",
             "dropped from session memory",
             "each backend connection",
-            "title, question, owner or comments",
+            "title, question, owner, description or comments",
             "a draft typed for one backend never appears on another",
         ):
             self.assertIn(needle, text)
