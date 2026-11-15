@@ -6,6 +6,41 @@ import unittest
 import needs
 
 
+class NumericCodesOnEveryAskPath(unittest.TestCase):
+    def test_a_code_named_by_a_name_value_pair_or_a_yaml_block_is_redacted(self):
+        """R6-002: ``{"name":"otp","value":123456}`` and ``otp: |`` blocks kept the code; counts survive."""
+        self.assertEqual(needs._ask_card_view({"name": "otp", "value": 123456})["value"], "[redacted]")
+        self.assertEqual(needs._ask_card_view({"key": "login_pin", "val": "2468"})["val"], "[redacted]")
+        for text in (
+            'log {"name":"otp","value":123456} end',
+            "otp: |\n  123456\n",
+            "passcode: >-\n  98765432\n",
+            "name: otp\nvalue: 123456\n",
+            "{name: totp, value: 654321}",
+            "? otp\n: 123456\n",
+            "--otp 123456",
+            "--pin=1234",
+        ):
+            with self.subTest(text=text):
+                out = needs._ask_redact(text)
+                self.assertIn("[redacted]", out)
+                self.assertNotRegex(out, r"\d{4,}")
+        # Prose, short counts and longer names still survive on those paths.
+        self.assertEqual(needs._ask_card_view({"name": "otp", "value": 12}), {"name": "otp", "value": 12})
+        self.assertEqual(needs._ask_card_view({"name": "pin_count", "value": 1234})["value"], 1234)
+        for text in (
+            "pin: |\n  the version\n",
+            "pin_count: |\n  1234\n",
+            "name: pin\nvalue: 3\n",
+            '{"name":"pin_count","value":1234}',
+            "pin the version; bearer of bad news",
+            "--pin 12",
+            "run --pin-count 1234",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(needs._ask_redact(text), text)
+
+
 class HtmlHiding(unittest.TestCase):
     def test_a_script_inside_an_uncertain_hidden_element_is_still_dropped(self):
         """R6-011: the script inherited the hidden ancestor's doubt and its text was shown."""
