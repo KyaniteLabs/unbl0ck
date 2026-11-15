@@ -130,6 +130,7 @@
 - **Ask redacts one-time codes in every form, and hidden HTML stays hidden (round 6).** A code named by a name/value pair (`{"name": "otp", "value": 123456}`) or held in a YAML block is redacted like `otp=123456`. Scripts and styles inside a hidden element never reach the card, and an inline `display` value the converter does not know no longer shows `hidden` text without a note.
 - **Live-prompt hook failures stay reported until they settle (round 6).** Each dropped fault stays attributed to the agent process that holds it, so another process exiting no longer hides it; it stops being reported once that prompt is recorded or cleared; and an unreadable `wait-faults.json` is now a queue error rather than an empty list.
 - **One Ask id runs once across gateway processes, and restore locks the directory it changes (round 6).** A new Ask whose journal lock another worker holds past the wait is refused (503) instead of admitted twice; a deletion fences a record published while it waited; `recovery.py restore --apply` takes the state lock of the directory it opened, not of whatever that path names later.
+- **Explicit-key YAML codes are redacted, and a lost dismissal counter refuses instead of reordering (round 7).** A code under `? otp` / `: |` is redacted like `otp: 123456`; an invalid `display` such as `block block` no longer shows `hidden` text; a missing or damaged `dismissal-order.json` refuses "Not for me" and Done (restore it from backup) instead of handing out an order older than one Desktop holds.
 
 ## 0.5.1 (2026-11-14)
 
