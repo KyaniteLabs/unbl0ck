@@ -10,7 +10,7 @@ restore from a verified backup. It is stdlib only, runs outside the dashboard, a
   ``preserve`` only adds a backup file (creating the recovery directory on first use) and never
   changes the store; ``diagnose`` writes nothing.
 
-Backups live in ``plugin-data/unbl0ck/recovery/`` (directory 0700, files 0600). They hold the same
+Backups live in ``plugin-data/unbl0ck/recovery/`` (directory created 0700 when absent, files 0600). They hold the same
 private content as the stores they copy and are never deleted here.
 
 CLI::
@@ -116,12 +116,14 @@ _TRUSTED: dict[str, tuple[int, int]] = {}
 
 def _trust(p: Path) -> None:
     """Remember which directory *p* is now (identity, not name). Only a real directory, never a link."""
+    prefix = str(p)
+    for key in [k for k in _TRUSTED if k == prefix or k.startswith(prefix + os.sep)]:
+        del _TRUSTED[key]  # a directory under a checked one is trusted again when it is next checked
     if not _DIRFD:
         return
     try:
         fd = os.open(p, os.O_RDONLY | _O_DIRECTORY | _NOFOLLOW)
     except FileNotFoundError:
-        _TRUSTED.pop(str(p), None)
         return
     except OSError as exc:
         raise RuntimeError("the plugin data path contains a link or a non-directory; refusing to use it") from exc
@@ -184,9 +186,12 @@ def _writer_active(d: Path) -> bool | None:
     if fcntl is None:
         return None
     try:
-        fd = os.open(d / LOCK_NAME, os.O_RDWR | _NOFOLLOW | _NONBLOCK)
+        with _anchored(d) as dfd:  # the lock of the directory that was checked, whatever the name is now
+            fd = _open_at(dfd, d / LOCK_NAME, os.O_RDWR | _NOFOLLOW | _NONBLOCK)
     except FileNotFoundError:
         return False  # no lock file: nobody has ever held it
+    except RuntimeError:
+        raise
     except OSError:
         return None  # unreadable or a link: we cannot say, and never claim "no writer"
     try:
@@ -245,7 +250,8 @@ def _inspect(d: Path, store: str) -> dict[str, Any]:
         return {**base, "status": "absent", "entries": 0}
     if why == "too_large":
         try:
-            size = p.lstat().st_size
+            with _anchored(p.parent) as pfd:
+                size = _lstat_at(pfd, p).st_size
         except OSError:
             size = None
         return {**base, "bytes": size, "status": "corrupt", "entries": None, "error": "too large to be a state file"}

@@ -406,6 +406,64 @@ class ReaderIsTheDefense(Base):
         self.assertIn("unsafe", [r["status"] for r in listing["items"] if r["name"] == name2])
 
 
+class SweepInstances(Base):
+    """Class C and M instances found by the sweep over the same module."""
+
+    def swapped_dir(self):
+        real_dir = rec._dir
+
+        def swapped(home=None):
+            d = real_dir(home)
+            os.rename(d, self.home / "moved")
+            os.symlink(self.other_d, d)
+            return d
+
+        return swapped
+
+    @unittest.skipIf(rec.fcntl is None, "needs flock")
+    def test_the_writer_probe_never_reports_the_lock_of_another_installation(self):
+        import fcntl
+        self.put("hidden.json", GOOD)
+        lock = self.other_d / ".state.lock"
+        lock.write_bytes(b"")
+        os.chmod(lock, 0o600)
+        fd = os.open(lock, os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # a writer in the other installation
+        with mock.patch.object(rec, "_dir", self.swapped_dir()):
+            try:
+                out = rec.diagnose(self.home)
+            except (RuntimeError, OSError):
+                return  # refused: the probe did not look through the swapped name
+        self.assertIsNot(out["writer_active"], True)
+
+    def test_the_size_of_an_oversized_store_is_not_read_from_a_swapped_directory(self):
+        self.put("hidden.json", b"x" * 3000)
+        self.put("hidden.json", b"y" * 1234, where=self.other_d)
+        real_read = rec._read_file
+
+        def read_file(p, limit=rec.MAX_STORE_BYTES):
+            out = real_read(p, 100)  # the file is over the (lowered) limit
+            os.rename(self.d, self.home / "moved")
+            os.symlink(self.other_d, self.d)
+            return out
+
+        with mock.patch.object(rec, "_read_file", read_file):
+            try:
+                row = rec._inspect(self.d, "hidden")
+            except (RuntimeError, OSError):
+                return
+        self.assertNotEqual(row.get("bytes"), 1234)
+
+    def test_a_recovery_directory_recreated_between_two_commands_is_trusted_again(self):
+        self.backup("hidden-20260101.bak")
+        self.assertEqual(rec.diagnose(self.home)["recovery_dir"], "ok")
+        os.rename(self.d / "recovery", self.home / "moved-recovery")
+        self.backup("hidden-20260102.bak")  # a new, real directory under the same name
+        out = rec.diagnose(self.home)  # a long-lived process (a test run, a tool) must not refuse this
+        self.assertEqual([b["name"] for b in out["backups"]], ["hidden-20260102.bak"])
+
+
 class DocsMatchBehavior(unittest.TestCase):
     guide = " ".join((ROOT / "docs" / "operator-guide.md").read_text().split())
 
@@ -421,6 +479,13 @@ class DocsMatchBehavior(unittest.TestCase):
 
     def test_the_guide_says_an_existing_recovery_directory_keeps_its_mode(self):
         self.assertIn("an existing directory keeps its mode", self.guide)
+
+    def test_the_recovery_directory_mode_is_described_as_created_not_enforced(self):
+        self.assertNotIn("(directory 0700, files 0600)", rec.__doc__)
+        self.assertIn("created 0700", rec.__doc__)
+        arch = " ".join((ROOT / "docs" / "architecture.md").read_text().split())
+        self.assertNotIn("(directory 0700, files 0600)", arch)
+        self.assertIn("directory created 0700 and then left as it is", arch)
 
     def test_the_guide_says_a_scan_can_be_partial(self):
         self.assertIn("`backups_complete`", self.guide)
