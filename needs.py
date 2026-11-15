@@ -4031,6 +4031,13 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         "expires_at": now + 3600,
         "mode": "unblock",
         "cards": cards,
+        # What this pack leaves out, as counts only; the original surface has the rest.
+        "omitted": {
+            "asks": max(0, len(asks) - limit),
+            "stuck": sum(1 for it in queue["items"] if it.get("tier") == "stuck"),
+            "answered": sum(1 for it in queue["items"] if it.get("tier") == "answered"),
+            "see": "Open UNBL0CK in Hermes Desktop",
+        },
     }
 
 

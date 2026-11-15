@@ -14,9 +14,22 @@ def _needs():
     return needs
 
 
+def _other_work(q: dict) -> list[str]:
+    """Counts of cards a list of asks leaves out: stuck and answered. Counts only, no text."""
+    parts = []
+    for tier in ("stuck", "answered"):
+        n = sum(1 for it in q.get("items", ()) if it.get("tier") == tier)
+        if n:
+            parts.append(f"{n} {tier}")
+    return parts
+
+
 def _summary(limit: int = 12) -> str:
     q = _needs().build_queue()
+    other = _other_work(q)
     if not q["count"] and not q["errors"]:
+        if other:
+            return f"Nothing is waiting on you, but {' and '.join(other)} card(s) need a look. Open /unblock in Desktop."
         return "Nothing is blocked on you."
     asks = [it for it in q["items"] if it.get("tier") not in ("stuck", "answered")]
     lines = [f"{q['count']} thing(s) waiting on you:" if q["count"]
@@ -34,6 +47,8 @@ def _summary(limit: int = 12) -> str:
             lines.append(f"  approve: {it['approve_command']}")
     if q["count"] > limit:
         lines.append(f"…and {q['count'] - limit} more. Open /unblock in Desktop.")
+    if other and q["count"]:
+        lines.append(f"Not listed here: {', '.join(other)}. Open /unblock in Desktop.")
     for err in q["errors"]:
         lines.append(f"(source error: {err})")
     return "\n".join(lines)
@@ -47,9 +62,13 @@ LOCAL_SURFACES = frozenset({"cli", "tui", "desktop", "local"})
 
 def _count_only() -> str:
     q = _needs().build_queue()
-    if not q["count"] and not q["errors"]:
+    other = _other_work(q)
+    if not q["count"] and not q["errors"] and not other:
         return "Nothing is blocked on you."
     lead = f"{q['count']} thing(s) waiting on you. " if q["count"] else ""
+    if other:
+        # Counts of other cards only: remote senders never see a title, a reason or an id.
+        lead += f"Also {' and '.join(other)} card(s). " if q["count"] else f"No new asks, but {' and '.join(other)} card(s) need a look. "
     if q["errors"]:
         lead += "The queue is incomplete. "
     return (lead + "Open UNBL0CK in Hermes Desktop or run "

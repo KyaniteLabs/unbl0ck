@@ -49,6 +49,27 @@ from its source for that item version, and never sends it to a model. A changed 
 vanished record, or an unreadable source, reports an error with Retry and leaves the
 excerpt labelled as an excerpt. Password prompts are never expanded.
 
+## What each surface shows
+
+The same queue reaches you through five surfaces. They are deliberately not equal: the
+further a surface is from the machine's owner, the less it says. This table is checked by
+`tests/test_surface_contract.py`, which also pins what stays common (item identity, order
+and status) and each difference below.
+
+<!-- surface-matrix:start -->
+| Surface | Visibility | Context | Action routing | Completion | Recovery | Intentional limits |
+|---|---|---|---|---|---|---|
+| Desktop | Every source and tier: asks, stuck, answered | Context panel, Full text, TL;DR on Kanban | Answer, release, open the session or board, Done, Not for me | The card leaves on the next poll; Undo for a few minutes | Drafts and Ask jobs survive remounts; per-source errors with retry | Only inside Hermes Desktop |
+| CLI and local slash | Asks only, 12 listed; says how many more and how many stuck or answered cards are not listed | One line per ask: where, title, summary or first 140 characters | Prints the native `hermes pairing approve` command; no inline action | Run it again | Source errors are printed; run it again | Local surfaces only (`cli`, `tui`, `desktop`, `local`) |
+| CLI --json | The raw queue, every tier | Full item fields | None | Run it again | Pairs with `--pack` | Machine owner only; contains private text |
+| Remote slash | Counts only: asks, plus counts of stuck and answered cards and whether the queue is incomplete | None: never a title, text, id, name or approval command | Says to open Desktop or run `hermes unbl0ck` on the machine | Ask again after acting there | "Incomplete" is stated as a count-level fact | Anyone admitted to a gateway can type it, so an unknown or missing platform counts as remote |
+| Pocket pack | Up to six asks in queue order; no stuck or answered cards; `omitted` gives counts of what is left out | Title, short summary and ask text | One fixed pointer per card ("Answer in Telegram", "Open pairing requests"); never an approval or inline action | Pack is regenerated, expires in one hour | Written only when you ask for it | Counts in `omitted` are the only disclosure of omitted work |
+<!-- surface-matrix:end -->
+
+Actions are not flattened into every surface: a surface gets a new action only after its
+authorization model is defined, and password prompts and pairing codes never leave the
+original surface or Desktop's own redacted view.
+
 ## What you can do per source
 
 One queue does not mean one set of abilities. This table is published as `capabilities` in
