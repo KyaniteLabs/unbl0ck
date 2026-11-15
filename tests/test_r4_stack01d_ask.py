@@ -76,7 +76,7 @@ class NumericCredentialsAreStillCredentials(unittest.TestCase):
                 assert_redacted(needs._ask_redact(text), secret)
 
     def test_numeric_json_values_under_credential_keys_are_redacted(self):
-        view = needs._ask_card_view({"password": 123456, "api_key": "9876543210"})
+        view = needs._ask_redact_value({"password": 123456, "api_key": "9876543210"})
         self.assertEqual(view["password"], "[redacted]")
         self.assertEqual(view["api_key"], "[redacted]")
 
@@ -84,7 +84,7 @@ class NumericCredentialsAreStillCredentials(unittest.TestCase):
         for text in ("max_tokens: 4000", "password_attempts: 3", "token_count=5", "3 of 4 passed"):
             with self.subTest(text=text):
                 self.assertEqual(needs._ask_redact(text), text)
-        self.assertEqual(needs._ask_card_view({"password": True})["password"], True)
+        self.assertEqual(needs._ask_redact_value({"password": True})["password"], True)
 
 
 class EmbeddedJsonCannotHideASecret(unittest.TestCase):

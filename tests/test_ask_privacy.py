@@ -100,6 +100,7 @@ def test_json_secret_keys_and_quoted_values_redacted_from_ask_and_bluf():
     card = {
         "title": "Review the deployment",
         "ask": embedded,
+        "body": embedded,
         "events": [
             {
                 "payload": {
@@ -141,7 +142,7 @@ def test_auth_credential_keys_redacted_without_redacting_person_fields():
         "authorization": "synthetic-authorization-value-0204",
     }
 
-    safe = needs._ask_card_view(card)
+    safe = needs._ask_redact_value(card)
 
     for key in ("author", "authors", "authored", "authority"):
         assert safe[key] == card[key]
@@ -156,7 +157,7 @@ def test_auth_key_detection_keeps_author_ids_modes_and_oauth_scopes():
         "oauth_scopes": ["read:tasks", "write:comments"],
     }
 
-    safe = needs._ask_card_view(card)
+    safe = needs._ask_redact_value(card)
 
     assert safe == card
 
@@ -173,7 +174,7 @@ def test_cookie_shell_credentials_and_password_phrases_redacted_from_ask_and_blu
         'password is "synthetic password phrase-0007"\n'
         "password is synthetic-password-0003"
     )
-    card = {"title": "Review deployment", "ask": sensitive}
+    card = {"title": "Review deployment", "ask": sensitive, "body": sensitive}
     payloads = (
         json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
         json.dumps(needs.bluf_messages(card), ensure_ascii=False),
@@ -198,7 +199,7 @@ def test_ordinary_response_objects_are_not_secret_redacted():
     card["events"] = [
         {"payload": {"response": {"status": 403, "body": "CEO approval missing"}}}
     ]
-    payload = needs.build_ask_messages(card, [])[1]["content"]
+    payload = json.dumps(needs._ask_redact_value(card["events"]))
     assert '"status": 403' in payload
     assert "CEO approval missing" in payload
 
@@ -208,7 +209,7 @@ def test_authorization_prose_survives_redaction_in_ask_and_bluf():
         "Authorization: header missing in request; deploy broke at step 3.\n"
         "The authorization: flow is broken; need CEO approval for the 12k spend."
     )
-    card = {"title": "Deploy", "ask": prose}
+    card = {"title": "Deploy", "ask": prose, "body": prose}
     payloads = (
         json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
         json.dumps(needs.bluf_messages(card), ensure_ascii=False),
@@ -229,7 +230,7 @@ def test_authorization_prose_and_following_question_survive_redaction():
     )
     payloads = (
         json.dumps(
-            needs.build_ask_messages({"title": "Deploy", "ask": prose}, []),
+            needs.build_ask_messages({"title": "Deploy", "body": prose}, []),
             ensure_ascii=False,
         ),
         json.dumps(
@@ -258,7 +259,7 @@ def test_authorization_headers_with_any_scheme_and_nested_secret_values_are_reda
         'log payload="{\\"tokens\\": [\\"synthetic-escaped-json-token-0111\\"]}"\n'
         "private_key: |\n  synthetic-yaml-private-key-0112\n"
     )
-    card = {"title": "Review", "ask": sensitive}
+    card = {"title": "Review", "ask": sensitive, "body": sensitive}
     payloads = (
         json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
         json.dumps(needs.bluf_messages(card), ensure_ascii=False),
@@ -291,7 +292,7 @@ def test_structured_redaction_keeps_text_after_the_secret_value():
     )
     payloads = (
         json.dumps(
-            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            needs.build_ask_messages({"title": "Review", "body": body}, []),
             ensure_ascii=False,
         ),
         json.dumps(
@@ -319,7 +320,7 @@ def test_yaml_block_scalars_under_secret_keys_are_redacted_in_ask_and_bluf():
     )
     payloads = (
         json.dumps(
-            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            needs.build_ask_messages({"title": "Review", "body": body}, []),
             ensure_ascii=False,
         ),
         json.dumps(
@@ -346,7 +347,7 @@ def test_named_environment_values_and_short_password_keys_are_redacted():
     )
     payloads = (
         json.dumps(
-            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            needs.build_ask_messages({"title": "Review", "body": body}, []),
             ensure_ascii=False,
         ),
         json.dumps(
@@ -367,7 +368,7 @@ def test_named_environment_values_and_short_password_keys_are_redacted():
 def test_deeply_nested_json_is_redacted_without_crashing_ask_or_bluf():
     nested = "[" * 1100 + '{"token":"R8_NESTED_SECRET"}' + "]" * 1100
     ask = json.dumps(
-        needs.build_ask_messages({"title": "Review", "ask": nested}, []),
+        needs.build_ask_messages({"title": "Review", "body": nested}, []),
         ensure_ascii=False,
     )
     bluf = json.dumps(
@@ -391,7 +392,7 @@ def test_stripe_gitlab_google_and_npm_tokens_are_redacted():
     body = " ".join(secrets)
     payloads = (
         json.dumps(
-            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            needs.build_ask_messages({"title": "Review", "body": body}, []),
             ensure_ascii=False,
         ),
         json.dumps(
@@ -415,7 +416,7 @@ def test_cookie_and_command_line_credentials_are_redacted():
         "docker login -p synthetic-docker-password-0208\n"
         'config={"auth": "synthetic-auth-value-0209", "passphrase": "synthetic-passphrase-0210"}\n'
     )
-    card = {"title": "Review", "ask": sensitive}
+    card = {"title": "Review", "ask": sensitive, "body": sensitive}
     payloads = (
         json.dumps(needs.build_ask_messages(card, []), ensure_ascii=False),
         json.dumps(needs.bluf_messages(card), ensure_ascii=False),
@@ -455,6 +456,7 @@ def test_cookie_keys_in_recursive_and_embedded_mappings_are_redacted():
     card = {
         "title": "Review",
         "ask": sensitive,
+        "body": sensitive,
         "events": [{"payload": {"Cookie": "session=synthetic-map-cookie-0303"}}],
     }
     payloads = (
@@ -802,7 +804,7 @@ def test_round9_secret_name_value_layouts_and_token_prefixes_are_redacted():
         for secret in secrets:
             assert secret not in payload, secret
 
-    safe = needs._ask_card_view(
+    safe = needs._ask_redact_value(
         {"Name": "DB_PASSWORD", "Value": "R9_DIRECT_CAPITAL_SECRET"}
     )
     assert safe["Value"] == "[redacted]"
@@ -847,7 +849,7 @@ cpw_secret: S"""
         ):
             assert f"{key}: S" not in payload
 
-    safe = needs._ask_card_view(
+    safe = needs._ask_redact_value(
         {
             "env": {"DB_PASS": "hunter2"},
             "config": {"bypass_token": "S"},
@@ -891,7 +893,7 @@ def test_round10_structured_next_line_and_explicit_yaml_values_are_redacted():
     comments = [{"body": "password =\n  R10_COMMENT_PASSWORD_SENTINEL"}]
     payloads = (
         json.dumps(
-            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            needs.build_ask_messages({"title": "Review", "body": body}, []),
             ensure_ascii=False,
         ),
         json.dumps(
@@ -942,7 +944,7 @@ def test_round10_authorization_headers_and_nested_oauth_values_are_redacted():
     )
     payloads = (
         json.dumps(
-            needs.build_ask_messages({"title": "Review", "ask": body}, []),
+            needs.build_ask_messages({"title": "Review", "body": body}, []),
             ensure_ascii=False,
         ),
         json.dumps(

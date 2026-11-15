@@ -87,7 +87,8 @@ turns the matching columns off in the payload and in behavior.
 
 Notes. `outside` covers agent-filed items and watched-folder files. Filed items live in one shared folder, so every profile reads them (the filing profile is recorded as provenance and scopes `dedupe_key`); that is what the `outside` row's yes means. Watched folders are not shared that way: each profile's process reads only the `outside_dirs` its own settings configure, so two profiles read different folders unless they configure the same ones. `kanban` is read across profiles because Hermes keeps one Kanban store shared by every profile; a blocked card is visible from all of them. Full-text search reads
 local text and never calls a model; it skips password prompts and returns ids, versions and
-counts only. Summaries and Ask run the card text, comments and owner through the same
+counts only. Ask sends only the card fields named in `_ask_card_payload`, never event payloads,
+attachments or linked cards. Summaries and Ask run the card text, comments and owner through the same
 redaction (secrets, home directory and workspace path); the operator's own typed Ask
 question is sent as typed. Password prompts and pairing codes are never summarized, asked
 about or returned by search. Cached summaries are keyed by item id (which carries the

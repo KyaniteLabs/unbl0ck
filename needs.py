@@ -1169,7 +1169,7 @@ def bluf_messages(
             }
             for c in comments[-6:]
         ]
-    card = _ask_card_view(card)  # same redaction as Ask: no home dir, no secrets (F4)
+    card = _ask_redact_value(card)  # same redaction as Ask: no home dir, no secrets (F4)
     return [
         {"role": "system", "content": BLUF_SYSTEM},
         {
@@ -6397,7 +6397,7 @@ def _ask_redact_embedded_json(text: str) -> str:
                     embedded = None
                 if isinstance(embedded, (dict, list)):
                     try:
-                        safe = _ask_card_view(embedded)
+                        safe = _ask_redact_value(embedded)
                     except RecursionError:
                         out.append(json.dumps("[redacted]"))
                     else:
@@ -6424,7 +6424,7 @@ def _ask_redact_embedded_json(text: str) -> str:
                 failures += 1
             if isinstance(value, (dict, list)):
                 try:
-                    safe = _ask_card_view(value)
+                    safe = _ask_redact_value(value)
                 except RecursionError:
                     out.append("[redacted]")
                 else:
@@ -6465,98 +6465,75 @@ def _fit(text: str, room: int) -> str:
     if len(text) <= room:
         return text
     return text[: room - len(_ASK_CUT)] + _ASK_CUT if room > len(_ASK_CUT) else text[:room]
-# The decision comes first when the budget runs out; the description comes last.
-_ASK_VIEW_PRIORITY = {
-    "title": 0,
-    "block": 1,
-    "status": 2,
-    "comments": 3,
-    "last_run": 4,
-    "events": 5,
-    "result": 6,
-    "last_failure_error": 6,
-    "body": 9,
-}
 
 
-def _ask_workspace_paths(value: Any) -> tuple[str, ...]:
-    workspace = value.get("workspace") if isinstance(value, dict) else None
-    path = workspace.get("path") if isinstance(workspace, dict) else None
-    if isinstance(path, str) and len(path.strip().rstrip("/")) > 1:
-        return (path.strip().rstrip("/"),)
-    return ()
-
-
-def _ask_card_view(
-    value: Any,
-    _key: str = "",
-    _text_budget: list[int] | None = None,
-    _scrub: tuple[str, ...] | None = None,
-) -> Any:
-    """A copy of the card fit to send to an LLM: no workspace path, no home dir, no secrets.
-
-    The operator asked about the card, not about their filesystem or credentials, so the Ask
-    payload keeps the decision context (title, body, block reason, comments, branch, errors)
-    and drops or redacts what could leak (F4). The workspace path is removed wherever it is
-    repeated; text budgeted by priority, newest list entries first, cut fields end in a marker."""
-    if _scrub is None:
-        _scrub = _ask_workspace_paths(value)
+def _ask_redact_value(value: Any) -> Any:
+    """*value* with every string redacted and every credential-named field's value replaced: the
+    second line for JSON found inside text. What Ask sends is chosen by :func:`_ask_card_payload`."""
     if isinstance(value, dict):
         named = [
-            field_value
-            for field, field_value in value.items()
-            if str(field).casefold() in {"name", "key"}
-            and isinstance(field_value, str)
-            and _ask_names_credential(field_value)
+            v for k, v in value.items()
+            if str(k).casefold() in {"name", "key"} and isinstance(v, str) and _ask_names_credential(v)
         ]
-        keys = list(value)
-        if _text_budget is not None:
-            keys.sort(key=lambda k: _ASK_VIEW_PRIORITY.get(str(k), 8))
-        done: dict[Any, Any] = {}
-        for k in keys:
-            v = value[k]
-            if _key == "workspace" and k == "path":
-                continue
-            key = str(k)
-            if key.casefold() in {"value", "val", "default"} and any(
-                _ask_secret_word(n) is not None or _ask_is_secret_key(n, v) for n in named
-            ):
-                done[k] = "[redacted]"
-            elif _ask_is_secret_key(key, v):
-                done[k] = "[redacted]"
-            else:
-                done[k] = _ask_card_view(v, key, _text_budget, _scrub)
-        shown: dict[Any, Any] = {}
-        for k in value:
-            if k not in done:
-                continue
-            name = k
-            if isinstance(k, str):
-                for path in _scrub:
-                    name = name.replace(path, "[workspace]")
-                while name in shown:  # a key that scrubs like another key, either order, keeps both
-                    name += "#"
-            shown[name] = done[k]
-        return shown
+        return {
+            k: "[redacted]"
+            if _ask_is_secret_key(str(k), v)
+            or str(k).casefold() in {"value", "val", "default"}
+            and any(_ask_secret_word(n) is not None or _ask_is_secret_key(n, v) for n in named)
+            else _ask_redact_value(v)
+            for k, v in value.items()
+        }
     if isinstance(value, (list, tuple)):
-        if _text_budget is None:
-            return [_ask_card_view(v, _key, None, _scrub) for v in value]
-        # Newest entries are last; they are budgeted first.
-        return [_ask_card_view(v, _key, _text_budget, _scrub) for v in reversed(value)][::-1]
-    if isinstance(value, str):
-        for path in _scrub:
-            value = value.replace(path, "[workspace]")
-        remaining = None if _text_budget is None else max(0, _text_budget[0])
-        if remaining == 0:
+        return [_ask_redact_value(v) for v in value]
+    return _ask_redact(value) if isinstance(value, str) else value
+
+
+def _ask_card_payload(card: Any, budget: int) -> dict[str, Any]:
+    """The card fields Ask sends, each named here: raw event payloads, attachments, the graph and
+    the workspace path never reach the model (#71). Text has the workspace path replaced, is
+    redacted whole and then cut to what is left of *budget*, spent in the order written: the
+    decision first, the description last, newest comments and events before older ones."""
+    card = card if isinstance(card, dict) else {}
+
+    def part(name: str) -> dict[str, Any]:
+        value = card.get(name)
+        return value if isinstance(value, dict) else {}
+
+    path = part("workspace").get("path")
+    scrub = path.strip().rstrip("/") if isinstance(path, str) and len(path.strip().rstrip("/")) > 1 else ""
+    left = [budget]
+
+    def text(value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        value = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        if scrub:
+            value = value.replace(scrub, "[workspace]")
+        if left[0] <= 0:
             return _ASK_CUT if value else value  # nothing left to spend; skip the redaction work
-        # Redact the whole string, then cut it to the budget: a secret straddling the cut
-        # is replaced as a whole instead of being left as a readable fragment.
-        value = _ask_redact(value)
-        if remaining is not None:
-            value = _fit(value, min(remaining, _ASK_FIELD_CAP))
-            _text_budget[0] = remaining - len(value)
+        # Redact the whole string, then cut it: a secret straddling the cut is replaced whole.
+        value = _fit(_ask_redact(value), min(left[0], _ASK_FIELD_CAP))
+        left[0] -= len(value)
         return value
-    return value
+
+    def newest_first(rows: Any, fields: tuple[str, ...]) -> list[dict[str, Any]]:
+        rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+        return [{f: text(r.get(f)) for f in fields} for r in reversed(rows)][::-1]
+
+    block, run = part("block"), part("last_run")
+    view = {"id": text(card.get("id")), "title": text(card.get("title"))}
+    view["block"] = {f: text(block.get(f)) for f in ("reason", "kind", "recurrences", "limit", "since")}
+    for f in ("status", "priority", "assignee", "created_by", "consecutive_failures"):
+        view[f] = text(card.get(f))
+    view["comments"] = newest_first(card.get("comments"), ("author", "body", "created_at"))
+    view["last_run"] = {f: text(run.get(f)) for f in ("status", "outcome", "summary", "error", "ended_at")}
+    view["events"] = newest_first(card.get("events"), ("kind", "created_at"))
+    view["branch"] = text(part("workspace").get("branch"))
+    view["pr"] = text(part("pr").get("reference"))
+    view["omitted"] = {f: text(part("omitted").get(f)) for f in ("events", "comments", "attachments")}
+    for f in ("result", "last_failure_error", "body"):
+        view[f] = text(card.get(f))
+    return view
 
 
 # Whole-prompt cap for Ask (system + card context + history), in characters.
@@ -6598,9 +6575,7 @@ def build_ask_messages(
     card_limit = max(2000, min(ASK_CARD_CONTEXT_LIMIT, ASK_PROMPT_BUDGET - frame - newest))
     budget = card_limit
     for _ in range(8):
-        context = json.dumps(
-            _ask_card_view(card, _text_budget=[budget]), ensure_ascii=False, default=str
-        )
+        context = json.dumps(_ask_card_payload(card, budget), ensure_ascii=False, default=str)
         if len(context) <= card_limit:
             break
         budget = max(0, budget - (len(context) - card_limit) - 1)  # escapes made it longer

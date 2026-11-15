@@ -33,7 +33,7 @@ class AnUnterminatedPrivateKeyIsStillAPrivateKey(unittest.TestCase):
 class NumericCredentialsUnderTokenKeys(unittest.TestCase):
     def test_numeric_auth_token_is_redacted(self):
         """R5-needs-003 (class F): token and authentication keys keep their digits private."""
-        self.assertEqual(needs._ask_card_view({"auth_token": 123456})["auth_token"], "[redacted]")
+        self.assertEqual(needs._ask_redact_value({"auth_token": 123456})["auth_token"], "[redacted]")
         assert_redacted(needs._ask_redact("auth_token=123456"), "123456")
         for text, digits in (
             ("access_token: 998877", "998877"),
@@ -60,27 +60,23 @@ class AnExhaustedJsonScanWithholdsEscapedSecrets(unittest.TestCase):
         assert_redacted(needs._ask_redact(s), SYNTH)
 
 
-class WorkspacePathIsScrubbedFromKeys(unittest.TestCase):
+class OnlyNamedFieldsReachTheModel(unittest.TestCase):
     def test_a_path_used_as_a_key_does_not_reach_the_model(self):
-        """R5-needs-016 (class F): keys are text too."""
-        view = needs._ask_card_view(
-            {
-                "workspace": {"path": "/srv/private/repo"},
-                "events": [{"payload": {"/srv/private/repo/file": "safe"}}],
-            }
-        )
-        out = json.dumps(view)
-        self.assertNotIn("/srv/private/repo", out)
-        self.assertIn("safe", out)
-
-    def test_a_scrubbed_key_keeps_every_value(self):
-        view = needs._ask_card_view(
-            {
-                "workspace": {"path": "/srv/private/repo"},
-                "m": {"/srv/private/repo/a": 1, "[workspace]/a": 2},
-            }
-        )
-        self.assertEqual(sorted(view["m"].values()), [1, 2])
+        """R5-needs-016 (class F), retired by the #71 allowlist: no key of the card is copied."""
+        card = {
+            "title": "t",
+            "body": "see /srv/private/repo/a",
+            "workspace": {"path": "/srv/private/repo/", "branch": "b"},
+            "events": [{"kind": "k", "payload": {"/srv/private/repo/file": "PAYLOAD"}}],
+            "graph": {"parents": ["GRAPH"]},
+            "attachments": [{"filename": "ATTACHED"}],
+            "extra": "EXTRA",
+        }
+        out = needs.build_ask_messages(card, [])[1]["content"]
+        for gone in ("/srv/private/repo", "PAYLOAD", "GRAPH", "ATTACHED", "EXTRA"):
+            self.assertNotIn(gone, out)
+        self.assertIn("[workspace]/a", out)
+        self.assertIn('"events": [{"kind": "k", "created_at": null}]', out)
 
 
 class TheAskTestsLoadWithoutHermes(unittest.TestCase):

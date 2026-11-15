@@ -230,7 +230,7 @@ class SyntheticSecretsNeverEnterModelInput(unittest.TestCase):
             self.assertFalse(rows[source]["summary"] or rows[source]["ask"], source)
 
     def test_ask_messages_redact_card_comments_and_history(self):
-        card = {"title": "t", "description": LEAKY, "comments": [{"author": "a", "body": LEAKY}], "workspace": {"path": "/home/x/secret"}}
+        card = {"title": "t", "body": LEAKY, "comments": [{"author": "a", "body": LEAKY}], "workspace": {"path": "/home/x/secret"}}
         history = [{"role": "user", "content": LEAKY}]
         messages = needs.build_ask_messages(card, history)
         card_blob = json.dumps(messages[:-1])
