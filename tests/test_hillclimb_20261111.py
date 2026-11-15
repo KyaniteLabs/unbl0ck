@@ -239,3 +239,27 @@ def test_bot_name_falls_back_when_the_file_is_missing_or_removed(tmp_path):
     assert needs._bot_name(tmp_path, "ada") == "Ada"
     f.unlink()
     assert needs._bot_name(tmp_path, "ada") == "ada"
+
+
+def test_bot_name_ignores_a_symlinked_or_oversized_profile_file(tmp_path):
+    # Class sweep: the plugin reads only its profile's own plain file, and never a huge one.
+    needs._BOT_NAME_CACHE.clear()
+    outside = tmp_path / "elsewhere.yaml"
+    outside.write_text("ui_meta:\n  hermes-bots:\n    title: Stolen\n")
+    d = tmp_path / "profiles" / "ada"
+    d.mkdir(parents=True)
+    (d / "profile.yaml").symlink_to(outside)
+    assert needs._bot_name(tmp_path, "ada") == "ada"
+    big = _profile(tmp_path, "bo", "Bo")
+    big.write_text("ui_meta:\n  hermes-bots:\n    title: Bo\n" + "# pad\n" * 40000)
+    assert needs._bot_name(tmp_path, "bo") == "bo"
+
+
+def test_state_dbs_lists_one_database_once_however_many_names_point_at_it(tmp_path):
+    # Class sweep: two profile names for the same database file would count its chats twice.
+    real = tmp_path / "state.db"
+    real.write_bytes(b"")
+    prof = tmp_path / "profiles" / "alias"
+    prof.mkdir(parents=True)
+    (prof / "state.db").symlink_to(real)
+    assert [name for name, _ in needs._state_dbs(tmp_path)] == ["default"]

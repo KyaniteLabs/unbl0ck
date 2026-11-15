@@ -1331,11 +1331,19 @@ def kanban_items(
 
 def _state_dbs(home: Path) -> list[tuple[str, Path]]:
     out = []
-    root = home / "state.db"
-    if root.exists():
-        out.append(("default", root))
-    for db in sorted((home / "profiles").glob("*/state.db")):
-        out.append((db.parent.name, db))
+    seen: set[tuple[int, int]] = set()  # one database file is one profile's, whatever names reach it
+    candidates = [("default", home / "state.db")] + [
+        (db.parent.name, db) for db in sorted((home / "profiles").glob("*/state.db"))
+    ]
+    for name, db in candidates:
+        try:
+            st = db.stat()
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) in seen:
+            continue
+        seen.add((st.st_dev, st.st_ino))
+        out.append((name, db))
     return out
 
 
@@ -1370,7 +1378,9 @@ def _bot_name(home: Path, profile: str) -> str:
     path = home / "profiles" / profile / "profile.yaml"
     key = str(path)
     try:
-        st = path.stat()
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
+            raise OSError("not a plain, small profile.yaml")  # a link or a huge file is not read
         sig = (st.st_mtime_ns, st.st_size)
         hit = _BOT_NAME_CACHE.get(key)
         if hit and hit[0] == sig:
