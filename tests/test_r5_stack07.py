@@ -264,6 +264,40 @@ class ParentSwapAndLinkedRecords(rec.RecoveryBase):
         self.assertNotIn("FOREIGN REPLY", json.dumps(got))
 
 
+class DeleteStopsTheOwner(Profiles):
+    """R5-jobs-009 and R5-jobs-010 (classes G and B)."""
+
+    def two_workers(self):
+        a, b = self.table(), self.table()
+        a._journal.pid = os.getppid()  # a different, running process wrote what b sees
+        return a, b
+
+    def test_a_deletion_that_cannot_leave_its_tombstone_is_not_reported_as_done(self):
+        a, b = self.two_workers()
+        ticket = a.create(J1, card="c1")
+        real_open = os.open
+
+        def refusing(path, flags, *args, **kw):
+            if str(path).endswith(".gone"):
+                raise PermissionError("no new files")
+            return real_open(path, flags, *args, **kw)
+
+        with patch("os.open", refusing):
+            with self.assertRaises(jobs.DiscardFailed):
+                b.discard(J1)
+        self.assertTrue((self.dirs["home"] / f"{J1}.json").exists(), "the record must stay when the owner cannot be stopped")
+        self.assertTrue(a.mark_sent(ticket))
+
+    def test_discarding_a_settled_job_stops_its_owner_serving_it(self):
+        a, b = self.two_workers()
+        ticket = a.create(J1, card="c1")
+        a.mark_sent(ticket)
+        a.finish(ticket, "PRIVATE ANSWER", "p", "m")
+        self.assertEqual(a.get(J1)["reply"], "PRIVATE ANSWER")
+        self.assertTrue(b.discard(J1))
+        self.assertIsNone(a.get(J1))
+
+
 class HugeIntegersAreImplausibleNotFatal(rec.RecoveryBase):
     """R5-jobs-013 (class G)."""
 

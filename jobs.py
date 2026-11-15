@@ -682,16 +682,20 @@ class AskJournal:
                     return False
                 return self._publish(fd, job, body)
 
-    def _touch(self, fd: int, name: str) -> None:
+    def _touch(self, fd: int, name: str) -> bool:
         try:
             os.close(os.open(name, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=fd))
         except OSError:
             self.failures += 1
+            return False
+        return True
 
     def delete(self, job: str, d: Optional[Path] = None, tombstone: bool = False) -> bool:
         """True when a record was removed. With ``tombstone``, a job another running worker still
-        owns is also marked deleted, so that worker's later write is refused instead of
-        resurrecting the answer."""
+        owns (queued, sent or already settled, which that worker may still serve from memory) is
+        also marked deleted, so that worker's later write is refused and its next read drops the
+        answer. When the mark cannot be made nothing is deleted and False is returned: a deletion
+        the owner can undo must not be reported as done."""
         if not self._valid(job):
             return False
         with self._session(False, d) as (fd, _status):
@@ -703,9 +707,10 @@ class AskJournal:
                 name = f"{job}.json"
                 if tombstone:
                     rec = self._read_fd(fd, name, job)
-                    if (isinstance(rec, dict) and rec.get("state") in ("queued", "sent")
+                    if (isinstance(rec, dict) and rec.get("state") in self.STATES
                             and not rec.get("corrupt") and self.owner_live(rec)):
-                        self._touch(fd, f"{job}.gone")
+                        if not self._touch(fd, f"{job}.gone"):
+                            return False
                 try:
                     os.unlink(name, dir_fd=fd)
                 except FileNotFoundError:
