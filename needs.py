@@ -3130,6 +3130,45 @@ def _event_payload(event: Any) -> dict[str, Any]:
     return dict(payload) if isinstance(payload, dict) else {}
 
 
+CARD_CONTEXT_EVENTS = 20
+CARD_CONTEXT_COMMENTS = 50
+CARD_CONTEXT_ATTACHMENTS = 50
+CARD_CONTEXT_GRAPH = 50
+
+
+def _newest_rows(
+    conn: Any, kanban_db: Any, table: str, cls: str, lister: str, task_id: str, limit: int
+) -> tuple[list[Any], int]:
+    """The newest *limit* rows of one card's table, oldest first, and the table's row count for
+    the card. The limit is applied by the query; the public lister is only the fallback."""
+    try:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (task_id, limit),
+        ).fetchall()
+        return [getattr(kanban_db, cls).from_row(r) for r in reversed(rows)], int(total)
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        everything = list(getattr(kanban_db, lister)(conn, task_id))
+        return everything[-limit:], len(everything)
+
+
+def _latest_event_of_kind(conn: Any, kanban_db: Any, task_id: str, kind: str) -> Any | None:
+    try:
+        row = conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (task_id, kind),
+        ).fetchone()
+        return kanban_db.Event.from_row(row) if row is not None else None
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        return next(
+            (e for e in reversed(list(kanban_db.list_events(conn, task_id))) if e.kind == kind), None
+        )
+
+
 def card_context(board: str, task_id: str) -> dict[str, Any]:
     """Read-only context for one Kanban card: description, comments, graph, workspace,
     recent events, last run, attachments and who filed it."""
@@ -3144,28 +3183,35 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise LookupError(f"card {task_id} not found on {board}")
-        events = kanban_db.list_events(conn, task_id)
-        block = _latest_block_event(events)
+        # Bounded reads: a long-lived card has thousands of events and comments, and the
+        # decision context only needs the newest few, so the limit is applied in the query.
+        block = _latest_block(conn, kanban_db, task_id)
         block_payload = _event_payload(block) if block else {}
-        recent = events[-20:]
-        comments = kanban_db.list_comments(conn, task_id)[-50:]
+        recent, events_total = _newest_rows(
+            conn, kanban_db, "task_events", "Event", "list_events", task_id, CARD_CONTEXT_EVENTS
+        )
+        comments, comments_total = _newest_rows(
+            conn, kanban_db, "task_comments", "Comment", "list_comments", task_id, CARD_CONTEXT_COMMENTS
+        )
+        receipt_event = _latest_event_of_kind(conn, kanban_db, task_id, "pr_acceptance")
         graph = kanban_db.task_graph_context(conn, task_id)
-        attachments = kanban_db.list_attachments(conn, task_id)
+        attachments, attachments_total = _newest_rows(
+            conn, kanban_db, "task_attachments", "Attachment", "list_attachments", task_id,
+            CARD_CONTEXT_ATTACHMENTS,
+        )
         run = kanban_db.latest_run(conn, task_id)
 
     pr = None
     contract = getattr(task, "completion_contract", None)
     if isinstance(contract, str) and _PR_LIKE.match(contract):
         pr = {"reference": contract}
-    for event in reversed(events):
-        if event.kind == "pr_acceptance":
-            receipt = _event_payload(event)
-            pr = {
-                **receipt,
-                "reference": pr.get("reference") if pr else None,
-                "since": event.created_at,
-            }
-            break
+    if receipt_event is not None:
+        receipt = _event_payload(receipt_event)
+        pr = {
+            **receipt,
+            "reference": pr.get("reference") if pr else None,
+            "since": receipt_event.created_at,
+        }
 
     body = getattr(task, "body", None)
     return {
@@ -3216,8 +3262,13 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
             for c in comments
         ],
         "graph": {
-            "parents": list(graph.get("parents") or []),
-            "children": list(graph.get("children") or []),
+            "parents": list(graph.get("parents") or [])[:CARD_CONTEXT_GRAPH],
+            "children": list(graph.get("children") or [])[:CARD_CONTEXT_GRAPH],
+        },
+        "omitted": {
+            "events": max(0, events_total - len(recent)),
+            "comments": max(0, comments_total - len(comments)),
+            "attachments": max(0, attachments_total - len(attachments)),
         },
         "events": [
             {
@@ -3611,6 +3662,38 @@ def _ask_harmless_secret_value(value: Any) -> bool:
     )
 
 
+_ASK_NUMERIC_SECRET_WORDS = frozenset(
+    {
+        "password",
+        "passwd",
+        "passphrase",
+        "pwd",
+        "pw",
+        "secret",
+        "api_key",
+        "access_key",
+        "secret_key",
+        "private_key",
+        "credential",
+        "storepass",
+    }
+)
+
+
+def _ask_numeric_credential(key: str, value: Any, word: str) -> bool:
+    """A number or digit-only string under an exact credential key (``password=123456``) is the
+    credential itself. Counts under other keys (``password_attempts: 3``) are not."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        digits = True
+    elif isinstance(value, str):
+        digits = bool(re.fullmatch(r"\d+", value.strip().strip("\"' ")))
+    else:
+        return False
+    return digits and word in _ASK_NUMERIC_SECRET_WORDS and _ask_secret_key_is_exact(key)
+
+
 def _ask_path_field_value(key: str, value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -3656,7 +3739,7 @@ def _ask_is_secret_key(key: str, value: Any = None) -> bool:
     word = _ask_secret_word(key)
     if word is None:
         return False
-    if _ask_harmless_secret_value(value):
+    if _ask_harmless_secret_value(value) and not _ask_numeric_credential(key, value, word):
         return False
     if _ask_path_field_value(key, value):
         return False
@@ -4151,19 +4234,44 @@ def _ask_redact_short_password_flags(text: str) -> str:
     return _ASK_SHORT_PASSWORD_FLAG.sub(replace, text)
 
 
+def _ask_withhold_unscanned(rest: str) -> str:
+    """The scan budget ran out: text that could hold a credential is withheld, not copied."""
+    def risky(chunk: str) -> bool:
+        return bool(_ASK_SECRET_KEY_RE.search(chunk) or "\\u" in chunk)
+
+    out: list[str] = []
+    i = 0
+    scans = 0
+    while i < len(rest):
+        if rest[i] in "{[":
+            scans += 1
+            if scans > 256:  # still cheap and still closed: the remainder is withheld if it could matter
+                out.append("[redacted: too much structured text to scan]" if risky(rest[i:]) else rest[i:])
+                break
+            end = _ask_json_container_end(rest, i)
+            if end is not None and risky(rest[i:end]):
+                out.append("[redacted]")
+                i = end
+                continue
+        out.append(rest[i])
+        i += 1
+    return "".join(out)
+
+
 def _ask_redact_embedded_json(text: str) -> str:
     """Redact valid JSON objects embedded in prose or escaped JSON log strings."""
-    if not _ASK_SECRET_KEY_RE.search(text):
+    # A key spelled with escapes (``"\\u0070assword"``) has no literal credential word, so
+    # any escape sequence also sends the text through the decoder.
+    if not _ASK_SECRET_KEY_RE.search(text) and "\\u" not in text:
         return text
     decoder = json.JSONDecoder()
     out: list[str] = []
     i = 0
-    attempts = 0
+    failures = 0  # decodes that found nothing; successes advance and cost only their own length
     while i < len(text):
         if text[i] == '"' and text[i + 1 : i + 2] in ("{", "["):
-            attempts += 1
-            if attempts > 128:
-                out.append(text[i:])
+            if failures > 128:
+                out.append(_ask_withhold_unscanned(text[i:]))
                 break
             try:
                 value, end = decoder.raw_decode(text, i)
@@ -4173,6 +4281,7 @@ def _ask_redact_embedded_json(text: str) -> str:
                 continue
             except ValueError:
                 value = None
+                failures += 1
             if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
                 try:
                     embedded = json.loads(value)
@@ -4195,10 +4304,10 @@ def _ask_redact_embedded_json(text: str) -> str:
                         )
                     i = end
                     continue
+            failures += 1
         if text[i] in "{[":
-            attempts += 1
-            if attempts > 128:
-                out.append(text[i:])
+            if failures > 128:
+                out.append(_ask_withhold_unscanned(text[i:]))
                 break
             try:
                 value, end = decoder.raw_decode(text, i)
@@ -4208,6 +4317,7 @@ def _ask_redact_embedded_json(text: str) -> str:
                 continue
             except ValueError:
                 value = None
+                failures += 1
             if isinstance(value, (dict, list)):
                 try:
                     safe = _ask_card_view(value)
@@ -4240,46 +4350,85 @@ def _ask_redact(text: str) -> str:
 
 
 ASK_CARD_CONTEXT_LIMIT = 24000
+_ASK_FIELD_CAP = 8000  # one field never takes more than this of the card budget
+_ASK_CUT = "…[truncated]"
+# The decision comes first when the budget runs out; the description comes last.
+_ASK_VIEW_PRIORITY = {
+    "title": 0,
+    "block": 1,
+    "status": 2,
+    "comments": 3,
+    "last_run": 4,
+    "events": 5,
+    "result": 6,
+    "last_failure_error": 6,
+    "body": 9,
+}
+
+
+def _ask_workspace_paths(value: Any) -> tuple[str, ...]:
+    workspace = value.get("workspace") if isinstance(value, dict) else None
+    path = workspace.get("path") if isinstance(workspace, dict) else None
+    if isinstance(path, str) and len(path.strip().rstrip("/")) > 1:
+        return (path.strip().rstrip("/"),)
+    return ()
 
 
 def _ask_card_view(
-    value: Any, _key: str = "", _text_budget: list[int] | None = None
+    value: Any,
+    _key: str = "",
+    _text_budget: list[int] | None = None,
+    _scrub: tuple[str, ...] | None = None,
 ) -> Any:
     """A copy of the card fit to send to an LLM: no workspace path, no home dir, no secrets.
 
     The operator asked about the card, not about their filesystem or credentials, so the Ask
     payload keeps the decision context (title, body, block reason, comments, branch, errors)
-    and drops or redacts what could leak (F4)."""
+    and drops or redacts what could leak (F4). The workspace path is removed wherever it is
+    repeated; text budgeted by priority, newest list entries first, cut fields end in a marker."""
+    if _scrub is None:
+        _scrub = _ask_workspace_paths(value)
     if isinstance(value, dict):
-        out: dict[str, Any] = {}
         named_secret = any(
             str(field).casefold() in {"name", "key"}
             and isinstance(field_value, str)
             and _ask_secret_word(field_value) is not None
             for field, field_value in value.items()
         )
-        for k, v in value.items():
+        keys = list(value)
+        if _text_budget is not None:
+            keys.sort(key=lambda k: _ASK_VIEW_PRIORITY.get(str(k), 8))
+        done: dict[Any, Any] = {}
+        for k in keys:
+            v = value[k]
             if _key == "workspace" and k == "path":
                 continue
             key = str(k)
             if named_secret and key.casefold() in {"value", "val", "default"}:
-                out[k] = "[redacted]"
-                continue
-            if _ask_is_secret_key(key, v):
-                out[k] = "[redacted]"
-                continue
-            out[k] = _ask_card_view(v, key, _text_budget)
-        return out
+                done[k] = "[redacted]"
+            elif _ask_is_secret_key(key, v):
+                done[k] = "[redacted]"
+            else:
+                done[k] = _ask_card_view(v, key, _text_budget, _scrub)
+        return {k: done[k] for k in value if k in done}
     if isinstance(value, (list, tuple)):
-        return [_ask_card_view(v, _key, _text_budget) for v in value]
+        if _text_budget is None:
+            return [_ask_card_view(v, _key, None, _scrub) for v in value]
+        # Newest entries are last; they are budgeted first.
+        return [_ask_card_view(v, _key, _text_budget, _scrub) for v in reversed(value)][::-1]
     if isinstance(value, str):
+        for path in _scrub:
+            value = value.replace(path, "[workspace]")
+        remaining = None if _text_budget is None else max(0, _text_budget[0])
+        if remaining == 0:
+            return _ASK_CUT if value else value  # nothing left to spend; skip the redaction work
         # Redact the whole string, then cut it to the budget: a secret straddling the cut
         # is replaced as a whole instead of being left as a readable fragment.
         value = _ask_redact(value)
-        if _text_budget is not None:
-            remaining = max(0, _text_budget[0])
-            if len(value) > remaining:
-                value = value[:remaining]
+        if remaining is not None:
+            cap = min(remaining, _ASK_FIELD_CAP)
+            if len(value) > cap:
+                value = value[: max(0, cap - len(_ASK_CUT))] + _ASK_CUT
             _text_budget[0] = remaining - len(value)
         return value
     return value
@@ -4306,14 +4455,34 @@ def ask_history_turns(settings: dict[str, Any] | None = None) -> int:
 def build_ask_messages(
     card: dict[str, Any], history: Iterable[dict[str, Any]], turns: int | None = None
 ) -> list[dict[str, str]]:
-    """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns."""
-    context = json.dumps(
-        _ask_card_view(card, _text_budget=[ASK_CARD_CONTEXT_LIMIT]),
-        ensure_ascii=False,
-        default=str,
-    )
-    if len(context) > ASK_CARD_CONTEXT_LIMIT:
-        context = context[:ASK_CARD_CONTEXT_LIMIT] + "…[truncated]"
+    """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns.
+
+    The operator's newest turn is sent whole (up to the API's own limit); the card data takes
+    the room that is left, and always stays valid JSON."""
+    recent = list(history)[-(ask_history_turns() if turns is None else turns) :]
+    turn_list: list[tuple[str, str]] = []
+    for item in recent:
+        role = item.get("role") if isinstance(item, dict) else None
+        content = item.get("content") if isinstance(item, dict) else None
+        if role in ("user", "assistant") and isinstance(content, str):
+            content = content.strip()[:ASK_TURN_LIMIT]
+            if content:
+                turn_list.append((role, content))
+    newest = len(turn_list[-1][1]) if turn_list else 0
+    frame = len(ASK_SYSTEM) + 400  # the wrapper text around the card data
+    card_limit = max(2000, min(ASK_CARD_CONTEXT_LIMIT, ASK_PROMPT_BUDGET - frame - newest))
+    budget = card_limit
+    for _ in range(8):
+        context = json.dumps(
+            _ask_card_view(card, _text_budget=[budget]), ensure_ascii=False, default=str
+        )
+        if len(context) <= card_limit:
+            break
+        budget = max(0, budget - (len(context) - card_limit) - 1)  # escapes made it longer
+    else:
+        context = json.dumps(
+            {"id": str(card.get("id", "")) if isinstance(card, dict) else "", "note": "card data omitted: too large"}
+        )
     messages: list[dict[str, str]] = [
         {"role": "system", "content": ASK_SYSTEM},
         {
@@ -4326,21 +4495,12 @@ def build_ask_messages(
     ]
     used = sum(len(m["content"]) for m in messages)
     kept: list[dict[str, str]] = []
-    for item in reversed(
-        list(history)[-(ask_history_turns() if turns is None else turns) :]
-    ):  # newest first
-        role = item.get("role") if isinstance(item, dict) else None
-        content = item.get("content") if isinstance(item, dict) else None
-        if role not in ("user", "assistant") or not isinstance(content, str):
-            continue
-        content = content.strip()[:ASK_TURN_LIMIT]
-        if not content:
-            continue
+    for role, content in reversed(turn_list):  # newest first
         room = ASK_PROMPT_BUDGET - used
         if len(content) > room:
             if kept or room <= 0:
                 break
-            content = content[:room]  # the newest turn is always sent, trimmed to fit
+            content = content[: max(0, room - len(_ASK_CUT))] + _ASK_CUT  # never silent
         kept.append({"role": role, "content": content})
         used += len(content)
     messages.extend(reversed(kept))
