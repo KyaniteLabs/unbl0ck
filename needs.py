@@ -1710,39 +1710,43 @@ def _same_author(a: Any, b: Any) -> bool:
     return str(a or "").strip().casefold() == str(b or "").strip().casefold()
 
 
-def _comment_events(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> tuple[int, int]:
-    """How many ``commented`` events of *author* come before and after the block event (all after
-    when there is none). Kanban writes a comment with its event in one transaction and ids only
-    grow, so this places the author's comments by write order, without reading them."""
+PLACEMENT_ROWS = 500  # newest rows one placement check reads; past them it finds no answer
+
+
+def _comment_events(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> list[Any]:
+    """The logged ``len`` of each ``commented`` event of *author* after the block (all when there is
+    none), newest first. Kanban writes a comment with its event in one transaction and ids only grow."""
     try:
         rows = conn.execute(
-            "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = 'commented'", (task_id,)
-        ).fetchall()
+            "SELECT rowid FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ? "
+            "ORDER BY id DESC LIMIT ?", (task_id, block_id or 0, PLACEMENT_ROWS)).fetchall()
+        rows = [_read_text(conn, "task_events", "payload", r, 4096) for (r,) in rows]  # an author and a length
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        rows = [(e.id, e.payload) for e in kanban_db.list_events(conn, task_id) if e.kind == "commented"]
-    mine = [int(i or 0) > (block_id or 0) for i, p in rows if _same_author(_json_payload(p).get("author"), author)]
-    return mine.count(False), mine.count(True)
+        rows = [(e.payload, 0) for e in kanban_db.list_events(conn, task_id)[::-1] if e.kind == "commented" and e.id > (block_id or 0)]
+    payloads = (_json_payload(p) for p, _ in rows[:PLACEMENT_ROWS])
+    return [p.get("len") for p in payloads if _same_author(p.get("author"), author)]
 
 
 def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> bool:
     """Has *author* commented since the block began: one of their ``commented`` events is later
     than the block's. The one test for "answered", used by the queue and by answer_card; a comment
     no event records never answers, so the card stays in front of you."""
-    return _comment_events(conn, kanban_db, task_id, author, block_id)[1] > 0
+    return bool(_comment_events(conn, kanban_db, task_id, author, block_id))
 
 
 def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
-    """Has *author* posted *text* since the block began? Their oldest comments, as many as their
-    events before the block, belong to earlier blocks; every later one counts (no body is read)."""
-    before = _comment_events(conn, kanban_db, task_id, author, block_id)[0]
+    """Has *author* posted *text* since the block began? Each event logs its comment's length, so the
+    k events of that length after the block logged the author's k newest comments of that length."""
+    k = _comment_events(conn, kanban_db, task_id, author, block_id).count(len(text))
     try:
         rows = conn.execute(
-            "SELECT author, body = ? FROM task_comments WHERE task_id = ? ORDER BY id", (text, task_id)
-        ).fetchall()
+            "SELECT rowid, author FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?", (task_id, PLACEMENT_ROWS)).fetchall()
+        rows = [(a, _read_text(conn, "task_comments", "body", r, 4 * len(text) + 1)[0]) for r, a in rows]  # tells a longer body
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: getattr(c, "id", 0) or 0)
-        rows = [(c.author, c.body == text) for c in listed]
-    return any([same for who, same in rows if _same_author(who, author)][before:])
+        listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: -(getattr(c, "id", 0) or 0))
+        rows = [(c.author, str(c.body).encode("utf-8", "replace")) for c in listed]
+    bodies = (bytes(b or b"").decode("utf-8", "replace") for a, b in rows[:PLACEMENT_ROWS] if _same_author(a, author))
+    return text in [b for b in bodies if len(b) == len(text)][:k]
 
 
 class CardStatus(str, Enum):
@@ -1811,22 +1815,22 @@ def _digest(*texts: Any) -> str:
 
 def _comments_sig(conn: Any, kanban_db: Any, task_id: str) -> str:
     """"count:newest id:digest" of a card's comments: it changes when a comment is added and when
-    the bounded read every model call and Desktop are given (:func:`_newest_comments`) changes."""
+    anything in the bounded view every model call and Desktop are given (:func:`_newest_comments`) does."""
     rows, count = _newest_comments(conn, kanban_db, task_id, CARD_CONTEXT_COMMENTS)
-    return f"{count}:{max((r[0] or 0 for r in rows), default=0)}:{_digest(*(p for r in rows for p in r[:3]))}"
+    return f"{count}:{max((r[0] or 0 for r in rows), default=0)}:{_digest(*(p for r in rows for p in r))}"
 
 
 def _newest_comments(conn: Any, kanban_db: Any, task_id: str, limit: int) -> tuple[list[tuple[Any, ...]], int]:
     """The newest *limit* ``(id, author, body, created_at)`` comments of a card, oldest first, and
-    its comment count. A body is its first ASK_CARD_CONTEXT_LIMIT bytes (past any NUL), ending in
-    ``_ASK_CUT`` when cut: the one bounded read the signature, Ask, summaries and Desktop share."""
+    its comment count. A body is its first ASK_CARD_CONTEXT_LIMIT bytes (past any NUL), cut clean
+    and ending in ``_ASK_CUT``: the one bounded read the signature, Ask, summaries and Desktop share."""
+    cut = ASK_CARD_CONTEXT_LIMIT
     try:
         count = conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (task_id,)).fetchone()[0]
         rows = conn.execute(
-            "SELECT id, author, SUBSTR(CAST(body AS BLOB), 1, ?), created_at FROM task_comments "
-            "WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-            (ASK_CARD_CONTEXT_LIMIT + 1, task_id, limit),
-        ).fetchall()[::-1]
+            "SELECT rowid, id, author, created_at FROM task_comments "
+            "WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ?", (task_id, limit)).fetchall()[::-1]
+        rows = [(i, a, _read_text(conn, "task_comments", "body", r, cut + 1)[0], t) for r, i, a, t in rows]
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
         listed = list(kanban_db.list_comments(conn, task_id))
         count = len(listed)
@@ -1834,9 +1838,8 @@ def _newest_comments(conn: Any, kanban_db: Any, task_id: str, limit: int) -> tup
             (getattr(c, "id", 0), c.author, str(c.body or "").encode("utf-8", "replace"), getattr(c, "created_at", None))
             for c in listed[-limit:]
         ]
-    cut = ASK_CARD_CONTEXT_LIMIT
     return [
-        (i, a, bytes(b or b"")[:cut].decode("utf-8", "replace") + (_ASK_CUT if len(b or b"") > cut else ""), t)
+        (i, a, _drop_cut(b[:cut].decode("utf-8", "replace"), False) + _ASK_CUT if len(b) > cut else b.decode("utf-8", "replace"), t)
         for i, a, b, t in rows
     ], int(count)
 
@@ -2140,6 +2143,7 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # sits at the end of a turn, so a longer message is read from its end.
 CHAT_READ_CHARS = 100_000
 CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_CHARS characters
+CHAT_BLANK_ROWS = 20  # newest space-only messages passed over to find the latest turn
 
 
 def _text_digest(length: Any, text: str) -> str:
@@ -2150,19 +2154,22 @@ _CUT_TOKEN = re.compile(r"\s*[A-Za-z0-9+/=_.\-]{32,}(?=\s|$)")
 _CUT_PEM_TAIL = re.compile(r"[A-Za-z0-9+/=\s]*(?=-----END )")
 
 
-def _drop_cut_prefix(text: str) -> str:
-    """A message read from its end starts in the middle of something. Whatever it began with, a
-    credential label, a key header, lies before the cut and cannot be seen, so the fragment that
-    follows cannot be judged: the partial first word and the run of long key-like words after it
-    are dropped, which leaves the readable ending where the ask is."""
+def _read_text(conn: sqlite3.Connection, table: str, column: str, rowid: Any, room: int, tail: bool = False) -> tuple[bytes, int]:
+    """At most *room* bytes of a stored text, from its start or *tail*, and its byte length; SQLite loads no more."""
+    with conn.blobopen(table, column, rowid, readonly=True) as blob:
+        blob.seek(max(0, len(blob) - room) if tail else 0)
+        return blob.read(room), len(blob)
+
+
+def _drop_cut(text: str, at_start: bool) -> str:
+    """Drop the partial word at a cut (*at_start* or end) and the long key-like run beside it: their
+    label lies past the cut, so they cannot be judged. Every cut made before redaction comes here."""
+    if not at_start:
+        return _drop_cut(text[::-1], True)[::-1]
     rest = text[re.match(r"\S*", text).end() :]
-    while True:
-        hit = _CUT_TOKEN.match(rest)
-        if not hit:
-            break
+    while hit := _CUT_TOKEN.match(rest):
         rest = rest[hit.end() :]
-    pem = _CUT_PEM_TAIL.match(rest)
-    if pem:
+    if pem := _CUT_PEM_TAIL.match(rest):
         rest = rest[pem.end() :]
     return rest.lstrip()
 
@@ -2417,18 +2424,12 @@ def chat_items(
                 continue
             # Only the columns this profile's schema has: an old schema must not fail per session.
             last_sql = (
-                # Bytes, not text: SQLite's text functions stop at an embedded NUL.
-                "SELECT id, role, SUBSTR(CAST(content AS BLOB), ?), LENGTH(CAST(content AS BLOB)), "
-                "timestamp FROM messages "
-                "WHERE session_id=? "
-                "AND role IN ('user','assistant') AND content IS NOT NULL AND TRIM(content) != '' "
-                + (
-                    "AND COALESCE(display_kind,'') != 'hidden' "
-                    if "display_kind" in mcols
-                    else ""
-                )
+                # typeof() reads no content: the text itself is read in a bounded piece below.
+                "SELECT id, rowid, role, timestamp FROM messages WHERE session_id=? "
+                "AND role IN ('user','assistant') AND typeof(content) IN ('text','blob') "
+                + ("AND COALESCE(display_kind,'') != 'hidden' " if "display_kind" in mcols else "")
                 + ("AND COALESCE(active,1)=1 " if "active" in mcols else "")
-                + "ORDER BY timestamp DESC, id DESC LIMIT 1"
+                + "ORDER BY timestamp DESC, id DESC LIMIT ?"
             )
             for sid, title, platform, chat_type, user_id, display_name in sessions:
                 platform = str(platform or "")
@@ -2445,22 +2446,19 @@ def chat_items(
                     cov["skipped_other_owner"] += 1
                     continue
                 try:
-                    row = conn.execute(last_sql, (-CHAT_READ_BYTES, sid)).fetchone()
+                    for mid, rowid, role, ts in conn.execute(last_sql, (sid, CHAT_BLANK_ROWS)).fetchall():
+                        raw, length = _read_text(conn, "messages", "content", rowid, CHAT_READ_BYTES, tail=True)
+                        if raw.strip(b" ") or length > len(raw):
+                            break  # the newest message that is not blank
+                    else:
+                        continue
                 except sqlite3.Error as exc:
                     failed(exc)
                     break  # same schema for every session: say it once
-                if not row:
-                    continue
-                mid, role, raw, length, ts = row
-                length = int(length or 0)
-                raw = bytes(raw or b"") if not isinstance(raw, str) else raw.encode("utf-8", "replace")
                 content = raw.decode("utf-8", "replace")
                 over = length > len(raw) or len(content) > CHAT_READ_CHARS
                 if over:  # only the end of a very long message was read
-                    content = content[-CHAT_READ_CHARS:]
-                    if length > len(raw):
-                        content = content.lstrip("\ufffd")  # a character cut in two
-                    content = _drop_cut_prefix(content)
+                    content = _drop_cut(content[-CHAT_READ_CHARS:], True)
                 ts = _num(ts)  # an infinite or NaN stored time is not a time (int() would raise)
                 retained = content
                 content = content.replace("\x00", " ")

@@ -513,7 +513,7 @@ class FakeKanban(unittest.TestCase):
             get_task=lambda c, t: self.task if t == "t_1" else None,
             # Hermes logs every comment with a "commented" event; these fixture comments follow the block.
             list_events=lambda c, t: self.events + [
-                types.SimpleNamespace(id=100 + i, kind="commented", payload={"author": x.author}, created_at=x.created_at)
+                types.SimpleNamespace(id=100 + i, kind="commented", payload={"author": x.author, "len": len(x.body)}, created_at=x.created_at)
                 for i, x in enumerate(self.comments)
             ],
             list_comments=lambda c, t: self.comments,

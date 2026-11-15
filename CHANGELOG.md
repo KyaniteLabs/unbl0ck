@@ -137,6 +137,7 @@
 - **HTML-only mail keeps zero-width joiners (round 7).** The converter dropped every invisible format character, which also broke Persian words and joined emoji; the joiner and non-joiner are kept now, and the other format characters, which can hide text, are still removed.
 - **Not for me works on a very long chat ask again, and a renamed chat database is refused (round 8).** A cut message past the poll's hashing budget kept a new version on every poll, so dismissing it or opening its full text failed as stale; it now keeps a stable version from its length, its first 64 KiB and the end the queue reads. A `state.db` renamed while it is opened is refused instead of read without its WAL.
 - **Explicit-key YAML codes are redacted around comments, and only CSS whitespace splits a `display` value (round 8).** `? otp # login`, a comment between any key and its value, a key on its own line under `?`, a quoted explicit key and a trailing comment after the code all redact like `otp: 123456`. A `display` value split by a non-breaking or other Unicode space, or spelled with a non-ASCII case fold, is invalid CSS, so its `hidden` text now comes with a note.
+- **An old unlogged comment no longer answers a card, and long comments stay safe and cheap to read (round 8).** An answer must match a comment logged after the block; a queue poll reads only the events after it; a long comment or chat message is read in a bounded piece, a cut comment drops the half-secret at its cut, and a changed comment date refreshes Ask and Desktop.
 
 ## 0.5.1 (2026-11-14)
 
