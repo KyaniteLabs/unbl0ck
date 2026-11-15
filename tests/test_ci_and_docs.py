@@ -48,3 +48,10 @@ def test_docs_match_what_done_ask_markers_and_card_limits_actually_do():
     # jobs.py also holds the Ask journal; the stale "last 20" comment is gone.
     assert "In-memory Summary and Ask lifecycle tables" not in arch
     assert "Ask only uses the last 20" not in api
+
+
+def test_ask_markers_are_documented_as_not_written_without_fcntl():
+    doc = " ".join((ROOT / "docs" / "architecture.md").read_text(encoding="utf-8").split())
+    assert "Ask restart markers are stricter: without `fcntl`" in doc
+    assert "not written at all" in doc
+    assert "Without fcntl" in (ROOT / "jobs.py").read_text(encoding="utf-8")

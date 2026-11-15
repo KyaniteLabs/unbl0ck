@@ -223,10 +223,13 @@ class SearchBudget(RealReaders):
     def test_a_hidden_chat_that_changed_is_searched_again(self):
         self.chats(["Should I merge change 0 now?"])
         (it,) = needs.chat_items(self.home)
-        needs.hide(it["id"], "an-older-version", self.home)
-        self.assertEqual(len(needs.search_text("change")["matches"]), 1)
         needs.hide(it["id"], it["version"], self.home)
         self.assertEqual(needs.search_text("change")["matches"], [])
+        db = sqlite3.connect(self.home / "state.db")
+        db.execute("UPDATE messages SET content = ? WHERE session_id = 's0'", ("Should I merge change 0 and 1 now?",))
+        db.commit()
+        db.close()
+        self.assertEqual(len(needs.search_text("change")["matches"]), 1)
 
     def test_a_dismissed_live_prompt_is_not_searched_but_a_changed_one_is(self):
         needs.record_wait(self.home, request_id="0123456789abcdef", kind="clarify",
@@ -389,7 +392,7 @@ class DesktopSearchPreservesState(unittest.TestCase):
         s = (ROOT / "desktop/src/plugin.src.js").read_text()
         # Every list renders Item with the item id as its key, and the full-text result never
         # replaces the list: it only adds a summary line and marks matches.
-        self.assertGreaterEqual(s.count("}, item.id))"), 2)
+        self.assertGreaterEqual(s.count("}, askKey(scope, item.id)))"), 2)
         self.assertNotIn("setItems(fullHits", s)
         self.assertNotIn("items={fullHits", s)
 
@@ -603,6 +606,20 @@ class SearchFolderBudget(unittest.TestCase):
             p = patch.object(needs, name, value)
             p.start()
             self.addCleanup(p.stop)
+
+    def test_filed_records_obey_the_read_budget_and_the_rest_are_counted_unread(self):
+        # Class D: the filed-record loop read every record before the budget was looked at, so
+        # a budget of one returned all three and reported nothing unread.
+        for n in range(3):
+            needs.file_outside({"kind": "draft", "title": f"Reply {n}", "body": "a needle", "act_where": "Mail",
+                                "dedupe_key": f"k{n}"}, self.home, profile="work", session_id="s1")
+        unread = [0]
+        reads = []
+        real = needs._read_json
+        with patch.object(needs, "_read_json", lambda *a, **k: reads.append(a[0]) or real(*a, **k)):
+            got = needs.outside_items(self.home, readonly=True, read_budget=1, unread=unread)
+        self.assertEqual((len(got), unread[0]), (1, 2))
+        self.assertEqual(len(reads), 1)
 
     def test_files_left_unread_under_two_overlapping_roots_are_counted_once(self):
         parent = self.root / "parent"

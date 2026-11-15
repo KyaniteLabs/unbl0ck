@@ -647,7 +647,7 @@ class WidenedWindowIsBackfill(QueueCase):
         self._queue(home, 1)
         self._queue(home, 7)
         data = json.loads((home / "plugin-data" / "unbl0ck" / needs.BACKFILL_FILE).read_text())
-        self.assertEqual(sorted(data), ["floor", "ids"])
+        self.assertEqual(sorted(data), ["floor", "id_ts", "ids"])  # times and ids; `before` only past the cap
         self.assertEqual(data["ids"], ["chat:work:three"])
         self.assertNotIn("Should I open", json.dumps(data))
         self.assertLessEqual(needs.BACKFILL_IDS_MAX, 1000)

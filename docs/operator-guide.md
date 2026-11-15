@@ -78,7 +78,7 @@ and status) and each difference below.
 | CLI and local slash | Asks only, 12 listed; says how many more and how many stuck or answered cards are not listed | One line per ask: where, title, summary or first 140 characters (a password prompt gets a fixed notice instead) | Prints the native `hermes pairing approve` command; no inline action | Run it again | Source errors are printed; run it again | Local surfaces only (`cli`, `tui`, `desktop`, `local`) |
 | CLI --json | The raw queue, every tier | Full item fields | None | Run it again | Pairs with `--pack` | Machine owner only; contains private text, including Hermes's already redacted excerpt of a live password prompt |
 | Remote slash | Counts only: asks, plus counts of stuck and answered cards and whether the queue is incomplete | None: never a title, text, id, name or approval command | Says to open Desktop or run `hermes unbl0ck` on the machine | Ask again after acting there | "Incomplete" is stated as a count-level fact | Anyone admitted to a gateway can type it, so an unknown or missing platform counts as remote |
-| Pocket pack | Up to six asks in queue order; no stuck or answered cards; `omitted` gives counts of what is left out, and `complete` is false (with `omitted.unread_sources` counting each unreadable source once) when a source could not be read or a list was cut at its limit, so an empty pack is not "nothing needs you" | Title, short summary and ask text; a password prompt's text is replaced by a fixed notice | One fixed pointer per card ("Answer in Telegram", "Open pairing requests"); never an approval or inline action | Pack is regenerated, expires in one hour | Written only when you ask for it | Counts in `omitted` are the only disclosure of omitted work |
+| Pocket pack | Up to six asks in queue order; no stuck or answered cards; `omitted` gives counts of what is left out, and `complete` is false (with `omitted.unread_sources` counting each unreadable source once) when a source could not be read or a list was cut at its limit, so an empty pack is not "nothing needs you" | Title, short summary and ask text; a password prompt's text is replaced by a fixed notice | One fixed pointer per chat, prompt, pairing or outside card ("Answer in Telegram", "Open pairing requests"); a Kanban card carries two fixed choices that name its board and block ("Answer and unblock <task>", "Keep <task> blocked"); never an approval command, a pairing code or an answer text | Pack is regenerated, expires in one hour | Written only when you ask for it | Counts in `omitted` are the only disclosure of omitted work |
 <!-- surface-matrix:end -->
 
 Actions are not flattened into every surface: a surface gets a new action only after its
@@ -106,9 +106,12 @@ authorization: it is not a gap and will not be added. **Not yet** is a real gap.
 <!-- capability-matrix:end -->
 
 - **Context** is the Context panel for Kanban and the Full text view for chats, live prompts
-  and outside items. Chats and live prompts show Full text only when the card holds a
-  shortened tail; password prompts never offer Full text, and pairing requests show neither
-  (the code and the person's platform id are never shown).
+  and outside items. The **+ Full text** button is on every card without a summary: it
+  expands or collapses the text already on the card. Only chats and live prompts that hold a
+  shortened tail, and outside items, load the whole record from the source; short chats,
+  password prompts and pairing requests never fetch anything. Password prompts are never
+  expanded to a larger record, and a pairing request never shows its code or the person's
+  platform id.
 - **Model help** is the interactive TL;DR: it sends card text to your configured provider
   only on an explicit click, and only for Kanban. It is separate from the one-line summary,
   which is on by default and is sent automatically in the background when the queue is
@@ -156,7 +159,7 @@ the result expired) and offers a fresh attempt. The client polls for up to 150 s
 and checked after every response, including a finished answer. Each Ask carries a random
 request ID that Retry reuses, so a lost response cannot start a second model call, and it
 carries the card version, so a changed card is refused instead of answered from old context.
-A follow-up over 20,000 characters, or one the server refuses, is not kept in the conversation.
+A follow-up over 20,000 characters, or one the server refuses outright (a client error other than busy or timeout), is not kept in the conversation. After a busy (429) or timeout answer it stays, so Retry can send it again.
 
 
 After a gateway restart the plugin never sends a request again by itself. Each Ask job
@@ -190,15 +193,16 @@ returning to the page restores the conversation without asking the model again; 
 request still running when you left is followed to its result. A reload or app restart
 clears this memory, and nothing is written to disk, so there is nothing to delete. Conversations
 are kept for each backend connection separately: the same card id on another backend or
-profile never shows or resends them, and closing a connection removes its conversations.
+profile never shows or resends them, and closing a connection removes its conversations, its queue and its Undo list. A card and the page itself are remounted per connection, so an answer being typed or advice for the same card id never carries over to another backend.
 One conversation keeps at most 100 messages and 200,000 characters; older messages are
 dropped, and the card says so. A conversation that expires while its card stays open
 leaves the screen too. If a request's conversation is evicted or expires while the model
 is still answering, the card reports that it was dropped from session memory and offers
 Retry; the late answer is not shown. The recovered conversation stays bound to the card it
-was asked about: if the block version or the title, question, owner or comments changed,
-it is marked as out of date and its suggestion cannot be used as an answer until you ask
-again. A late response from an older request
+was asked about: if the block version or the title, question, owner, description or comments
+(including a comment rewritten in place) changed, it is marked as out of date and its suggestion
+cannot be used as an answer until you ask again. A Retry after leaving and returning to the
+page reuses the request's id, so a response lost in transit never starts a second model call. A late response from an older request
 never replaces a newer one.
 
 ## What an empty queue does not prove
@@ -214,7 +218,7 @@ that is older than 14 days, or older than any earlier read (widening 1 to 7 days
 three-day-old asks), is listed but never summarized automatically, even when summaries are
 on; the Summarize action still works on it. To keep that flag across refreshes the queue keeps a
 small `chat-backfill.json` in the plugin data folder: the oldest time any read reached and the
-ids of such chats (at most 1000), never chat text. If a chat database cannot be read, the coverage note says so instead of naming a window. The labeled
+ids of such chats (at most 1000; past that the oldest are dropped and everything as old as the newest dropped stays flagged), never chat text. Narrowing the window again keeps the flag, and the file is rewritten under the shared state lock. If a chat database cannot be read, the coverage note says so instead of naming a window. The labeled
 corpus in `tests/ask_corpus.py` lists the known misses (`KNOWN_GAPS`); run
 `python tests/test_ask_corpus.py --report` to print the false-positive and false-negative
 report.
@@ -253,14 +257,21 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
    the state lock (`lock_check` says when this filesystem cannot report it). Records
    written by older releases with a null or empty version are valid and count as healthy.
    `recovery_dir` is `absent`, `ok` or `unsafe` (a file or link where the directory
-   belongs; the command exits 1). A diagnosis lists at most 100 backups, newest label
-   first, and reads at most 64 MiB of them; the rest are counted in `backups_omitted` or
-   marked `not_checked`. A link anywhere in `plugin-data/unbl0ck` makes every command
-   refuse.
+   belongs; the command exits 1). A diagnosis looks at no more than 10,000 directory entries
+   and 5 seconds of listing, lists at most 100 backups, newest label first, and reads at
+   most 64 MiB of them (the budget is enforced on the bytes actually read); the rest are
+   counted in `backups_omitted` or marked `not_checked`. When the listing stopped early,
+   `backups_complete` is `false` and the counts are lower bounds. A backup that cannot be
+   opened is listed as `unsafe`, never dropped. A link at `plugin-data`, at
+   `plugin-data/unbl0ck` or at the recovery directory, or in place of a store, a backup or
+   the lock file, makes the command that uses it refuse; links elsewhere under the data
+   directory (for example in `waits/`) are not inspected. A directory that passes the check
+   is the one every later step uses: if it is swapped for a link or another directory
+   afterwards, the command refuses instead of reading or writing there.
 2. **Preserve.** `preserve` copies the exact current bytes, readable or not, into
    `plugin-data/unbl0ck/recovery/` (it creates the recovery directory, mode 700, on first
-   use), checks the copy and syncs it and its directory to disk; a sync that fails is
-   reported as a failure. The store itself is not changed. These backups
+   use; an existing directory keeps its mode), checks the copy and syncs it and its directory
+   to disk; a sync that fails is reported as a failure that names the copy it created. The store itself is not changed. These backups
    hold the same private content as the store and are never deleted by the plugin or this
    tool; remove them yourself when you no longer need them.
 3. **Restore.** Put a backup you trust in that directory as `<store>-<label>.bak` with mode
@@ -272,9 +283,12 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
    copies the current bytes aside first, writes the backup beside the store, verifies it and
    swaps it in atomically, then reads the installed file back and syncs the directory.
    A failure before the swap leaves the store as it was. A failure after it (the directory
-   sync or the readback) is reported as `failed` with `store_unchanged` false and the
-   preserved copy of the previous bytes in `preserved_current`; the tool does not roll
-   back. The reported entry counts and warnings are those of the backup and store actually
+   sync or the readback) is reported as `failed` with the preserved copy of the previous
+   bytes in `preserved_current` (also when only that copy's directory sync failed), and
+   `store_unchanged` says what the store holds now: `false` when it differs from before the
+   restore began, `true` when it is byte-for-byte what it was (for example a backup
+   identical to the current file) and `null` when it cannot be read back to say; the tool
+   does not roll back. The reported entry counts and warnings are those of the backup and store actually
    replaced, rebuilt after the lock is held.
 
 Consequences to expect: everything changed after the backup was made is lost (dismissals,
@@ -328,9 +342,15 @@ selectors are applied; media queries and attribute, pseudo-class or sibling sele
 not evaluated, and when one of those could hide text the card says "styles ... were not
 evaluated" and may show text such a rule hides. External stylesheets are never fetched,
 and positioning, colour or text-indent tricks are not evaluated. When part of the body
-could not be shown (an element that is hidden or never closed, markup nested too deeply,
-an unterminated comment, tag or quoted value, a reader failure) the card says so instead
-of presenting the rest as complete.
+could not be shown (text inside an element that is hidden or never closed, markup nested
+too deeply, an unterminated comment, tag or quoted value, a reader failure) the card says
+so instead of presenting the rest as complete. Hidden text is reported even when the
+element closes: a closed `hidden` or `display:none` element that held text adds the notice
+(an empty one does not). A body that is longer than the card shows is cut and says so.
+Invalid declarations are discarded as CSS does, so they never override a valid one;
+`initial`, `revert` and `visible` restore an inherited `visibility` or `font-size`, while
+`inherit` and `unset` keep the parent's. Styles inside a `<template>` apply to nothing, and
+an omitted `</head>` or table-section end tag is understood.
 
 **What kind of card an `.eml` becomes** comes from its own headers: a message marked
 unsent by its mail client (`X-Unsent`, Thunderbird or Apple Mail draft markers) is a

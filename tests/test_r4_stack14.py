@@ -146,6 +146,8 @@ class FailureReported(Mail):
         self.assertIn("Important tail", t)
 
     def test_a_hex_reference_that_overflows_does_not_drop_the_tail(self):
+        # Guard only: the stdlib parser already turns any hexadecimal reference into U+FFFD, so this
+        # passes with or without converter code (the decimal case above is the one the converter fixes).
         t = self.text("<p>Start</p>&#x" + "f" * 5000 + ";<p>Important tail</p>")
         self.assertIn("Important tail", t)
 

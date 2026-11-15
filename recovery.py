@@ -10,7 +10,7 @@ restore from a verified backup. It is stdlib only, runs outside the dashboard, a
   ``preserve`` only adds a backup file (creating the recovery directory on first use) and never
   changes the store; ``diagnose`` writes nothing.
 
-Backups live in ``plugin-data/unbl0ck/recovery/`` (directory 0700, files 0600). They hold the same
+Backups live in ``plugin-data/unbl0ck/recovery/`` (directory created 0700 when absent, files 0600). They hold the same
 private content as the stores they copy and are never deleted here.
 
 CLI::
@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import heapq
 import importlib.util
 import json
 import os
 import re
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -46,6 +48,7 @@ _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _POSIX_MODES = os.name != "nt"  # Windows reports 0666/0444 for any file: permission bits mean nothing there
 # One diagnosis reads a bounded amount however many backups pile up (they are never deleted).
 MAX_LISTED_BACKUPS = 100
+MAX_SCANNED_ENTRIES = 10_000  # directory entries one diagnosis looks at, matching or not
 BACKUP_READ_BUDGET = 64 * 1024 * 1024
 BACKUP_SCAN_SECONDS = 5.0
 BACKUP_NAME = re.compile(r"^(?P<stem>hidden|pending-release|bluf)-[A-Za-z0-9._-]{1,80}\.bak$")
@@ -102,15 +105,79 @@ def _is_link(p: Path) -> bool:
     return p.is_symlink() or bool(getattr(os.path, "isjunction", lambda _p: False)(p))
 
 
+# A directory is checked once (no link, a real directory) and its identity is remembered. Every
+# later read, backup and replacement opens that directory again, compares the identity, and then
+# works through the descriptor, so a swap after the check is refused instead of followed.
+_DIRFD = (os.name != "nt" and all(f in os.supports_dir_fd for f in (os.open, os.stat, os.unlink, os.rename, os.mkdir))  # os.replace takes the same dir_fd arguments as os.rename
+          and os.scandir in os.supports_fd)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_TRUSTED: dict[str, tuple[int, int]] = {}
+
+
+def _trust(p: Path) -> None:
+    """Remember which directory *p* is now (identity, not name). Only a real directory, never a link."""
+    prefix = str(p)
+    for key in [k for k in _TRUSTED if k == prefix or k.startswith(prefix + os.sep)]:
+        del _TRUSTED[key]  # a directory under a checked one is trusted again when it is next checked
+    if not _DIRFD:
+        return
+    try:
+        fd = os.open(p, os.O_RDONLY | _O_DIRECTORY | _NOFOLLOW)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError("the plugin data path contains a link or a non-directory; refusing to use it") from exc
+    try:
+        st = os.fstat(fd)
+        _TRUSTED[str(p)] = (st.st_dev, st.st_ino)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _anchored(p: Path):
+    """A descriptor for directory *p* that is the directory checked earlier (``None`` where the
+    platform has no directory descriptors). A different directory under the same name is refused."""
+    if not _DIRFD:
+        yield None
+        return
+    fd = os.open(p, os.O_RDONLY | _O_DIRECTORY | _NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if _TRUSTED.setdefault(str(p), (st.st_dev, st.st_ino)) != (st.st_dev, st.st_ino):
+            raise RuntimeError("a state directory changed after it was checked; refusing to use it")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _open_at(pfd: int | None, p: Path, flags: int, mode: int = 0o777) -> int:
+    return os.open(p, flags, mode) if pfd is None else os.open(p.name, flags, mode, dir_fd=pfd)
+
+
+def _lstat_at(pfd: int | None, p: Path) -> os.stat_result:
+    return os.lstat(p) if pfd is None else os.stat(p.name, dir_fd=pfd, follow_symlinks=False)
+
+
+def _unlink_at(pfd: int | None, p: Path) -> None:
+    try:
+        os.unlink(p) if pfd is None else os.unlink(p.name, dir_fd=pfd)
+    except FileNotFoundError:
+        pass
+
+
 def _dir(home: Path | None) -> Path:
     """The plugin data directory, without creating it. The two directories below the chosen
     home must be real directories: a link at either place would send every read, backup and
-    replacement to another folder, whatever the file names there look like."""
+    replacement to another folder, whatever the file names there look like. The directory that
+    passes is the one every later step uses (see ``_anchored``)."""
     base = Path(home) if home else _needs().hermes_home()
     for part in (base / "plugin-data", base / "plugin-data" / "unbl0ck"):
         if _is_link(part):
             raise RuntimeError("the plugin data path contains a link; refusing to use it")
-    return base / "plugin-data" / "unbl0ck"
+    d = base / "plugin-data" / "unbl0ck"
+    _trust(d)
+    return d
 
 
 def _writer_active(d: Path) -> bool | None:
@@ -119,9 +186,12 @@ def _writer_active(d: Path) -> bool | None:
     if fcntl is None:
         return None
     try:
-        fd = os.open(d / LOCK_NAME, os.O_RDWR | _NOFOLLOW | _NONBLOCK)
+        with _anchored(d) as dfd:  # the lock of the directory that was checked, whatever the name is now
+            fd = _open_at(dfd, d / LOCK_NAME, os.O_RDWR | _NOFOLLOW | _NONBLOCK)
     except FileNotFoundError:
         return False  # no lock file: nobody has ever held it
+    except RuntimeError:
+        raise
     except OSError:
         return None  # unreadable or a link: we cannot say, and never claim "no writer"
     try:
@@ -141,7 +211,8 @@ def _read_file(p: Path, limit: int = MAX_STORE_BYTES):
     descriptor that is not a link, FIFO or device, are bounded by what is actually read, and
     carry the ``fstat`` of the file read, so nothing is decided on a name that can change."""
     try:
-        raw, st = _needs()._read_plain_bytes_st(p, limit)
+        with _anchored(p.parent) as pfd:
+            raw, st = _needs()._read_plain_bytes_st(p, limit, dir_fd=pfd)
         return raw, st, None, None
     except FileNotFoundError:
         return None, None, "absent", None
@@ -179,7 +250,8 @@ def _inspect(d: Path, store: str) -> dict[str, Any]:
         return {**base, "status": "absent", "entries": 0}
     if why == "too_large":
         try:
-            size = p.lstat().st_size
+            with _anchored(p.parent) as pfd:
+                size = _lstat_at(pfd, p).st_size
         except OSError:
             size = None
         return {**base, "bytes": size, "status": "corrupt", "entries": None, "error": "too large to be a state file"}
@@ -210,6 +282,7 @@ def diagnose(home: Path | None = None) -> dict[str, Any]:
         "backups": listing["items"],
         "backups_total": listing["total"],
         "backups_omitted": listing["omitted"],
+        "backups_complete": listing["complete"],
         "note": "Counts only. A held lock is never cleared; wait for the writer or stop it in its owning installation.",
     }
 
@@ -220,14 +293,24 @@ def _fsync_dir(p: Path) -> None:
     directory to sync it, so it is skipped there."""
     if not _POSIX_MODES:
         return
-    fd = os.open(p, os.O_RDONLY)
-    try:
+    with _anchored(p) as fd:
+        if fd is None:
+            fd = os.open(p, os.O_RDONLY)
         os.fsync(fd)
-    finally:
-        os.close(fd)
+
+
+class _NotDurable(OSError):
+    """A backup was created and verified, but its directory entry could not be synced. It exists
+    on disk, so the caller must still be able to name it."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__("the backup was created but its directory entry could not be made durable")
+        self.backup_name = name
 
 
 def _recovery_dir(d: Path, create: bool) -> Path | None:
+    """The recovery directory. It is created (0700) only when absent; an existing one keeps its
+    mode, because ``preserve`` only adds a file. Its identity is remembered for later steps."""
     r = d / RECOVERY_DIR
     if _is_link(r):
         raise RuntimeError("recovery directory is a symlink; refusing to use it")
@@ -236,48 +319,66 @@ def _recovery_dir(d: Path, create: bool) -> Path | None:
     if not r.exists():
         if not create:
             return None
-        r.mkdir(mode=0o700)
+        with _anchored(d) as dfd:
+            if dfd is None:
+                r.mkdir(mode=0o700)
+            else:
+                os.mkdir(r.name, 0o700, dir_fd=dfd)
         _fsync_dir(d)  # the new directory's entry lives in its parent
-    os.chmod(r, 0o700)
+    _trust(r)
     return r
 
 
 def _list_backups(d: Path) -> dict[str, Any]:
-    """Backups, newest label first, within a fixed budget (count, bytes read and time), so a
-    large archive cannot turn a read-only diagnosis into a multi-gigabyte scan. What the budget
-    left unchecked is counted, never silently dropped."""
+    """Backups, newest label first, within a fixed budget (entries looked at, time, count shown and
+    bytes read), enforced while enumerating and reading, so a large archive cannot turn a
+    read-only diagnosis into a long or multi-gigabyte scan. What a budget left unchecked is
+    counted or marked, never silently dropped; ``complete`` is false when enumeration stopped
+    early (the totals are then lower bounds)."""
     r = d / RECOVERY_DIR
     if _is_link(r) or (r.exists() and not r.is_dir()):
-        return {"state": "unsafe", "items": [], "total": 0, "omitted": 0}
+        return {"state": "unsafe", "items": [], "total": 0, "omitted": 0, "complete": True}
     if not r.is_dir():
-        return {"state": "absent", "items": [], "total": 0, "omitted": 0}
-    try:
-        with os.scandir(r) as entries:
-            names = sorted((e.name for e in entries if BACKUP_NAME.match(e.name)), reverse=True)
-    except OSError:
-        return {"state": "unsafe", "items": [], "total": 0, "omitted": 0}
-    shown = names[:MAX_LISTED_BACKUPS]
-    budget = BACKUP_READ_BUDGET
+        return {"state": "absent", "items": [], "total": 0, "omitted": 0, "complete": True}
     deadline = time.monotonic() + BACKUP_SCAN_SECONDS
+    newest: list[str] = []  # a min-heap of the MAX_LISTED_BACKUPS greatest names: bounded memory
+    total = seen = 0
+    complete = True
+    try:
+        with _anchored(r) as rfd:
+            with os.scandir(r if rfd is None else rfd) as entries:
+                for e in entries:
+                    if seen >= MAX_SCANNED_ENTRIES or time.monotonic() > deadline:
+                        complete = False
+                        break
+                    seen += 1
+                    if BACKUP_NAME.match(e.name):
+                        total += 1
+                        if len(newest) < MAX_LISTED_BACKUPS:
+                            heapq.heappush(newest, e.name)
+                        else:
+                            heapq.heappushpop(newest, e.name)
+    except OSError:
+        return {"state": "unsafe", "items": [], "total": 0, "omitted": 0, "complete": True}
+    shown = sorted(newest, reverse=True)
+    budget = BACKUP_READ_BUDGET
+    read_deadline = time.monotonic() + BACKUP_SCAN_SECONDS
     out = []
     for name in shown:
         p = r / name
         m = BACKUP_NAME.match(name)
         row: dict[str, Any] = {"name": name, "store": m["stem"]}
-        try:
-            size = p.lstat().st_size
-        except OSError:
-            continue
-        row["bytes"] = size
-        if size > budget or time.monotonic() > deadline:
+        out.append(row)
+        if budget <= 0 or time.monotonic() > read_deadline:
             row["status"] = "not_checked"  # over the read budget of this diagnosis
-            out.append(row)
             continue
-        raw, st, why, _err = _read_file(p)
+        limit = min(MAX_STORE_BYTES, budget)
+        raw, st, why, _err = _read_file(p, limit)
         if why == "too_large":
-            row["status"] = "corrupt"
+            budget -= limit  # the read consumed up to the limit before it was refused
+            row["status"] = "corrupt" if limit == MAX_STORE_BYTES else "not_checked"
         elif why:
-            row["status"] = "unsafe"
+            row["status"] = "not_checked" if why == "absent" else "unsafe"  # gone since listed, or unreadable
         else:
             budget -= len(raw)
             row["bytes"] = st.st_size
@@ -285,8 +386,7 @@ def _list_backups(d: Path) -> dict[str, Any]:
             owner = _owner_only(st)
             if owner is not None:
                 row["owner_only"] = owner
-        out.append(row)
-    return {"state": "ok", "items": out, "total": len(names), "omitted": len(names) - len(shown)}
+    return {"state": "ok", "items": out, "total": total, "omitted": total - len(shown), "complete": complete}
 
 
 def _sha(raw: bytes) -> str:
@@ -311,27 +411,29 @@ def _read_back(fd: int, expected: int) -> bytes:
 def _write_new(path: Path, raw: bytes) -> os.stat_result:
     """Create ``path`` exclusively with mode 0600 (never through a link), write, flush to disk and
     read the same descriptor back. Returns the ``fstat`` of the file written, so a caller can
-    tell later whether the name still holds it. A copy that does not match is removed."""
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
-    try:
-        view = memoryview(raw)
-        while view:
-            view = view[os.write(fd, view):]
-        os.fsync(fd)
-        if _read_back(fd, len(raw)) != raw:
-            raise OSError("written copy does not match the original bytes")
-        st = os.fstat(fd)
-        if not os.path.samestat(st, os.lstat(path)):
-            raise OSError("the new file was replaced before it could be verified")
-        return st
-    except BaseException:
+    tell later whether the name still holds it. A copy that does not match is removed. The file
+    is created inside the directory that was checked, whatever that name points at now."""
+    with _anchored(path.parent) as pfd:
+        fd = _open_at(pfd, path, os.O_RDWR | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
         try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-    finally:
-        os.close(fd)
+            view = memoryview(raw)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+            if _read_back(fd, len(raw)) != raw:
+                raise OSError("written copy does not match the original bytes")
+            st = os.fstat(fd)
+            if not os.path.samestat(st, _lstat_at(pfd, path)):
+                raise OSError("the new file was replaced before it could be verified")
+            return st
+        except BaseException:
+            try:
+                _unlink_at(pfd, path)
+            except OSError:
+                pass
+            raise
+        finally:
+            os.close(fd)
 
 
 def _preserve_raw(d: Path, store: str, raw: bytes) -> str:
@@ -343,7 +445,10 @@ def _preserve_raw(d: Path, store: str, raw: bytes) -> str:
             _write_new(r / name, raw)
         except FileExistsError:
             continue
-        _fsync_dir(r)
+        try:
+            _fsync_dir(r)
+        except OSError as exc:
+            raise _NotDurable(name) from exc  # the copy exists: the caller must be able to name it
         return name
     raise OSError("could not find a free backup name")
 
@@ -367,6 +472,11 @@ def preserve(store: str, home: Path | None = None) -> dict[str, Any]:
                                                 "too_large": "the store is too large to be a state file"}[why]}
     try:
         name = _preserve_raw(d, store, raw)
+    except _NotDurable as exc:
+        return {"status": "failed", "error": type(exc.__cause__ or exc).__name__,
+                "backup": f"{RECOVERY_DIR}/{exc.backup_name}",
+                "reason": "the copy was created and verified but its directory entry could not be made "
+                          "durable; it may not survive a crash. The store was not changed"}
     except (OSError, RuntimeError) as exc:
         if isinstance(exc, RuntimeError):
             raise
@@ -423,9 +533,11 @@ def restore(store: str, backup: str, home: Path | None = None, *, apply: bool = 
     Order: validate the backup, refuse if another process holds the state lock, copy the current
     bytes aside and verify the copy, write the backup beside the store, verify it, then replace
     atomically and read the installed file back. A failure before the replacement leaves the
-    store as it was; a failure after it is reported with ``store_unchanged`` false and the
-    preserved copy of the previous bytes. The plan is rebuilt under the lock, so what is
-    reported is what was installed."""
+    store as it was; a failure after it is reported as failed, with the preserved copy of the
+    previous bytes and ``store_unchanged``, which says what the store holds:
+    false when it differs from before, true when it is byte-for-byte what it was (a backup
+    identical to the current file), null when it cannot be read back to say. The plan is
+    rebuilt under the lock, so what is reported is what was installed."""
     if store not in STORES:
         return {"status": "refused", "reason": "unknown store"}
     d = _dir(home)
@@ -466,26 +578,41 @@ def _apply(d: Path, store: str, backup: str) -> dict[str, Any]:
     preserved = None
     try:
         if before is not None:
-            preserved = f"{RECOVERY_DIR}/{_preserve_raw(d, store, before)}"
-        tmp.unlink(missing_ok=True)
+            try:
+                preserved = f"{RECOVERY_DIR}/{_preserve_raw(d, store, before)}"
+            except _NotDurable as nd:
+                preserved = f"{RECOVERY_DIR}/{nd.backup_name}"  # created, though its entry is not durable
+                raise
+        with _anchored(d) as dfd:
+            _unlink_at(dfd, tmp)
         written = _write_new(tmp, raw)
-        if not os.path.samestat(written, os.lstat(tmp)):  # the name must still hold the verified bytes
-            raise OSError("the restore file was replaced before it was installed")
-        os.replace(tmp, target)
+        with _anchored(d) as dfd:
+            if not os.path.samestat(written, _lstat_at(dfd, tmp)):  # the name must still hold the verified bytes
+                raise OSError("the restore file was replaced before it was installed")
+            if dfd is None:
+                os.replace(tmp, target)
+            else:
+                os.replace(tmp.name, target.name, src_dir_fd=dfd, dst_dir_fd=dfd)
         _fsync_dir(d)
         installed, _st, why, _err = _read_file(target)
         if installed != raw:
             raise OSError("the installed file is not the verified backup")
     except BaseException as exc:  # noqa: BLE001 - report, never raise away the preserved reference
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
+            with _anchored(d) as dfd:
+                _unlink_at(dfd, tmp)
+        except (OSError, RuntimeError):
             pass
         if not isinstance(exc, Exception):
             raise
         try:
-            after, _ = _read_store(d, store)
-            unchanged: bool | None = after == before
+            after, after_why = _read_store(d, store)
+            if after_why is None:
+                unchanged: bool | None = after == before
+            elif after_why == "absent":
+                unchanged = before is None  # still absent, or gone since: either way known
+            else:
+                unchanged = None  # unreadable or unsafe now: the store cannot be compared, never "unchanged"
         except Exception:  # noqa: BLE001 - the reread failed too: say it is unknown, keep the rest
             unchanged = None
         return {"status": "failed", **plan, "error": type(exc).__name__, "preserved_current": preserved,
