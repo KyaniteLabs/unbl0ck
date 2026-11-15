@@ -645,5 +645,123 @@ class SearchFolderBudget(unittest.TestCase):
         self.assertEqual(stats.get("hidden_unread", 0), 0)
 
 
+class DesktopSearchExecuted(unittest.TestCase):
+    """Round 4: the page is run, not read. Click the button, render the answer, change the queue."""
+
+    PRELUDE = r"""
+let queueNow={items:[{source:'outside',id:'outside:filed:a',version:'v1',title:'Reply to Sam',ask:'x'},
+                     {source:'outside',id:'outside:filed:b',version:'v1',title:'Other',ask:'y'}],count:2,errors:[],at:1000};
+const refs=[];let rc=0;
+env.useRef=()=>{const i=rc++;return refs[i]||(refs[i]={current:0})};
+env.useValue=key=>key==='queue'?queueNow:key===env.$undo?undo:false;
+const render=ctx=>{cursor=0;rc=0;return Page({ctx,refresh})};
+const status=tree=>{const n=all(tree).find(n=>n?.props?.className==='ub-filter-status');return n?String(n.props.children):''};
+const typeQuery=(tree,v)=>all(tree).find(n=>n?.type==='input'&&n.props.type==='search').props.onChange({target:{value:v}});
+const reply=(matches,extra={})=>({matches,searched:{outside:2},not_searched:{},items_cut:0,errors:[],partial:false,
+  limits:{items_per_source:200,chars_per_item:20000},skipped_private:0,...extra});
+const shown=tree=>all(tree).filter(n=>n?.type===Item&&!n.props.hidden).length;
+"""
+
+    def run_views(self, script):
+        from tests.test_operator_recovery import HARNESS
+        for path in (ROOT / "desktop/src/plugin.src.js", ROOT / "desktop/plugin.js"):
+            with self.subTest(path=path.name):
+                r = subprocess.run(["node", "-e", HARNESS + self.PRELUDE + script, str(path)], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_the_button_asks_once_and_the_answer_is_rendered_with_its_coverage(self):
+        self.run_views(r"""
+let asked=[];
+const ctx={rest:async u=>{asked.push(u);return reply([{id:'outside:filed:b',version:'v1',source:'outside'}],{not_searched:{outside:30},partial:true})}};
+(async()=>{
+ typeQuery(render(ctx),'zzz');
+ assert.equal(asked.length,0,'typing must not search');
+ assert.equal(shown(render(ctx)),0);
+ await find(render(ctx),'Search full text').onClick();
+ assert.deepEqual(asked,['/search?q=zzz']);
+ const t=render(ctx);
+ assert.equal(shown(t),1,'only the matched card is shown');
+ const s=status(t);
+ assert.match(s,/2 outside/);assert.match(s,/30 outside not searched/);assert.match(s,/may be incomplete/);
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_a_match_for_another_version_does_not_show_the_card(self):
+        self.run_views(r"""
+const ctx={rest:async()=>reply([{id:'outside:filed:b',version:'OLD',source:'outside'}])};
+(async()=>{
+ typeQuery(render(ctx),'zzz');
+ await find(render(ctx),'Search full text').onClick();
+ const t=render(ctx);
+ assert.equal(shown(t),0,'a stale version never reveals the current card');
+ assert.match(status(t),/1 match\(es\) are not on a card loaded now/);
+ assert.match(status(t),/may be incomplete/);
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_a_refresh_after_the_search_says_to_search_again(self):
+        self.run_views(r"""
+const ctx={rest:async()=>reply([{id:'outside:filed:b',version:'v1',source:'outside'}])};
+(async()=>{
+ typeQuery(render(ctx),'zzz');
+ await find(render(ctx),'Search full text').onClick();
+ assert.doesNotMatch(status(render(ctx)),/refreshed/);
+ queueNow={...queueNow,at:2000};
+ assert.match(status(render(ctx)),/search again/);
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_a_late_answer_after_the_query_changed_is_dropped(self):
+        self.run_views(r"""
+let release;const ctx={rest:()=>new Promise(r=>{release=r})};
+(async()=>{
+ typeQuery(render(ctx),'zzz');
+ const pending=find(render(ctx),'Search full text').onClick();
+ typeQuery(render(ctx),'zzzz');
+ typeQuery(render(ctx),'zzz');  // same text again: only the generation tells the answers apart
+ release(reply([{id:'outside:filed:b',version:'v1',source:'outside'}]));
+ await pending;
+ const t=render(ctx);
+ assert.equal(shown(t),0,'the late answer must not reveal a card');
+ assert.doesNotMatch(status(t),/full text searched/);
+ assert.equal(find(t,'Search full text').disabled,false);
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+    def test_a_failed_search_shows_no_hits(self):
+        self.run_views(r"""
+const ctx={rest:async()=>{throw new Error('offline')}};
+(async()=>{
+ typeQuery(render(ctx),'zzz');
+ await find(render(ctx),'Search full text').onClick();
+ const t=render(ctx);
+ assert.equal(shown(t),0);
+ assert.ok(all(t).some(n=>typeof n==='string'&&n.includes('offline')));
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
+
+class SearchDocs(unittest.TestCase):
+    """Round 4: the guides say what search does, and the verification map matches the tests."""
+
+    def _flat(self, name):
+        return " ".join((ROOT / name).read_text().split())
+
+    def test_operator_guide_states_the_cap_per_source_and_what_the_page_shows(self):
+        g = self._flat("docs/operator-guide.md")
+        self.assertIn("at most 200 items per source", g)
+        self.assertNotIn("at most 200 items and", g)
+        self.assertIn("the page shows a match only on a card of the same id and version", g)
+        self.assertIn("Search only reads: it deletes, rewrites and creates nothing", g)
+
+    def test_verification_map_names_the_executed_search_tests_that_exist(self):
+        v = self._flat("docs/verification.md")
+        self.assertNotIn("are not yet written", v)
+        me = Path(__file__).read_text()
+        for name in ("SearchProfileBoundary", "SearchRealHome", "SearchFolderBudget", "DesktopSearchExecuted"):
+            self.assertIn(f"`{name}`", v)
+            self.assertIn(f"class {name}(", me)
+
+
 if __name__ == "__main__":
     unittest.main()

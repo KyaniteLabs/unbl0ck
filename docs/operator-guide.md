@@ -27,9 +27,14 @@ Done item hidden; changed content brings it back.
 
 The filter box searches titles and previews of the cards loaded in the window only; its
 status line says so. **Search full text** runs one bounded read of the stored text behind
-those cards (at most 200 items and 20,000 characters each) and lists matches with their
-source and version, plus what it did not cover: items past the cap, text cut at the limit,
-sources that failed, and password prompts, which are never read. It does not call your
+those cards (at most 200 items per source and 20,000 characters each). The card list then
+shows the cards that matched, and the status line gives the coverage in totals: what was
+searched, items past the cap, text cut at the limit, sources that failed, and password
+prompts, which are never read. (The search endpoint itself lists each match with its source
+and version; the page shows a match only on a card of the same id and version, counts the
+rest as not on a loaded card, and says to search again if the queue refreshed afterwards.)
+Search only reads: it deletes, rewrites and creates nothing, so expired Done records and
+stale waits are left for the queue to clean up. It does not call your
 model and does not repeat on its own.
 
 Search and source filtering use already loaded text. They preserve mounted answer

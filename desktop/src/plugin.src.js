@@ -1684,7 +1684,8 @@ function Page({ ctx, refresh, scope = '' }) {
     try {
       const d = await ctx.rest(`/search?q=${encodeURIComponent(asked)}`)
       if (searchGen.current !== gen) return
-      setFullHits({ ...d, query: asked })
+      // The answer is bound to the queue it was asked against: a later refresh makes it say so.
+      setFullHits({ ...d, query: asked, queueAt: q.at || 0 })
     } catch (e) {
       if (searchGen.current !== gen) return
       setFullHits(null)
@@ -1700,7 +1701,13 @@ function Page({ ctx, refresh, scope = '' }) {
     if (h.items_cut) parts.push(`${h.items_cut} long item(s) searched only to ${h.limits.chars_per_item} characters`)
     if (h.skipped_private) parts.push(`${h.skipped_private} password prompt(s) never searched`)
     for (const e of h.errors || []) parts.push(e)
-    return parts.join(' · ') + (h.partial ? ' · results may be incomplete' : '')
+    // A match is shown only on a card of the same id and version that is loaded now; say what is not.
+    const loaded = new Set(q.items.map(i => `${i.id}@${i.version}`))
+    const missing = (h.matches || []).filter(m => !loaded.has(`${m.id}@${m.version}`)).length
+    if (missing) parts.push(`${missing} match(es) are not on a card loaded now (changed or gone since the search)`)
+    const stale = (h.queueAt || 0) !== (q.at || 0)
+    if (stale) parts.push('the queue was refreshed after this search, so search again for current results')
+    return parts.join(' · ') + (h.partial || missing || stale ? ' · results may be incomplete' : '')
   }
   const oldest = oldestAskSince(q.items)
   const oldestH = oldest ? (Date.now() / 1000 - oldest) / 3600 : 0
