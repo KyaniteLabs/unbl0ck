@@ -59,9 +59,10 @@ def _hermes_identity() -> dict:
         for dist in ("hermes-agent", "hermes_agent", "hermes"):
             try:
                 found = metadata.version(dist)
-            except metadata.PackageNotFoundError:
+            except Exception:  # noqa: BLE001 - absent or malformed metadata is no identity
                 continue
-            if found.strip().lower() not in _PLACEHOLDERS:
+            # A distribution without a Version field answers None: that is no identity either.
+            if isinstance(found, str) and found.strip().lower() not in _PLACEHOLDERS:
                 version = found
                 break
     return {"hermes_version": version or "unknown", "hermes_release_date": date or "unknown"}

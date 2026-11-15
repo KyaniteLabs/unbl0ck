@@ -6,6 +6,7 @@ Kanban board isolate HERMES_KANBAN_HOME and HERMES_HOME in a temporary directory
 """
 
 import ast
+from datetime import datetime
 import importlib
 import json
 import os
@@ -263,6 +264,42 @@ class RuntimeIdentity(unittest.TestCase):
                 patch.object(script.metadata, "version", lambda dist: "2.3.4"):
             self.assertEqual(script._hermes_identity()["hermes_version"], "2.3.4")
 
+    def test_metadata_that_supplies_no_version_is_unknown_not_a_crash(self):
+        # importlib.metadata returns None when a distribution has no Version field.
+        script = load_script()
+        for value in (None, 7, b"1.0", ["1"]):
+            with self.subTest(value=value):
+                with patch.dict(sys.modules, {"hermes_cli": types.SimpleNamespace()}), \
+                        patch.object(script.metadata, "version", lambda dist, v=value: v):
+                    self.assertEqual(
+                        script._hermes_identity(),
+                        {"hermes_version": "unknown", "hermes_release_date": "unknown"},
+                    )
+
+    def test_one_bad_distribution_does_not_hide_a_later_good_one(self):
+        script = load_script()
+        answers = {"hermes-agent": None, "hermes_agent": "3.4.5"}
+
+        def version(dist):
+            if dist == "hermes":
+                raise ValueError("malformed metadata")
+            return answers[dist]
+
+        with patch.dict(sys.modules, {"hermes_cli": types.SimpleNamespace()}), \
+                patch.object(script.metadata, "version", version):
+            self.assertEqual(script._hermes_identity()["hermes_version"], "3.4.5")
+
+    def test_the_script_does_not_crash_on_versionless_metadata(self):
+        # Run the real script with the same failure injected into a real interpreter.
+        code = (
+            "import importlib.metadata as m, runpy;"
+            "m.version = lambda dist: None;"
+            "runpy.run_path(%r, run_name='__main__')" % str(ROOT / "scripts" / "host_compat.py")
+        )
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertNotIn("AttributeError", out.stderr)
+        self.assertIn('"hermes_version"', out.stdout)
+
     @unittest.skipUnless(HERMES, "Hermes is not importable here")
     def test_the_script_records_the_installed_hermes_runtime_version(self):
         out = subprocess.run(
@@ -289,13 +326,59 @@ class MatrixRowsAreIdentifiable(unittest.TestCase):
                 out.append([c.strip() for c in line.strip().strip("|").split("|")])
         return out
 
-    def test_a_passing_row_names_its_source_revision_hermes_revision_and_utc_time(self):
-        for receipt, host, revision, when, result in self.rows():
-            if result.lower().startswith("not run"):
-                continue
-            self.assertRegex(when, r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", receipt)
-            self.assertRegex(revision, r"source [0-9a-f]{7,40}", receipt)
-            self.assertRegex(revision, r"Hermes \S+", receipt)
+    REVISION = re.compile(
+        r"^source [0-9a-f]{7,40} / Hermes (?!(?:unknown|0\.0\.0|0|none)\b)\S+ \((\d{4}[.-]\d{1,2}[.-]\d{1,2})\)$"
+    )
+
+    @classmethod
+    def problems(cls, row):
+        """What stops a matrix row from being a passing, identifiable receipt (empty when none)."""
+        receipt, host, revision, when, result = row
+        found = []
+        if not cls.REVISION.match(revision):
+            found.append("revision must read 'source <sha> / Hermes <version> (<release date>)' with a real Hermes version")
+        try:
+            datetime.strptime(when, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            found.append("time must be a UTC timestamp")
+        if not re.match(r"^(pass|fail)\b", result.lower()):
+            found.append("result must say pass or fail")
+        return found
+
+    def test_the_validator_rejects_rows_that_miss_their_identity(self):
+        good = ["Source tests", "Linux", "source abcdef0 / Hermes 1.2.3 (2030.1.2)", "2030-01-02T03:04:05Z", "pass"]
+        self.assertEqual(self.problems(good), [])
+        bad_revisions = [
+            "source abcdef0 / Hermes unknown",  # no Hermes identity, no release date
+            "source abcdef0 / Hermes unknown (2030.1.2)",
+            "source abcdef0 / Hermes 0.0.0 (2030.1.2)",  # the placeholder is not an identity
+            "source abcdef0 / Hermes 1.2.3",  # no release date
+            "source abcdef0 / Hermes 1.2.3 (unknown)",
+            "source xyz / Hermes 1.2.3 (2030.1.2)",  # not a commit
+            "Hermes 1.2.3 (2030.1.2)",  # no source commit
+        ]
+        for revision in bad_revisions:
+            with self.subTest(revision=revision):
+                self.assertTrue(self.problems(good[:2] + [revision] + good[3:]))
+        for when in ("not recorded", "2030-01-02", "2030-01-02T03:04:05"):
+            with self.subTest(when=when):
+                self.assertTrue(self.problems(good[:3] + [when, "pass"]))
+        self.assertTrue(self.problems(good[:4] + ["not run"]))
+
+    def test_every_passing_row_in_the_shipped_table_is_identifiable(self):
+        rows = self.rows()
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(len(row), 5, row)
+            if row[4].lower().startswith("not run"):
+                # a row that was not run claims no identity at all
+                self.assertEqual(row[2:4], ["not recorded", "not recorded"], row[0])
+            else:
+                self.assertEqual(self.problems(row), [], row[0])
+
+    def test_the_docs_state_the_revision_format_the_validator_enforces(self):
+        text = " ".join((ROOT / "docs" / "verification.md").read_text().split())
+        self.assertIn("source <sha> / Hermes <version> (<release date>)", text)
 
     def test_the_source_row_is_not_claimed_without_a_run_record(self):
         rows = {r[0]: r for r in self.rows()}

@@ -107,6 +107,9 @@ prints one JSON record (UTC time, plugin version, Hermes runtime version and rel
 and exits 1 if an interface is missing. It reads no settings, chats, cards or credentials. A
 row is filled only from such a record plus the source commit that was tested: a row that cannot
 name the source commit, the Hermes version and release date, and the UTC time stays "not run".
+A filled row writes the revision column as `source <sha> / Hermes <version> (<release date>)`
+and the time as `YYYY-MM-DDTHH:MM:SSZ`; an `unknown` or `0.0.0` Hermes version is not an
+identity, so a host that reports one cannot fill a row.
 
 Interfaces taken from Hermes that are not documented plugin APIs are listed in
 `needs.HOST_API` (six of them are private helpers: four in `kanban_db`, two in the webhook
