@@ -138,7 +138,7 @@ class RealHermesRelease(unittest.TestCase):
                         top_level_txns += 1
                     with original_write_txn(conn, allow_nested=allow_nested):
                         yield conn
-                    if top_level and top_level_txns == 2 and not interleaved:
+                    if top_level and top_level_txns == 1 and not interleaved:  # the answer and release are one transaction
                         interleaved = True
                         with kanban_db_connect.connect(board="default") as other:
                             self.assertTrue(

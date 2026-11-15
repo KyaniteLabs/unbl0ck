@@ -2839,8 +2839,10 @@ def _unblock_task_at_version(
 
     Hermes' public helper owns its transaction, so calling it after a separate check leaves a
     race. Its transition rules are applied here with the same native helpers and SQL semantics.
+    Inside an open transaction (``answer_card``) this runs as a savepoint, so a failure here
+    undoes only the unblock and leaves the answer written before it.
     """
-    with kanban_db.write_txn(conn):
+    with kanban_db.write_txn(conn, allow_nested=True):
         current = kanban_db.get_task(conn, task_id)
         if current is None:
             raise LookupError(f"card {task_id} not found")
@@ -2849,8 +2851,8 @@ def _unblock_task_at_version(
         current_version = str(block.id if block else since)
         if current_version != version:
             raise StaleAnswer(
-                f"card {task_id} has a newer block; your answer was posted, but the new question "
-                "remains blocked; refresh to see it"
+                f"card {task_id} has a newer block; nothing was posted or released; "
+                "refresh to see the new question"
             )
 
         status = str(getattr(current.status, "value", current.status))
@@ -2896,6 +2898,52 @@ def _unblock_task_at_version(
         return True
 
 
+def _comments_since_block(
+    conn: Any, kanban_db: Any, task_id: str, since: int, block_id: int | None
+) -> list[tuple[str, str]]:
+    """``(author, body)`` of the comments made since the current block began, oldest first.
+
+    With the block's event id a comment counts when its ``commented`` event follows the block
+    (event ids keep their order within one second) or its time is strictly later; without it,
+    when it is at or after the block's second. Older blocks' comments never count."""
+    strict = block_id is not None
+    cut = (since or 0) + 1 if strict else (since or 0)
+    try:
+        rows = {
+            r[0]: (r[1], r[2])
+            for r in conn.execute(
+                "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+                (task_id, cut),
+            ).fetchall()
+        }
+        if strict:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
+                (task_id, block_id),
+            ).fetchone()[0]
+            if n:
+                for r in conn.execute(
+                    "SELECT id, author, body FROM task_comments WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (task_id, n),
+                ).fetchall():
+                    rows[r[0]] = (r[1], r[2])
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        comments = list(kanban_db.list_comments(conn, task_id))
+        keyed = [(getattr(c, "id", None) or i, c) for i, c in enumerate(comments, 1)]
+        rows = {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
+        if strict:
+            n = sum(
+                1
+                for e in kanban_db.list_events(conn, task_id)
+                if getattr(e, "kind", None) == "commented"
+                and int(getattr(e, "id", 0) or 0) > block_id
+            )
+            for k, c in keyed[len(keyed) - n :] if n else []:
+                rows[k] = (c.author, c.body)
+    return [rows[k] for k in sorted(rows)]
+
+
 def answer_card(
     board: str,
     task_id: str,
@@ -2909,10 +2957,12 @@ def answer_card(
 
     *version* is the queue item's version the human read (the block event id). It is required to
     release; an answer is refused if the card has been blocked again since, so an answer to an old
-    question never releases a new one. The answer is posted first, so a resumed worker sees it;
-    Hermes owns the unblock transaction. A failed unblock is remembered, and a retry releases
-    without posting the answer twice. Triage cards (``block_loop_detected``) accept
-    the answer but cannot be released here.
+    question never releases a new one. The answer and the release are one write transaction: a
+    refused answer (stale version) leaves no comment behind, and a resumed worker always sees the
+    answer. A release that fails after the answer is written (it returns false or raises) is
+    remembered, and a retry releases without posting the answer twice; the marker is reserved
+    before anything is written, so a lock held by another writer cannot lose it. Triage cards
+    (``block_loop_detected``) accept the answer but cannot be released here.
     """
     board = str(board or "").strip()
     task_id = str(task_id or "").strip()
@@ -2926,86 +2976,137 @@ def answer_card(
         raise ValueError("answer text is required")
     if release and version is None:
         raise ValueError("queue version is required to release a card")
+    pending: dict[str, str] = {}
     if release:
         # Check recovery state before posting or releasing, so a damaged record cannot
         # turn a successful action into a late, misleading failure or be overwritten.
-        load_pending_releases(home, strict=True)
+        pending = load_pending_releases(home, strict=True)
     settings, settings_error = _settings_state()
     if settings_error:
         raise RuntimeError("could not read plugin settings; repair them before answering")
     author = principal_author(settings)
     item_id = f"kanban:{board}:{task_id}"
+    version_s = str(version) if version is not None else None
     comment_id: int | None = None
     post_answer = False
-    with closing(kbc.connect(board=board)) as conn:
-        if kanban_db.get_task(conn, task_id) is None:
-            raise LookupError(f"card {task_id} not found on {board}")
-        with kanban_db.write_txn(conn, allow_nested=True):
-            # Re-read inside the write transaction: a concurrent unblock or answer must not
-            # slip between the check and the comment.
-            current = kanban_db.get_task(conn, task_id)
-            if current is None:
+    marker_reserved = False  # the recovery marker for this block is recorded
+    marker_ours = False  # ... and this call recorded it (a refused call removes only its own)
+    marker_full = False
+    if release:
+        # Reserve the failed-release marker BEFORE anything is written: a marker that cannot
+        # be stored after the answer was posted would leave an answered card with no recovery
+        # state. A full store is not a reason to refuse the answer; it is reported afterwards.
+        if pending.get(item_id) == version_s:
+            marker_reserved = True
+        else:
+            try:
+                _set_pending_release(item_id, version_s, home)
+                marker_reserved = marker_ours = True
+            except PendingReleaseFull:
+                marker_full = True
+    released = False
+    release_failed = False
+    release_error: BaseException | None = None
+    committed = False
+    try:
+        with closing(kbc.connect(board=board)) as conn:
+            if kanban_db.get_task(conn, task_id) is None:
                 raise LookupError(f"card {task_id} not found on {board}")
-            check_answerable(task_id, current.status, release=release)
-            block = _latest_block(conn, kanban_db, task_id)
-            since = _block_since(block, current)
-            current_version = str(block.id if block else since)
-            if version is not None and str(version) != current_version:
-                raise StaleAnswer(
-                    f"card {task_id} was blocked again after you read it; refresh to see the new question"
-                )
-            # The same "answered since this block" test the queue uses.
-            already_answered = _answered_since(
-                conn, kanban_db, task_id, author, since, block.id if block else None
-            )
-            if already_answered:
-                if not release:
-                    raise RuntimeError(
-                        f"card {task_id} was already answered since it was blocked"
+            with kanban_db.write_txn(conn):
+                # Re-read inside the write transaction: a concurrent unblock or answer must not
+                # slip between the check and the comment, and the release below runs in this same
+                # transaction so a newer block cannot slip in between the comment and the release.
+                current = kanban_db.get_task(conn, task_id)
+                if current is None:
+                    raise LookupError(f"card {task_id} not found on {board}")
+                check_answerable(task_id, current.status, release=release)
+                block = _latest_block(conn, kanban_db, task_id)
+                since = _block_since(block, current)
+                current_version = str(block.id if block else since)
+                if version is not None and str(version) != current_version:
+                    raise StaleAnswer(
+                        f"card {task_id} was blocked again after you read it; nothing was posted "
+                        "or released; refresh to see the new question"
                     )
-                if text:
-                    prior = kanban_db.list_comments(conn, task_id)
-                    post_answer = not any(
-                        str(getattr(c, "author", "")).casefold() == author.casefold()
-                        and str(getattr(c, "body", "")).strip() == text
-                        for c in prior
-                    )
-            elif not text:
-                raise ValueError("answer text is required")
-            else:
-                post_answer = True
-            # Post before releasing so a resumed worker always sees the answer. A retry after a
-            # failed release finds this comment and does not post it again.
-            if post_answer:
-                comment_id = kanban_db.add_comment(
-                    conn, task_id, author=author, body=text
+                # The same "answered since this block" test the queue uses.
+                already_answered = _answered_since(
+                    conn, kanban_db, task_id, author, since, block.id if block else None
                 )
-        released = False
-        if release:
-            release_failed = False
-            if _unblock_task_at_version(conn, kanban_db, task_id, current_version):
-                released = True
-            else:
-                latest = kanban_db.get_task(conn, task_id)
-                if (
-                    latest is None
-                    or str(getattr(latest.status, "value", latest.status))
-                    in HELD_STATUSES
-                ):
-                    release_failed = True
+                if already_answered:
+                    if not release:
+                        raise RuntimeError(
+                            f"card {task_id} was already answered since it was blocked"
+                        )
+                    if text:
+                        # Only this block's comments: an earlier block's identical answer
+                        # is not this block's answer.
+                        prior = _comments_since_block(
+                            conn, kanban_db, task_id, since, block.id if block else None
+                        )
+                        post_answer = not any(
+                            str(a or "").casefold() == author.casefold()
+                            and str(b or "").strip() == text
+                            for a, b in prior
+                        )
+                elif not text:
+                    raise ValueError("answer text is required")
                 else:
-                    released = (
-                        True  # another actor released it; do not claim it was ours
+                    post_answer = True
+                # Post before releasing so a resumed worker always sees the answer. A retry after
+                # a failed release finds this comment and does not post it again.
+                if post_answer:
+                    comment_id = kanban_db.add_comment(
+                        conn, task_id, author=author, body=text
                     )
-            if release_failed:
-                try:
-                    _set_pending_release(item_id, current_version, home)
-                except PendingReleaseFull:
-                    # Say so: the retry the queue would offer does not exist for this card.
-                    raise UnblockFailed(task_id, comment_id, marker_full=True) from None
-                raise UnblockFailed(task_id, comment_id)
-            # Only this block's own marker: one recorded for a newer block stays.
-            _set_pending_release(item_id, None, home, expected=current_version)
+                if release:
+                    try:
+                        if _unblock_task_at_version(conn, kanban_db, task_id, current_version):
+                            released = True
+                        else:
+                            latest = kanban_db.get_task(conn, task_id)
+                            if (
+                                latest is None
+                                or str(getattr(latest.status, "value", latest.status))
+                                in HELD_STATUSES
+                            ):
+                                release_failed = True
+                            else:
+                                released = True  # another actor released it; not ours to claim
+                    except (StaleAnswer, LookupError):
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - reconciled like a false return
+                        # The unblock ran as a savepoint: only it is undone; the answer stays.
+                        release_failed = True
+                        release_error = exc
+                        log.warning(
+                            "unbl0ck: releasing %s failed after the answer was written: %s: %s",
+                            task_id,
+                            type(exc).__name__,
+                            exc,
+                        )
+            committed = True
+    finally:
+        if not committed and marker_ours:
+            # Nothing was written (stale, refused, unreadable): drop the marker reserved for it.
+            try:
+                _set_pending_release(item_id, None, home, expected=version_s)
+            except Exception:  # noqa: BLE001 - an inert marker (no answer exists) is harmless
+                log.warning("unbl0ck: could not remove an unused recovery marker for %s", item_id)
+    if release_failed:
+        raise UnblockFailed(
+            task_id, comment_id, marker_full=marker_full and not marker_reserved
+        ) from release_error
+    if release and marker_reserved:
+        # Only this block's own marker: one recorded for a newer block stays. The card is
+        # released; failing to tidy the marker must not turn that into a failed request.
+        try:
+            _set_pending_release(item_id, None, home, expected=version_s)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "unbl0ck: released %s but could not clear its recovery marker",
+                item_id,
+                exc_info=True,
+            )
     return {"ok": True, "comment_id": comment_id, "released": released}
 
 

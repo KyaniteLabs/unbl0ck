@@ -74,7 +74,7 @@ as private. Settings and source files remain owned by their original application
 | State | Lifetime and ownership |
 | --- | --- |
 | `hidden.json` | Version-specific hides, capped at 1,000 (the oldest dismissal goes first); a hide for a version older than the card's current one is refused; shared by local operator surfaces |
-| `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one |
+| `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is always recoverable |
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; shared across profiles |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
 | `bluf.json` | Summary cache capped at 2,000, bound to the item version and to a hash of its title, text, owner and comment count (an edit or a new comment is summarized again); failed-source entries retained subject to cap |
@@ -82,6 +82,10 @@ as private. Settings and source files remain owned by their original application
 | Summary/Ask jobs | Process memory; restart loses pending work and results |
 | Answer drafts | Desktop session memory, 100 entries, 30 minutes after last edit; original question version retained |
 | Display preferences | Effects and sound only, in Desktop localStorage |
+
+An answer with release is one Kanban write transaction: a stale version is refused (409) with no comment
+written, and a release that fails after the answer is written (false or an error) leaves the comment and a
+recovery marker for the retry. Duplicate detection looks only at comments made since the current block.
 
 Shared read-modify-write stores for hidden, summary, pending-release and filed state
 use thread locks and atomic replacement. macOS/Linux additionally use `fcntl`
