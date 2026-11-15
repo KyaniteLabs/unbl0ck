@@ -5681,13 +5681,35 @@ POCKET_TOTAL_PROMPT_CHARS = 20000  # all prompts in one pack
 # source could not be read: some say a listing was cut at its limit, and some are about cleanup or
 # stored state. Only a read failure is an "unread source".
 _READ_SOURCES = ("kanban", "chat", "prompt", "pairing", "outside")
-_CAPACITY_NOTICES = ("agent-filed items are waiting (limit",)  # every record was read
-_LISTING_CUT_NOTICES = (  # records exist that the list does not show
-    "folder limit, showing the newest",
-    "filed entries; only the first",
-    "hidden files are not listed",
+
+# Each notice is matched as a whole message built from its own template. A file name or an exception
+# message can contain any of these words, so a substring match would turn a failed read into a
+# "cleanup" notice and an empty pack would claim to be complete.
+def _notice(*patterns: str) -> tuple[re.Pattern[str], ...]:
+    return tuple(re.compile(p, re.DOTALL) for p in patterns)
+
+
+_CAPACITY_NOTICES = _notice(  # every record was read
+    r"outside: \d+ agent-filed items are waiting \(limit \d+\); agents cannot file more until you finish some",
 )
-_STATE_NOTICES = ("could not remove", "retention cleanup", "invalid done_at")
+_LISTING_CUT_NOTICES = _notice(  # records exist that the list does not show
+    r"outside: .*: folder limit, showing the newest \d+; \d+ older files are waiting\. "
+    r"Finish or hide items to bring them into view",
+    r"outside: more than \d+ filed entries; only the first \d+ are read",
+    r"outside: \d+ hidden files are not listed \(at most the newest \d+ per folder are shown\)",
+)
+_STATE_NOTICES = _notice(
+    r"outside: could not remove \d+ expired done record\(s\); their text stays until a later cleanup succeeds",
+    r"outside: retention cleanup stopped early; some filed records were not checked",
+    r"outside: retention cleanup failed: \w+",
+    r"outside: retention cleanup did not run: \w+; it retries on the next poll",
+    r"outside: .*: invalid done_at; kept for repair",
+    r"prompt: .*: \w+; could not remove stale record",
+)
+
+
+def _is_notice(text: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
+    return any(p.fullmatch(text) for p in patterns)
 
 
 def unread_sources(errors: list[str] | None) -> int:
@@ -5700,7 +5722,7 @@ def unread_sources(errors: list[str] | None) -> int:
         head = text.split(":", 1)[0]
         if head.split("[", 1)[0] not in _READ_SOURCES:
             continue
-        if any(m in text for m in _CAPACITY_NOTICES + _LISTING_CUT_NOTICES + _STATE_NOTICES):
+        if _is_notice(text, _CAPACITY_NOTICES + _LISTING_CUT_NOTICES + _STATE_NOTICES):
             continue
         sources.add(head)
     return len(sources)
@@ -5708,7 +5730,7 @@ def unread_sources(errors: list[str] | None) -> int:
 
 def listing_cut(errors: list[str] | None) -> bool:
     """True when a source says some of its records are not in the list."""
-    return any(m in str(e) for e in errors or () for m in _LISTING_CUT_NOTICES)
+    return any(_is_notice(str(e), _LISTING_CUT_NOTICES) for e in errors or ())
 
 
 def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
