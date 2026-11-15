@@ -140,6 +140,14 @@ def bluf_enabled(settings: dict[str, Any] | None = None) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def answer_version_required(settings: dict[str, Any] | None = None) -> bool:
+    """Whether Kanban answers must carry the queue version (``require_answer_version``)."""
+    raw = (settings if settings is not None else _settings()).get(
+        "require_answer_version", False
+    )
+    return raw if isinstance(raw, bool) else str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def ask_enabled(settings: dict[str, Any] | None = None) -> bool:
     """The in-panel Ask feature (off only when the setting is explicitly false)."""
     raw = (settings if settings is not None else _settings()).get("ask_enabled", True)
@@ -351,7 +359,7 @@ _HIDDEN_KEEP = 1000
 
 def hide(item_id: str, version: str, home: Path | None = None) -> None:
     item_id, version = str(item_id or ""), str(version or "")
-    if not item_id or len(item_id) > 300 or len(version) > 200:
+    if not item_id or len(item_id) > 300 or len(version) > 300:
         raise ValueError("item id and version must be short strings")
     with _state_lock(home):
         hidden = load_hidden(home, strict=True)
@@ -2398,7 +2406,13 @@ def answer_card(
                 _set_pending_release(item_id, current_version, home)
                 raise UnblockFailed(task_id, comment_id)
             _set_pending_release(item_id, None, home)
-    return {"ok": True, "comment_id": comment_id, "released": released}
+    return {
+        "ok": True,
+        "comment_id": comment_id,
+        "released": released,
+        "version": current_version,
+        "versioned": version is not None,
+    }
 
 
 # --- Card context (read-only) ---------------------------------------------------------------

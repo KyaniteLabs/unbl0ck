@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Answers carry an explicit version precondition and every route bounds identifiers (#41).** `POST /kanban/answer` now reports the block `version` it applied and whether the caller sent one (`versioned`). Unversioned comment-only answers keep working but get a `Warning` header; the new `require_answer_version` setting (off by default) turns them into a 428 before anything is written. An empty version is a 400. `/card`, `/hide`, `/unhide`, `/outside/done` and the answer route share one 300-character, no-control-character limit, and a malformed, non-Kanban or conflicting card id is a 400 rather than a silent retarget. Stale and retried answers never duplicate a comment or release a newer block.
 - **Full text shows the whole chat message or live prompt (#32).** Polling still carries a 480-character tail, now labelled; opening Full text reads the complete record (up to 20,000 characters) for that version via `GET /source/text`. Stale, missing and unreadable sources report errors with retry; password prompts are never expanded and nothing is sent to a model.
 
 ## 0.5.1 (2026-11-14)

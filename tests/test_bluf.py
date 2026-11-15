@@ -35,6 +35,7 @@ class BlufTest(unittest.TestCase):
                 self.status_code, self.detail = status_code, detail
 
         fastapi.HTTPException = HTTPException
+        fastapi.Response = type("Response", (), {})
         pydantic = types.ModuleType("pydantic")
         pydantic.BaseModel = type("BaseModel", (), {})
         pydantic.Field = lambda *a, **k: None
@@ -221,6 +222,7 @@ class BlufTest(unittest.TestCase):
         fastapi = types.ModuleType("fastapi")
         fastapi.APIRouter = Router
         fastapi.HTTPException = type("HTTPException", (Exception,), {})
+        fastapi.Response = type("Response", (), {})
         pydantic = types.ModuleType("pydantic")
         pydantic.BaseModel = type("BaseModel", (), {})
         pydantic.Field = lambda *a, **k: None

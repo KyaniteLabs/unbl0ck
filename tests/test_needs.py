@@ -547,7 +547,7 @@ class FakeKanban(unittest.TestCase):
 
     def test_answer_and_release(self):
         r = needs.answer_card("factory", "t_1", "Go with A", release=True, version="11")
-        self.assertEqual(r, {"ok": True, "comment_id": 7, "released": True})
+        self.assertEqual(r, {"ok": True, "comment_id": 7, "released": True, "version": "11", "versioned": True})
         self.assertEqual(
             self.calls, [("comment", "t_1", "ada", "Go with A"), ("unblock", "t_1")]
         )
@@ -632,7 +632,7 @@ class FakeKanban(unittest.TestCase):
             needs.answer_card("factory", "t_1", "Go", release=False)
         self.release_behavior = lambda *args: True
         r = needs.answer_card("factory", "t_1", "Go", release=True, version="11")
-        self.assertEqual(r, {"ok": True, "comment_id": None, "released": True})
+        self.assertEqual(r, {"ok": True, "comment_id": None, "released": True, "version": "11", "versioned": True})
         self.assertEqual([c[0] for c in self.calls], ["comment", "unblock", "unblock"])
         self.assertEqual(needs.load_pending_releases(), {})
         kdb.list_tasks = (
@@ -660,7 +660,7 @@ class FakeKanban(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             needs.answer_card("factory", "t_1", "again", release=False)
         r = needs.answer_card("factory", "t_1", "", release=True, version="11")
-        self.assertEqual(r, {"ok": True, "comment_id": None, "released": True})
+        self.assertEqual(r, {"ok": True, "comment_id": None, "released": True, "version": "11", "versioned": True})
         self.assertEqual([c[0] for c in self.calls], ["comment", "unblock"])
 
     def test_release_with_updated_answer_posts_it_on_an_already_answered_card(self):

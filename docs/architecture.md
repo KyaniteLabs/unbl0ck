@@ -54,8 +54,8 @@ control and are not a standalone public API.
 | `POST /card/ask` | Validated question history; returns a job ID immediately or an explicit admission error |
 | `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502 |
 | `GET /card/ask/{job}?poll=true` | Same job, with terminal model failures encoded as `{ok:false,detail}` for the client |
-| `POST /kanban/answer` | Versioned native comment and optional release; settings uncertainty prevents writes |
-| `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID |
+| `POST /kanban/answer` | Versioned native comment and optional release; stale version 409 with no comment or release; empty version 400; unversioned comment-only answers still work for older callers (response `versioned:false`, `Warning: 299` header) unless `require_answer_version` is on (428, nothing written); the response reports the block `version` applied; settings uncertainty prevents writes |
+| `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID. Identifiers (and `board`/`task_id` on `/card`, `/kanban/answer`, `/outside/done`) are limited to 300 characters with no control characters (400); a malformed or non-Kanban `id`, or one that disagrees with `board`/`task_id`, is rejected instead of retargeted |
 | `POST /outside/done` | Delete a filed record or hide a folder item version |
 | `GET /pack`, `POST /pack` | Read pack representation, or explicitly write it |
 

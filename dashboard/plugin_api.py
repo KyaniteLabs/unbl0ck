@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -133,21 +133,45 @@ class CardAsk(BaseModel):
         return msgs
 
 
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_OTHER_SOURCES = ("chat:", "prompt:", "pairing:", "outside:")
+
+
+def _bounded(**fields: str) -> None:
+    """Reject over-long or control-character identifiers; never truncate or retarget them."""
+    for name, value in fields.items():
+        if len(value) > MAX_ID:
+            raise HTTPException(status_code=400, detail=f"{name} is over {MAX_ID} characters")
+        if _CONTROL.search(value):
+            raise HTTPException(status_code=400, detail=f"{name} contains control characters")
+
+
 def _card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
-    """Accept either the queue id (``kanban:<board>:<task>``) or board + task_id."""
+    """Accept either the queue id (``kanban:<board>:<task>``) or board + task_id.
+
+    An id and explicit fields must agree; a malformed or non-Kanban id is an error rather
+    than a silent fallback to other fields (which could target a different card).
+    """
     if id_:
+        if id_.startswith(_OTHER_SOURCES):
+            raise HTTPException(status_code=400, detail="id is not a Kanban card")
         if id_.startswith("kanban:"):
             parts = id_.split(":", 2)
-            if len(parts) == 3:
-                return parts[1], parts[2]
-        elif not task_id:
-            task_id = id_
+            if len(parts) != 3 or not parts[1] or not parts[2]:
+                raise HTTPException(status_code=400, detail="malformed Kanban card id")
+            if (board and board != parts[1]) or (task_id and task_id != parts[2]):
+                raise HTTPException(status_code=400, detail="id conflicts with board/task_id")
+            return parts[1], parts[2]
+        if task_id and task_id != id_:
+            raise HTTPException(status_code=400, detail="id conflicts with task_id")
+        task_id = id_
     return board, task_id
 
 
 def _checked_card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
     from hermes_cli import kanban_db  # type: ignore
 
+    _bounded(id=id_, board=board, task_id=task_id)
     board, task_id = _card_ref(id_, board, task_id)
     board = str(board or "").strip()
     task_id = str(task_id or "").strip()
@@ -255,7 +279,7 @@ def card(id: str = "", board: str = "", task_id: str = ""):
 
 @router.get("/outside/text")
 def outside_text(id: str = "", version: str = ""):
-    if len(id) > MAX_ID or not id.startswith("outside:") or len(version) > MAX_ID:
+    if len(id) > MAX_ID or not id.startswith("outside:") or len(version) > MAX_ID or _CONTROL.search(id + version):
         raise HTTPException(status_code=400, detail="invalid outside item reference")
     items = _needs().outside_items()
     item = next((candidate for candidate in items if candidate.get("id") == id), None)
@@ -382,10 +406,25 @@ def card_ask_result(job: str, poll: bool = False):
     return {k: st[k] for k in ("ok", "reply", "provider", "model")}
 
 
+UNVERSIONED_WARNING = (
+    '299 unbl0ck "answers without version are deprecated; send the queue item version"'
+)
+
+
 @router.post("/kanban/answer")
-def answer(body: Answer):
+def answer(body: Answer, response: Response):
     from hermes_cli import kanban_db  # type: ignore
 
+    _bounded(board=body.board, task_id=body.task_id)
+    if body.version is not None:
+        _bounded(version=body.version)
+        if not body.version.strip():
+            raise HTTPException(status_code=400, detail="version must not be empty; omit it or send the queue version")
+    elif getattr(_needs(), "answer_version_required", lambda: False)():
+        raise HTTPException(
+            status_code=428,
+            detail="this installation requires the queue item version with every answer",
+        )
     try:
         board = _needs().normalize_board_slug(body.board)
     except ValueError as exc:
@@ -393,17 +432,24 @@ def answer(body: Answer):
     if not kanban_db.board_exists(board):
         raise HTTPException(status_code=404, detail=f"board {board!r} does not exist")
     try:
-        return _needs().answer_card(board, body.task_id, body.text, release=body.release, version=body.version)
+        result = _needs().answer_card(board, body.task_id, body.text, release=body.release, version=body.version)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    if body.version is None:
+        # Legacy caller: accepted against the card's current block, and told how to migrate.
+        response.headers["Warning"] = UNVERSIONED_WARNING
+    if isinstance(result, dict):
+        result.setdefault("versioned", body.version is not None)
+    return result
 
 
 @router.post("/hide")
 def hide(body: Hide):
+    _bounded(id=body.id, version=body.version)
     try:
         _needs().hide(body.id, body.version)
     except ValueError as exc:
@@ -417,6 +463,7 @@ def hide(body: Hide):
 
 @router.post("/outside/done")
 def outside_done(body: Hide):
+    _bounded(id=body.id, version=body.version)
     try:
         return _needs().done_outside(body.id, body.version)
     except ValueError as exc:
@@ -435,6 +482,7 @@ class Unhide(BaseModel):
 
 @router.post("/unhide")
 def unhide(body: Unhide):
+    _bounded(id=body.id)
     try:
         return {"ok": True, "restored": _needs().unhide(body.id)}
     except TimeoutError:
