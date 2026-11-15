@@ -98,7 +98,7 @@ reused, not represented as a new rendered run. The
 
 The rendered harness exercises host SDK contracts, not a complete packaged Electron
 application. Live external chat providers, production mail applications, real model
-providers, Windows cross-process concurrency, and every Hermes version are not covered
+providers, Windows cross-process concurrency (the lock is only simulated), and every Hermes version are not covered
 by these results. Use the actual supported host for release acceptance.
 
 The Security bridge is built and locally tested but not activated. At this observation

@@ -230,8 +230,8 @@ Stores: `hidden`, `pending-release`, `bluf`. Pass `--home DIR` to name the Herme
 Consequences to expect: everything changed after the backup was made is lost (dismissals,
 pending releases, summaries). The tool never creates defaults for a record it cannot read,
 and it never clears a lock. If it reports `writer_active`, wait for the other process or
-stop it in its owning installation, then run it again. On Windows there is no
-cross-process lock to check, so `--apply` is refused; dry runs and `preserve` still work.
+stop it in its owning installation, then run it again. On Windows this tool does not
+yet probe the state lock, so `--apply` is refused until that is verified on a real host; dry runs and `preserve` still work.
 Per-record files (`outside/`, `waits/`, `ask/`) are not covered: a corrupt record there is
 skipped on its own and does not block the others.
 

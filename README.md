@@ -93,7 +93,7 @@ The things you would want to know before installing:
 
 ## Platform limits
 
-State files (`hidden.json`, `bluf.json`, `pending-release.json`) are guarded by a thread lock everywhere and by an `fcntl` file lock on macOS and Linux. **Windows has no cross-process lock**: two processes writing at once there can lose an update. On macOS and Linux a lock held longer than 5 seconds raises `TimeoutError` instead of hanging.
+State files (`hidden.json`, `bluf.json`, `pending-release.json`) are guarded by a thread lock everywhere and by a cross-process file lock: `fcntl` on macOS and Linux (tested with real concurrent processes) and a byte-range lock on Windows (**implemented but not yet run on a real Windows host**, so treat Windows as unverified and keep to one writer until it is). A lock held longer than 5 seconds raises `TimeoutError` instead of hanging.
 
 ## Develop
 

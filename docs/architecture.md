@@ -120,10 +120,20 @@ as private. Settings and source files remain owned by their original application
 | Display preferences | Effects and sound only, in Desktop localStorage |
 
 Shared read-modify-write stores for hidden, summary, pending-release and filed state
-use thread locks and atomic replacement. macOS/Linux additionally use `fcntl`
-cross-process locking with a five-second timeout. Live prompt files and Pocket pack
-use per-file atomic replacement without those shared-store locks. Windows lacks that
-cross-process guarantee. Never repair corruption by silently replacing it with defaults.
+use thread locks and atomic replacement, plus one cross-process lock on
+`plugin-data/unbl0ck/.state.lock` with a five-second timeout (`needs.state_lock_mode()`
+names which one applies):
+
+| OS | Lock | Evidence |
+| --- | --- | --- |
+| macOS, Linux | `fcntl.flock`, released by the OS if the holder dies | real multi-process test in the suite (`tests/test_state_lock_platforms.py`) |
+| Windows | byte-range lock (`msvcrt.locking`) on the first byte of the same file, released by the OS if the holder dies | logic tested against a simulated lock only; **no run on a real Windows host yet** |
+| Any other platform without either module | thread lock only; run a single writer | none |
+
+The lock file is never deleted, so an active lock is never removed. A busy lock raises
+`TimeoutError` after the timeout instead of hanging. Live prompt files and Pocket pack use
+per-file atomic replacement without those shared-store locks. Never repair corruption by
+silently replacing it with defaults.
 
 Summary admission is bounded to two workers; Ask admission to four. Failed submission
 must release its slot and settle/remove its pending job. Settled Ask eviction follows

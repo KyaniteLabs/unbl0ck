@@ -44,6 +44,10 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows: the process-local lock still applies
     fcntl = None  # type: ignore[assignment]
+try:
+    import msvcrt  # Windows only
+except ImportError:  # pragma: no cover - macOS and Linux use fcntl
+    msvcrt = None  # type: ignore[assignment]
 import threading
 import time
 from collections.abc import Iterable
@@ -324,6 +328,7 @@ def _state_lock(home: Path | None):
     try:
         d = data_dir(home)
         fd = os.open(d / ".state.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        locked_with_msvcrt = False
         try:
             if fcntl is not None:
                 while True:
@@ -336,11 +341,44 @@ def _state_lock(home: Path | None):
                                 "unbl0ck: state lock busy (another process holds it)"
                             )
                         time.sleep(0.02)
+            elif msvcrt is not None:
+                # Windows: a byte-range lock on the first byte of the lock file. The OS drops it
+                # when the process ends, so a crashed writer never strands it and the file is
+                # never deleted. Locking past the end of a file is allowed, so it needs no content.
+                while True:
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        locked_with_msvcrt = True
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "unbl0ck: state lock busy (another process holds it)"
+                            )
+                        time.sleep(0.02)
             yield
         finally:
+            if locked_with_msvcrt:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass  # closing the descriptor releases it anyway
             os.close(fd)  # closing the descriptor drops the flock
     finally:
         _STATE_LOCK.release()
+
+
+def state_lock_mode() -> str:
+    """How the shared state files are guarded across processes on this machine:
+    ``flock`` (macOS, Linux), ``msvcrt`` (Windows) or ``thread-only`` (neither is available, so
+    a second process can lose an update; run a single writer)."""
+    if fcntl is not None:
+        return "flock"
+    if msvcrt is not None:
+        return "msvcrt"
+    return "thread-only"
 
 
 def _read_json(p: Path, *, errors: list[str] | None = None, source: str = "state", strict: bool = False) -> dict[str, Any]:

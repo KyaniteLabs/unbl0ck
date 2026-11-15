@@ -61,6 +61,6 @@ Security review can satisfy review acceptance without claiming the relay is live
 > verification guides explain recovery steps and limits.
 
 Retain the documented limits: drafts are session-only; watched folders select the
-newest 200 eligible files; Windows has no cross-process state lock; and private Hermes
+newest 200 eligible files; the Windows cross-process state lock has not been run on a real Windows host; and private Hermes
 imports require revalidation on upgrades. Do not describe the finite audit as proof
 that every environment or quality-of-life possibility has been exhausted.
