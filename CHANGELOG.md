@@ -128,6 +128,7 @@
 - **Ask redacts one-time codes (round 5).** A digit-only value under an `otp`, `pin`, `passcode`, `bearer`, session id or signing key name (`otp=123456`, `"pin": 1234`) is redacted from the Ask context. The words in prose ("pin the version"), short counts and longer names (`pin_count=3`) are left alone.
 - **A closed Desktop connection no longer changes the Undo list (round 6).** A "Not for me" or Done that finishes after its connection was closed adds no Undo entry, so it cannot push out one of the current connection's five.
 - **Ask redacts one-time codes in every form, and hidden HTML stays hidden (round 6).** A code named by a name/value pair (`{"name": "otp", "value": 123456}`) or held in a YAML block is redacted like `otp=123456`. Scripts and styles inside a hidden element never reach the card, and an inline `display` value the converter does not know no longer shows `hidden` text without a note.
+- **Live-prompt hook failures stay reported until they settle (round 6).** Each dropped fault stays attributed to the agent process that holds it, so another process exiting no longer hides it; it stops being reported once that prompt is recorded or cleared; and an unreadable `wait-faults.json` is now a queue error rather than an empty list.
 
 ## 0.5.1 (2026-11-14)
 

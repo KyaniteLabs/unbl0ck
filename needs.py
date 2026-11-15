@@ -2679,6 +2679,11 @@ def _proc_start(pid: int) -> str | None:
     return out or None
 
 
+def _valid_pid(v: Any) -> int | None:
+    """A process id ``os.kill`` accepts (1 to 2**31-1), or None."""
+    return v if isinstance(v, int) and not isinstance(v, bool) and 0 < v < 2**31 else None
+
+
 def _alive(pid: int, start: str | None) -> bool:
     try:
         os.kill(pid, 0)
@@ -2706,28 +2711,26 @@ WAIT_FAULT_LIMIT = 50
 # (home, request id) -> (what failed, the record to write). The hooks run in the agent; when a
 # write or removal fails there, polling in the same process retries it and says so until it works.
 _WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
-# Faults dropped because the list was full, per home: never retried, so reported, not forgotten.
-_WAIT_FAULTS_LOST: dict[str, int] = {}
+# Request ids dropped because the list was full, per home: never retried, so reported until
+# the prompt settles. Ids only, never the prompt.
+_WAIT_FAULTS_LOST: dict[str, set[str]] = {}
 # Hooks and polls in one process settle a prompt one at a time: a retry in flight must not
 # recreate a record that a clear has just removed.
 _WAIT_FAULT_LOCK = threading.RLock()
-_FAULT_LOST_KEY = "+lost"  # not a request id, so it never collides with one
 
 
 def _fault_path(home: Path) -> Path:
     return data_dir(home) / "wait-faults.json"
 
 
-def _journal_fault(
-    home: Path, rid: str, what: str | None, *, lost: int = 0
-) -> None:
+def _journal_fault(home: Path, rid: str, what: str | None) -> None:
     """Best effort: tell other processes that this one holds a prompt it could not record or
     clear. It holds only the request id, what failed and this process's identity, never the
     prompt, and it is removed when the fault is settled. ``what=None`` removes *rid*."""
     try:
         with _state_lock(home):
             data = _read_json(_fault_path(home))
-            if what is None and not lost and rid not in data:
+            if what is None and rid not in data:
                 return
             if what is not None:
                 pid = os.getpid()
@@ -2739,15 +2742,6 @@ def _journal_fault(
                 }
             else:
                 data.pop(rid, None)
-            if lost:
-                pid = os.getpid()
-                old = data.get(_FAULT_LOST_KEY)
-                count = int(_num(old.get("count"))) if isinstance(old, dict) else 0
-                data[_FAULT_LOST_KEY] = {
-                    "count": count + lost,
-                    "pid": pid,
-                    "proc_start": _proc_start(pid),
-                }
             if data:
                 _write_json(_fault_path(home), data, ordered=True)
             else:
@@ -2757,18 +2751,36 @@ def _journal_fault(
 
 
 def _remember_wait_fault(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
+    """A dropped fault keeps its journal entry, so other processes still see it under its owner."""
     with _WAIT_FAULT_LOCK:
         _WAIT_FAULTS.pop((str(home), rid), None)
         _WAIT_FAULTS[(str(home), rid)] = (what, rec)
-        dropped: list[tuple[str, str]] = []
         while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
-            dropped.append(next(iter(_WAIT_FAULTS)))
-            _WAIT_FAULTS.pop(dropped[-1])
-        for h, r in dropped:
-            _WAIT_FAULTS_LOST[h] = _WAIT_FAULTS_LOST.get(h, 0) + 1
-    _journal_fault(home, rid, what)
-    for h, r in dropped:
-        _journal_fault(Path(h), r, None, lost=1)
+            h, r = next(iter(_WAIT_FAULTS))
+            _WAIT_FAULTS.pop((h, r))
+            _WAIT_FAULTS_LOST.setdefault(h, set()).add(r)
+        _journal_fault(home, rid, what)
+
+
+def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
+    """Write or remove one prompt's record and settle its fault under the fault lock, so this
+    cleanup can never remove a newer fault for the same prompt. Raises if the write fails."""
+    with _WAIT_FAULT_LOCK:
+        had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
+        lost = _WAIT_FAULTS_LOST.get(str(home), set())
+        had_fault |= rid in lost
+        lost.discard(rid)
+        try:
+            path = _waits_dir(home) / f"{rid}.json"
+            if what == "record":
+                _write_json(path, rec)
+            else:
+                _unlink_wait(path)
+        except Exception:
+            _remember_wait_fault(home, rid, what, rec)
+            raise
+        if had_fault:
+            _journal_fault(home, rid, None)
 
 
 def _unlink_wait(path: Path) -> None:
@@ -2778,27 +2790,20 @@ def _unlink_wait(path: Path) -> None:
 def _other_process_faults(home: Path, errors: list[str]) -> None:
     """Faults another live process (the agent running a hook) reported but could not retry here."""
     try:
-        data = _read_json(_fault_path(home))
-    except Exception:  # noqa: BLE001
+        data = _read_json(_fault_path(home), errors=errors, source="prompt")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"prompt: {type(exc).__name__}; could not read live-prompt faults")
         return
     for rid, entry in data.items():
         if not isinstance(entry, dict):
             continue
-        try:
-            pid = int(entry.get("pid") or 0)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if pid <= 0 or pid == os.getpid():
+        pid = _valid_pid(entry.get("pid"))
+        if pid is None or pid == os.getpid():
             continue
         if not _alive(pid, entry.get("proc_start")):
             _journal_fault(home, rid, None)  # its prompts died with it
             continue
-        if rid == _FAULT_LOST_KEY:
-            errors.append(
-                f"prompt: {int(_num(entry.get('count')))} live prompts could not be recorded or cleared "
-                "and are no longer retried"
-            )
-        elif _SAFE_ID.match(rid):
+        if _SAFE_ID.match(rid):
             verb = "record" if entry.get("what") == "record" else "clear"
             errors.append(f"prompt: {rid}: could not {verb} a live prompt (reported by the agent)")
 
@@ -2806,7 +2811,7 @@ def _other_process_faults(home: Path, errors: list[str]) -> None:
 def _reconcile_waits(home: Path, errors: list[str]) -> None:
     """Retry hook writes/removals that failed; what still fails is a reported source error."""
     _other_process_faults(home, errors)
-    lost = _WAIT_FAULTS_LOST.get(str(home), 0)
+    lost = len(_WAIT_FAULTS_LOST.get(str(home), ()))
     if lost:
         errors.append(f"prompt: {lost} live prompts could not be recorded or cleared and are no longer retried")
     with _WAIT_FAULT_LOCK:
@@ -2853,15 +2858,7 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
             "proc_start": _proc_start(pid),
             "since": int(time.time()),
         }
-        with _WAIT_FAULT_LOCK:
-            had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
-            try:
-                _write_json(_waits_dir(home) / f"{rid}.json", rec)
-            except Exception:
-                _remember_wait_fault(home, rid, "record", rec)
-                raise
-        if had_fault:
-            _journal_fault(home, rid, None)
+        _settle_wait(home, rid, "record", rec)
     except Exception as exc:  # noqa: BLE001 - observability must never break a human prompt
         log.warning("unbl0ck: could not record wait: %s", type(exc).__name__)
 
@@ -2871,16 +2868,7 @@ def clear_wait(home: Path | None = None, **payload: Any) -> None:
     try:
         rid = str(payload.get("request_id") or "")
         if _SAFE_ID.match(rid):
-            home = home or hermes_home()
-            with _WAIT_FAULT_LOCK:
-                had_fault = _WAIT_FAULTS.pop((str(home), rid), None) is not None
-                try:
-                    _unlink_wait(_waits_dir(home) / f"{rid}.json")
-                except Exception:
-                    _remember_wait_fault(home, rid, "clear", None)
-                    raise
-            if had_fault:
-                _journal_fault(home, rid, None)
+            _settle_wait(home or hermes_home(), rid, "clear", None)
     except Exception as exc:  # noqa: BLE001
         log.warning("unbl0ck: could not clear wait: %s", type(exc).__name__)
 
@@ -2916,14 +2904,11 @@ class WaitState(str, Enum):
 def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitState:
     """Classify one wait record read from *f* (an empty dict means unreadable)."""
     now = time.time() if now is None else now
-    try:
-        pid = int(rec.get("pid") or 0)
-    except (TypeError, ValueError, OverflowError):
-        pid = 0
+    pid = _valid_pid(rec.get("pid"))
     rid = str(rec.get("request_id") or "")
     if (
         not rec
-        or pid <= 0
+        or pid is None
         or not _SAFE_ID.match(rid)
         or f.stem != rid
         or now - _num(rec.get("since")) > WAIT_MAX_AGE

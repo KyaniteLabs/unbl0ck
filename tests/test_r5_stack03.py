@@ -87,12 +87,13 @@ class MalformedNumbersInOtherRecords(OutsideFixture):
         data = {f"k{n}": {"version": "1", "bluf": "b", "why": "w", "at": float("inf") if n == 0 else n} for n in range(needs._BLUF_KEEP + 3)}
         self.assertEqual(len(needs._trim_blufs(data)), needs._BLUF_KEEP)
 
-    def test_a_fault_journal_with_a_text_count_still_records_a_new_loss(self):
+    def test_a_legacy_lost_entry_with_a_text_count_does_not_block_a_new_fault(self):
         path = needs._fault_path(self.home)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({needs._FAULT_LOST_KEY: {"count": "many", "pid": 1}}))
-        needs._journal_fault(self.home, "r", None, lost=2)
-        self.assertEqual(json.loads(path.read_text())[needs._FAULT_LOST_KEY]["count"], 2)
+        path.write_text(json.dumps({"+lost": {"count": "many", "pid": 1}}))
+        needs._journal_fault(self.home, "0123456789abcdef", "record")
+        self.assertEqual(json.loads(path.read_text())["0123456789abcdef"]["what"], "record")
+        needs.wait_items(self.home, errors=[])
 
 
 class CountingScandir:
