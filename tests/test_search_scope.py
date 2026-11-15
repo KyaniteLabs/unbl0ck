@@ -143,13 +143,6 @@ class Bounds(Fixture):
         with patch.object(needs, "ask_enabled", side_effect=AssertionError("model path touched"), create=True):
             needs.search_text("needle")
 
-    def test_search_reads_the_same_sources_as_the_queue_and_writes_nothing(self):
-        with tempfile.TemporaryDirectory() as d:
-            before = sorted(Path(d).rglob("*"))
-            self.outside_items = [outside(1, "needle")]
-            needs.search_text("needle")
-            self.assertEqual(sorted(Path(d).rglob("*")), before)
-
 
 class RealReaders(unittest.TestCase):
     """The chat and live-prompt readers cut text at the search limit and expand records on demand."""
@@ -407,7 +400,10 @@ class Endpoint(Fixture):
         super().setUp()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        os.environ["HERMES_HOME"] = self.tmp.name
+        env = patch.dict(os.environ, {"HERMES_HOME": self.tmp.name,
+                                      "HERMES_KANBAN_HOME": str(Path(self.tmp.name) / "kanban")})
+        env.start()
+        self.addCleanup(env.stop)
         aspec = importlib.util.spec_from_file_location("unbl0ck_search_api", ROOT / "dashboard/plugin_api.py")
         self.api = importlib.util.module_from_spec(aspec)
         aspec.loader.exec_module(self.api)
@@ -454,6 +450,199 @@ class DesktopSearch(unittest.TestCase):
         window = s[max(0, i - 400):i]
         self.assertIn("const runFullSearch", window)
         self.assertNotIn("useEffect", window)
+
+
+class SearchRealHome(unittest.TestCase):
+    """Round 4: the real readers over a real temporary home. Only where the home and the plugin
+    settings come from is replaced, and every environment variable is restored afterwards."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.settings = {"principal_name": "Ada"}
+        env = patch.dict(os.environ, {"HERMES_HOME": str(self.home), "HERMES_KANBAN_HOME": str(self.root / "kanban"),
+                                      "UNBL0CK_OUTSIDE_DIRS": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        for name, value in (("_settings", lambda: self.settings), ("hermes_home", lambda: self.home)):
+            p = patch.object(needs, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def file(self, key, body="a needle in the body", title="Reply"):
+        return needs.file_outside({"kind": "draft", "title": title, "body": body, "act_where": "Mail",
+                                   "dedupe_key": key}, self.home, profile="work", session_id="s1")
+
+    def snapshot(self):
+        out = {}
+        for p in sorted(self.home.rglob("*")):
+            out[str(p.relative_to(self.home))] = p.read_bytes() if p.is_file() else None
+        return out
+
+    def chat(self, title, content, sid="s1"):
+        db = sqlite3.connect(self.home / "state.db")
+        db.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT, title TEXT, source TEXT, chat_type TEXT, started_at REAL,"
+                   " last_activity_at REAL, user_id TEXT, display_name TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT,"
+                   " timestamp REAL, display_kind TEXT, active INT)")
+        now = time.time()
+        db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)", (sid, title, "cli", "dm", now - 60, now - 30, "u", "n"))
+        db.execute("INSERT INTO messages(session_id, role, content, timestamp) VALUES(?, 'assistant', ?, ?)",
+                   (sid, content, now - 30))
+        db.commit()
+        db.close()
+
+    # --- damaged dismissals (class G) ---------------------------------------------------
+
+    def test_a_dismissal_entry_with_no_version_is_reported_not_read_as_resurfaced(self):
+        made = self.file("k1")
+        hidden = needs.data_dir(self.home) / "hidden.json"
+        hidden.write_text(json.dumps({made["id"]: None}))
+        r = needs.search_text("needle")
+        self.assertEqual(len(r["matches"]), 1)
+        self.assertTrue(r["partial"])
+        self.assertTrue(any("dismiss" in e for e in r["errors"]), r["errors"])
+
+    def test_every_malformed_dismissal_value_is_reported_and_a_good_one_is_not(self):
+        made = self.file("k1")
+        hidden = needs.data_dir(self.home) / "hidden.json"
+        for bad in (5, ["v"], {"a": 1}, True, ""):
+            hidden.write_text(json.dumps({made["id"]: bad}))
+            r = needs.search_text("needle")
+            self.assertTrue(any("dismiss" in e for e in r["errors"]), (bad, r["errors"]))
+        hidden.write_text(json.dumps({"outside:filed:" + "0" * 32: "some-version"}))
+        r = needs.search_text("needle")
+        self.assertEqual((r["errors"], r["partial"]), ([], False))
+
+    # --- read-only contract (class G/I) -------------------------------------------------
+
+    def test_search_deletes_no_expired_done_record_and_no_stale_wait(self):
+        made = self.file("k1")
+        (item,) = needs.outside_items(self.home)
+        needs.done_outside(item["id"], item["version"], self.home)
+        path = needs.data_dir(self.home) / "outside" / (made["id"].split(":")[-1] + ".json")
+        rec = json.loads(path.read_text())
+        rec["done_at"] -= needs.OUTSIDE_UNDO_SECONDS + 1
+        path.write_text(json.dumps(rec))
+        needs.record_wait(self.home, kind="clarify", request_id="0123456789abcdef", prompt="Which branch?")
+        wait = needs.data_dir(self.home) / "waits" / "0123456789abcdef.json"
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        stale = needs._read_json(wait)
+        stale["pid"], stale["proc_start"] = dead.pid, "1"
+        needs._write_json(wait, stale)
+        before = self.snapshot()
+        needs.search_text("branch")
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(path.exists() and wait.exists())
+
+    def test_searching_a_fresh_home_creates_no_state_folders(self):
+        r = needs.search_text("anything")
+        self.assertEqual(r["errors"], [])
+        self.assertEqual(list(self.home.rglob("*")), [])
+
+    def test_the_queue_still_cleans_up_what_search_leaves_alone(self):
+        made = self.file("k1")
+        (item,) = needs.outside_items(self.home)
+        needs.done_outside(item["id"], item["version"], self.home)
+        path = needs.data_dir(self.home) / "outside" / (made["id"].split(":")[-1] + ".json")
+        rec = json.loads(path.read_text())
+        rec["done_at"] -= needs.OUTSIDE_UNDO_SECONDS + 1
+        path.write_text(json.dumps(rec))
+        needs.search_text("needle")
+        self.assertTrue(path.exists())
+        needs.outside_items(self.home)
+        self.assertFalse(path.exists())
+
+    # --- a full queue of healthy records is not a read failure (class G) -----------------
+
+    def test_exactly_the_filed_capacity_of_healthy_records_is_complete(self):
+        for n in range(needs._OUTSIDE_LIMIT):
+            self.file(f"key-{n}", body=f"record {n} needle")
+        r = needs.search_text("needle")
+        self.assertEqual(r["searched"]["outside"], needs._OUTSIDE_LIMIT)
+        self.assertEqual(len(r["matches"]), needs._OUTSIDE_LIMIT)
+        self.assertEqual((r["errors"], r["partial"]), ([], False))
+
+    # --- one query over every field a card is filtered on (class K) -----------------------
+
+    def test_terms_may_be_split_between_the_chat_title_and_the_deep_body(self):
+        body = "needle " + "filler words " * 200 + "Should I merge it now?"
+        self.chat("Release", body)
+        r = needs.search_text("release needle")
+        self.assertEqual([m["source"] for m in r["matches"]], ["chat"])
+        self.assertFalse(r["partial"])
+        self.assertEqual(needs.search_text("release nothing-like-this")["matches"], [])
+
+    def test_terms_may_be_split_between_the_app_and_the_body(self):
+        self.file("k1", body="the needle sentence", title="Reply")
+        self.assertEqual(len(needs.search_text("mail needle")["matches"]), 1)
+        self.assertEqual(len(needs.search_text("reply mail needle")["matches"]), 1)
+        self.assertEqual(needs.search_text("skype needle")["matches"], [])
+
+
+class SearchFolderBudget(unittest.TestCase):
+    """Round 4: overlapping and failing watched folders against the shared read budget."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.settings = {"principal_name": "Ada"}
+        env = patch.dict(os.environ, {"HERMES_HOME": str(self.home), "HERMES_KANBAN_HOME": str(self.root / "kanban"),
+                                      "UNBL0CK_OUTSIDE_DIRS": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        for name, value in (("_settings", lambda: self.settings), ("hermes_home", lambda: self.home),
+                            ("chat_items", lambda *a, **k: []), ("wait_items", lambda *a, **k: [])):
+            p = patch.object(needs, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_files_left_unread_under_two_overlapping_roots_are_counted_once(self):
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        for n in range(230):
+            (child / f"{n}.txt").write_text(f"note {n}")
+        self.settings.update(outside_dirs=f"{child},{parent}", outside_recursive=True)
+        r = needs.search_text("note")
+        self.assertEqual(r["searched"]["outside"], 200)
+        self.assertEqual(r["not_searched"]["outside"], 30)
+
+    def test_reads_that_fail_still_use_up_the_shared_budget(self):
+        a, b = self.root / "a", self.root / "b"
+        for folder in (a, b):
+            folder.mkdir()
+            for n in range(200):
+                (folder / f"{n}.txt").write_text(f"note {n}")
+        self.settings["outside_dirs"] = f"{a},{b}"
+        attempts = []
+        with patch.object(needs, "_folder_outside_item", lambda *args, **k: attempts.append(1)):  # changed mid-read
+            r = needs.search_text("note")
+        self.assertLessEqual(len(attempts), needs.SEARCH_MAX_ITEMS)
+        self.assertTrue(r["partial"])
+        self.assertEqual(r["not_searched"]["outside"], 200)
+
+    def test_dismissed_files_left_unread_by_one_root_and_read_by_another_are_not_counted_missing(self):
+        parent = self.root / "parent"
+        child = parent / "child"
+        child.mkdir(parents=True)
+        for n in range(5):
+            (child / f"{n}.txt").write_text(f"note {n}")
+        self.settings.update(outside_dirs=f"{child},{parent}", outside_recursive=True)
+        for item in needs.outside_items(self.home):
+            needs.hide(item["id"], item["version"], self.home)
+        stats = {}
+        with patch.object(needs, "_OUTSIDE_LIMIT", 3):
+            listed = needs.outside_items(self.home, with_hidden=True, stats=stats)
+        self.assertEqual(len(listed), 5)
+        self.assertEqual(stats.get("hidden_unread", 0), 0)
 
 
 if __name__ == "__main__":

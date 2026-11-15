@@ -267,12 +267,15 @@ def hermes_home() -> Path:
     return home
 
 
-def data_dir(home: Path | None = None) -> Path:
+def data_dir(home: Path | None = None, *, create: bool = True) -> Path:
+    """The plugin's state folder. ``create=False`` is for readers that promise to write
+    nothing: the path is returned (and checked for links) but never made."""
     base = (home or hermes_home()) / "plugin-data"
     _refuse_link(base)  # an ancestor link redirects every write as surely as a link on the folder
     d = base / "unbl0ck"
     _refuse_link(d)
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -281,6 +284,11 @@ def _refuse_link(d: Path) -> None:
     plugin's data or an unrelated folder."""
     if d.is_symlink():
         raise OSError(f"{d.name} is a symbolic link; refusing to use it for state")
+
+
+class Notice(str):
+    """A message in a reader's ``errors`` list that reports a state, not a failure: the queue
+    shows it like any other, but a caller that counts failures (full-text search) does not."""
 
 
 def _list_files(d: Path, suffix: str = "") -> list[Path]:
@@ -293,8 +301,8 @@ def _list_files(d: Path, suffix: str = "") -> list[Path]:
 # --- hidden items -------------------------------------------------------------------------
 
 
-def _hidden_path(home: Path | None) -> Path:
-    return data_dir(home) / "hidden.json"
+def _hidden_path(home: Path | None, *, create: bool = True) -> Path:
+    return data_dir(home, create=create) / "hidden.json"
 
 
 STATE_LOCK_TIMEOUT = 5.0  # seconds to wait for the state lock before giving up
@@ -454,15 +462,19 @@ def _split_hidden(value: Any) -> tuple[Any, str | None]:
     return value, None
 
 
-def _load_hidden_raw(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, Any]:
+def _load_hidden_raw(
+    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False, create: bool = True
+) -> dict[str, Any]:
     return _read_json(
-        _hidden_path(home), errors=errors, strict=strict, entry_ok=_hidden_entry_ok
+        _hidden_path(home, create=create), errors=errors, strict=strict, entry_ok=_hidden_entry_ok
     )
 
 
-def load_hidden(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, str]:
+def load_hidden(
+    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False, create: bool = True
+) -> dict[str, str]:
     """``{item_id: version}``; the dismissal tokens are not part of this view."""
-    raw = _load_hidden_raw(home, errors=errors, strict=strict)
+    raw = _load_hidden_raw(home, errors=errors, strict=strict, create=create)
     return {item_id: _split_hidden(value)[0] for item_id, value in raw.items()}
 
 
@@ -2161,10 +2173,11 @@ def _num(value: Any) -> float:
     return number if math.isfinite(number) else 0.0  # NaN/inf are not times
 
 
-def _waits_dir(home: Path | None = None) -> Path:
-    d = data_dir(home) / "waits"
+def _waits_dir(home: Path | None = None, *, create: bool = True) -> Path:
+    d = data_dir(home, create=create) / "waits"
     _refuse_link(d)
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -2364,14 +2377,19 @@ def wait_items(
     full_limit: int | None = None,
     visible: Callable[[str, str], bool] | None = None,
     only_rid: str | None = None,
+    readonly: bool = False,
 ) -> list[dict[str, Any]]:
     """Open live prompts. A wait whose process is gone is deleted, not shown. ``only_rid``
-    reads that one record and touches no other."""
+    reads that one record and touches no other. ``readonly`` neither creates the folder nor
+    deletes or rewrites any record: a dead waiter is only left out."""
     home = home or hermes_home()
     errors = errors if errors is not None else []
     items: list[dict[str, Any]] = []
-    waits = _waits_dir(home)
-    _reconcile_waits(home, errors)
+    waits = _waits_dir(home, create=not readonly)
+    if readonly and not waits.is_dir():
+        return items  # nothing was ever recorded
+    if not readonly:
+        _reconcile_waits(home, errors)
     try:
         records = _list_files(waits, ".json")
     except OSError as exc:
@@ -2388,6 +2406,8 @@ def wait_items(
         if wait_state(f, rec) is WaitState.STALE:
             # Dead waiter, malformed record, or a wait so old its resolved hook must have been
             # missed: never show a prompt nobody is waiting on.
+            if readonly:
+                continue
             try:
                 f.unlink(missing_ok=True)
             except OSError as exc:
@@ -2501,6 +2521,8 @@ SEARCH_MAX_ITEMS = 200
 SEARCH_MAX_CHARS = FULL_TEXT_LIMIT
 SEARCH_MAX_QUERY = 200
 SEARCH_MAX_TERMS = 8
+# The card fields the queue's own filter matches, searched together with the stored text.
+_SEARCH_FIELDS = ("title", "chat_title", "chat_with", "act_where", "ref", "to", "owner", "profile")
 
 
 def search_text(query: Any) -> dict[str, Any]:
@@ -2516,7 +2538,12 @@ def search_text(query: Any) -> dict[str, Any]:
         raise ValueError(f"use at most {SEARCH_MAX_TERMS} search terms")
     home = hermes_home()
     hidden_errors: list[str] = []
-    hidden = load_hidden(home, errors=hidden_errors)
+    raw_hidden = _load_hidden_raw(home, errors=hidden_errors, create=False)
+    hidden = {item_id: _split_hidden(value)[0] for item_id, value in raw_hidden.items()}
+    # A dismissal that names no version (null, a number, a list, an empty string) cannot say what
+    # was dismissed, so the card reads as shown: that is damage to report, like an unreadable file.
+    hidden_errors += ["a dismissal entry has no usable version"
+                      for value in raw_hidden.values() if not isinstance(value, str) or not value][:1]
 
     def visible(item_id: str, version: str) -> bool:
         # The queue's own rule: dismissed at this version means not a card, so not searchable
@@ -2528,7 +2555,8 @@ def search_text(query: Any) -> dict[str, Any]:
         (
             "outside",
             lambda errs: outside_items(
-                home, errors=errs, visible=visible, read_budget=SEARCH_MAX_ITEMS, unread=unread
+                home, errors=errs, visible=visible, read_budget=SEARCH_MAX_ITEMS, unread=unread,
+                readonly=True,
             ),
         ),
         (
@@ -2540,7 +2568,8 @@ def search_text(query: Any) -> dict[str, Any]:
         (
             "prompt",
             lambda errs: wait_items(
-                home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS, visible=visible
+                home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS, visible=visible,
+                readonly=True,
             ),
         ),
     )
@@ -2560,7 +2589,7 @@ def search_text(query: Any) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             errors.append(f"{source}: could not be read, so it was not searched")
             continue
-        if source_errors:
+        if any(not isinstance(e, Notice) for e in source_errors):
             errors.append(f"{source}: some records could not be read")
         window = items[:SEARCH_MAX_ITEMS]
         skipped = len(items) - len(window) + (unread[0] if source == "outside" else 0)
@@ -2578,7 +2607,9 @@ def search_text(query: Any) -> dict[str, Any]:
             if item.get("text_cut") or item.get("truncated") or len(text) > SEARCH_MAX_CHARS:
                 cut += 1
                 text = text[:SEARCH_MAX_CHARS]
-            hay = f"{item.get('title') or ''}\n{text}".casefold()
+            # One query over everything a card is filtered on plus its stored text, so terms may
+            # be split between a title, an app or a chat's name and the body.
+            hay = "\n".join([*(str(item.get(key) or "") for key in _SEARCH_FIELDS), text]).casefold()
             if all(term in hay for term in terms):
                 matches.append({"id": str(item.get("id")), "version": str(item.get("version")), "source": source})
         searched[source] = examined
@@ -2615,10 +2646,11 @@ _FILED_ID = re.compile(r"outside:filed:([a-f0-9]{32})\Z")
 _FOLDER_ID = re.compile(r"outside:folder:[a-f0-9]{64}\Z")
 
 
-def _outside_dir(home: Path | None = None) -> Path:
-    d = data_dir(home) / "outside"
+def _outside_dir(home: Path | None = None, *, create: bool = True) -> Path:
+    d = data_dir(home, create=create) / "outside"
     _refuse_link(d)
-    d.mkdir(mode=0o700, exist_ok=True)
+    if create:
+        d.mkdir(mode=0o700, exist_ok=True)
     return d
 
 
@@ -3231,16 +3263,19 @@ def _read_folder_window(
     limit: int,
     deadline: float,
     errors: list[str],
-) -> tuple[list[dict[str, Any]], int]:
+    attempts: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[tuple[Path, os.stat_result]]]:
     """Read files in order until *limit* are read, backfilling past files that cannot be.
 
-    Returns ``(items, not_attempted)``. The read budget is checked before every file after the
-    first, so a poll always makes progress and never reads without bound."""
+    Returns ``(items, not_attempted)``: the files never tried. The time budget is checked before
+    every file after the first, so a poll always makes progress and never reads without bound.
+    ``attempts`` is a count shared by every folder of one call: each file tried (read or not)
+    uses one, and no file is tried once it reaches zero."""
     out: list[dict[str, Any]] = []
     failed = 0
     attempted = 0
     for f, st in pairs:
-        if len(out) >= limit:
+        if len(out) >= limit or (attempts is not None and attempts[0] <= 0):
             break
         if attempted and time.monotonic() > deadline:
             errors.append(
@@ -3249,6 +3284,8 @@ def _read_folder_window(
             )
             break
         attempted += 1
+        if attempts is not None:
+            attempts[0] -= 1
         try:
             item = _folder_outside_item(f, root, st, dfd)
             if item is not None:
@@ -3265,7 +3302,7 @@ def _read_folder_window(
             f"outside: {root.name}: {failed} files could not be read "
             f"(the first {_READ_ERRORS_LISTED} are listed)"
         )
-    return out, len(pairs) - attempted
+    return out, pairs[attempted:]
 
 
 def outside_items(
@@ -3278,6 +3315,7 @@ def outside_items(
     visible: Callable[[str, str], bool] | None = None,
     read_budget: int | None = None,
     unread: list[int] | None = None,
+    readonly: bool = False,
 ) -> list[dict[str, Any]]:
     """Our filed records plus bounded reads of explicitly watched folders.
 
@@ -3286,16 +3324,21 @@ def outside_items(
     receives ``hidden_unread``: dismissed folder files that were counted but not listed.
     ``visible(id, version)`` drops filed records that are dismissed at their current version.
     ``read_budget`` caps how many items are returned in all (filed first, then folder files
-    newest first, across every watched folder); files left unread because of it are added to
-    ``unread[0]`` so a caller can report them."""
+    newest first, across every watched folder) and counts every file it tries, read or not;
+    files left unread because of it are added to ``unread[0]``, each once even when two watched
+    folders overlap. ``readonly`` creates, deletes and rewrites nothing (no retention cleanup,
+    no state folders)."""
     errors = errors if errors is not None else []
     if unread is not None and not unread:
         unread.append(0)
     items = []
     done_seen = False
-    outside = _outside_dir(home)
+    outside = _outside_dir(home, create=not readonly)
     try:
-        filed, over = _filed_files(outside)
+        if readonly and not outside.is_dir():
+            filed, over = [], False  # nothing was ever filed
+        else:
+            filed, over = _filed_files(outside)
         if over:
             errors.append(f"outside: more than {_PURGE_SCAN_LIMIT} filed entries; only the first {_PURGE_SCAN_LIMIT} are read")
     except OSError as exc:
@@ -3331,10 +3374,12 @@ def outside_items(
     filed_waiting = len(items)
     if filed_waiting >= _OUTSIDE_LIMIT:
         errors.append(
-            f"outside: {filed_waiting} agent-filed items are waiting (limit {_OUTSIDE_LIMIT}); "
-            "agents cannot file more until you finish some"
+            Notice(
+                f"outside: {filed_waiting} agent-filed items are waiting (limit {_OUTSIDE_LIMIT}); "
+                "agents cannot file more until you finish some"
+            )
         )
-    if done_seen:
+    if done_seen and not readonly:
         try:
             with _state_lock(home):
                 _purge_done(_outside_dir(home), errors=errors)
@@ -3347,9 +3392,13 @@ def outside_items(
     settings = _settings()  # one snapshot: the folders and the recursion flag cannot disagree
     raw = settings.get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
     recursive = outside_recursive(settings)
-    hidden = load_hidden(home, errors=errors) if str(raw).strip() else {}
+    hidden = load_hidden(home, errors=errors, create=not readonly) if str(raw).strip() else {}
     seen: set[Path] = set()
-    claimed: set[Path] = set()  # a file under two overlapping roots is listed once, where it is shown
+    # A file under two overlapping roots is listed once, where it is tried first.
+    claimed: set[Path] = set()
+    omitted: set[Path] = set()  # files never read, and dismissed ones never listed: each counted once
+    hidden_omitted: set[Path] = set()
+    attempts = [max(0, read_budget - len(items))] if read_budget is not None else None
     for name in str(raw).split(","):
         if not name.strip():
             continue
@@ -3371,34 +3420,37 @@ def outside_items(
             waiting.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
             read_deadline = time.monotonic() + OUTSIDE_SCAN_SECONDS
             with _watched_dir(root) as dfd:
-                room = _OUTSIDE_LIMIT
-                if read_budget is not None:
-                    room = min(room, max(0, read_budget - len(items)))
                 shown, unattempted = _read_folder_window(
-                    waiting, root, dfd, room, read_deadline, errors
+                    waiting, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors, attempts
                 )
-                if unattempted and len(shown) >= room:
-                    if room >= _OUTSIDE_LIMIT:
-                        errors.append(
-                            f"outside: {root.name}: folder limit, showing the newest {_OUTSIDE_LIMIT}; "
-                            f"{unattempted} older files are waiting. "
-                            "Finish or hide items to bring them into view"
-                        )
-                    if unread is not None:
-                        unread[0] += unattempted  # waiting, never read
+                if unattempted and len(shown) >= _OUTSIDE_LIMIT:
+                    errors.append(
+                        f"outside: {root.name}: folder limit, showing the newest {_OUTSIDE_LIMIT}; "
+                        f"{len(unattempted)} older files are waiting. "
+                        "Finish or hide items to bring them into view"
+                    )
+                omitted.update(f for f, _ in unattempted)
+                # Every file tried here (read or failed) belongs to this root, so an overlapping
+                # root neither lists it again nor spends the read budget on it again.
+                claimed.update(f for f, _ in waiting[: len(waiting) - len(unattempted)])
                 read_hidden: list[dict[str, Any]] = []
+                hidden_rest = dismissed
                 if with_hidden:
                     dismissed.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
-                    read_hidden, _ = _read_folder_window(
+                    read_hidden, hidden_rest = _read_folder_window(
                         dismissed, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors
                     )
-            if stats is not None:
-                stats["hidden_unread"] = stats.get("hidden_unread", 0) + len(dismissed) - len(read_hidden)
+                hidden_omitted.update(f for f, _ in hidden_rest)
             for item in shown + read_hidden:
                 items.append(item)
                 claimed.add(Path(item["ref"]))
         except (OSError, ValueError, RuntimeError) as exc:
             errors.append(f"outside: {name.strip()}: {type(exc).__name__}: {exc}")
+    # What another root went on to read is not missing; what is left is counted once.
+    if unread is not None:
+        unread[0] += len(omitted - claimed)
+    if stats is not None:
+        stats["hidden_unread"] = stats.get("hidden_unread", 0) + len(hidden_omitted - claimed)
     for it in items:
         it["ask"] = it.get("text") or "(No text supplied.)"
         it["excerpt"] = _excerpt_head(it["ask"])
