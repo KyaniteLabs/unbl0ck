@@ -344,6 +344,18 @@ class Notice(str):
         return notice
 
 
+def _list_files(d: Path, suffix: str = "", errors: list[str] | None = None, where: str | None = None) -> list[Path]:
+    """The entries among the first ``_PURGE_SCAN_LIMIT`` of *d* whose name ends with *suffix*, by
+    name. A longer folder adds a notice naming *where* to *errors*, or raises with no *where*.
+    Unlike ``Path.glob``, a folder that cannot be listed raises instead of looking empty."""
+    entries, cut = _bounded_scandir(d, limit=_PURGE_SCAN_LIMIT)
+    if cut and where is None:
+        raise RuntimeError(_TOO_MANY_FILED)
+    if cut and errors is not None:
+        errors.append(Notice(f"{where}: more than {_PURGE_SCAN_LIMIT} entries; only the first {_PURGE_SCAN_LIMIT} are read", "listing_cut"))
+    return sorted((p for p in entries if p.name.endswith(suffix)), key=lambda p: p.name)
+
+
 # --- hidden items -------------------------------------------------------------------------
 
 
@@ -794,9 +806,9 @@ def _orders_issued(home: Path | None) -> int:
     """The highest stored order (hide token prefixes, Done orders); raises when one cannot be read."""
     tokens = (_split_hidden(v)[1] for v in _load_hidden_raw(home, strict=True).values())
     d, errors = _outside_dir(home, create=False), []
-    files, cut = _filed_files(d) if d.is_dir() else ([], False)
+    files = _list_files(d, ".json", errors, "outside") if d.is_dir() else []
     orders = [r["done_order"] for r in (_read_json(f, errors=errors) for f in files) if "done_order" in r]
-    if cut or errors or not all(map(_order_ok, orders)):
+    if errors or not all(map(_order_ok, orders)):
         raise RuntimeError(f"{ORDER_FILE} is missing and the stored orders could not all be read; restore it")
     return max([int(t[:13], 16) for t in tokens if t] + orders, default=0)
 
@@ -903,9 +915,7 @@ def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> 
             clear_done = d_match or (h_match and done and h_applies)
             clear_hidden = h_match or (d_match and h_applies)
         if clear_done:
-            files, over = _filed_files(d)
-            if over:
-                raise RuntimeError(_TOO_MANY_FILED)
+            files = _list_files(d, ".json")
             if _count_active(files, skip=f) >= _OUTSIDE_LIMIT:
                 raise RuntimeError(
                     f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before undoing Done"
@@ -1978,9 +1988,7 @@ def _state_dbs(
         consider("default", home / "state.db")
     if only != "default":
         try:
-            entries, cut = ([home / "profiles" / only], False) if only else _list_files(home / "profiles")
-            if cut and errors is not None:
-                errors.append(_listing_cut("chat: profiles folder"))
+            entries = [home / "profiles" / only] if only else _list_files(home / "profiles", "", errors, "chat: profiles folder")
         except FileNotFoundError:
             entries = []
         except OSError as exc:
@@ -2533,9 +2541,7 @@ def _pairing_dirs(home: Path, errors: list[str] | None = None) -> list[tuple[str
     out: list[tuple[str, Path]] = []
     cands = [("default", home / "platforms" / "pairing"), ("default", home / "pairing")]
     try:
-        profiles, cut = _list_files(home / "profiles")
-        if cut and errors is not None:
-            errors.append(_listing_cut("pairing: profiles folder"))
+        profiles = _list_files(home / "profiles", "", errors, "pairing: profiles folder")
     except FileNotFoundError:
         profiles = []
     except OSError as exc:
@@ -2606,10 +2612,7 @@ def pairing_items(
     folders = _pairing_dirs(home, errors)
     for profile, folder in folders:
         try:
-            files, cut = _list_files(folder, "-pending.json")
-            if cut and errors is not None:
-                errors.append(_listing_cut(f"pairing[{profile}]"))
-            for f in files:
+            for f in _list_files(folder, "-pending.json", errors, f"pairing[{profile}]"):
                 if _pending_file_damage(f) and errors is not None:
                     errors.append(f"pairing[{profile}]: {f.name}: could not read pending requests")
         except OSError as exc:
@@ -2987,13 +2990,11 @@ def wait_items(
     if not readonly:
         _reconcile_waits(home, errors)
     try:
-        records, cut = _list_files(waits, ".json")
+        records = _list_files(waits, ".json", errors, "prompt: waits")
     except OSError as exc:
         # An unreadable folder is not an empty one: the prompts in it are unknown.
         errors.append(f"prompt: waits: {type(exc).__name__}; could not list live prompts")
         return items
-    if cut:
-        errors.append(_listing_cut("prompt: waits"))
     if only_rid is not None:
         records = [f for f in records if f.name == f"{only_rid}.json"]
     for f in records:
@@ -3373,22 +3374,6 @@ def _bounded_scandir(d: Path, *, limit: int, deadline: float | None = None) -> t
     return out, False
 
 
-def _list_files(d: Path, suffix: str = "") -> tuple[list[Path], bool]:
-    """The entries among the first ``_PURGE_SCAN_LIMIT`` of *d* whose name ends with *suffix*,
-    by name, and whether the listing was cut. Every state-folder read goes through this one
-    bound. Unlike ``Path.glob``, a folder that cannot be listed raises instead of looking empty."""
-    entries, cut = _bounded_scandir(d, limit=_PURGE_SCAN_LIMIT)
-    return sorted((p for p in entries if p.name.endswith(suffix)), key=lambda p: p.name), cut
-
-
-def _filed_files(d: Path) -> tuple[list[Path], bool]:
-    return _list_files(d, ".json")
-
-
-def _listing_cut(where: str, what: str = "entries") -> Notice:
-    return Notice(f"{where}: more than {_PURGE_SCAN_LIMIT} {what}; only the first {_PURGE_SCAN_LIMIT} are read", "listing_cut")
-
-
 def _count_active(files: list[Path], skip: Path | None = None) -> int:
     return sum(1 for f in files if f != skip and not f.is_symlink() and not _is_done(_read_json(f)))
 
@@ -3558,9 +3543,7 @@ def file_outside(
         _purge_logged(d)  # best effort: an undeletable expired record must not block unrelated work
         files: list[Path] = []
         if key:  # an id names its record directly: no listing, no scan of the whole folder
-            files, over = _filed_files(d)  # a listing that fails must not look like "no match"
-            if over:
-                raise RuntimeError(_TOO_MANY_FILED)
+            files = _list_files(d, ".json")  # a listing that fails must not look like "no match"
         match = None
         if action == "resolve" and item_id:
             match = d / (_FILED_ID.fullmatch(item_id).group(1) + ".json")
@@ -3634,9 +3617,7 @@ def file_outside(
                 out["note"] = "resolved; a stale Not for me marker could not be removed and is harmless"
             return out
         if action == "file" and not key:
-            files, over = _filed_files(d)
-            if over:
-                raise RuntimeError(_TOO_MANY_FILED)
+            files = _list_files(d, ".json")
         old = _read_json(match, strict=True) if match else {}
         record_id = match.stem if match else uuid.uuid4().hex
         item_id = f"outside:filed:{record_id}"
@@ -4135,7 +4116,7 @@ def _watched_dir(root: Path):
 
     The directory is opened once, without following a link, and a file directly inside it is
     opened relative to that descriptor, so replacing the folder or one of its parents with a
-    link after the scan cannot redirect a read."""
+    link after the scan cannot redirect a read. Nested files are opened one folder at a time."""
     if not _DIR_FD:
         yield None
         return
@@ -4150,17 +4131,14 @@ def _open_beneath(root_fd: int, parts: tuple[str, ...]) -> int:
     """Open the file *parts* names below the folder *root_fd* for reading, one directory at a
     time from that descriptor and never through a link, so a subfolder swapped for a link
     after a check raises instead of redirecting the read."""
-    fd = root_fd
+    fd = os.dup(root_fd)
     try:
         for part in parts[:-1]:
-            sub = os.open(part, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW, dir_fd=fd)
-            if fd != root_fd:
-                os.close(fd)
-            fd = sub
+            fd, parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW, dir_fd=fd), fd
+            os.close(parent)
         return os.open(parts[-1], os.O_RDONLY | _NOFOLLOW | _NONBLOCK, dir_fd=fd)
     finally:
-        if fd != root_fd:
-            os.close(fd)
+        os.close(fd)
 
 
 def _folder_outside_item(
@@ -4453,11 +4431,9 @@ def outside_items(
     outside = _outside_dir(home, create=not readonly)
     try:
         if readonly and not outside.is_dir():
-            filed, over = [], False  # nothing was ever filed
+            filed = []  # nothing was ever filed
         else:
-            filed, over = _filed_files(outside)
-        if over:
-            errors.append(_listing_cut("outside", "filed entries"))
+            filed = _list_files(outside, ".json", errors, "outside")
     except OSError as exc:
         errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
         filed = []
