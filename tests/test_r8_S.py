@@ -1,6 +1,7 @@
 """Round-8 lane S regression tests: one per finding, each driven through an entry point the
 round-7 code already had, so it fails there for the behavioural reason."""
 
+import pathlib
 import unittest
 
 from test_outside import needs
@@ -34,6 +35,17 @@ class CssWhitespaceOnly(unittest.TestCase):
             self.assertTrue("HIDDEN" not in text or notes, (value, text, notes))
         for value in ("block\tflex", "block\fflex", "BLOCK", "block !important"):
             self.assertEqual(needs._html_convert(f'<div hidden style="display:{value}">SHOWN</div>', 1000), ("SHOWN", []))
+
+
+class ChangelogMatchesDisplayBehaviour(unittest.TestCase):
+    def test_the_changelog_says_invalid_display_values_warn(self):
+        """R8-015: the round-7 bullet says an invalid display value warns, as the converter does."""
+        log = (pathlib.Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text(encoding="utf-8")
+        bullet = next(line for line in log.splitlines() if "Explicit-key YAML codes" in line)
+        self.assertNotIn("no longer shows `hidden` text", bullet)
+        self.assertIn("with a note", bullet)
+        text, notes = needs._html_convert('<div hidden style="display:block block">HIDDEN</div>', 1000)
+        self.assertTrue(notes and "HIDDEN" in text)
 
 
 if __name__ == "__main__":
