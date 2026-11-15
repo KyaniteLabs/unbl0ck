@@ -4921,7 +4921,13 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         cut = bool(it.get("ask_truncated") or it.get("truncated"))
         room = min(POCKET_PROMPT_CHARS, max(0, POCKET_TOTAL_PROMPT_CHARS - spent))
         if len(prompt) > room:
-            prompt = prompt[: max(0, room - len(_ASK_CUT))] + _ASK_CUT
+            # The marker is part of the budget: with no room left for it, the card carries no
+            # prompt text and says it was cut through its flag and warning.
+            prompt = (
+                prompt[: room - len(_ASK_CUT)] + _ASK_CUT
+                if room > len(_ASK_CUT)
+                else prompt[:room]
+            )
             cut = True
         spent += len(prompt)
         cards.append(
