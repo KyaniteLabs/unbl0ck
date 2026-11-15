@@ -89,10 +89,10 @@ class FolderPaging(OutsideFixture):
         gone = self.make("gone.txt", age=10)
         real = needs._folder_outside_item
 
-        def racing(f, root, st):
+        def racing(f, root, st, *rest):
             if f.name == "keep.txt":
                 gone.unlink()
-            return real(f, root, st)
+            return real(f, root, st, *rest)
 
         with patch.object(needs, "_folder_outside_item", racing):
             q = self.items()
@@ -273,7 +273,7 @@ class FiledCap(OutsideFixture):
                 self.file(dedupe_key=f"k{n}", title=f"T{n}")
             reply = self.file(dedupe_key="extra", title="Extra")
             self.assertFalse(reply.get("ok", False), reply)
-            self.assertIn("3 filed items waiting", json.dumps(reply))
+            self.assertIn("Outside queue is full (3 filed items)", json.dumps(reply))
             q = needs.build_queue()
             self.assertEqual({i["title"] for i in q["items"]}, {"T0", "T1", "T2"})
             self.assertTrue(any("3 agent-filed items are waiting" in e for e in q["errors"]), q["errors"])
@@ -307,19 +307,18 @@ class RetentionEvictsOldestNotAlphabetical(unittest.TestCase):
             self.assertNotIn("chat:z0001", hidden)
             self.assertIn("chat:z0002", hidden)
 
-    def test_pending_release_cap_evicts_the_oldest_record_too(self):
+    def test_pending_release_store_refuses_a_new_marker_when_full_and_keeps_the_old_ones(self):
+        """The pending-release store is not trimmed (a marker is recovery state): it refuses and reports."""
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
             for n in range(needs._HIDDEN_KEEP):
                 needs._set_pending_release(f"kanban:b:z{n:04d}", "1", home)
-            needs._set_pending_release("kanban:b:a-newer", "1", home)
-            needs._set_pending_release("kanban:b:a-newest", "1", home)
+            with self.assertRaises(needs.PendingReleaseFull):
+                needs._set_pending_release("kanban:b:a-newer", "1", home)
             pending = needs.load_pending_releases(home)
             self.assertEqual(len(pending), needs._HIDDEN_KEEP)
-            self.assertIn("kanban:b:a-newer", pending)
-            self.assertIn("kanban:b:a-newest", pending)
-            self.assertNotIn("kanban:b:z0000", pending)
-            self.assertNotIn("kanban:b:z0001", pending)
+            self.assertIn("kanban:b:z0000", pending)
+            self.assertNotIn("kanban:b:a-newer", pending)
 
 
 if __name__ == "__main__":

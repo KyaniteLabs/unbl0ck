@@ -113,10 +113,11 @@ restored after unmount from the same bounded session memory, without a second mo
 call; transport retry is implemented and verified.
 
 Bounded folder selection discloses older omissions instead of silently scanning an
-unbounded directory. Folder pagination and automatic export archiving were not adopted;
-the latter would change the read-only source contract. Filed dedupe keys are
-profile-scoped by default, with an explicit global scope; existing records are adopted
-in place by their own profile.
+unbounded directory. Folders are paged by completion rather than by a cursor: each poll
+shows the newest 200 waiting files, and Done or Not for me on a file brings an older one
+into view. Automatic export archiving was not adopted; it would change the read-only
+source contract. Filed dedupe keys are profile-scoped by default, with an explicit global
+scope; existing records are adopted in place by their own profile.
 
 The review link reuses native signed ingress and verifies GitHub review identity rather
 than adding a listener, executing PR code with secrets, or treating duplicate responses
