@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Resolving a filed item also drops its "Not for me" marker, and a `dedupe_key` over 120 characters is refused instead of cut (#46 sweep).** A cut key let two different long keys collide into one record; the marker of a resolved record stayed in `hidden.json` until the cap evicted it. A damaged `hidden.json` is left untouched.
 - **Records filed by 0.6.0 before profiles existed keep their Done and Not for me state (#46).** Adopting an ownerless record into a profile keeps its version when the content is unchanged, so an unchanged refile no longer resurfaces finished work; key-only resolve finds it. Tests start from the exact record 0.6.0 wrote.
 - **Filed dedupe keys are profile-scoped by default (#46).** `unbl0ck_file` takes `dedupe_scope` (`profile` or `global`); the same key in two profiles now files two items and one profile can no longer replace or resolve another's by key. Records and replies carry `dedupe_scope` and `profile`; legacy records are adopted in place by their own profile without resurfacing a local Done.
 - **The hidden and pending-release caps now drop the oldest entry, not the alphabetically first (#37 sweep).** Both stores were written with sorted keys, so after a reload "oldest first" meant "first in the alphabet": a recent dismissal could be evicted while an old one stayed, and folder paging progress (hash keys) was lost at random. They now keep insertion order on disk.

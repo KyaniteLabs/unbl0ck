@@ -128,7 +128,7 @@ class Outside(OutsideFixture):
             body="b" * 9000,
             act_where="a" * 150,
             ref="r" * 400,
-            dedupe_key="d" * 150,
+            dedupe_key="d" * 120,
         )
         (it,) = needs.build_queue()["items"]
         self.assertEqual(len(it["title"]), 160)

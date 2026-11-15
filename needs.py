@@ -2055,6 +2055,9 @@ def file_outside(
     if action not in ("file", "resolve"):
         raise ValueError("action must be file or resolve")
     key = _outside_field(args, "dedupe_key", 120)
+    if len(str(args.get("dedupe_key") or "")) > 120:
+        # A cut key would let two different long keys collide into one record.
+        raise ValueError("dedupe_key must be at most 120 characters")
     # Hermes' tool dispatch passes task_id, session_id and user_task but not the profile, so
     # an absent kwarg falls back to the profile the process is running under, the same way
     # record_wait() resolves it. An explicit kwarg still wins.
@@ -2129,7 +2132,15 @@ def file_outside(
             if match is None or not match.is_file() or match.is_symlink():
                 raise LookupError("No filed outside item matches that id or dedupe_key")
             match.unlink()
-            return {"ok": True, "resolved": True, "id": f"outside:filed:{match.stem}"}
+            resolved_id = f"outside:filed:{match.stem}"
+            # A "Not for me" marker names a record that no longer exists: drop it here,
+            # under the same lock, so hidden.json does not keep dead ids. A damaged
+            # hidden.json is left as it is for repair rather than overwritten.
+            marks = load_hidden(home, errors=(bad := []))
+            if not bad and resolved_id in marks:
+                marks.pop(resolved_id)
+                _write_json(_hidden_path(home), marks, ordered=True)
+            return {"ok": True, "resolved": True, "id": resolved_id}
         if match is None and len(files) >= _OUTSIDE_LIMIT:
             # Done records waiting out their undo window do not count against the cap.
             active = sum(1 for f in files if not f.is_symlink() and not _is_done(_read_json(f)))
