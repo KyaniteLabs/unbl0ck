@@ -105,7 +105,7 @@ class CredentialDigits(unittest.TestCase):
         for key in ("auth_token", "refresh_token", "session_token"):
             with self.subTest(key=key):
                 assert_redacted(needs._ask_redact(f"{key}=483920"), "483920")
-                self.assertNotIn("483920", json.dumps(needs._ask_card_view({key: "483920"})))
+                self.assertNotIn("483920", json.dumps(needs._ask_redact_value({key: "483920"})))
 
 
 class Completeness(OutsideFixture):
@@ -280,10 +280,8 @@ class Links(Home):
 class Budgets(unittest.TestCase):
     def test_a_cut_card_field_with_its_marker_stays_within_the_budget(self):
         """R5-needs-045: the cut marker is counted in the room it is cut to."""
-        budget = [5]
-        view = needs._ask_card_view({"title": "x" * 100}, _text_budget=budget)
+        view = needs._ask_card_payload({"title": "x" * 100}, 5)
         self.assertLessEqual(len(view["title"]), 5)
-        self.assertGreaterEqual(budget[0], 0)
 
 
 @unittest.skipIf(HERMES_ERROR, f"Hermes unavailable: {HERMES_ERROR}")

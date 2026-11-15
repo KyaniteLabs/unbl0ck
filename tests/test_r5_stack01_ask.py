@@ -33,7 +33,7 @@ class AnUnterminatedPrivateKeyIsStillAPrivateKey(unittest.TestCase):
 class NumericCredentialsUnderTokenKeys(unittest.TestCase):
     def test_numeric_auth_token_is_redacted(self):
         """R5-needs-003 (class F): token and authentication keys keep their digits private."""
-        self.assertEqual(needs._ask_card_view({"auth_token": 123456})["auth_token"], "[redacted]")
+        self.assertEqual(needs._ask_redact_value({"auth_token": 123456})["auth_token"], "[redacted]")
         assert_redacted(needs._ask_redact("auth_token=123456"), "123456")
         for text, digits in (
             ("access_token: 998877", "998877"),
@@ -60,27 +60,46 @@ class AnExhaustedJsonScanWithholdsEscapedSecrets(unittest.TestCase):
         assert_redacted(needs._ask_redact(s), SYNTH)
 
 
-class WorkspacePathIsScrubbedFromKeys(unittest.TestCase):
+class OnlyNamedFieldsReachTheModel(unittest.TestCase):
     def test_a_path_used_as_a_key_does_not_reach_the_model(self):
-        """R5-needs-016 (class F): keys are text too."""
-        view = needs._ask_card_view(
-            {
-                "workspace": {"path": "/srv/private/repo"},
-                "events": [{"payload": {"/srv/private/repo/file": "safe"}}],
-            }
-        )
-        out = json.dumps(view)
-        self.assertNotIn("/srv/private/repo", out)
-        self.assertIn("safe", out)
+        """R5-needs-016 (class F), retired by the #71 allowlist: no key of the card is copied."""
+        card = {
+            "title": "t",
+            "body": "see /srv/private/repo/a",
+            "workspace": {"path": "/srv/private/repo/", "branch": "b"},
+            "events": [{"kind": "k", "payload": {"/srv/private/repo/file": "PAYLOAD"}}],
+            "graph": {"parents": ["GRAPH"]},
+            "attachments": [{"filename": "ATTACHED"}],
+            "extra": "EXTRA",
+        }
+        out = needs.build_ask_messages(card, [])[1]["content"]
+        for gone in ("/srv/private/repo", "PAYLOAD", "GRAPH", "ATTACHED", "EXTRA"):
+            self.assertNotIn(gone, out)
+        self.assertIn("[workspace]/a", out)
+        self.assertIn('"events": [{"kind": "k", "created_at": null}]', out)
 
-    def test_a_scrubbed_key_keeps_every_value(self):
-        view = needs._ask_card_view(
-            {
-                "workspace": {"path": "/srv/private/repo"},
-                "m": {"/srv/private/repo/a": 1, "[workspace]/a": 2},
-            }
-        )
-        self.assertEqual(sorted(view["m"].values()), [1, 2])
+    def test_a_container_under_a_named_field_is_not_sent(self):
+        """#71 review: a container was JSON-dumped whole, escaping the path past the scrub and carrying
+        a numeric credential and arbitrary nested fields. Hermes stores these fields as text."""
+        card = {
+            "workspace": {"path": '/srv/a"b'},
+            "result": {"note": '/srv/a"b/file'},
+            "block": {"limit": {"signing key": 123456, "attachments": [{"content": "PRIVATE"}]}},
+        }
+        out = needs.build_ask_messages(card, [])[1]["content"]
+        for gone in ("srv", "123456", "PRIVATE"):
+            self.assertNotIn(gone, out)
+        payload = needs._ask_card_payload(card, 10_000)
+        self.assertEqual((payload["result"], payload["block"]["limit"]), ("[not text]", "[not text]"))
+
+    def test_json_inside_text_loses_its_own_workspace_path(self):
+        """#71 review: embedded JSON kept ``workspace.path``; the card view used to drop and scrub it."""
+        s = '{"workspace": {"path": "/srv/private/repo"}, "note": "/srv/private/repo/x", "password": "x"}'
+        for content in (
+            needs.build_ask_messages({"body": s}, [])[1]["content"],
+            needs.bluf_messages({"ask": s})[1]["content"],
+        ):
+            self.assertNotIn("/srv/private", content)
 
 
 class TheAskTestsLoadWithoutHermes(unittest.TestCase):

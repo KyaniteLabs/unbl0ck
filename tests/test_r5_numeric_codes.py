@@ -56,7 +56,7 @@ class NumericCodeRedaction(unittest.TestCase):
 
     def test_a_numeric_code_field_in_a_card_is_redacted(self):
         """Extra (round-5 sweep): a structured card field holding a code is redacted, a count is not."""
-        view = needs._ask_card_view({"pin": 1234, "otp": "123456", "pins": 2, "pin_count": 3}, None, None, ())
+        view = needs._ask_redact_value({"pin": 1234, "otp": "123456", "pins": 2, "pin_count": 3})
         self.assertEqual(view, {"pin": "[redacted]", "otp": "[redacted]", "pins": 2, "pin_count": 3})
 
 

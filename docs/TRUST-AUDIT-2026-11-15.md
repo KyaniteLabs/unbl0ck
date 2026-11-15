@@ -21,14 +21,14 @@ An outside audit found 15 gaps in how UNBL0CK checks its own guarantees (#71). T
 
 | # | Finding | Status |
 |---|---|---|
-| 1 | Allowlist card view (the queue's trust boundary) is spread across `needs.py` | Deferred: a redesign that needs the owner's approval |
+| 1 | Allowlist card view (the queue's trust boundary) is spread across `needs.py` | Fixed: Ask builds its payload from a fixed list of named fields in `_ask_card_payload`, pinned by `tests/test_r5_stack01_ask.py` |
 | 2 | Process-start test is a characterization labelled as a contract; redaction tests assert on substrings | Fixed: the ps test is relabelled and a syntax-tree scan pins the one process start; `assert_redacted` fails on any surviving 4-character piece of a secret |
 | 3 | CI runs no linter or type checker | Fixed for lint (ruff). No type-check job: mypy is not set up and could not be shown passing |
 | 4 | CI has no job timeout or dependency cache | Fixed. Making the checks required on `main` is a repository setting for the owner |
 | 5 | No feature list or driver | Fixed: `docs/FEATURES.md` |
 | 6 | No property-based tests for the state machines | Fixed: Hypothesis state machines for Ask jobs and for outside Done, Not for me and Undo |
 | 7 | Skip directives across many test files | Reviewed, rejected as a defect: each skip is a platform or optional-dependency guard, and CI fails on any skipped test |
-| 8 | `needs.py` is one large module; the "only one `subprocess` use" README claim is unchecked | Claim now checked (see 2). Splitting the module is deferred: it needs the owner's approval |
+| 8 | `needs.py` is one large module; the "only one `subprocess` use" README claim is unchecked | Claim now checked (see 2). Partly fixed: secret redaction (about 1,000 lines) moved to `redact.py`. Other sections stay for now, because tests patch names such as `_settings` and `hermes_home` on `needs`; moving them first needs those tests to patch the new module |
 | 9 | Repeated `kanban_db` imports | Unused imports removed in 16 files. The repeated `kanban_db` imports in `dashboard/plugin_api.py` are lazy imports of an optional Hermes module, kept and exempted in `ruff.toml` |
 | 10 | CANON rules are prose only | Rejected for now: CANON is a design guide for people, not a machine-checkable rule set |
 | 11 | Bare `# noqa: BLE001` | Fixed: every production suppression gives its reason |

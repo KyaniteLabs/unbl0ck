@@ -343,7 +343,7 @@ class SummaryCache(Home):
         ask = "x" * 5800 + " " + pem
         content = needs.bluf_messages({"title": "t", "ask": ask, "owner": "o"})[1]["content"]
         self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", content)
-        view = needs._ask_card_view({"t": "y" * 100 + pem}, _text_budget=[400])
+        view = needs._ask_card_payload({"title": "y" * 100 + pem}, 400)
         self.assertNotIn("QUJDREVGR0hJSktMTU5PUA", json.dumps(view))
 
     def test_a_long_chat_secret_keeps_no_bare_value_in_the_excerpt(self):
