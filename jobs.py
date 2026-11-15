@@ -35,6 +35,8 @@ Ask job, one per question::
         unreadable, oversized, foreign, symlinked or implausible file -> UNKNOWN
         storage that cannot be checked -> UNKNOWN (never "absent")
     The plugin never resubmits a recovered job on its own.
+    Without fcntl (no lock other processes honour) nothing is written: a restart reads such a
+    job as unknown, and the journal never claims a lock it does not hold.
 
     consume is refused while PENDING; finish/fail are refused unless PENDING (a late
     worker for an expired job is a no-op, never a resurrection).

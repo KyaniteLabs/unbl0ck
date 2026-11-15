@@ -97,6 +97,8 @@ use thread locks and atomic replacement. macOS/Linux additionally use `fcntl`
 cross-process locking with a five-second timeout. Live prompt files and Pocket pack
 use per-file atomic replacement without those shared-store locks. Windows lacks that
 cross-process guarantee. Never repair corruption by silently replacing it with defaults.
+The Ask restart markers are stricter: without `fcntl` (Windows) they are not written at all, so a
+restart there reports an Ask job as unknown instead of two processes sharing an unlocked journal.
 
 State reads and writes never follow a link: a symbolic link in place of `plugin-data/unbl0ck`,
 its subfolders, the lock file or a state file is refused; a link planted where a temporary file would go is removed, never followed, and the write continues with a fresh private file; a state file
