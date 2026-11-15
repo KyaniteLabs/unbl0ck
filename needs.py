@@ -3070,7 +3070,8 @@ def file_outside(
             # hidden.json is left as it is for repair rather than overwritten.
             marker_failed = False
             try:
-                marks = load_hidden(home, errors=(bad := []))
+                # The raw view: it keeps every other dismissal's undo token intact.
+                marks = _load_hidden_raw(home, errors=(bad := []))
                 if not bad and resolved_id in marks:
                     marks.pop(resolved_id)
                     _write_json(_hidden_path(home), marks, ordered=True)

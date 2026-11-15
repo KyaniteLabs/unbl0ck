@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Resolving a filed item keeps the other dismissals' Undo tokens, and the key-only resolve is documented as unguarded (#46 round 5).** The marker cleanup on resolve rewrote `hidden.json` from the version-only view and stripped every other dismissal's token, so their Undo failed. The README and tool schema now say that only a resolve with `version` is protected against another agent's refile.
 - **Resolving a filed item reports success once its record is gone (#46 round 4).** If the stale Not for me marker cannot be removed after the record was deleted, resolve still returns resolved, with a note, instead of an error that invites a pointless retry.
 - **Filed keys only match our own records, and never guess (#46 round 4).** Matching by `dedupe_key` skips stray JSON files and records whose name and id disagree, refuses to overwrite or delete when several records claim one key (including explicit global keys and duplicate profile matches), still stops when an unreadable record might hold the key, and the tool description and README say a global key is resolved with `dedupe_scope: "global"`.
 - **Resolving a filed item also drops its "Not for me" marker, and a `dedupe_key` over 120 characters is refused instead of cut (#46 sweep).** A cut key let two different long keys collide into one record; the marker of a resolved record stayed in `hidden.json` until the cap evicted it. A damaged `hidden.json` is left untouched.

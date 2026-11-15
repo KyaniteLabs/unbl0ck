@@ -118,7 +118,7 @@ FILE_SCHEMA = {
             "dedupe_key": {"type": "string", "maxLength": 120, "description": "Re-file this key to update in place; also usable with resolve"},
             "dedupe_scope": {"type": "string", "enum": ["profile", "global"], "description": "Who shares dedupe_key: profile (default when your profile is known) keeps it private to your profile; global shares it across profiles. Pass the same dedupe_scope when you resolve by dedupe_key"},
             "id": {"type": "string", "description": "Previously returned item id, for resolve"},
-            "version": {"type": "string", "description": "The version returned when the item was filed. Required when resolving by id; a changed item is not resolved"},
+            "version": {"type": "string", "description": "The version returned when the item was filed. Required when resolving by id; a changed item is not resolved. Optional with dedupe_key: without it, the resolve clears whatever record currently holds the key, even one another agent refiled"},
         },
         "description": "file requires kind, title, body and act_where; resolve requires either id or dedupe_key",
         "additionalProperties": False,
