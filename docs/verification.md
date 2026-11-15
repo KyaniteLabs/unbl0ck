@@ -35,13 +35,13 @@ does not prove focus, accessible controls or the operator journey in a browser.
 | Local CLI/slash and pack | `test_inbox_quality`, `test_outside`, `test_qa` | Messaging sees counts only; JSON stdout remains parseable while writing a pack |
 | Answer / keep blocked / release / triage | `test_needs_hermes`, `test_api_qa`, `test_hardening`, rendered operator checks | One comment; partial release retries without another comment; stale versions never submit |
 | Hide / folder Done / Undo | `test_outside`, `test_failure_quality`, `test_operator_recovery`, rendered operator checks | Failed Undo retains retry; corrupt state is preserved; folder source is untouched |
-| Disclosure matrix, redaction and cache partitions | `test_disclosure_matrix` | Matrix equals code and docs; synthetic secrets never reach summary or Ask input; pairing and prompt never summarized; settings fault disables model paths; caches partitioned and concurrent-safe |
-| Ask detection corpus, window and coverage | `test_ask_corpus`, `test_ask_coverage`, `test_desktop_coverage` | Known false positives and negatives pinned exactly; window, skipped counts and backfill bounds reported; no duplicates; coverage is counts and fixed text |
-| Full-text search scope and bounds | `test_search_scope`, `test_desktop_quality` | Matches beyond excerpts, 200-item cap, failed sources, Unicode, no model call, never automatic; profile-boundary and draft-preservation checks for the new button are not yet written |
+| Disclosure matrix, redaction and cache partitions | `test_disclosure_matrix`, `test_r4_stack12` | Matrix equals code and docs, and each search and cross-profile flag equals what the real readers and search do; the state inventory lists every persistent file the code names; one settings snapshot per queue response; a settings fault sends nothing end to end; synthetic secrets never reach summary or Ask input; pairing and prompt never summarized; settings fault disables model paths; caches partitioned and concurrent-safe |
+| Ask detection corpus, window and coverage | `test_ask_corpus`, `test_ask_coverage`, `test_desktop_coverage`, `test_r4_stack11` | Known false positives and negatives pinned exactly (named cases carry the configured name); window, skipped counts, read budget and snapshot, and backfill marks reported; no duplicates; coverage is counts and fixed text |
+| Full-text search scope and bounds | `test_search_scope`, `test_desktop_quality` | Matches beyond excerpts, 200-item cap, failed sources, Unicode, no model call, never automatic; executed checks: the profile boundary (`SearchProfileBoundary`), a real home that search must leave untouched (`SearchRealHome`), the shared read budget (`SearchFolderBudget`), and the page itself run under node (`DesktopSearchExecuted`: button click, rendered hits and coverage, stale versions, late answers). Only the draft-preservation and never-automatic checks read the source text rather than run it |
 | Full text / Context / search / keys | `test_desktop_quality`, `test_desktop_contract`, rendered operator checks | Retry controls work; filters preserve mounted state; Escape and focus follow the documented order |
 | Typed answer recovery | `test_operator_recovery`, rendered partial-source checks | Card disappears and returns with draft intact; changed question keeps recovered draft disabled |
 | Surface contract | `test_surface_contract` | Same item order and identity on the CLI list and Pocket pack; every surface agrees on the ask count; remote output carries counts only (no title, text, name, id or command) yet discloses stuck and answered counts; limited output states what it omits; unknown platforms are remote; docs matrix lists every surface and dimension |
-| Capability matrix | `test_capability_matrix` | Every source classified (supported, by design, not yet) with a reason; docs table equals the code; Desktop explains missing model help; non-Kanban ids never reach Ask or the provider; the set of write routes is pinned; password prompts, pairing secrets and Pocket packs carry no inline action or secret; disabled/unreachable provider fails closed |
+| Capability matrix | `test_capability_matrix` | Every source classified (supported, by design, not yet) with a reason; docs table equals the code; Desktop explains missing model help; non-Kanban ids are refused by the interactive Ask route (automatic one-line summaries are separate and covered by the summary rows); the set of write routes is pinned; password prompts, pairing secrets and Pocket packs carry no inline action or secret; disabled/unreachable provider fails closed |
 | Ask restart recovery | `test_ask_job_recovery`, `test_desktop_ask_recovery` | Restart before send, after send, after completion (with and without answer persistence) and after failure; repeated polling; TTL, cap and settled eviction; corrupt, foreign and symlinked markers; 0600/0700 modes; no answer text on disk by default; card isolation; delete; the provider is never called by recovery |
 | Summary / Ask | `test_bluf*`, `test_ask_job`, `test_ask_privacy`, `test_state_machines`, rendered operator checks | Bounded admission; reasoning stripped; lost terminal response can be collected with no second model POST |
 | Config read failure and repair | `test_failure_quality`, independent actual Hermes parser probes | Raised, marked-dictionary and import failures fail closed, both cold and after a good config; concurrent refresh shares one settled read; another caller's repair cannot erase an in-flight fault |
@@ -145,10 +145,11 @@ restored after unmount from the same bounded session memory, without a second mo
 call; transport retry is implemented and verified.
 
 Bounded folder selection discloses older omissions instead of silently scanning an
-unbounded directory. Folder pagination and automatic export archiving were not adopted;
-the latter would change the read-only source contract. Filed dedupe keys are
-profile-scoped by default, with an explicit global scope; existing records are adopted
-in place by their own profile.
+unbounded directory. Folders are paged by completion rather than by a cursor: each poll
+shows the newest 200 waiting files, and Done or Not for me on a file brings an older one
+into view. Automatic export archiving was not adopted; it would change the read-only
+source contract. Filed dedupe keys are profile-scoped by default, with an explicit global
+scope; existing records are adopted in place by their own profile.
 
 The review link reuses native signed ingress and verifies GitHub review identity rather
 than adding a listener, executing PR code with secrets, or treating duplicate responses

@@ -27,8 +27,11 @@ This module imports Hermes lazily so it can be unit-tested without a Hermes inst
 from __future__ import annotations
 
 import collections
+import errno
 import hashlib
 import html.parser
+import itertools
+import math
 import json
 import logging
 import os
@@ -149,14 +152,18 @@ def bluf_enabled(settings: dict[str, Any] | None = None) -> bool:
 def chat_window_days(settings: dict[str, Any] | None = None) -> int:
     """How many days back chats are read (setting ``chat_window_days``): 14 by default, 1 to 90.
 
-    Anything else (zero, negative, fractional, boolean, text) falls back to the default so a bad
-    value can neither disable the source nor widen it past the cap."""
+    Anything else (zero, negative, above 90, fractional, boolean, text, digits that are not a
+    number this reader can convert) uses the default, exactly as the setting's description says,
+    so a bad value can neither disable the source, widen it, nor fail the queue build."""
     raw = (settings if settings is not None else _settings()).get("chat_window_days")
-    if isinstance(raw, str) and raw.strip().isdigit():
-        raw = int(raw.strip())
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+    if isinstance(raw, str):
+        text = raw.strip()
+        # ASCII digits only, and short: ``"²".isdigit()`` is true but ``int("²")`` raises, and a
+        # digit string past the interpreter's conversion limit raises too.
+        raw = int(text) if text.isascii() and text.isdigit() and len(text) <= 6 else None
+    if isinstance(raw, bool) or not isinstance(raw, int) or not 1 <= raw <= CHAT_WINDOW_MAX_DAYS:
         return CHAT_WINDOW_DAYS
-    return min(raw, CHAT_WINDOW_MAX_DAYS)
+    return raw
 
 
 def outside_recursive(settings: dict[str, Any] | None = None) -> bool:
@@ -212,6 +219,10 @@ def ask_journal_dir(home: Path | None = None) -> Path:
 CHAT_WINDOW_DAYS = 14
 CHAT_WINDOW_MAX_DAYS = 90  # the most a configured backfill may reach
 CHAT_SESSION_CAP = 500  # sessions read per profile in one queue build; the rest are counted, not read
+# SQLite work one profile's chat read may spend (virtual-machine steps, about a second or two): the
+# session cap bounds rows returned, this bounds the work behind them, so a table without the
+# indexes Hermes creates fails the source visibly instead of stalling the refresh.
+CHAT_QUERY_OPS = 30_000_000
 CHAT_TITLES = ("Bot Chat",)
 
 _PATTERN_CACHE: dict[str, dict[str, re.Pattern[str]]] = {}
@@ -299,23 +310,64 @@ def hermes_home() -> Path:
     return home
 
 
-def data_dir(home: Path | None = None) -> Path:
-    d = (home or hermes_home()) / "plugin-data" / "unbl0ck"
-    d.mkdir(parents=True, exist_ok=True)
+def data_dir(home: Path | None = None, *, create: bool = True) -> Path:
+    """The plugin's state folder. ``create=False`` is for readers that promise to write
+    nothing: the path is returned (and checked for links) but never made."""
+    base = (home or hermes_home()) / "plugin-data"
+    _refuse_link(base)  # an ancestor link redirects every write as surely as a link on the folder
+    d = base / "unbl0ck"
+    _refuse_link(d)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _refuse_link(d: Path) -> None:
+    """State lives only where it was created: a link there could aim every write at another
+    plugin's data or an unrelated folder."""
+    if d.is_symlink():
+        raise OSError(f"{d.name} is a symbolic link; refusing to use it for state")
+
+
+class Notice(str):
+    """A message in a reader's ``errors`` list that reports a state, not a failure: the queue
+    shows it like any other, but a caller that counts failures (full-text search) does not."""
+
+
+def _list_files(d: Path, suffix: str = "") -> list[Path]:
+    """Entries of *d* whose name ends with *suffix*, sorted by name. Unlike ``Path.glob``, a
+    directory that cannot be listed raises instead of looking empty."""
+    with os.scandir(d) as entries:
+        return sorted((Path(e.path) for e in entries if e.name.endswith(suffix)), key=lambda p: p.name)
 
 
 # --- hidden items -------------------------------------------------------------------------
 
 
-def _hidden_path(home: Path | None) -> Path:
-    return data_dir(home) / "hidden.json"
+def _hidden_path(home: Path | None, *, create: bool = True) -> Path:
+    return data_dir(home, create=create) / "hidden.json"
 
 
 STATE_LOCK_TIMEOUT = 5.0  # seconds to wait for the state lock before giving up
 _STATE_LOCK = (
     threading.Lock()
 )  # shared state, including filed outside items, is read-modify-write
+
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # absent on Windows
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+
+
+_WIN_LOCK_VIOLATION = 33  # ERROR_LOCK_VIOLATION
+
+
+def _msvcrt_contention(exc: OSError) -> bool:
+    """True when ``msvcrt.locking`` failed only because another holder has the byte: EACCES
+    (LK_NBLCK on a held range), EDEADLK/EDEADLOCK (a blocking lock that gave up) or the Windows
+    lock-violation code. EBADF, EINVAL and the rest are permanent and must not read as "busy"."""
+    if getattr(exc, "winerror", None) == _WIN_LOCK_VIOLATION:
+        return True
+    return exc.errno in {errno.EACCES, errno.EDEADLK, getattr(errno, "EDEADLOCK", errno.EDEADLK)}
 
 
 @contextmanager
@@ -327,9 +379,14 @@ def _state_lock(home: Path | None):
         raise TimeoutError("unbl0ck: state lock busy (another thread holds it)")
     try:
         d = data_dir(home)
-        fd = os.open(d / ".state.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        # O_NOFOLLOW: a dangling or redirected link is never created through or locked.
+        fd = os.open(d / ".state.lock", os.O_RDWR | os.O_CREAT | _NOFOLLOW, 0o600)
         locked_with_msvcrt = False
         try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError("the state lock is not a regular file")
+            if not _names_open_file(fd, d / ".state.lock"):
+                raise OSError("the state lock is a link; refusing to lock through it")
             if fcntl is not None:
                 while True:
                     try:
@@ -351,7 +408,9 @@ def _state_lock(home: Path | None):
                         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                         locked_with_msvcrt = True
                         break
-                    except OSError:
+                    except OSError as exc:
+                        if not _msvcrt_contention(exc):
+                            raise  # a bad descriptor, argument or filesystem is not a busy lock
                         if time.monotonic() >= deadline:
                             raise TimeoutError(
                                 "unbl0ck: state lock busy (another process holds it)"
@@ -383,30 +442,81 @@ def state_lock_mode() -> str:
 
 # No state file is legitimately larger; a bigger one is damage or abuse, refused before it is read.
 MAX_STATE_BYTES = 16 * 1024 * 1024
-_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)  # absent on Windows
-_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_PROFILE_YAML_BYTES = 64 * 1024
 
 
-def _read_plain_text(p: Path) -> str:
-    """Read a small regular file without following a link or blocking on a FIFO or device."""
+class UnsafeStateFile(OSError):
+    """A state path that is not a plain regular file of a sane size (a link, FIFO, device,
+    oversized or swapped file). ``reason`` is one of ``not_regular``, ``too_large``, ``changed``."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _names_open_file(fd: int, p: Path) -> bool:
+    """True when the path still names the very file *fd* is open on. This is what refuses a
+    link on a platform that has no ``O_NOFOLLOW`` (the open follows it and ``fstat`` sees a
+    regular target) and a path that was swapped after the open."""
+    try:
+        return os.path.samestat(os.fstat(fd), os.lstat(p))
+    except OSError:
+        return False
+
+
+def _read_plain_bytes_st(p: Path, limit: int | None = None) -> tuple[bytes, os.stat_result]:
+    """Read a regular file's exact bytes without following a link or blocking on a FIFO or
+    device, refusing one larger than *limit* (before reading when ``fstat`` already says so, and
+    by the bytes actually read when it grew). Returns the bytes with the ``fstat`` of the very
+    descriptor they were read from, so a caller that caches by file signature caches the
+    signature of what it read, not of whatever a later path lookup finds."""
+    limit = MAX_STATE_BYTES if limit is None else limit
     fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise OSError("not a regular file")
-        if st.st_size > MAX_STATE_BYTES:
-            raise OSError("too large to be a state file")
-        with os.fdopen(fd, "r", closefd=False) as fh:
-            return fh.read(MAX_STATE_BYTES + 1)
+            raise UnsafeStateFile("not a regular file", "not_regular")
+        if not _names_open_file(fd, p):
+            raise UnsafeStateFile("not the file that was opened (a link or a swapped path)", "changed")
+        if st.st_size > limit:
+            raise UnsafeStateFile("too large to be a state file", "too_large")
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            raw = fh.read(limit + 1)
+        if len(raw) > limit:
+            raise UnsafeStateFile("too large to be a state file", "too_large")
+        return raw, st
     finally:
         os.close(fd)
 
 
-def _read_json(p: Path, *, errors: list[str] | None = None, source: str = "state", strict: bool = False) -> dict[str, Any]:
+def _read_plain_text_st(
+    p: Path, limit: int | None = None, errors: str = "strict"
+) -> tuple[str, os.stat_result]:
+    """:func:`_read_plain_bytes_st`, decoded as UTF-8."""
+    raw, st = _read_plain_bytes_st(p, limit)
+    return raw.decode("utf-8", errors), st
+
+
+def _read_plain_text(p: Path, limit: int | None = None, errors: str = "strict") -> str:
+    return _read_plain_text_st(p, limit, errors)[0]
+
+
+def _read_json(
+    p: Path,
+    *,
+    errors: list[str] | None = None,
+    source: str = "state",
+    strict: bool = False,
+    entry_ok: Any = None,
+) -> dict[str, Any]:
+    """Read one JSON object. A strict read also checks every entry with *entry_ok*, so a record
+    in a shape this version does not write is refused rather than rewritten."""
     try:
         data = json.loads(_read_plain_text(p))
         if not isinstance(data, dict):
             raise ValueError("expected a JSON object")
+        if strict and entry_ok is not None and not all(entry_ok(v) for v in data.values()):
+            raise ValueError("unsupported entry shape")
     except FileNotFoundError:
         return {}
     except Exception as exc:  # noqa: BLE001 - a corrupt file must not break the queue, but say so
@@ -421,27 +531,85 @@ def _read_json(p: Path, *, errors: list[str] | None = None, source: str = "state
     return data
 
 
+_REPLACE_ATTEMPTS = 25  # about half a second: a reader on Windows holds the file open only briefly
+
+
 def _write_json(p: Path, data: dict[str, Any], *, ordered: bool = False) -> None:
     """Atomic JSON write. ``ordered`` keeps insertion order (stores that evict the oldest entry)."""
+    # UTF-8 as written, so a compact file restored from a backup is not inflated by escapes on
+    # the next write; text that cannot be encoded (a lone surrogate) falls back to escapes.
+    try:
+        payload = json.dumps(data, indent=1, sort_keys=not ordered, ensure_ascii=False).encode()
+    except UnicodeEncodeError:
+        payload = json.dumps(data, indent=1, sort_keys=not ordered).encode()
+    if len(payload) > MAX_STATE_BYTES:
+        # The reader refuses a file this large: never write what could not be read back.
+        raise OSError(f"{p.name} would exceed the {MAX_STATE_BYTES}-byte state limit; nothing was written")
     tmp = p.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
     # A leftover or planted file at this name is removed, never written through: O_EXCL and
-    # O_NOFOLLOW make a link there fail instead of clobbering its target.
+    # O_NOFOLLOW make a link there fail instead of clobbering its target, and a new file
+    # starts at 0600 whatever its predecessor's mode was.
     tmp.unlink(missing_ok=True)
     fd = os.open(
         tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600
     )  # waits hold prompt text
     try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps(data, indent=1, sort_keys=not ordered))
-        tmp.replace(p)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            # The pathname must still be the file just written: a swapped temporary name would
+            # otherwise be installed as the state file.
+            if not _names_open_file(fh.fileno(), tmp):
+                raise OSError(f"{p.name}: the temporary file was replaced before it was installed")
+        for attempt in range(_REPLACE_ATTEMPTS):
+            try:
+                tmp.replace(p)
+                break
+            except PermissionError:
+                # Windows refuses to replace a file a reader has open; readers hold it briefly.
+                if attempt == _REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.02)
     finally:
         tmp.unlink(
             missing_ok=True
         )  # gone after a successful replace; removed after a failed write
 
 
-def load_hidden(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, str]:
-    return _read_json(_hidden_path(home), errors=errors, strict=strict)
+def _hidden_entry_ok(value: Any) -> bool:
+    # A string version; null and "" are older writes that unhide still removes.
+    return value is None or isinstance(value, str)
+
+
+# A hide stores ``version`` plus a per-dismissal token (``version \x1f token``), so an Undo can
+# name this dismissal and not just the content version two dismissals share. Entries written
+# before tokens existed hold the bare version, which stays their token.
+_HIDDEN_TOKEN = re.compile(r"(.*)\x1f([0-9a-f]{32})\Z", re.S)
+
+
+def _split_hidden(value: Any) -> tuple[Any, str | None]:
+    """(version, token) of one stored hidden entry; the token is None for a bare version."""
+    if isinstance(value, str):
+        match = _HIDDEN_TOKEN.fullmatch(value)
+        if match:
+            return match.group(1), match.group(2)
+    return value, None
+
+
+def _load_hidden_raw(
+    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False, create: bool = True
+) -> dict[str, Any]:
+    return _read_json(
+        _hidden_path(home, create=create), errors=errors, strict=strict, entry_ok=_hidden_entry_ok
+    )
+
+
+def load_hidden(
+    home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False, create: bool = True
+) -> dict[str, str]:
+    """``{item_id: version}``; the dismissal tokens are not part of this view."""
+    raw = _load_hidden_raw(home, errors=errors, strict=strict, create=create)
+    return {item_id: _split_hidden(value)[0] for item_id, value in raw.items()}
 
 
 class Visibility(str, Enum):
@@ -473,75 +641,154 @@ _HIDDEN_KEEP = 1000
 # most OUTSIDE_SCAN_ENTRIES files per folder, so finishing that many must not evict the earliest
 # completions (they would outrank the files still waiting). They keep their own, larger bound.
 _HIDDEN_FOLDER_KEEP = 5000
+# Each watched folder has its own scan bound, so the folder dismissals scale with the number of
+# watched folders (up to a ceiling that keeps the store far below the state-file size limit).
+_HIDDEN_MAX_ROOTS = 8
+
+
+def _watched_root_count(settings: dict[str, Any] | None = None) -> int:
+    raw = (settings if settings is not None else _settings()).get("outside_dirs") or os.environ.get(
+        "UNBL0CK_OUTSIDE_DIRS", ""
+    )
+    return len({name.strip() for name in str(raw).split(",") if name.strip()})
+
+
+def _hidden_folder_cap() -> int:
+    """How many folder dismissals are kept: 5,000 per watched folder, at most 8 folders' worth."""
+    return _HIDDEN_FOLDER_KEEP * min(max(_watched_root_count(), 1), _HIDDEN_MAX_ROOTS)
 
 
 def _trim_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
-    """Oldest-first eviction, separately for folder Done records and every other dismissal."""
+    """Oldest-first eviction, separately for folder dismissals and every other dismissal."""
     folder = [k for k in hidden if k.startswith("outside:folder:")]
     other = [k for k in hidden if not k.startswith("outside:folder:")]
-    drop = set(folder[:-_HIDDEN_FOLDER_KEEP] if len(folder) > _HIDDEN_FOLDER_KEEP else [])
+    cap = _hidden_folder_cap()
+    drop = set(folder[:-cap] if len(folder) > cap else [])
     drop |= set(other[:-_HIDDEN_KEEP] if len(other) > _HIDDEN_KEEP else [])
     return {k: v for k, v in hidden.items() if k not in drop} if drop else hidden
 
 
-def hide(item_id: str, version: str, home: Path | None = None) -> None:
+def _fit_hidden(hidden: dict[str, Any]) -> dict[str, Any]:
+    """Drop the oldest dismissals until the store, as it will be written, fits the read limit.
+
+    The count caps alone do not bound the size (a version string can be long). A single
+    dismissal that alone exceeds the limit is refused."""
+    def size(data: dict[str, Any]) -> int:
+        try:
+            return len(json.dumps(data, indent=1, ensure_ascii=False).encode())
+        except UnicodeEncodeError:
+            return len(json.dumps(data, indent=1).encode())
+
+    while size(hidden) > MAX_STATE_BYTES:
+        if len(hidden) <= 1:
+            raise ValueError("that dismissal is too large to store")
+        keep = max(1, len(hidden) - max(1, len(hidden) // 10))
+        hidden = dict(list(hidden.items())[-keep:])
+    return hidden
+
+
+class StaleHide(RuntimeError):
+    """The dismissal names an older version than the card now has, and a newer one is already hidden."""
+
+
+def _current_version(item_id: str, home: Path | None) -> str | None:
+    """The queue's current version of one item, or None when it is gone or cannot be looked up."""
+    try:
+        for it in build_queue(home, include_hidden=True).get("items", []):
+            if it.get("id") == item_id:
+                return str(it.get("version") or "")
+    except Exception:  # noqa: BLE001 - a lookup failure must not block a dismissal
+        log.warning("unbl0ck: could not look up %s before hiding it", item_id, exc_info=True)
+    return None
+
+
+def hide(item_id: str, version: str, home: Path | None = None) -> str:
+    """Hide one version. Returns the token naming this dismissal, for ``unhide``."""
     item_id, version = str(item_id or ""), str(version or "")
-    if not item_id or len(item_id) > 300 or len(version) > 300:
+    if not item_id or len(item_id) > 300 or len(version) > 300 or "\x1f" in version:
         raise ValueError("item id and version must be short strings")
+    # An older tab's "Not for me" must not replace a newer dismissal. Checked outside the
+    # lock because the queue build takes it.
+    existing = load_hidden(home).get(item_id)
+    if existing and existing != version:
+        current = _current_version(item_id, home)
+        if current is not None and current != version:
+            raise StaleHide("the card changed since this view; refresh before hiding it")
     with _state_lock(home):
-        hidden = load_hidden(home, strict=True)
+        hidden = _load_hidden_raw(home, strict=True)
         hidden.pop(item_id, None)
-        hidden[item_id] = version
-        hidden = _trim_hidden(hidden)  # oldest first out; the store never grows unbounded
+        token = uuid.uuid4().hex
+        hidden[item_id] = f"{version}\x1f{token}"
+        hidden = _fit_hidden(_trim_hidden(hidden))  # oldest first out; the store never grows unbounded
         _write_json(_hidden_path(home), hidden, ordered=True)
+        return token
 
 
 def unhide(item_id: str, home: Path | None = None, token: str | None = None) -> bool:
     """Undo "Not for me" or a local Done. Returns whether anything was restored.
 
-    ``token`` names the dismissal being undone: the version that was hidden, or the ``token``
-    a Done returned. A caller holding one may only restore that dismissal: a newer one (the
-    item resurfaced with changed content and was dismissed again) is left alone and the
-    answer is False. Without a token every dismissal of the id is restored (older callers).
+    ``token`` names the dismissal being undone: the token ``hide`` or a Done returned. It
+    identifies one dismissal, not a content version, so a consumed token never authorizes
+    removing a later dismissal of the same unchanged item. A hide whose version is no longer
+    the card's current one hid nothing, so undoing it restores nothing (False). Without a token
+    every dismissal of the id is restored (older callers).
     A filed record dismissed twice (Done in one tab, "Not for me" in another) carries both
     markers; one matching token clears both, under one lock, so the card cannot stay hidden
-    behind the marker the undo did not name."""
+    behind the marker the undo did not name. Restoring a Done record counts against the
+    filed-item cap; a full queue refuses with RuntimeError and leaves the Done in place."""
     item_id = str(item_id)
     token = None if token is None else str(token)
     filed = _FILED_ID.fullmatch(item_id)
+    current: str | None = None
+    if token is not None and not filed:
+        # Outside the lock: the queue build takes it. None means unknown, which is not "changed".
+        current = _current_version(item_id, home)
     with _state_lock(home):
-        hidden = load_hidden(home, strict=True)
-        rec = f = None
+        hidden = _load_hidden_raw(home, strict=True)
+        rec: dict[str, Any] = {}
+        f = None
+        d = None
         if filed:
             d = _outside_dir(home)
-            _purge_done(d)
+            _purge_logged(d)
             f = d / (filed.group(1) + ".json")
             if not f.is_symlink() and f.is_file():
                 rec = _read_json(f)
+            current = str(rec.get("version")) if rec else None
         done = bool(rec) and _is_done(rec)
         # Membership, not the stored value: a legacy or hand-edited entry may hold null or "".
         is_hidden = item_id in hidden
-        if token is not None:
-            matches = (done and token in (_done_token(rec), str(rec.get("version")))) or (
-                is_hidden and hidden[item_id] == token
-            )
-            if not matches:
+        h_version, h_token = _split_hidden(hidden.get(item_id))
+        # The marker only hides the card while it names the card's current version.
+        h_applies = is_hidden and (current is None and not filed or str(h_version) == current)
+        if token is None:
+            if not done and not is_hidden:
                 return False
-        if not done and not is_hidden:
-            return False
-        clear_done, clear_hidden = done, is_hidden
-        if token is not None and done and is_hidden and hidden[item_id] != str(rec.get("version")):
-            # The two markers belong to different versions of the item (hidden at v1, Done at v2).
-            # A token for one never authorizes removing the other's newer dismissal.
-            if token == hidden[item_id]:
+            clear_done, clear_hidden = done, is_hidden
+        else:
+            d_match = done and token == _done_token(rec)
+            h_match = is_hidden and token == (h_token if h_token is not None else h_version)
+            if not (d_match or h_match):
                 return False
-            clear_hidden = False
+            if h_match and not d_match and not h_applies:
+                return False  # the dismissal it names no longer hides anything
+            clear_done = d_match or (h_match and done and h_applies)
+            clear_hidden = h_match or (d_match and h_applies)
+        if clear_done:
+            files, over = _filed_files(d)
+            if over:
+                raise RuntimeError(_TOO_MANY_FILED)
+            if _count_active(files, skip=f) >= _OUTSIDE_LIMIT:
+                raise RuntimeError(
+                    f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before undoing Done"
+                )
         # Hidden marker first: if the second write fails the Done token still matches on retry.
         if clear_hidden:
             del hidden[item_id]
             _write_json(_hidden_path(home), hidden, ordered=True)
         if clear_done:
-            rec.pop("done_at")
+            rec.pop("done_at", None)
+            rec.pop("done_token", None)
             _write_json(f, rec)
         return True
 
@@ -557,21 +804,50 @@ def _pending_path(home: Path | None) -> Path:
 
 
 def load_pending_releases(home: Path | None = None, *, errors: list[str] | None = None, strict: bool = False) -> dict[str, str]:
-    return _read_json(_pending_path(home), errors=errors, strict=strict)
+    return _read_json(
+        _pending_path(home), errors=errors, strict=strict, entry_ok=lambda v: isinstance(v, str)
+    )
+
+
+class PendingReleaseFull(RuntimeError):
+    """The recovery store holds its cap of unfinished releases; a new one is refused, never an old one evicted."""
+
+
+def _version_number(version: Any) -> int | None:
+    try:
+        return int(str(version))
+    except (TypeError, ValueError):
+        return None
 
 
 def _set_pending_release(
-    item_id: str, version: str | None, home: Path | None = None
+    item_id: str,
+    version: str | None,
+    home: Path | None = None,
+    *,
+    expected: str | None = None,
 ) -> None:
+    """Record (version) or clear (None) the unfinished release for one card.
+
+    A clear with *expected* removes only the marker recorded for that version, and a record
+    never replaces a marker for a newer block: a slow worker for an older version cannot undo
+    the newer one's recovery."""
     with _state_lock(home):
         data = load_pending_releases(home, strict=True)
         if version is None:
-            if data.pop(item_id, None) is None:
+            if item_id not in data or (expected is not None and data[item_id] != expected):
                 return
+            del data[item_id]
         else:
+            old, new = _version_number(data.get(item_id)), _version_number(version)
+            if old is not None and new is not None and new < old:
+                return
+            if item_id not in data and len(data) >= _HIDDEN_KEEP:
+                raise PendingReleaseFull(
+                    "too many unfinished releases are waiting to be retried"
+                )
+            data.pop(item_id, None)  # an updated marker is the newest
             data[item_id] = version
-            if len(data) > _HIDDEN_KEEP:
-                data = dict(list(data.items())[-_HIDDEN_KEEP:])
         _write_json(_pending_path(home), data, ordered=True)
 
 
@@ -595,8 +871,20 @@ def _bluf_path(home: Path | None) -> Path:
     return data_dir(home) / "bluf.json"
 
 
-def load_blufs(home: Path | None = None) -> dict[str, dict[str, str]]:
-    return _read_json(_bluf_path(home))
+def load_blufs(home: Path | None = None, *, strict: bool = False) -> dict[str, dict[str, str]]:
+    return _read_json(_bluf_path(home), strict=strict)
+
+
+def summary_fingerprint(item: dict[str, Any]) -> str:
+    """Identifies the text a summary was written from: a card can change without a new version
+    (an edited title, a new comment)."""
+    parts = [
+        str(item.get("title") or ""),
+        str(item.get("ask") or ""),
+        str(item.get("owner") or ""),
+        str(item.get("comments_sig") or ""),
+    ]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str, Any]:
@@ -606,7 +894,7 @@ def _trim_blufs(data: dict[str, Any], newest_id: str | None = None) -> dict[str,
     def saved_at(entry: Any) -> int:
         try:
             return int(entry.get("at") or 0) if isinstance(entry, dict) else 0
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return 0
 
     ranked = sorted(
@@ -623,31 +911,39 @@ def save_bluf(
     home: Path | None = None,
     *,
     started_at: float | None = None,
+    fp: str | None = None,
 ) -> None:
-    """Cache one summary. ``started_at`` is when the model request began: if a summary for a
-    different version of the item was saved after that, this one is superseded and is dropped,
-    so a slow request for an old question cannot replace the newer question's summary."""
+    """Cache one summary. ``started_at`` is when the model request began. A request that began
+    before the one behind the cached summary of a different version is superseded and dropped,
+    so a slow request for an old question cannot replace the newer question's summary. Start
+    order decides, not completion order: the older request finishing first must not make the
+    newer one look stale. A summary saved without a start time is never treated as newer."""
     with _state_lock(
         home
     ):  # read-modify-write: concurrent workers must not drop each other's entries
-        data = load_blufs(home)
+        data = load_blufs(home, strict=True)  # a damaged cache is repaired, not overwritten
         existing = data.get(item_id)
         if (
             started_at is not None
             and isinstance(existing, dict)
             and existing.get("version") != version
-            and _num(existing.get("at")) > started_at
+            and _num(existing.get("started_at")) > started_at
         ):
             return
         data.pop(item_id, None)
-        data[item_id] = {
+        entry = {
             "version": version,
             "bluf": bluf,
             "why": why,
-            "at": int(time.time()),
+            "at": time.time(),  # not truncated: a sub-second order against observed_at must hold
         }
+        if started_at is not None:
+            entry["started_at"] = started_at
+        if fp is not None:
+            entry["fp"] = fp
+        data[item_id] = entry
         data = _trim_blufs(data, item_id)
-        _write_json(_bluf_path(home), data)
+        _write_json(_bluf_path(home), data, ordered=True)
 
 
 def prune_blufs(
@@ -663,7 +959,7 @@ def prune_blufs(
     caller's view, so it is kept rather than judged against a list that predates it."""
     current = {item["id"]: item["version"] for item in items}
     with _state_lock(home):
-        data = load_blufs(home)
+        data = load_blufs(home, strict=True)
         kept = {
             item_id: value
             for item_id, value in data.items()
@@ -676,7 +972,7 @@ def prune_blufs(
         }
         kept = _trim_blufs(kept)
         if kept != data:
-            _write_json(_bluf_path(home), kept)
+            _write_json(_bluf_path(home), kept, ordered=True)
 
 
 def attach_blufs(
@@ -689,25 +985,35 @@ def attach_blufs(
         if (
             isinstance(hit, dict)
             and hit.get("version") == it["version"]
-            and hit.get("bluf")
+            and isinstance(hit.get("bluf"), str)
+            and hit["bluf"]
+            # An entry saved before fingerprints existed has none and still matches.
+            and ("fp" not in hit or hit["fp"] == summary_fingerprint(it))
         ):
-            it["bluf"], it["bluf_why"] = hit["bluf"], hit.get("why") or ""
+            why = hit.get("why")
+            it["bluf"], it["bluf_why"] = hit["bluf"], why if isinstance(why, str) else ""
     return items
+
+
+def _redacted_cut(value: Any, n: int) -> str:
+    """At most *n* characters of *value*, redacted before they are cut so a secret straddling the
+    cut is never left half-visible. The input is bounded first so a huge field stays cheap."""
+    return _ask_redact(str(value or "")[: n * 20])[:n]
 
 
 def bluf_messages(
     item: dict[str, Any], comments: list[dict[str, Any]] | None = None
 ) -> list[dict[str, str]]:
     card: dict[str, Any] = {
-        "title": item.get("title"),
-        "text": str(item.get("ask") or "")[:6000],
-        "owner": item.get("owner"),
+        "title": _redacted_cut(item.get("title"), 300),
+        "text": _redacted_cut(item.get("ask"), 6000),
+        "owner": _redacted_cut(item.get("owner"), 200),
     }
     if comments:
         card["recent_comments"] = [
             {
-                "author": str(c.get("author") or ""),
-                "text": str(c.get("body") or "")[:600],
+                "author": _redacted_cut(c.get("author"), 200),
+                "text": _redacted_cut(c.get("body"), 600),
             }
             for c in comments[-6:]
         ]
@@ -1138,29 +1444,35 @@ _CLOSER = re.compile(
 _ANSWERED = re.compile(r"(?:because|answer:|a:|it was|the answer)\b", re.IGNORECASE)
 
 
-def chat_asks_you(text: str) -> bool:
-    """Does a bot's final turn ask the human for something?
+def chat_ask_span(text: str) -> int:
+    """How many trailing characters of a bot's final turn hold its ask (0 when it asks nothing).
 
     Anchored to the tail of the turn: a gate idiom inside an earlier status report
     ("…Platform's, on your word.") is not an ask. Packet/option-list shapes are
-    exempt from the question mark; other cues need a ``?`` after the cue."""
+    exempt from the question mark and may be long; other cues need a ``?`` after the cue.
+    A name that must address you has to lie inside the same span."""
     # URLs carry "?" query strings; a polite sign-off ("Anything else you need?") asks nothing.
     text = _URL.sub(" ", text or "")
     text = _CLOSER.sub("", text.strip()).strip()
     tail = text[-900:]
     if not tail:
-        return False
+        return 0
     pats = _patterns()
     if pats["_ASK_PACKET"].search(text[-4000:]):
-        return True
+        return 4000
     for match in pats["_ASK_STRONG"].finditer(tail):
         if "?" in tail[match.end() : match.end() + 300]:
-            return True
+            return 900
     if "?" not in tail[-400:] or not pats["_YOU"].search(tail[-400:]):
-        return False
+        return 0
     # A question the turn goes on to answer ("Why did it fail? Because ...") is not an ask.
     rest = tail[tail.rfind("?") + 1 :].strip()
-    return len(rest) <= 120 and not _ANSWERED.match(rest)
+    return 900 if len(rest) <= 120 and not _ANSWERED.match(rest) else 0
+
+
+def chat_asks_you(text: str) -> bool:
+    """Does a bot's final turn ask the human for something?"""
+    return chat_ask_span(text) > 0
 
 
 def _excerpt(text: str, n: int = 480) -> str:
@@ -1173,13 +1485,17 @@ FULL_TEXT_LIMIT = 20_000  # most characters one on-demand full-text read returns
 
 
 def _is_excerpted(text: str, n: int = EXCERPT_CHARS) -> bool:
-    """True when ``_excerpt`` would drop part of *text*."""
-    return len(re.sub(r"\s+", " ", (text or "")).strip()) > n
+    """True when ``_excerpt`` would change *text*: cut it, or flatten its line breaks and spacing."""
+    original = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    collapsed = re.sub(r"\s+", " ", original)
+    return len(collapsed) > n or collapsed != original
 
 
 def _full_text(text: str) -> tuple[str, bool]:
     """The permitted full text of one record: original newlines, bounded; second value is truncation."""
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # Leading blank lines and trailing space go; the first line's indentation is content.
+    text = re.sub(r"\A(?:[ \t]*\n)+", "", text).rstrip()
     return (text, False) if len(text) <= FULL_TEXT_LIMIT else (text[:FULL_TEXT_LIMIT], True)
 
 
@@ -1225,7 +1541,7 @@ def _latest_block(conn: Any, kanban_db: Any, task_id: str) -> Any | None:
     try:
         row = conn.execute(
             "SELECT * FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected') "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            "ORDER BY id DESC LIMIT 1",  # event ids follow the order events happened; clocks can step back
             (task_id,),
         ).fetchone()
         return kanban_db.Event.from_row(row) if row is not None else None
@@ -1237,23 +1553,59 @@ def _same_author(a: Any, b: Any) -> bool:
     return str(a or "").casefold() == str(b or "").casefold()
 
 
+def _commented_after(events: Iterable[Any], block_id: int, author: str) -> bool:
+    """Did *author* comment after the block event? Kanban appends a ``commented`` event, with
+    the author in its payload, for every comment; event ids keep their order within one second."""
+    for e in events:
+        if getattr(e, "kind", None) != "commented" or int(getattr(e, "id", 0) or 0) <= block_id:
+            continue
+        if _same_author(_event_payload(e).get("author"), author):
+            return True
+    return False
+
+
 def _answered_since(
-    conn: Any, kanban_db: Any, task_id: str, author: str, since: int
+    conn: Any,
+    kanban_db: Any,
+    task_id: str,
+    author: str,
+    since: int,
+    block_id: int | None = None,
 ) -> bool:
     """Has *author* commented since the block began? The one test for "answered", used by
     the queue and by answer_card. Names compare in Python (casefold) on both paths: SQLite's
-    LOWER() folds ASCII only, so "ZOË" and "Zoë" used to differ on the fast path alone."""
+    LOWER() folds ASCII only, so "ZOË" and "Zoë" used to differ on the fast path alone.
+
+    Comment times have one-second resolution, so a comment made just before a re-block can
+    share the block's second. With the block's event id, a comment counts when it is strictly
+    later than the block or its ``commented`` event follows the block event; without it the
+    old same-second rule (>=) applies."""
+    cut = since or 0
+    strict = block_id is not None
     try:
         rows = conn.execute(
             "SELECT author FROM task_comments WHERE task_id = ? AND created_at >= ?",
-            (task_id, since or 0),
+            (task_id, cut + 1 if strict else cut),
         ).fetchall()
-        return any(_same_author(r[0], author) for r in rows)
+        if any(_same_author(r[0], author) for r in rows):
+            return True
+        if not strict:
+            return False
+        events = [
+            kanban_db.Event.from_row(r)
+            for r in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
+                (task_id, block_id),
+            ).fetchall()
+        ]
+        return _commented_after(events, block_id, author)
     except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        return any(
-            _same_author(c.author, author) and c.created_at >= (since or 0)
+        if any(
+            _same_author(c.author, author) and c.created_at >= (cut + 1 if strict else cut)
             for c in kanban_db.list_comments(conn, task_id)
-        )
+        ):
+            return True
+        return strict and _commented_after(kanban_db.list_events(conn, task_id), block_id, author)
 
 
 class CardStatus(str, Enum):
@@ -1310,6 +1662,20 @@ def stuck_reason(reason: str, kind: str | None, block: Any) -> str:
     return "Blocked with no ask for you recorded; route to its owner"
 
 
+def _comments_sig(conn: Any, kanban_db: Any, task_id: str) -> str:
+    """"count:newest id" of a card's comments: it changes when a comment is added, so a summary
+    written before the comment is not shown for the card as it is now."""
+    try:
+        n, newest = conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return f"{n}:{newest}"
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        comments = kanban_db.list_comments(conn, task_id)
+        return f"{len(comments)}:{max((getattr(c, 'id', 0) or 0 for c in comments), default=0)}"
+
+
 def kanban_items(
     boards: Iterable[str] | None = None,
     errors: list[str] | None = None,
@@ -1358,7 +1724,9 @@ def kanban_items(
                     # Answered cards leave the queue in both tiers, so a card the queue shows
                     # is exactly a card answer_card accepts.
                     version = str(block.id if block else since)
-                    if _answered_since(conn, kanban_db, task.id, author, since):
+                    if _answered_since(
+                        conn, kanban_db, task.id, author, since, block.id if block else None
+                    ):
                         if pending is None:
                             pending = load_pending_releases(errors=errors)
                         if pending.get(f"kanban:{board}:{task.id}") == version:
@@ -1395,6 +1763,7 @@ def kanban_items(
                             "block_recurrences": payload.get("recurrences")
                             or getattr(task, "block_recurrences", 0),
                             "since": since,
+                            "comments_sig": _comments_sig(conn, kanban_db, task.id),
                         }
                     )
         except Exception as exc:  # noqa: BLE001 - per-board failure must be visible
@@ -1406,22 +1775,73 @@ def kanban_items(
 # --- Chat source ---------------------------------------------------------------------------
 
 
-def _state_dbs(home: Path) -> list[tuple[str, Path]]:
-    out = []
-    seen: set[tuple[int, int]] = set()  # one database file is one profile's, whatever names reach it
-    candidates = [("default", home / "state.db")] + [
-        (db.parent.name, db) for db in sorted((home / "profiles").glob("*/state.db"))
-    ]
-    for name, db in candidates:
+def _state_dbs(
+    home: Path,
+    errors: list[str] | None = None,
+    only: str | None = None,
+    known: Callable[[str], bool] | None = None,
+) -> list[tuple[str, Path]]:
+    """Every profile's chat database that lies inside *home*. A link (to a profile folder or to the
+    database itself) could aim the search at another Hermes home, so a linked one is reported and
+    skipped; so is anything that is not a plain file (opening a FIFO or a device could block the
+    whole refresh), and a database that cannot be inspected or a profiles folder that cannot be
+    listed is a failed source, not an empty one. Only a genuinely absent database is optional.
+
+    One database file is one profile's, whatever names reach it. When several profile names reach
+    the same file, the one for which *known* says state already exists (a dismissal or a cached
+    summary keyed by that name) keeps it, so adding an alias never renames an existing chat;
+    otherwise the first in listing order does."""
+    groups: dict[tuple[int, int], list[tuple[str, Path]]] = {}
+
+    def refuse(profile: str, why: str) -> None:
+        if errors is not None:
+            errors.append(f"chat[{profile}]: {why}; not searched")
+
+    def consider(profile: str, db: Path) -> bool:
+        """Whether *db* is present and a plain file; every other case but absence is reported."""
         try:
-            st = db.stat()
-        except OSError:
-            continue
-        if (st.st_dev, st.st_ino) in seen:
-            continue
-        seen.add((st.st_dev, st.st_ino))
-        out.append((name, db))
-    return out
+            st = os.lstat(db)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError as exc:
+            refuse(profile, f"state.db could not be inspected ({type(exc).__name__})")
+            return False
+        if stat.S_ISLNK(st.st_mode):
+            refuse(profile, "state.db is a symbolic link")
+        elif not stat.S_ISREG(st.st_mode):
+            refuse(profile, "state.db is not a regular file")
+        else:
+            groups.setdefault((st.st_dev, st.st_ino), []).append((profile, db))
+        return True
+
+    if only in (None, "default"):
+        consider("default", home / "state.db")
+    if only != "default":
+        try:
+            entries = [home / "profiles" / only] if only else _list_files(home / "profiles")
+        except FileNotFoundError:
+            entries = []
+        except OSError as exc:
+            entries = []
+            if errors is not None:
+                errors.append(f"chat: profiles folder: {type(exc).__name__}; could not list profiles")
+        base = home.resolve()
+        for prof in entries:
+            db = prof / "state.db"
+            if prof.is_symlink():
+                if os.path.lexists(db):
+                    refuse(prof.name, "profile folder is a symbolic link")
+            elif os.path.lexists(db) and not db.is_symlink() and not db.resolve().is_relative_to(base):
+                refuse(prof.name, "state.db lies outside the Hermes home")
+            else:
+                consider(prof.name, db)
+    out: list[tuple[str, Path]] = []
+    for names in groups.values():
+        keep = names[0]
+        if len(names) > 1 and known is not None:
+            keep = next((n for n in names if known(n[0])), keep)
+        out.append(keep)
+    return sorted(out, key=lambda n: (n[0] != "default", n[0]))
 
 
 # Hermes has no public board-slug validator, so this mirrors kanban_db._normalize_board_slug (the
@@ -1443,27 +1863,33 @@ def normalize_board_slug(slug: Any) -> str | None:
 
 
 _BOT_NAME_CACHE: dict[
-    str, tuple[tuple[int, int], str]
-] = {}  # profile.yaml path -> ((mtime_ns, size), title or "")
+    str, tuple[tuple[int, ...], str]
+] = {}  # profile.yaml path -> ((mtime_ns, size, inode, ctime_ns), title or "")
 
 
 def _bot_name(home: Path, profile: str) -> str:
     """The name Bot Mode shows for a seat (profile.yaml ui_meta.hermes-bots.title).
     A line scan, not a YAML parser: the plugin host may not ship PyYAML. The file is re-read only
-    when its mtime or size changes, so the 45 s poll does not open every profile each time."""
+    when the file changes (mtime, size, inode or change time: an atomic replace keeps the first
+    two), so the 45 s poll does not open every profile each time. A title is cosmetic, so an
+    unreadable, oversized or oddly encoded file gives the fallback and never an error."""
     fallback = "Your agent" if profile == "default" else profile
     path = home / "profiles" / profile / "profile.yaml"
     key = str(path)
     try:
         st = path.lstat()
-        if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _PROFILE_YAML_BYTES:
             raise OSError("not a plain, small profile.yaml")  # a link or a huge file is not read
-        sig = (st.st_mtime_ns, st.st_size)
+        sig = (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
         hit = _BOT_NAME_CACHE.get(key)
         if hit and hit[0] == sig:
             return hit[1] or fallback
-        lines = path.read_text().splitlines()
-    except OSError:
+        # The checks above only decide whether to look; what is read is checked on the opened
+        # descriptor (no link, regular, bounded), and the cache keeps that descriptor's signature.
+        text, fst = _read_plain_text_st(path, limit=_PROFILE_YAML_BYTES, errors="replace")
+        sig = (fst.st_mtime_ns, fst.st_size, fst.st_ino, fst.st_ctime_ns)
+        lines = text.splitlines()
+    except (OSError, ValueError):
         _BOT_NAME_CACHE.pop(key, None)
         return fallback
     title = _scan_bot_title(lines)
@@ -1472,9 +1898,15 @@ def _bot_name(home: Path, profile: str) -> str:
 
 
 def _scan_bot_title(lines: list[str]) -> str:
+    in_ui = False
     in_bots = False
     for line in lines:
-        if re.match(r"^\s{2}hermes-bots:\s*$", line):
+        if re.match(r"^\S", line) and not line.startswith("#"):
+            in_ui = re.match(r"^ui_meta:\s*(?:#.*)?$", line) is not None
+            in_bots = False
+        elif not in_ui:
+            continue
+        elif re.match(r"^\s{2}hermes-bots:\s*$", line):
             in_bots = True
         elif in_bots and re.match(r"^\s{0,2}\S", line):
             in_bots = False
@@ -1540,6 +1972,87 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
+# Most characters of one chat message that are read from the database and processed. The ask
+# sits at the end of a turn, so a longer message is read from its end.
+CHAT_READ_CHARS = 100_000
+
+
+def _text_digest(length: Any, text: str) -> str:
+    return hashlib.sha256(f"{length}\0{text}".encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
+    if not over:
+        return _full_fields(shown)
+    full, _ = _full_text(shown[-FULL_TEXT_LIMIT:])  # the end holds the ask
+    return {"text": full, "text_cut": True}
+
+
+BACKFILL_FILE = "chat-backfill.json"
+BACKFILL_IDS_MAX = 1000
+
+
+def _backfill_state(home: Path | None) -> tuple[float | None, list[str], bool]:
+    """``(floor, ids, readable)``: the oldest time any earlier queue read reached back to, and the
+    chats first listed from before it (a widened ``chat_window_days`` found them). Nothing here is
+    chat text: a time and the ids the dismissal and summary stores already hold."""
+    try:
+        p = data_dir(home, create=False) / BACKFILL_FILE
+        if not os.path.lexists(p):
+            return None, [], True
+        data = json.loads(_read_plain_text(p))
+        floor = data.get("floor")
+        floor = float(floor) if isinstance(floor, (int, float)) and math.isfinite(floor) else None
+        ids = [i for i in data.get("ids", []) if isinstance(i, str)][-BACKFILL_IDS_MAX:]
+        return floor, ids, True
+    except (OSError, ValueError, AttributeError, TypeError, UnicodeError):
+        return None, [], False
+
+
+def _mark_backfill(
+    home: Path | None,
+    items: list[dict[str, Any]],
+    since: float,
+    *,
+    record: bool,
+    complete: bool,
+    errors: list[str] | None,
+) -> None:
+    """Flag chats that only a widened window reached (``backfilled``), so nothing is sent to a
+    model for them automatically. A chat is backfill when it is older than the default window or
+    older than anything an earlier read looked at; the flag then stays with it, so a later
+    refresh cannot turn it back into an ordinary ask. Only ``record`` (the queue build) saves."""
+    default_since = time.time() - CHAT_WINDOW_DAYS * 86400
+    floor, ids, readable = _backfill_state(home)
+    edge = floor if floor is not None else since
+    marked = dict.fromkeys(ids)
+    changed = False
+    for it in items:
+        ts = it.get("since") or 0
+        if it["id"] not in marked and (ts < edge or not readable) and ts < time.time() - 86400:
+            marked[it["id"]] = None
+            changed = True
+        if ts < default_since or it["id"] in marked:
+            it["backfilled"] = True
+    if complete:  # a whole read: chats no longer listed need no flag
+        listed = {it["id"] for it in items}
+        kept = {i: None for i in marked if i in listed}
+        changed = changed or len(kept) != len(marked)
+        marked = kept
+    new_floor = min(edge, since)
+    if not record or not readable or (not changed and floor is not None and new_floor >= floor):
+        return
+    try:
+        _write_json(
+            data_dir(home) / BACKFILL_FILE,
+            {"floor": new_floor, "ids": list(marked)[-BACKFILL_IDS_MAX:]},
+            ordered=True,
+        )
+    except OSError as exc:
+        if errors is not None:
+            errors.append(f"chat: backfill marks could not be saved ({type(exc).__name__})")
+
+
 def chat_items(
     home: Path | None = None,
     days: int | None = None,
@@ -1549,13 +2062,19 @@ def chat_items(
     coverage: dict[str, Any] | None = None,
     full_limit: int | None = None,
     visible: Callable[[str, str], bool] | None = None,
+    only: tuple[str, str] | None = None,
+    unread_profiles: set[str] | None = None,
+    record_backfill: bool = False,
 ) -> list[dict[str, Any]]:
     """Chats on any platform a person uses (Desktop, TUI, CLI, Discord, Telegram, ...) whose
-    last visible turn is the bot asking you something you have not answered.
+    last visible turn is the bot asking you something you have not answered. ``only`` =
+    (profile, session id) looks at that one chat and opens no other database.
 
     ``coverage`` (when given) is filled with counts only: the window actually read, sessions
     checked and left unread past ``CHAT_SESSION_CAP``, and chats skipped by the group-name and
-    owner rules, so an empty result is never mistaken for an exhaustive one."""
+    owner rules, so an empty result is never mistaken for an exhaustive one. ``unread_profiles``
+    (when given) receives the profiles that left sessions unread, so the caller keeps the cached
+    summaries of chats it did not look at."""
     home = home or hermes_home()
     items: list[dict[str, Any]] = []
     settings, settings_error = _settings_state()
@@ -1571,7 +2090,16 @@ def chat_items(
     names = _patterns(principal_names(settings), role_words(settings))["_NAMES"]
     owners = chat_owner_ids(settings)
     me = {n.lower() for n in principal_names(settings)}
-    for profile, db in _state_dbs(home):
+    def known(profile: str) -> bool:
+        """Whether a dismissal or a cached summary already exists under this profile's chat ids."""
+        prefix = f"chat:{profile}:"
+        try:
+            ids = list(load_hidden(home, create=False)) + list(load_blufs(home))
+        except Exception:  # noqa: BLE001 - only a tie-break between aliases; the first one wins
+            return False
+        return any(str(i).startswith(prefix) for i in ids)
+
+    for profile, db in _state_dbs(home, errors, only[0] if only else None, known):
         try:
             conn = sqlite3.connect(
                 db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2
@@ -1580,8 +2108,29 @@ def chat_items(
             if errors is not None:
                 errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
             continue
+        budget = {"ops": 0, "hit": False}
+
+        def spend() -> int:
+            budget["ops"] += 1000
+            if budget["ops"] > CHAT_QUERY_OPS:
+                budget["hit"] = True
+                return 1  # abort the running statement
+            return 0
+
+        def failed(exc: sqlite3.Error) -> None:
+            if errors is not None:
+                why = (
+                    "read budget exceeded; its chats were not fully read"
+                    if budget["hit"]
+                    else f"{type(exc).__name__}: {exc}"
+                )
+                errors.append(f"chat[{profile}]: {why}")
+
         with closing(conn):
+            conn.isolation_level = None  # explicit transaction: one snapshot for every read below
+            conn.set_progress_handler(spend, 1000)
             try:
+                conn.execute("BEGIN")
                 cols = _columns(conn, "sessions")
                 if not cols:
                     continue  # a profile that never chatted has no sessions table yet
@@ -1599,8 +2148,11 @@ def chat_items(
                     args += CHAT_TITLES
                 if "parent_session_id" in cols:
                     # A compressed chat continues in a child session; only the newest link counts.
+                    # One pass over the table (an uncorrelated list of parents), not a scan of
+                    # every session per session.
                     where.append(
-                        "NOT EXISTS (SELECT 1 FROM sessions c WHERE c.parent_session_id = s.id"
+                        "s.id NOT IN (SELECT c.parent_session_id FROM sessions c "
+                        "WHERE c.parent_session_id IS NOT NULL"
                         + (
                             f" AND COALESCE(c.source,'') NOT IN ({','.join('?' * len(CHAT_MACHINE_SOURCES))})"
                             if "source" in cols
@@ -1610,36 +2162,50 @@ def chat_items(
                     )
                     if "source" in cols:
                         args += CHAT_MACHINE_SOURCES
+                mcols = _columns(conn, "messages")
+                from_sql = "sessions s"
                 if "last_activity_at" in cols and "started_at" in cols:
-                    where.append("COALESCE(s.last_activity_at, s.started_at, 0) >= ?")
+                    activity = "COALESCE(s.last_activity_at, s.started_at, 0)"
+                elif "timestamp" in mcols:
+                    # No session activity columns (an older schema): the newest message says
+                    # how recent a chat is, so expired chats neither fill the scan cap nor count.
+                    from_sql += (
+                        " LEFT JOIN (SELECT session_id AS sid, MAX(timestamp) AS ts "
+                        "FROM messages GROUP BY session_id) a ON a.sid = s.id"
+                    )
+                    activity = "COALESCE(a.ts, 0)"
+                else:
+                    activity = ""
+                if activity:
+                    where.append(f"{activity} >= ?")
                     args.append(since)
+                if only:
+                    where.append("s.id = ?")
+                    args.append(only[1])
                 pick = ", ".join(
                     f"s.{c}" if c in cols else "NULL"
                     for c in ("source", "chat_type", "user_id", "display_name")
                 )
-                mcols = _columns(conn, "messages")
                 where_sql = " AND ".join(where) or "1"
-                order = (
-                    "COALESCE(s.last_activity_at, s.started_at, 0) DESC"
-                    if "last_activity_at" in cols and "started_at" in cols
-                    else "s.rowid DESC"
-                )
+                order = f"{activity} DESC, s.rowid DESC" if activity else "s.rowid DESC"
                 sessions = conn.execute(
-                    f"SELECT s.id, s.title, {pick} FROM sessions s WHERE {where_sql} "
+                    f"SELECT s.id, s.title, {pick} FROM {from_sql} WHERE {where_sql} "
                     f"ORDER BY {order} LIMIT {int(CHAT_SESSION_CAP)}",
                     args,
                 ).fetchall()
-                total = conn.execute(f"SELECT COUNT(*) FROM sessions s WHERE {where_sql}", args).fetchone()[0]
+                total = conn.execute(f"SELECT COUNT(*) FROM {from_sql} WHERE {where_sql}", args).fetchone()[0]
                 cov["sessions_checked"] += len(sessions)
                 cov["sessions_omitted"] += max(0, int(total) - len(sessions))
+                if int(total) > len(sessions) and unread_profiles is not None:
+                    unread_profiles.add(profile)
                 cov["profiles"] += 1
             except sqlite3.Error as exc:
-                if errors is not None:
-                    errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
+                failed(exc)
                 continue
             # Only the columns this profile's schema has: an old schema must not fail per session.
             last_sql = (
-                "SELECT id, role, content, timestamp FROM messages WHERE session_id=? "
+                "SELECT id, role, SUBSTR(content, ?), LENGTH(content), timestamp FROM messages "
+                "WHERE session_id=? "
                 "AND role IN ('user','assistant') AND content IS NOT NULL AND TRIM(content) != '' "
                 + (
                     "AND COALESCE(display_kind,'') != 'hidden' "
@@ -1653,37 +2219,43 @@ def chat_items(
                 platform = str(platform or "")
                 if (
                     owners
-                    and platform
                     and platform.lower() not in LOCAL_PLATFORMS
+                    and (platform or user_id)
                     and str(user_id or "") not in owners
                 ):
                     # A gateway chat with someone other than you, or with nobody known: when you
                     # set owner_user_ids, only chats proven to be yours are shown (and summarised).
+                    # An unknown source with a user id is a gateway chat too; only a session with
+                    # neither (an older local one) carries no remote identity to check.
                     cov["skipped_other_owner"] += 1
                     continue
                 try:
-                    row = conn.execute(last_sql, (sid,)).fetchone()
+                    row = conn.execute(last_sql, (-CHAT_READ_CHARS, sid)).fetchone()
                 except sqlite3.Error as exc:
-                    if errors is not None:
-                        errors.append(f"chat[{profile}]: {type(exc).__name__}: {exc}")
+                    failed(exc)
                     break  # same schema for every session: say it once
                 if not row:
                     continue
-                mid, role, content, ts = row
-                if (
-                    role != "assistant"
-                    or (ts or 0) < since
-                    or not chat_asks_you(content)
-                ):
+                mid, role, content, length, ts = row
+                ts = _num(ts)  # an infinite or NaN stored time is not a time (int() would raise)
+                content = str(content)
+                span = chat_ask_span(content) if role == "assistant" and (ts or 0) >= since else 0
+                if not span:
                     continue
-                if str(
-                    chat_type or ""
-                ).lower() in CHAT_GROUP_TYPES and not names.search(str(content)[-900:]):
+                if str(chat_type or "").lower() in CHAT_GROUP_TYPES and not names.search(
+                    content[-span:]
+                ):
                     cov["skipped_group_unnamed"] += 1
                     continue
-                if visible is not None and not visible(f"chat:{profile}:{sid}", str(mid)):
+                if visible is not None and not visible(
+                    f"chat:{profile}:{sid}", f"{mid}:{_text_digest(length, content)}"
+                ):
                     continue  # dismissed at this version: it must not use up a full-text budget
+                over = (length or 0) > len(content)  # only the end of a very long message was read
                 bot_chat = title in CHAT_TITLES
+                # Redact the whole turn before it is cut to an excerpt: the cut keeps the tail,
+                # so a long secret would otherwise leave a readable fragment.
+                shown = _ask_redact(content)
                 where_ = (
                     "Bot Chat"
                     if bot_chat
@@ -1692,7 +2264,9 @@ def chat_items(
                 items.append(
                     {
                         "id": f"chat:{profile}:{sid}",
-                        "version": str(mid),
+                        # The message row id and a digest of the text: Hermes can rewrite a
+                        # message in place, and the row id alone would not change.
+                        "version": f"{mid}:{_text_digest(length, content)}",
                         "source": "chat",
                         "profile": profile,
                         "session_id": sid,
@@ -1701,19 +2275,29 @@ def chat_items(
                         "chat_title": "" if bot_chat else _clean(title, 120),
                         "chat_with": _chat_with(platform, display_name, me),
                         "title": f"{_bot_name(home, profile)} is asking you",
-                        "ask": _excerpt(content),
-                        "ask_truncated": _is_excerpted(content),
+                        "ask": _excerpt(shown),
+                        "ask_truncated": over or _is_excerpted(shown),
                         # Only the first `full_limit` items pay for a full-text copy.
-                        **(_full_fields(content) if full and (full_limit is None or len(items) < full_limit) else {}),
+                        **(
+                            _chat_full_fields(shown, over)
+                            if full and (full_limit is None or len(items) < full_limit)
+                            else {}
+                        ),
                         "why": f"Last turn in this {where_} is a question for you",
                         "owner": profile,
                         "priority": 0,
                         "since": int(ts or 0),
-                        # Found only because chat_window_days reaches past the default window:
-                        # listed, but never sent to a model without a deliberate action.
-                        **({"backfilled": True} if (ts or 0) < time.time() - CHAT_WINDOW_DAYS * 86400 else {}),
                     }
                 )
+    # Found only because chat_window_days reaches further back than an earlier read did (or past
+    # the default window): listed, but never sent to a model without a deliberate action.
+    if only is None:
+        _mark_backfill(
+            home, items, since,
+            record=record_backfill,
+            complete=not cov.get("sessions_omitted") and not (errors or []) and not unread_profiles,
+            errors=errors,
+        )
     return items
 
 
@@ -1722,13 +2306,23 @@ def chat_items(
 PAIRING_TTL = 3600  # gateway/pairing.py CODE_TTL_SECONDS: a code is dead after an hour
 
 
-def _pairing_profiles(home: Path) -> list[str]:
-    """Profiles that have a pairing store on disk. Only existence is checked here: the
-    files themselves are read by the gateway's own PairingStore, never by us."""
+def _pairing_dirs(home: Path, errors: list[str] | None = None) -> list[tuple[str, Path]]:
+    """(profile, folder) for every pairing store on disk. Existence only; a profile folder that is
+    a link is not followed."""
     seen: set[Path] = set()
-    out: list[str] = []
+    out: list[tuple[str, Path]] = []
     cands = [("default", home / "platforms" / "pairing"), ("default", home / "pairing")]
-    for prof in sorted((home / "profiles").glob("*/")):
+    try:
+        profiles = _list_files(home / "profiles")
+    except FileNotFoundError:
+        profiles = []
+    except OSError as exc:
+        profiles = []
+        if errors is not None:
+            errors.append(f"pairing: profiles folder: {type(exc).__name__}; could not list profiles")
+    for prof in profiles:
+        if prof.is_symlink() or not prof.is_dir():
+            continue
         cands += [
             (prof.name, prof / "platforms" / "pairing"),
             (prof.name, prof / "pairing"),
@@ -1740,9 +2334,39 @@ def _pairing_profiles(home: Path) -> list[str]:
             continue
         if d.is_dir() and real not in seen:
             seen.add(real)
-            if profile not in out:
-                out.append(profile)
+            out.append((profile, d))
     return out
+
+
+def _pairing_profiles(home: Path, errors: list[str] | None = None) -> list[str]:
+    """Profiles that have a pairing store on disk. Only existence is checked here: the
+    files themselves are read by the gateway's own PairingStore, never by us."""
+    out: list[str] = []
+    for profile, _ in _pairing_dirs(home, errors):
+        if profile not in out:
+            out.append(profile)
+    return out
+
+
+def _pending_file_damage(path: Path) -> bool:
+    """True when a pending-requests file cannot be parsed as a JSON object. The stock store loads
+    such a file as "no requests", so it cannot tell a damaged store from an empty one. The content
+    is parsed and dropped here, never kept, logged or reported."""
+    try:
+        fd = os.open(path, os.O_RDONLY | _NONBLOCK)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_STATE_BYTES:
+                return True
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                raw = fh.read(MAX_STATE_BYTES + 1)
+        finally:
+            os.close(fd)
+        return not isinstance(json.loads(raw.decode("utf-8-sig")), dict)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
 
 
 def _stock_pairing_store(profile: str):
@@ -1765,7 +2389,16 @@ def pairing_items(
     store = store or _stock_pairing_store
     now = time.time()
     items: list[dict[str, Any]] = []
-    for profile in _pairing_profiles(home):
+    folders = _pairing_dirs(home, errors)
+    for profile, folder in folders:
+        try:
+            for f in _list_files(folder, "-pending.json"):
+                if _pending_file_damage(f) and errors is not None:
+                    errors.append(f"pairing[{profile}]: {f.name}: could not read pending requests")
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"pairing[{profile}]: {type(exc).__name__}; could not list requests")
+    for profile in dict.fromkeys(p for p, _ in folders):
         try:
             pending = store(profile).list_pending()
         except Exception as exc:  # noqa: BLE001 - an old Hermes API or locked store means skip
@@ -1840,14 +2473,17 @@ WAIT_MAX_AGE = (
 
 def _num(value: Any) -> float:
     try:
-        return float(value or 0)
+        number = float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+    return number if math.isfinite(number) else 0.0  # NaN/inf are not times
 
 
-def _waits_dir(home: Path | None = None) -> Path:
-    d = data_dir(home) / "waits"
-    d.mkdir(parents=True, exist_ok=True)
+def _waits_dir(home: Path | None = None, *, create: bool = True) -> Path:
+    d = data_dir(home, create=create) / "waits"
+    _refuse_link(d)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
     return d
 
 
@@ -1903,6 +2539,41 @@ def _profile_of(home: Path) -> str:
     return own.name if own.parent.name == "profiles" else "default"
 
 
+WAIT_TAIL_CHARS = 2000
+WAIT_FAULT_LIMIT = 50
+# (home, request id) -> (what failed, the record to write). The hooks run in the agent; when a
+# write or removal fails there, polling in the same process retries it and says so until it works.
+_WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
+
+
+def _remember_wait_fault(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
+    _WAIT_FAULTS.pop((str(home), rid), None)
+    _WAIT_FAULTS[(str(home), rid)] = (what, rec)
+    while len(_WAIT_FAULTS) > WAIT_FAULT_LIMIT:
+        _WAIT_FAULTS.pop(next(iter(_WAIT_FAULTS)))
+
+
+def _unlink_wait(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+def _reconcile_waits(home: Path, errors: list[str]) -> None:
+    """Retry hook writes/removals that failed; what still fails is a reported source error."""
+    for (h, rid), (what, rec) in list(_WAIT_FAULTS.items()):
+        if h != str(home):
+            continue
+        try:
+            path = _waits_dir(home) / f"{rid}.json"
+            if what == "record" and rec is not None:
+                _write_json(path, rec)
+            else:
+                _unlink_wait(path)
+            _WAIT_FAULTS.pop((h, rid), None)
+        except Exception as exc:  # noqa: BLE001
+            verb = "record" if what == "record" else "clear"
+            errors.append(f"prompt: {rid}: {type(exc).__name__}; could not {verb} a live prompt")
+
+
 def record_wait(home: Path | None = None, **payload: Any) -> None:
     """``on_human_input_request``: remember an open wait. Never raises (observer contract)."""
     try:
@@ -1921,6 +2592,8 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
             "kind": kind,
             "prompt": prompt[:keep],
             "prompt_cut": len(prompt) > keep,
+            # The question is at the end: a cut prompt also keeps its real tail for the excerpt.
+            **({"prompt_tail": prompt[-WAIT_TAIL_CHARS:]} if len(prompt) > keep else {}),
             "session_id": str(payload.get("session_id") or ""),
             "platform": str(payload.get("platform") or ""),
             "profile": _profile_of(home),
@@ -1928,7 +2601,12 @@ def record_wait(home: Path | None = None, **payload: Any) -> None:
             "proc_start": _proc_start(pid),
             "since": int(time.time()),
         }
-        _write_json(_waits_dir(home) / f"{rid}.json", rec)
+        _WAIT_FAULTS.pop((str(home), rid), None)
+        try:
+            _write_json(_waits_dir(home) / f"{rid}.json", rec)
+        except Exception:
+            _remember_wait_fault(home, rid, "record", rec)
+            raise
     except Exception as exc:  # noqa: BLE001 - observability must never break a human prompt
         log.warning("unbl0ck: could not record wait: %s", type(exc).__name__)
 
@@ -1938,7 +2616,13 @@ def clear_wait(home: Path | None = None, **payload: Any) -> None:
     try:
         rid = str(payload.get("request_id") or "")
         if _SAFE_ID.match(rid):
-            (_waits_dir(home or hermes_home()) / f"{rid}.json").unlink(missing_ok=True)
+            home = home or hermes_home()
+            _WAIT_FAULTS.pop((str(home), rid), None)
+            try:
+                _unlink_wait(_waits_dir(home) / f"{rid}.json")
+            except Exception:
+                _remember_wait_fault(home, rid, "clear", None)
+                raise
     except Exception as exc:  # noqa: BLE001
         log.warning("unbl0ck: could not clear wait: %s", type(exc).__name__)
 
@@ -1976,7 +2660,7 @@ def wait_state(f: Path, rec: dict[str, Any], now: float | None = None) -> WaitSt
     now = time.time() if now is None else now
     try:
         pid = int(rec.get("pid") or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         pid = 0
     rid = str(rec.get("request_id") or "")
     if (
@@ -1998,12 +2682,29 @@ def wait_items(
     full: bool = False,
     full_limit: int | None = None,
     visible: Callable[[str, str], bool] | None = None,
+    only_rid: str | None = None,
+    readonly: bool = False,
 ) -> list[dict[str, Any]]:
-    """Open live prompts. A wait whose process is gone is deleted, not shown."""
+    """Open live prompts. A wait whose process is gone is deleted, not shown. ``only_rid``
+    reads that one record and touches no other. ``readonly`` neither creates the folder nor
+    deletes or rewrites any record: a dead waiter is only left out."""
     home = home or hermes_home()
     errors = errors if errors is not None else []
     items: list[dict[str, Any]] = []
-    for f in sorted(_waits_dir(home).glob("*.json")):
+    waits = _waits_dir(home, create=not readonly)
+    if readonly and not waits.is_dir():
+        return items  # nothing was ever recorded
+    if not readonly:
+        _reconcile_waits(home, errors)
+    try:
+        records = _list_files(waits, ".json")
+    except OSError as exc:
+        # An unreadable folder is not an empty one: the prompts in it are unknown.
+        errors.append(f"prompt: waits: {type(exc).__name__}; could not list live prompts")
+        return items
+    if only_rid is not None:
+        records = [f for f in records if f.name == f"{only_rid}.json"]
+    for f in records:
         before = len(errors)
         rec = _read_json(f, errors=errors, source="prompt")
         if len(errors) != before:
@@ -2011,36 +2712,49 @@ def wait_items(
         if wait_state(f, rec) is WaitState.STALE:
             # Dead waiter, malformed record, or a wait so old its resolved hook must have been
             # missed: never show a prompt nobody is waiting on.
+            if readonly:
+                continue
             try:
                 f.unlink(missing_ok=True)
             except OSError as exc:
                 errors.append(f"prompt: {f.name}: {type(exc).__name__}; could not remove stale record")
             continue
         rid = str(rec["request_id"])
-        if visible is not None and not visible(f"prompt:{rid}", rid):
-            continue
         kind = str(rec.get("kind") or "")
         profile = str(rec.get("profile") or "default")
         who = _bot_name(home, profile) if profile != "default" else "An agent"
         platform = str(rec.get("platform") or "")
+        prompt = str(rec.get("prompt") or "")
+        # Cut by the store: new records say so; an older record (no flag) holding a full 4,000
+        # character prefix was cut too.
+        cut = bool(rec["prompt_cut"]) if "prompt_cut" in rec else len(prompt) >= 4000
+        shown = str(rec.get("prompt_tail") or "") if cut and rec.get("prompt_tail") else prompt
+        digest = hashlib.sha256(
+            json.dumps(
+                [rid, kind, prompt, rec.get("prompt_tail"), profile, rec.get("session_id"),
+                 platform, rec.get("pid"), rec.get("proc_start"), rec.get("since")],
+                default=str,
+            ).encode("utf-8", "replace")
+        ).hexdigest()[:12]
+        if visible is not None and not visible(f"prompt:{rid}", f"{rid}:{digest}"):
+            continue  # dismissed at this version: it must not use up a full-text budget
         expand = full and kind != "sudo" and (full_limit is None or len(items) < full_limit)
-        fields = _full_fields(str(rec.get("prompt") or "")) if expand else {}
+        fields = _full_fields(prompt) if expand else {}
         items.append(
             {
                 "id": f"prompt:{rid}",
-                "version": rid,
+                "version": f"{rid}:{digest}",
                 "source": "prompt",
                 "kind": kind,
                 "profile": profile,
                 "session_id": str(rec.get("session_id") or ""),
                 "platform": platform,
                 "title": f"{who} {_WAIT_KINDS.get(kind, 'is waiting on you')}",
-                "ask": _excerpt(str(rec.get("prompt") or ""))
-                or "(prompt text withheld by Hermes)",
+                "ask": _excerpt(shown) or "(prompt text withheld by Hermes)",
                 # A password prompt is never expanded: its excerpt is all the queue ever shows.
-                "ask_truncated": kind != "sudo" and _is_excerpted(str(rec.get("prompt") or "")),
+                "ask_truncated": kind != "sudo" and (cut or _is_excerpted(shown)),
                 **(
-                    {**fields, "text_cut": fields["text_cut"] or bool(rec.get("prompt_cut"))}
+                    {**fields, "text_cut": fields["text_cut"] or cut}
                     if expand
                     else {}
                 ),
@@ -2052,6 +2766,9 @@ def wait_items(
             }
         )
     return items
+
+
+_REF_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 
 
 class SourceUnavailable(RuntimeError):
@@ -2069,9 +2786,20 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
     if source not in ("chat", "prompt") or ":" not in item_id:
         raise ValueError("full text is available for chat and live-prompt items only")
     errors: list[str] = []
+    # Check the reference's shape first: a malformed one opens nothing, and a well-formed one
+    # looks at that single chat or prompt, so an unrelated broken profile cannot fail it.
+    parts = item_id.split(":", 2)
+    if source == "chat":
+        if len(parts) != 3 or not _REF_PART.fullmatch(parts[1]) or not parts[2]:
+            raise LookupError("chat item is no longer available")
+        look: dict[str, Any] = {"only": (parts[1], parts[2])}
+    else:
+        if len(parts) != 2 or not _REF_PART.fullmatch(parts[1]):
+            raise LookupError("prompt item is no longer available")
+        look = {"only_rid": parts[1]}
     try:
         items = (chat_items if source == "chat" else wait_items)(
-            hermes_home(), errors=errors, full=True
+            hermes_home(), errors=errors, full=True, **look
         )
     except Exception as exc:  # noqa: BLE001
         raise SourceUnavailable(f"{source} source unreadable: {type(exc).__name__}") from exc
@@ -2099,6 +2827,8 @@ SEARCH_MAX_ITEMS = 200
 SEARCH_MAX_CHARS = FULL_TEXT_LIMIT
 SEARCH_MAX_QUERY = 200
 SEARCH_MAX_TERMS = 8
+# The card fields the queue's own filter matches, searched together with the stored text.
+_SEARCH_FIELDS = ("title", "chat_title", "chat_with", "act_where", "ref", "to", "owner", "profile")
 
 
 def search_text(query: Any) -> dict[str, Any]:
@@ -2114,7 +2844,12 @@ def search_text(query: Any) -> dict[str, Any]:
         raise ValueError(f"use at most {SEARCH_MAX_TERMS} search terms")
     home = hermes_home()
     hidden_errors: list[str] = []
-    hidden = load_hidden(home, errors=hidden_errors)
+    raw_hidden = _load_hidden_raw(home, errors=hidden_errors, create=False)
+    hidden = {item_id: _split_hidden(value)[0] for item_id, value in raw_hidden.items()}
+    # A dismissal that names no version (null, a number, a list, an empty string) cannot say what
+    # was dismissed, so the card reads as shown: that is damage to report, like an unreadable file.
+    hidden_errors += ["a dismissal entry has no usable version"
+                      for value in raw_hidden.values() if not isinstance(value, str) or not value][:1]
 
     def visible(item_id: str, version: str) -> bool:
         # The queue's own rule: dismissed at this version means not a card, so not searchable
@@ -2127,7 +2862,8 @@ def search_text(query: Any) -> dict[str, Any]:
         (
             "outside",
             lambda errs: outside_items(
-                home, errors=errs, visible=visible, read_budget=SEARCH_MAX_ITEMS, unread=unread
+                home, errors=errs, visible=visible, read_budget=SEARCH_MAX_ITEMS, unread=unread,
+                readonly=True,
             ),
         ),
         (
@@ -2140,7 +2876,8 @@ def search_text(query: Any) -> dict[str, Any]:
         (
             "prompt",
             lambda errs: wait_items(
-                home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS, visible=visible
+                home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS, visible=visible,
+                readonly=True,
             ),
         ),
     )
@@ -2160,7 +2897,7 @@ def search_text(query: Any) -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             errors.append(f"{source}: could not be read, so it was not searched")
             continue
-        if source_errors:
+        if any(not isinstance(e, Notice) for e in source_errors):
             errors.append(f"{source}: some records could not be read")
         window = items[:SEARCH_MAX_ITEMS]
         skipped = len(items) - len(window) + (unread[0] if source == "outside" else 0)
@@ -2178,7 +2915,9 @@ def search_text(query: Any) -> dict[str, Any]:
             if item.get("text_cut") or item.get("truncated") or len(text) > SEARCH_MAX_CHARS:
                 cut += 1
                 text = text[:SEARCH_MAX_CHARS]
-            hay = f"{item.get('title') or ''}\n{text}".casefold()
+            # One query over everything a card is filtered on plus its stored text, so terms may
+            # be split between a title, an app or a chat's name and the body.
+            hay = "\n".join([*(str(item.get(key) or "") for key in _SEARCH_FIELDS), text]).casefold()
             if all(term in hay for term in terms):
                 matches.append({"id": str(item.get("id")), "version": str(item.get("version")), "source": source})
         searched[source] = examined
@@ -2219,9 +2958,11 @@ _FILED_ID = re.compile(r"outside:filed:([a-f0-9]{32})\Z")
 _FOLDER_ID = re.compile(r"outside:folder:[a-f0-9]{64}\Z")
 
 
-def _outside_dir(home: Path | None = None) -> Path:
-    d = data_dir(home) / "outside"
-    d.mkdir(mode=0o700, exist_ok=True)
+def _outside_dir(home: Path | None = None, *, create: bool = True) -> Path:
+    d = data_dir(home, create=create) / "outside"
+    _refuse_link(d)
+    if create:
+        d.mkdir(mode=0o700, exist_ok=True)
     return d
 
 
@@ -2233,43 +2974,144 @@ def _outside_field(
         raise ValueError(
             f"{name} must be {'a non-empty string' if required else 'a string'}"
         )
+    if name == "dedupe_key" and len(value) > limit:
+        # An identifier is never shortened: two long keys would collapse into one record.
+        raise ValueError(f"{name} must be at most {limit} characters")
     if name == "body" and len(value) > limit:
         marker = "\n[truncated]"
         return value[: limit - len(marker)] + marker
-    return value[:limit]
+    value = value[:limit]
+    if required and not value.strip():
+        raise ValueError(f"{name} must not be blank within its first {limit} characters")
+    return value
 
 
 def _done_token(rec: dict[str, Any]) -> str:
-    """Names one Done: a later Done of the same record gets a new token."""
-    return repr(rec.get("done_at"))
+    """Names one Done. It is random per Done, so a clock that repeats or steps back cannot make
+    two dismissals share a token; a record written before tokens existed falls back to its time."""
+    token = rec.get("done_token")
+    return token if isinstance(token, str) and token else repr(rec.get("done_at"))
+
+
+def _done_at(rec: dict[str, Any]) -> float | None:
+    """The Done time, or None when there is none or it is not a real finite time (a boolean is
+    an int to Python, and NaN or infinity never compare as expired)."""
+    value = rec.get("done_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
 
 
 def _is_done(rec: dict[str, Any]) -> bool:
-    return isinstance(rec.get("done_at"), (int, float))
+    return _done_at(rec) is not None
 
 
-def _purge_done(d: Path, now: float | None = None) -> int:
+def _bad_done(rec: dict[str, Any]) -> bool:
+    """A done_at that is present but unusable: preserved and reported, never deleted."""
+    return rec.get("done_at") is not None and _done_at(rec) is None
+
+
+_FILED_NAME = re.compile(r"[a-f0-9]{32}\.json\Z")
+# One cleanup or listing reads at most this many entries and runs at most this long, so a folder
+# full of files cannot make every Done, filing or poll read all of them first.
+_PURGE_SCAN_LIMIT = 1000
+_PURGE_SECONDS = 2.0
+_TOO_MANY_FILED = (
+    f"the filed outside folder holds more than {_PURGE_SCAN_LIMIT} entries; repair or remove the extra files"
+)
+
+
+def _is_filed_record(f: Path, rec: dict[str, Any]) -> bool:
+    """One of our records: named for its id and filed by an agent (not any JSON file in the folder)."""
+    return (
+        bool(_FILED_NAME.fullmatch(f.name))
+        and rec.get("id") == f"outside:filed:{f.stem}"
+        and rec.get("origin") == "filed"
+    )
+
+
+def _filed_files(d: Path) -> tuple[list[Path], bool]:
+    """At most ``_PURGE_SCAN_LIMIT`` filed-record paths of *d*, and whether there were more."""
+    with os.scandir(d) as entries:
+        names = [Path(e.path) for e in itertools.islice((e for e in entries if e.name.endswith(".json")), _PURGE_SCAN_LIMIT + 1)]
+    names.sort(key=lambda p: p.name)
+    return names[:_PURGE_SCAN_LIMIT], len(names) > _PURGE_SCAN_LIMIT
+
+
+def _count_active(files: list[Path], skip: Path | None = None) -> int:
+    return sum(1 for f in files if f != skip and not f.is_symlink() and not _is_done(_read_json(f)))
+
+
+def _purge_done(d: Path, now: float | None = None, errors: list[str] | None = None) -> int:
     """Delete done records past the undo window and the oldest beyond the keep limit.
+
+    Only a file named for its record id, carrying that id, filed by an agent and with a real
+    ``done_at`` is ever deleted; anything else (a stray JSON file, a boolean or non-finite
+    ``done_at``) is left for repair and reported. A clock that stepped back leaves a record
+    stamped in the future: its window restarts from now instead of the record being treated
+    as invalid. Reads at most ``_PURGE_SCAN_LIMIT`` entries and stops after ``_PURGE_SECONDS``.
+    A removal that fails does not stop the rest; it is added to *errors*.
 
     Call with the state lock held. Returns how many records were deleted."""
     now = time.time() if now is None else now
+    errors = [] if errors is None else errors
+    deadline = time.monotonic() + _PURGE_SECONDS
     done: list[tuple[float, Path]] = []
-    removed = 0
-    for f in d.glob("*.json"):
-        if f.is_symlink():
-            continue
-        rec = _read_json(f)
-        if not _is_done(rec):
-            continue
-        if now - rec["done_at"] > OUTSIDE_UNDO_SECONDS or rec["done_at"] > now + 60:
+    removed = failed = scanned = 0
+
+    def remove(f: Path) -> None:
+        nonlocal removed, failed
+        try:
             f.unlink(missing_ok=True)
             removed += 1
-        else:
-            done.append((rec["done_at"], f))
+        except OSError:
+            failed += 1
+
+    try:
+        scan = os.scandir(d)
+    except OSError as exc:
+        errors.append(f"outside: could not list filed records: {type(exc).__name__}")
+        return 0
+    with scan as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            if scanned >= _PURGE_SCAN_LIMIT or time.monotonic() > deadline:
+                errors.append("outside: retention cleanup stopped early; some filed records were not checked")
+                break
+            scanned += 1
+            f = Path(entry.path)
+            if f.is_symlink():
+                continue
+            rec = _read_json(f)
+            if not _is_filed_record(f, rec):
+                continue
+            if _bad_done(rec):
+                errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
+                continue
+            done_at = _done_at(rec)
+            if done_at is None:
+                continue
+            if done_at > now:
+                # The clock stepped back since this Done: keep the record and restart its window.
+                try:
+                    rec["done_token"] = _done_token(rec)
+                    rec["done_at"] = now
+                    _write_json(f, rec)
+                except OSError:
+                    failed += 1
+                done_at = now
+            if now - done_at > OUTSIDE_UNDO_SECONDS:
+                remove(f)
+            else:
+                done.append((done_at, f))
     done.sort()
     for _, f in done[: max(0, len(done) - _OUTSIDE_DONE_KEEP)]:
-        f.unlink(missing_ok=True)
-        removed += 1
+        remove(f)
+    if failed:
+        errors.append(
+            f"outside: could not remove {failed} expired done record(s); their text stays until a later cleanup succeeds"
+        )
     return removed
 
 
@@ -2304,6 +3146,18 @@ def _dedupe_matches(rec: dict[str, Any], key: str, scope: str | None, profile: s
     if scope == "global":
         return stored in (None, "global")
     return stored in (None, "profile") and owner == profile
+
+
+def _purge_logged(d: Path) -> int:
+    """Cleanup for a caller that must not fail because of it: returns how many problems it hit."""
+    errors: list[str] = []
+    try:
+        _purge_done(d, errors=errors)
+    except OSError as exc:
+        errors.append(f"outside: retention cleanup failed: {type(exc).__name__}")
+    for error in errors:
+        log.warning("unbl0ck: %s", error)
+    return len(errors)
 
 
 def file_outside(
@@ -2348,82 +3202,122 @@ def file_outside(
             raise ValueError("id must identify an agent-filed outside item")
         if bool(item_id) == bool(key):
             raise ValueError("resolve requires either id or dedupe_key")
+        version = args.get("version")
+        if version is not None and (not isinstance(version, str) or not version):
+            raise ValueError("version must be the version returned when the item was filed")
+        if item_id and version is None:
+            raise ValueError("resolving by id requires the version returned when it was filed")
     with _state_lock(home):
         d = _outside_dir(home)
-        _purge_done(d)
-        files = list(d.glob("*.json"))
+        _purge_logged(d)  # best effort: an undeletable expired record must not block unrelated work
+        files: list[Path] = []
+        if key:  # an id names its record directly: no listing, no scan of the whole folder
+            files, over = _filed_files(d)  # a listing that fails must not look like "no match"
+            if over:
+                raise RuntimeError(_TOO_MANY_FILED)
         match = None
         if action == "resolve" and item_id:
             match = d / (_FILED_ID.fullmatch(item_id).group(1) + ".json")
         elif key:
-            found = [
-                f
+            unreadable: list[str] = []
+            # Only a file named for its record id can be ours; a stray JSON file is neither a
+            # match nor a reason to refuse. Its id and origin are checked once it is read.
+            candidates = [
+                (f, rec)
                 for f in files
-                if not f.is_symlink() and _dedupe_matches(_read_json(f), key, scope, caller)
+                if not f.is_symlink() and _FILED_NAME.fullmatch(f.name)
+                for rec in (_read_json(f, errors=unreadable),)
+                if not rec or _is_filed_record(f, rec)
             ]
+            found = [f for f, rec in candidates if _dedupe_matches(rec, key, scope, caller)]
             if scope == "profile" and caller and not found:
                 # Before profile resolution, a tool call stored no profile. That record is
                 # the only copy of the key. Adopt one of those; never guess among several.
-                legacy = []
-                for f in files:
-                    if f.is_symlink():
-                        continue
-                    rec = _read_json(f)
-                    if (
-                        rec.get("dedupe_key") == key
-                        and "dedupe_scope" not in rec
-                        and not str(rec.get("profile") or "")
-                    ):
-                        legacy.append(f)
+                legacy = [
+                    f
+                    for f, rec in candidates
+                    if rec.get("dedupe_key") == key
+                    and "dedupe_scope" not in rec
+                    and not str(rec.get("profile") or "")
+                ]
                 if len(legacy) > 1:
                     raise ValueError(
                         f"dedupe_key matches {len(legacy)} legacy items with no profile; "
                         "resolve by id or pass dedupe_scope"
                     )
                 found = legacy
-            if scope is None and len(found) > 1:
+            if len(found) > 1:
+                # Several records claim this key: overwriting or deleting whichever the
+                # directory lists first would be a guess.
                 raise ValueError(
-                    f"dedupe_key matches {len(found)} items in different profiles; "
-                    "resolve by id or pass dedupe_scope"
+                    f"dedupe_key matches {len(found)} items; resolve by id or repair the duplicates"
                 )
             match = found[0] if found else None
+            if match is None and unreadable:
+                # The record that holds this key may be one of the unreadable ones: filing now
+                # could duplicate it, and resolving could report a claim as absent.
+                raise RuntimeError(
+                    "an outside record could not be read; repair or remove it before filing or resolving"
+                )
         if action == "resolve":
             if match is None or not match.is_file() or match.is_symlink():
                 raise LookupError("No filed outside item matches that id or dedupe_key")
+            if version is not None:
+                try:
+                    current = _read_json(match, strict=True).get("version")
+                except RuntimeError as exc:
+                    raise SourceUnavailable(str(exc)) from exc
+                if current != version:
+                    # Another agent refiled this item since: its newer text is not yours to delete.
+                    raise StaleAnswer("the filed item changed since you filed it; re-read it first")
             match.unlink()
             resolved_id = f"outside:filed:{match.stem}"
             # A "Not for me" marker names a record that no longer exists: drop it here,
             # under the same lock, so hidden.json does not keep dead ids. A damaged
             # hidden.json is left as it is for repair rather than overwritten.
-            marks = load_hidden(home, errors=(bad := []))
-            if not bad and resolved_id in marks:
-                marks.pop(resolved_id)
-                _write_json(_hidden_path(home), marks, ordered=True)
-            return {"ok": True, "resolved": True, "id": resolved_id}
-        if match is None and len(files) >= _OUTSIDE_LIMIT:
-            # Done records waiting out their undo window do not count against the cap.
-            active = sum(1 for f in files if not f.is_symlink() and not _is_done(_read_json(f)))
-        else:
-            active = 0
-        if match is None and active >= _OUTSIDE_LIMIT:
-            raise ValueError(
-                f"Outside queue is full ({active} filed items waiting, limit {_OUTSIDE_LIMIT}); "
-                "nothing was filed. Resolve an item or ask the human to finish one, then file again"
-            )
-        old = _read_json(match) if match else {}
+            marker_failed = False
+            try:
+                marks = load_hidden(home, errors=(bad := []))
+                if not bad and resolved_id in marks:
+                    marks.pop(resolved_id)
+                    _write_json(_hidden_path(home), marks, ordered=True)
+            except OSError as exc:
+                # The record is already gone: report that, not a failure that would make the
+                # caller retry a resolve that can no longer find it. The stale marker is harmless.
+                marker_failed = True
+                log.warning("unbl0ck: outside: could not drop a dismissal marker: %s", type(exc).__name__)
+            out = {"ok": True, "resolved": True, "id": resolved_id}
+            if marker_failed:
+                out["note"] = "resolved; a stale Not for me marker could not be removed and is harmless"
+            return out
+        if action == "file" and not key:
+            files, over = _filed_files(d)
+            if over:
+                raise RuntimeError(_TOO_MANY_FILED)
+        old = _read_json(match, strict=True) if match else {}
         record_id = match.stem if match else uuid.uuid4().hex
         item_id = f"outside:filed:{record_id}"
+        # The version names the content. The session that filed it is provenance: it is stored,
+        # but identical content refiled from another session must not look like a new item.
+        content = {k: v for k, v in fields.items() if k != "session_id"}
+
         def digest(values: dict[str, Any]) -> str:
             return hashlib.sha256(
                 json.dumps(values, sort_keys=True, ensure_ascii=False).encode()
             ).hexdigest()
 
-        version = digest(fields)
+        version = digest(content)
         # A record filed before the profile was known has a version computed with an empty
         # profile. Adopting it into a profile is not a change to the claim: keep that version so
         # the human's Done or Not for me still applies.
-        if old and fields["profile"] and old.get("version") == digest({**fields, "profile": ""}):
-            version = old["version"]
+        if old and fields["profile"]:
+            # Versions written before the session id left the digest still hold it.
+            legacy_digests = {
+                digest({**content, "profile": ""}),
+                digest({**content, "profile": "", "session_id": old.get("session_id", "")}),
+            }
+            if old.get("version") in legacy_digests:
+                version = old["version"]
         rec = {
             **fields,
             "id": item_id,
@@ -2438,8 +3332,18 @@ def file_outside(
         }
         # Re-filing identical content does not undo a local Done; a changed claim is new
         # work for the human and resurfaces.
-        if _is_done(old) and old.get("version") == version:
+        stays_done = _is_done(old) and old.get("version") == version
+        # A new record, or a Done one that this filing reactivates, adds to the active count.
+        # (Done records waiting out their undo window do not count against the cap.)
+        if (match is None or (_is_done(old) and not stays_done)) and len(files) >= _OUTSIDE_LIMIT:
+            if _count_active(files, skip=match) >= _OUTSIDE_LIMIT:
+                raise ValueError(
+                    f"Outside queue is full ({_OUTSIDE_LIMIT} filed items); resolve an item before filing another"
+                )
+        if stays_done:
             rec["done_at"] = old["done_at"]
+            if "done_token" in old:
+                rec["done_token"] = old["done_token"]
         _write_json(d / f"{record_id}.json", rec)
         return {
             "ok": True,
@@ -2453,67 +3357,426 @@ def file_outside(
 _HTML_VOID = frozenset("area base br col embed hr img input link meta param source track wbr".split())
 _HTML_DROP = frozenset(
     "head script style title noscript template iframe frame frameset object embed applet svg math canvas "
-    "audio video select textarea".split()
+    "audio video select".split()
+)
+_HTML_FOREIGN = frozenset(("svg", "math"))  # a self-closing tag really is empty only here
+_HTML_HEAD_OK = frozenset(
+    "title meta link style script base noscript template basefont bgsound command".split()
 )
 _HTML_BLOCK = frozenset(
     "p div section article header footer main nav aside blockquote pre table tr ul ol dl dt dd h1 h2 h3 h4 h5 h6 "
     "form fieldset figure figcaption address hr center".split()
 )
-_HTML_HIDDEN_STYLE = re.compile(
-    r"display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0\s*(?:;|$)|"
-    r"(?:font-size|max-height|max-width|width|height)\s*:\s*0(?:px|pt|em|rem|%)?\s*(?:;|!|$)",
-    re.I,
+# A start tag of these closes an open <p> (HTML's optional end tag for p).
+_HTML_CLOSES_P = frozenset(
+    "address article aside blockquote center details dialog dir div dl fieldset figcaption figure footer "
+    "form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre section table ul li dd dt".split()
 )
-_HTML_MAX_OPEN = 2000  # nesting tracked inside a hidden element; deeper ends the readable text
+_HTML_SCOPE = frozenset("table td th caption html button object marquee applet template".split())
+_HTML_MAX_OPEN = 1000  # open elements tracked; deeper nesting ends the readable text, and is reported
+
+
+class _HtmlStop(Exception):
+    """Raised inside the converter to end it early; the result is reported as incomplete."""
+
+
+_CSS_COMMENT = re.compile(r"/\*.*?(?:\*/|\Z)", re.S)
+_CSS_ZERO = re.compile(r"^[+-]?(?:0+(?:\.0*)?|\.0+)(?:[a-z]+|%)?$")
+_CSS_ABS_LENGTH = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:px|pt|pc|cm|mm|in|q|rem|vw|vh|vmin|vmax)$")
+_CSS_FONT_KEYWORDS = frozenset(
+    "xx-small x-small small medium large x-large xx-large xxx-large math".split()
+)
+_CSS_IMPORTANT = re.compile(r"\s*!\s*important\s*$")
+_CSS_COMPOUND = re.compile(r"^(?P<tag>[a-zA-Z][a-zA-Z0-9-]*|\*)?(?P<rest>(?:[.#][A-Za-z_][\w-]*)*)$")
+_CSS_PART = re.compile(r"([.#])([A-Za-z_][\w-]*)")
+_CSS_SKIP_BLOCKS = ("@font-face", "@keyframes", "@-webkit-keyframes", "@page", "@counter-style", "@property")
+_CSS_HIDING = frozenset(
+    "display visibility opacity font-size width height max-width max-height overflow overflow-x overflow-y".split()
+)
+_CSS_HIDINGISH = re.compile(
+    r"display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|opacity\s*:\s*0|font-size\s*:\s*0|overflow", re.I
+)
+_CSS_MAX_RULES = 2000
+_CSS_MAX_SELECTOR = 4  # compounds in a selector this converter evaluates
+_CSS_BIG_INT = re.compile(
+    r"&#(?:[0-9]{100,}|0*[1-9][0-9]{7,}|[xX](?:[0-9a-fA-F]{100,}|0*[1-9a-fA-F][0-9a-fA-F]{6,}));?"
+)
+
+
+def _css_declarations(block: str) -> dict[str, tuple[str, bool]]:
+    """``{property: (value, important)}`` from one declaration block. Property names are matched
+    whole (``min-width`` is never ``width``) and custom properties (``--x``) are not properties."""
+    out: dict[str, tuple[str, bool]] = {}
+    for piece in _CSS_COMMENT.sub("", block).split(";"):
+        name, sep, value = piece.partition(":")
+        name = name.strip().lower()
+        if not sep or not name or name.startswith("--"):
+            continue
+        value = value.strip().lower()
+        important = bool(_CSS_IMPORTANT.search(value))
+        value = _CSS_IMPORTANT.sub("", value).strip()
+        if name in out and out[name][1] and not important:
+            continue
+        out[name] = (value, important)
+    return out
+
+
+def _css_zero(value: str) -> bool:
+    return bool(_CSS_ZERO.match(value))
+
+
+def _css_clips(decls: dict[str, str]) -> bool:
+    return any(decls.get(p, "visible") in ("hidden", "clip", "scroll", "auto") for p in ("overflow", "overflow-x", "overflow-y"))
+
+
+def _css_hides(decls: dict[str, str]) -> bool:
+    """Whether declarations hide an element's whole subtree whatever its descendants say."""
+    if decls.get("display") == "none":
+        return True
+    if "opacity" in decls and _css_zero(decls["opacity"]):
+        return True
+    if _css_clips(decls):
+        return any(_css_zero(decls[p]) for p in ("width", "height", "max-width", "max-height") if p in decls)
+    return False
+
+
+def _css_can_hide(decls: dict[str, tuple[str, bool]]) -> bool:
+    plain = {k: v[0] for k, v in decls.items()}
+    return (
+        _css_hides(plain)
+        or plain.get("visibility") in ("hidden", "collapse")
+        or ("font-size" in plain and _css_zero(plain["font-size"]))
+    )
+
+
+class _CssRule:
+    __slots__ = ("chain", "spec", "order", "decls")
+
+    def __init__(self, chain, spec, order, decls):
+        self.chain, self.spec, self.order, self.decls = chain, spec, order, decls
+
+
+def _css_selector(text: str):
+    """``[(combinator, tag, classes, id)]`` for a selector of tags, classes, ids and the
+    descendant and child combinators, or None when it uses anything else."""
+    text = text.strip()
+    if not text or len(text) > 200 or "\\" in text:
+        return None
+    tokens = re.split(r"\s*(>)\s*|\s+", text)
+    chain, comb = [], " "
+    for tok in tokens:
+        if tok is None or tok == "":
+            continue
+        if tok == ">":
+            comb = ">"
+            continue
+        m = _CSS_COMPOUND.match(tok)
+        if not m:
+            return None
+        tag = (m.group("tag") or "*").lower()
+        classes, ident = [], ""
+        for kind, name in _CSS_PART.findall(m.group("rest")):
+            if kind == ".":
+                classes.append(name)
+            else:
+                ident = name
+        chain.append((comb, tag, tuple(classes), ident))
+        comb = " "
+    return chain if chain and len(chain) <= _CSS_MAX_SELECTOR else None
+
+
+def _css_parse(css: str, conditional: bool, rules: list, state: dict) -> None:
+    """Collect evaluable rules into *rules*; set ``state['uncertain']`` when a rule that could
+    hide text is one this converter cannot evaluate (media queries, attribute or pseudo selectors)."""
+    css = _CSS_COMMENT.sub("", css)
+    pos, n = 0, len(css)
+    while pos < n:
+        brace, semi = css.find("{", pos), css.find(";", pos)
+        stripped = css[pos:].lstrip()
+        if stripped.startswith("@") and semi != -1 and (brace == -1 or semi < brace):
+            pos = semi + 1  # @import, @charset: statements without a block
+            continue
+        if brace == -1:
+            break
+        prelude = css[pos:brace].strip()
+        depth, end = 1, brace + 1
+        while end < n and depth:
+            depth += {"{": 1, "}": -1}.get(css[end], 0)
+            end += 1
+        body = css[brace + 1 : end - 1 if depth == 0 else end]
+        pos = end
+        if prelude.startswith("@"):
+            if prelude.lower().startswith(_CSS_SKIP_BLOCKS):
+                continue
+            _css_parse(body, True, rules, state)
+            continue
+        if "{" in body:  # nested rules: not evaluated
+            if _CSS_HIDINGISH.search(body):
+                state["uncertain"] = True
+            continue
+        decls = _css_declarations(body)
+        decls = {k: v for k, v in decls.items() if k in _CSS_HIDING}
+        if not decls:
+            continue
+        can_hide = _css_can_hide(decls)
+        for sel in prelude.split(","):
+            chain = None if conditional else _css_selector(sel)
+            if chain is None:
+                if can_hide:
+                    state["uncertain"] = True
+                continue
+            if len(rules) >= _CSS_MAX_RULES:
+                state["uncertain"] = True
+                return
+            ids = sum(1 for c in chain if c[3])
+            classes = sum(len(c[2]) for c in chain)
+            tags = sum(1 for c in chain if c[1] != "*")
+            rules.append(_CssRule(chain, (ids, classes, tags), len(rules), decls))
+
+
+class _StyleCollector(html.parser.HTMLParser):
+    """First pass: the text of every <style> element, whatever the element sits inside."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.blocks: list[tuple[str, bool]] = []
+        self._open: list[str] | None = None
+        self._size = 0
+        self.capped = False  # a stylesheet was longer than is read: its rules are not all known
+        self._conditional = False
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag == "style":
+            a = {k: (v or "") for k, v in attrs}
+            media = a.get("media", "").strip().lower()
+            self._conditional = media not in ("", "all", "screen")
+            self._open, self._size = [], 0
+
+    handle_startendtag = handle_starttag
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "style" and self._open is not None:
+            self.blocks.append(("".join(self._open), self._conditional))
+            self._open = None
+
+    def handle_data(self, data: str) -> None:
+        if self._open is not None:
+            room = 200_000 - self._size
+            if len(data) > room:
+                self.capped = True
+            if room > 0:
+                self._open.append(data[:room])
+                self._size += min(len(data), room)
+
+
+class _Frame:
+    __slots__ = ("tag", "classes", "ident", "gone", "vis_hidden", "font_zero", "own")
+
+    def __init__(self, tag, classes, ident, gone, vis_hidden, font_zero, own):
+        self.tag, self.classes, self.ident = tag, classes, ident
+        self.gone, self.vis_hidden, self.font_zero, self.own = gone, vis_hidden, font_zero, own
 
 
 class _InertText(html.parser.HTMLParser):
     """HTML to plain text without interpreting any of it: nothing is fetched, no attribute value
     is kept (links, image sources and alt text never reach the output), and script, style, frames,
-    forms of embedding and visually hidden elements contribute no text."""
+    embedding and visually hidden elements contribute no text. Hiding follows the CSS cascade for
+    the properties it evaluates (see the operator guide); a descendant that overrides an inherited
+    one (``visibility``, ``font-size``) is read, while ``display:none``, zero opacity and a clipped
+    zero-size box hide the whole subtree."""
 
-    def __init__(self, limit: int) -> None:
+    def __init__(self, limit: int, rules: list[_CssRule] | None = None) -> None:
         super().__init__(convert_charrefs=True)
         self.out: list[str] = []
         self.size = 0
         self.limit = limit
-        self.hidden: list[str] = []  # open elements inside a dropped or hidden region
+        self.stack: list[_Frame] = []
+        self.open_count: collections.Counter[str] = collections.Counter()
+        self._head: tuple[int, _Frame] | None = None
+        self.by_tag: dict[str, list[_CssRule]] = {}
+        self.by_class: dict[str, list[_CssRule]] = {}
+        self.by_id: dict[str, list[_CssRule]] = {}
+        for r in rules or ():
+            last = r.chain[-1]
+            if last[3]:
+                self.by_id.setdefault(last[3], []).append(r)
+            elif last[2]:
+                self.by_class.setdefault(last[2][0], []).append(r)
+            else:
+                self.by_tag.setdefault(last[1], []).append(r)
+
+    @property
+    def hidden(self) -> bool:
+        """The markup ended inside an element that still hides text."""
+        return any(f.own for f in self.stack if f.tag != "head")
 
     def _emit(self, text: str) -> None:
         if self.size < self.limit:
             self.out.append(text)
             self.size += len(text)
 
+    def _visible(self) -> bool:
+        if not self.stack:
+            return True
+        top = self.stack[-1]
+        return not (top.gone or top.vis_hidden or top.font_zero)
+
+    # -- cascade ---------------------------------------------------------------------------
+    def _matches(self, rule: _CssRule, tag: str, classes: tuple, ident: str) -> bool:
+        comb, rtag, rclasses, rid = rule.chain[-1]
+        if rtag != "*" and rtag != tag:
+            return False
+        if rid and rid != ident:
+            return False
+        if any(c not in classes for c in rclasses):
+            return False
+        idx = len(self.stack) - 1  # the candidate element is not on the stack yet
+        # walk the chain right to left: each earlier compound sits above the later one
+        want = rule.chain
+        pos = len(want) - 1
+        while pos > 0:
+            link = want[pos][0]  # combinator between want[pos-1] and want[pos]
+            _, ptag, pclasses, pid = want[pos - 1]
+            if link == ">":
+                if idx < 0 or not self._frame_is(self.stack[idx], ptag, pclasses, pid):
+                    return False
+                idx -= 1
+            else:
+                while idx >= 0 and not self._frame_is(self.stack[idx], ptag, pclasses, pid):
+                    idx -= 1
+                if idx < 0:
+                    return False
+                idx -= 1
+            pos -= 1
+        return True
+
+    @staticmethod
+    def _frame_is(f: _Frame, tag: str, classes: tuple, ident: str) -> bool:
+        return (tag == "*" or tag == f.tag) and (not ident or ident == f.ident) and all(c in f.classes for c in classes)
+
+    def _computed(self, tag: str, classes: tuple, ident: str, style: str) -> dict[str, str]:
+        found: dict[int, _CssRule] = {}
+        for rule in itertools.chain(
+            self.by_tag.get(tag, ()),
+            self.by_tag.get("*", ()),
+            (r for c in classes for r in self.by_class.get(c, ())),
+            self.by_id.get(ident, ()) if ident else (),
+        ):
+            if rule.order not in found and self._matches(rule, tag, classes, ident):
+                found[rule.order] = rule
+        layers: list[tuple[int, int, tuple, int, str, str]] = []
+        for rule in found.values():
+            for name, (value, important) in rule.decls.items():
+                layers.append((int(important), 0, rule.spec, rule.order, name, value))
+        for name, (value, important) in _css_declarations(style).items():
+            if name in _CSS_HIDING:
+                layers.append((int(important), 1, (0, 0, 0), 0, name, value))
+        layers.sort(key=lambda t: t[:4])
+        return {name: value for *_k, name, value in layers}
+
+    # -- tree ------------------------------------------------------------------------------
+    def _close_to(self, tag: str, boundary: frozenset[str] = frozenset()) -> bool:
+        """Pop elements up to and including the nearest open *tag*, unless a boundary comes first."""
+        if not self.open_count[tag]:
+            return False
+        for i in range(len(self.stack) - 1, -1, -1):
+            t = self.stack[i].tag
+            if t == tag:
+                for f in self.stack[i:]:
+                    self.open_count[f.tag] -= 1
+                del self.stack[i:]
+                return True
+            if t in boundary:
+                return False
+        return False
+
+    def _implied_ends(self, tag: str) -> None:
+        h = self._head
+        if (
+            h is not None
+            and tag not in _HTML_HEAD_OK
+            and tag != "head"
+            and len(self.stack) > h[0]
+            and self.stack[h[0]] is h[1]
+        ):
+            self._close_to("head")  # the omitted </head>
+        if tag in _HTML_CLOSES_P:
+            self._close_to("p", _HTML_SCOPE)
+        if tag == "li":
+            self._close_to("li", frozenset(("ul", "ol", "table", "td", "th")))
+        elif tag in ("dt", "dd"):
+            for t in ("dt", "dd"):
+                self._close_to(t, frozenset(("dl", "table", "td", "th")))
+        elif tag in ("td", "th"):
+            for t in ("td", "th"):
+                self._close_to(t, frozenset(("tr", "table")))
+        elif tag in ("tr", "tbody", "thead", "tfoot"):
+            for t in ("td", "th", "tr"):
+                self._close_to(t, frozenset(("table",)))
+
     def handle_starttag(self, tag: str, attrs: list) -> None:
-        if self.hidden:
-            if tag not in _HTML_VOID and len(self.hidden) < _HTML_MAX_OPEN:
-                self.hidden.append(tag)
-            return
+        self._implied_ends(tag)
         a = {k: (v or "") for k, v in attrs}
-        if tag in _HTML_DROP or "hidden" in a or _HTML_HIDDEN_STYLE.search(a.get("style", "")):
-            if tag not in _HTML_VOID:
-                self.hidden.append(tag)
+        classes = tuple(a.get("class", "").split())
+        ident = a.get("id", "")
+        parent = self.stack[-1] if self.stack else None
+        gone = parent.gone if parent else False
+        vis_hidden = parent.vis_hidden if parent else False
+        font_zero = parent.font_zero if parent else False
+        own = False
+        if not gone:
+            c = self._computed(tag, classes, ident, a.get("style", ""))
+            if tag in _HTML_DROP or "hidden" in a or _css_hides(c):
+                gone = own = True
+            else:
+                vis = c.get("visibility")
+                if vis in ("hidden", "collapse"):
+                    vis_hidden = own = True
+                elif vis == "visible":
+                    vis_hidden = False
+                fs = c.get("font-size")
+                if fs is not None:
+                    if _css_zero(fs):
+                        font_zero = own = True
+                    elif _CSS_ABS_LENGTH.match(fs) or fs in _CSS_FONT_KEYWORDS:
+                        font_zero = False
+        if tag in _HTML_VOID:
+            if not (gone or vis_hidden or font_zero) and tag == "br":
+                self._emit("\n")
             return
-        if tag == "br":
-            self._emit("\n")
-        elif tag == "li":
+        if len(self.stack) >= _HTML_MAX_OPEN:
+            raise _HtmlStop
+        frame = _Frame(tag, classes, ident, gone, vis_hidden, font_zero, own)
+        if tag == "head":
+            self._head = (len(self.stack), frame)
+        self.stack.append(frame)
+        self.open_count[tag] += 1
+        if gone or vis_hidden or font_zero:
+            return
+        if tag == "li":
             self._emit("\n- ")
         elif tag in _HTML_BLOCK:
             self._emit("\n")
 
+    def handle_startendtag(self, tag: str, attrs: list) -> None:
+        # A trailing slash empties only void and foreign elements; anywhere else HTML ignores it.
+        self.handle_starttag(tag, attrs)
+        if tag in _HTML_FOREIGN and self.stack and self.stack[-1].tag == tag:
+            self.open_count[tag] -= 1
+            self.stack.pop()
+
     def handle_endtag(self, tag: str) -> None:
-        if self.hidden:
-            if tag in self.hidden:
-                while self.hidden and self.hidden.pop() != tag:
-                    pass
+        was_visible = self._visible()
+        if not self._close_to(tag):
             return
-        if tag in _HTML_BLOCK:
-            self._emit("\n")
-        elif tag in ("td", "th"):
-            self._emit(" ")
+        if was_visible:
+            if tag in _HTML_BLOCK:
+                self._emit("\n")
+            elif tag in ("td", "th"):
+                self._emit(" ")
 
     def handle_data(self, data: str) -> None:
-        if not self.hidden:
+        if self._visible():
             self._emit(data)
 
 
@@ -2522,27 +3785,58 @@ def html_to_text(markup: str, limit: int) -> str:
     return _html_convert(markup, limit)[0]
 
 
-def _html_convert(markup: str, limit: int) -> tuple[str, bool]:
-    """Inert text, and whether the markup ended inside a hidden or never-closed element, so
-    that whatever followed it was left out."""
-    parser = _InertText(limit)
+def _html_convert(markup: str, limit: int) -> tuple[str, list[str]]:
+    """Inert text, and a note for each way the result is incomplete: text left out because it sat
+    in an element that is hidden or never closed, markup the reader could not finish, or styles
+    that could not be evaluated."""
+    markup = _CSS_BIG_INT.sub("�", markup.replace("\x00", ""))
+    notes: list[str] = []
+    state: dict[str, bool] = {"uncertain": False}
+    rules: list[_CssRule] = []
     try:
-        # The trailing tag flushes text the parser holds back; an unterminated comment or style
-        # block swallows it, which is the safe outcome for hostile input.
-        parser.feed(markup.replace("\x00", "") + "\n<p></p>")
-    except Exception:  # noqa: BLE001 - hostile or broken markup: keep what was read so far
-        pass
+        sc = _StyleCollector()
+        sc.feed(markup + "\n<p></p>")
+        for css, conditional in sc.blocks:
+            _css_parse(css, conditional, rules, state)
+        if sc.capped:
+            state["uncertain"] = True
+    except Exception:  # noqa: BLE001 - styles are an aid; the markup pass reports what it cannot read
+        state["uncertain"] = True
+    parser = _InertText(limit, rules)
+    incomplete = False
+    try:
+        # The trailing tag flushes text the parser holds back. What it cannot flush (an unterminated
+        # comment, tag or quoted attribute) stays in rawdata and is reported, never shown.
+        parser.feed(markup + "\n<p></p>")
+        if parser.rawdata.strip():
+            incomplete = True
+    except _HtmlStop:
+        incomplete = True
+    except Exception:  # noqa: BLE001 - hostile or broken markup: keep what was read, and say so
+        incomplete = True
     text = "".join(parser.out)
     text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     lines = [re.sub(r"[^\S\n]+", " ", line).strip() for line in text.split("\n")]
     cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()[:limit]
-    return cleaned, bool(parser.hidden)
+    if parser.hidden:
+        notes.append(_HTML_SWALLOWED)
+    if incomplete:
+        notes.append(_HTML_INCOMPLETE)
+    if state["uncertain"]:
+        notes.append(_HTML_STYLE_NOTE)
+    return cleaned, notes
 
 
 _HTML_NOTE = "(Converted from HTML; formatting, images and links are not shown.)\n\n"
 _NO_BODY = "(No readable text body; this message has only attachments or parts that are not read.)"
 _HTML_SWALLOWED = (
     "(Part of this HTML body is not shown: it sits inside an element that is hidden or never closed.)"
+)
+_HTML_INCOMPLETE = (
+    "(Part of this HTML body is not shown: it is nested too deeply, is malformed or could not be read.)"
+)
+_HTML_STYLE_NOTE = (
+    "(Some styles in this HTML body were not evaluated, so text they hide may appear here.)"
 )
 # Headers a mail client writes when it saves an unsent message, and headers a receiving server adds.
 _DRAFT_MARKERS = (("x-unsent", lambda v: v.strip() == "1"), ("x-mozilla-draft-info", lambda v: True),
@@ -2559,21 +3853,27 @@ def _decode_part(part: Any) -> str:
         return payload.decode("utf-8", errors="replace")
 
 
+def _has_visible_text(text: str) -> bool:
+    """Whether *text* shows anything: whitespace, control and format characters (zero-width
+    spaces, byte-order marks, NULs, soft hyphens) alone are not a message."""
+    return any(not ch.isspace() and unicodedata.category(ch) not in ("Cc", "Cf", "Zs", "Zl", "Zp") for ch in text)
+
+
 def _eml_body(msg: Any) -> str:
     """The readable body: text/plain when it says anything, else inert text from text/html.
     Parts with a filename were already marked as attachments and are never used."""
     plain = msg.get_body(preferencelist=("plain",))
     if plain is not None:
         text = _decode_part(plain)
-        if text.strip():
+        if _has_visible_text(text):
             return text
     html_part = msg.get_body(preferencelist=("html",))
     if html_part is not None:
-        text, swallowed = _html_convert(_decode_part(html_part), _OUTSIDE_READ_LIMIT)
+        text, notes = _html_convert(_decode_part(html_part), _OUTSIDE_READ_LIMIT)
         if text:
-            return _HTML_NOTE + text + (f"\n\n{_HTML_SWALLOWED}" if swallowed else "")
-        if swallowed:
-            return _HTML_SWALLOWED
+            return _HTML_NOTE + text + "".join(f"\n\n{n}" for n in notes)
+        if notes:
+            return "\n\n".join(notes)
     return _NO_BODY
 
 
@@ -2588,8 +3888,34 @@ def _eml_kind(msg: Any) -> tuple[str, str]:
     return kind, "Your mail app → Drafts" if kind == "draft" else "Your mail app"
 
 
+_DIR_FD = (
+    os.open in os.supports_dir_fd
+    and os.stat in os.supports_dir_fd
+    and os.listdir in os.supports_fd
+    and hasattr(os, "O_DIRECTORY")
+    and hasattr(os, "O_NOFOLLOW")
+)
+
+
+@contextmanager
+def _watched_dir(root: Path):
+    """Yield a descriptor for one watched folder (None where descriptors are unsupported).
+
+    The directory is opened once, without following a link, and a file directly inside it is
+    opened relative to that descriptor, so replacing the folder or one of its parents with a
+    link after the scan cannot redirect a read."""
+    if not _DIR_FD:
+        yield None
+        return
+    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        yield dfd
+    finally:
+        os.close(dfd)
+
+
 def _folder_outside_item(
-    f: Path, root: Path, expected: os.stat_result
+    f: Path, root: Path, expected: os.stat_result, root_fd: int | None = None
 ) -> dict[str, Any] | None:
     # Recheck containment at read time. O_NOFOLLOW and fstat also reject a leaf swapped for
     # a symlink, FIFO or device after the directory scan; never block on a special file.
@@ -2603,9 +3929,11 @@ def _folder_outside_item(
         return None
     if any(part.startswith(".") for part in f.relative_to(root).parts):
         return None
-    fd = os.open(
-        f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    if root_fd is not None and f.parent == root:
+        fd = os.open(f.name, flags, dir_fd=root_fd)  # relative to the directory that was scanned
+    else:
+        fd = os.open(f, flags)
     with os.fdopen(fd, "rb") as fh:
         st = os.fstat(fh.fileno())
         if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (
@@ -2644,7 +3972,8 @@ def _folder_outside_item(
         kind, where = "notes", "Your notes app"
     return {
         "id": "outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest(),
-        "version": f"{st.st_mtime_ns}:{st.st_size}",
+        # Time and size alone can repeat after an in-place edit with a restored timestamp.
+        "version": f"{st.st_mtime_ns}:{st.st_size}:{hashlib.sha256(raw).hexdigest()[:16]}",
         "source": "outside",
         "tier": "normal",
         "origin": "folder",
@@ -2660,17 +3989,46 @@ def _folder_outside_item(
     }
 
 
+def _stat_hidden(hidden: dict[str, Any], f: Path, st: os.stat_result) -> bool:
+    """Whether a folder file is already dismissed at its current mtime and size.
+
+    The stored version also names the content, which only reading the file can tell; a
+    stat-identical match counts as dismissed here and is verified when the file is read."""
+    stored = hidden.get("outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest())
+    key = f"{st.st_mtime_ns}:{st.st_size}"
+    return isinstance(stored, str) and (stored == key or stored.startswith(key + ":"))
+
+
 def _scan_outside_folder(
-    root: Path, recursive: bool, errors: list[str]
-) -> list[tuple[Path, os.stat_result]]:
-    """Eligible regular files under *root*, never following symlinks, within the scan bounds."""
-    out: list[tuple[Path, os.stat_result]] = []
+    root: Path,
+    recursive: bool,
+    errors: list[str],
+    hidden: dict[str, Any] | None = None,
+) -> tuple[list[tuple[Path, os.stat_result]], list[tuple[Path, os.stat_result]]]:
+    """``(waiting, dismissed)`` eligible regular files under *root*, never following symlinks.
+
+    The entry budget is spent on files that still wait (and on everything that is not a
+    file): files already dismissed at their current version are the progress made through a
+    large folder, so they cost time but not budget, and finishing a page always reaches the
+    next one. The time budget covers every step, including the last directory opened."""
+    waiting: list[tuple[Path, os.stat_result]] = []
+    dismissed: list[tuple[Path, os.stat_result]] = []
     stack: list[tuple[Path, int]] = [(root, 0)]
     examined = 0
     deadline = time.monotonic() + OUTSIDE_SCAN_SECONDS
     stopped = ""
     too_deep = False
     unsupported: collections.Counter[str] = collections.Counter()
+    hidden = hidden or {}
+
+    def charge() -> bool:
+        nonlocal examined, stopped
+        examined += 1
+        if examined > OUTSIDE_SCAN_ENTRIES:
+            stopped = f"examined {OUTSIDE_SCAN_ENTRIES} entries"
+            return False
+        return True
+
     while stack and not stopped:
         d, depth = stack.pop()
         if time.monotonic() > deadline:
@@ -2686,35 +4044,51 @@ def _scan_outside_folder(
             errors.append(f"outside: {d.name}: {type(exc).__name__}: {exc}")
             continue
         # Entries are consumed one at a time so the entry and time budgets apply before a
-        # huge directory is read into memory.
-        with scan as entries:
-            for entry in entries:
-                examined += 1
-                if examined > OUTSIDE_SCAN_ENTRIES:
-                    stopped = f"examined {OUTSIDE_SCAN_ENTRIES} entries"
-                    break
-                if time.monotonic() > deadline:
-                    stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
-                    break
-                if entry.name.startswith("."):
-                    continue
-                f = d / entry.name
-                try:
-                    st = entry.stat(follow_symlinks=False)
-                    if stat.S_ISDIR(st.st_mode):
-                        if recursive and depth < OUTSIDE_MAX_DEPTH:
-                            stack.append((f, depth + 1))
-                        elif recursive:
-                            too_deep = True
+        # huge directory is read into memory. A listing that fails midway keeps what it gave.
+        try:
+            with scan as entries:
+                for entry in entries:
+                    if time.monotonic() > deadline:
+                        stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"
+                        break
+                    if entry.name.startswith("."):
+                        if not charge():
+                            break
                         continue
-                    if f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
-                        out.append((f, st))
-                    elif f.suffix.lower() in _OUTSIDE_UNSUPPORTED and stat.S_ISREG(st.st_mode):
-                        unsupported[f.suffix.lower()] += 1
-                except OSError as exc:
-                    errors.append(f"outside: {entry.name}: {type(exc).__name__}: {exc}")
+                    f = d / entry.name
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        if stat.S_ISDIR(st.st_mode):
+                            if not charge():
+                                break
+                            if recursive and depth < OUTSIDE_MAX_DEPTH:
+                                stack.append((f, depth + 1))
+                            elif recursive:
+                                too_deep = True
+                        elif f.suffix.lower() in _OUTSIDE_EXTS and stat.S_ISREG(st.st_mode):
+                            if _stat_hidden(hidden, f, st):
+                                dismissed.append((f, st))
+                            elif charge():
+                                waiting.append((f, st))
+                            else:
+                                break
+                        elif f.suffix.lower() in _OUTSIDE_UNSUPPORTED and stat.S_ISREG(st.st_mode):
+                            unsupported[f.suffix.lower()] += 1
+                            if not charge():
+                                break
+                        elif not charge():
+                            break
+                    except OSError as exc:
+                        errors.append(f"outside: {entry.name}: {type(exc).__name__}: {exc}")
+        except OSError as exc:
+            errors.append(f"outside: {d.name}: {type(exc).__name__}: {exc}; the rest of it was not listed")
+    if not stopped and time.monotonic() > deadline:
+        stopped = f"stopped after {OUTSIDE_SCAN_SECONDS:g} seconds"  # the last step overran
     if stopped:
-        errors.append(f"outside: {root.name}: scan {stopped}; some files may not be listed")
+        errors.append(
+            f"outside: {root.name}: scan {stopped}; some files may not be listed, and the newest-first "
+            "order covers only the files that were examined"
+        )
     if unsupported:
         total = sum(unsupported.values())
         kinds = ", ".join(f"{ext} x{n}" for ext, n in sorted(unsupported.items()))
@@ -2726,36 +4100,112 @@ def _scan_outside_folder(
         errors.append(
             f"outside: {root.name}: folders deeper than {OUTSIDE_MAX_DEPTH} levels were not scanned"
         )
-    return out
+    return waiting, dismissed
+
+
+_READ_ERRORS_LISTED = 5
+
+
+def _read_folder_window(
+    pairs: list[tuple[Path, os.stat_result]],
+    root: Path,
+    dfd: int | None,
+    limit: int,
+    deadline: float,
+    errors: list[str],
+    attempts: list[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[tuple[Path, os.stat_result]]]:
+    """Read files in order until *limit* are read, backfilling past files that cannot be.
+
+    Returns ``(items, not_attempted)``: the files never tried. The time budget is checked before
+    every file after the first, so a poll always makes progress and never reads without bound.
+    ``attempts`` is a count shared by every folder of one call: each file tried (read or not)
+    uses one, and no file is tried once it reaches zero."""
+    out: list[dict[str, Any]] = []
+    failed = 0
+    attempted = 0
+    for f, st in pairs:
+        if len(out) >= limit or (attempts is not None and attempts[0] <= 0):
+            break
+        if attempted and time.monotonic() > deadline:
+            errors.append(
+                f"outside: {root.name}: reading stopped after {OUTSIDE_SCAN_SECONDS:g} seconds; "
+                f"{len(pairs) - attempted} files were not read this poll"
+            )
+            break
+        attempted += 1
+        if attempts is not None:
+            attempts[0] -= 1
+        try:
+            item = _folder_outside_item(f, root, st, dfd)
+            if item is not None:
+                out.append(item)
+                continue
+            problem = "changed while it was read or is no longer a plain file; retry"
+        except Exception as exc:  # one hostile file must not hide the rest of the folder
+            problem = f"{type(exc).__name__}: {exc}"
+        failed += 1
+        if failed <= _READ_ERRORS_LISTED:
+            errors.append(f"outside: {f.name}: {problem}")
+    if failed > _READ_ERRORS_LISTED:
+        errors.append(
+            f"outside: {root.name}: {failed} files could not be read "
+            f"(the first {_READ_ERRORS_LISTED} are listed)"
+        )
+    return out, pairs[attempted:]
 
 
 def outside_items(
     home: Path | None = None,
     errors: list[str] | None = None,
+    retained: dict[str, str] | None = None,
     *,
     with_hidden: bool = False,
+    stats: dict[str, int] | None = None,
     visible: Callable[[str, str], bool] | None = None,
     read_budget: int | None = None,
     unread: list[int] | None = None,
+    readonly: bool = False,
 ) -> list[dict[str, Any]]:
-    """Our filed records plus bounded, non-recursive reads of explicitly watched folders.
+    """Our filed records plus bounded reads of explicitly watched folders.
 
+    ``retained``, when given, receives ``{id: version}`` of the records kept only for Undo, so
+    the caller can keep their cached summaries instead of treating them as gone. ``stats``
+    receives ``hidden_unread``: dismissed folder files that were counted but not listed.
     ``visible(id, version)`` drops filed records that are dismissed at their current version.
     ``read_budget`` caps how many items are returned in all (filed first, then folder files
-    newest first, across every watched folder); files left unread because of it are added to
-    ``unread[0]`` so a caller can report them."""
+    newest first, across every watched folder) and counts every file it tries, read or not;
+    files left unread because of it are added to ``unread[0]``, each once even when two watched
+    folders overlap. ``readonly`` creates, deletes and rewrites nothing (no retention cleanup,
+    no state folders)."""
     errors = errors if errors is not None else []
     if unread is not None and not unread:
         unread.append(0)
     items = []
     done_seen = False
-    for f in _outside_dir(home).glob("*.json"):
+    outside = _outside_dir(home, create=not readonly)
+    try:
+        if readonly and not outside.is_dir():
+            filed, over = [], False  # nothing was ever filed
+        else:
+            filed, over = _filed_files(outside)
+        if over:
+            errors.append(f"outside: more than {_PURGE_SCAN_LIMIT} filed entries; only the first {_PURGE_SCAN_LIMIT} are read")
+    except OSError as exc:
+        errors.append(f"outside: filed records: {type(exc).__name__}; could not list filed items")
+        filed = []
+    for f in filed:
         if f.is_symlink():
             continue
         before = len(errors)
         rec = _read_json(f, errors=errors, source="outside")
         if _is_done(rec):
             done_seen = True  # locally Done, waiting out its undo window; not in the queue
+            if retained is not None and _is_filed_record(f, rec) and isinstance(rec.get("version"), str):
+                retained[rec["id"]] = rec["version"]
+            continue
+        if _bad_done(rec):
+            errors.append(f"outside: {f.name}: invalid done_at; kept for repair")
             continue
         if (
             rec.get("id") == f"outside:filed:{f.stem}"
@@ -2768,25 +4218,37 @@ def outside_items(
         ):
             if visible is None or visible(rec["id"], rec["version"]):
                 items.append(rec)
-        elif len(errors) == before:
+        elif len(errors) == before and os.path.lexists(f):
+            # (A record purged between the listing and the read is gone, not invalid.)
             errors.append(f"outside: {f.name}: invalid filed record")
     filed_waiting = len(items)
     if filed_waiting >= _OUTSIDE_LIMIT:
         errors.append(
-            f"outside: {filed_waiting} agent-filed items are waiting (limit {_OUTSIDE_LIMIT}); "
-            "agents cannot file more until you finish some"
+            Notice(
+                f"outside: {filed_waiting} agent-filed items are waiting (limit {_OUTSIDE_LIMIT}); "
+                "agents cannot file more until you finish some"
+            )
         )
-    if done_seen:
+    if done_seen and not readonly:
         try:
             with _state_lock(home):
-                _purge_done(_outside_dir(home))
-        except (OSError, TimeoutError, RuntimeError):
-            pass  # cleanup retries on the next poll or the next Done
-    raw = _settings().get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
-    recursive = outside_recursive()
-    hidden = load_hidden(home, errors=errors) if str(raw).strip() else {}
+                _purge_done(_outside_dir(home), errors=errors)
+            if retained is not None:  # what the cleanup just deleted is gone, not retained
+                for item_id in [i for i in retained if not (outside / (i.rsplit(":", 1)[1] + ".json")).exists()]:
+                    del retained[item_id]
+        except (OSError, TimeoutError, RuntimeError) as exc:
+            # Reported, not swallowed: the text stays on disk until a later poll succeeds.
+            errors.append(f"outside: retention cleanup did not run: {type(exc).__name__}; it retries on the next poll")
+    settings = _settings()  # one snapshot: the folders and the recursion flag cannot disagree
+    raw = settings.get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
+    recursive = outside_recursive(settings)
+    hidden = load_hidden(home, errors=errors, create=not readonly) if str(raw).strip() else {}
     seen: set[Path] = set()
-    claimed: set[Path] = set()  # a file under two overlapping roots is listed once, where it is shown
+    # A file under two overlapping roots is listed once, where it is tried first.
+    claimed: set[Path] = set()
+    omitted: set[Path] = set()  # files never read, and dismissed ones never listed: each counted once
+    hidden_omitted: set[Path] = set()
+    attempts = [max(0, read_budget - len(items))] if read_budget is not None else None
     for name in str(raw).split(","):
         if not name.strip():
             continue
@@ -2798,50 +4260,47 @@ def outside_items(
             if root in seen:
                 continue
             seen.add(root)
-            candidates = []
-            hidden_pairs = []
-            for pair in _scan_outside_folder(root, recursive, errors):
-                if pair[0] in claimed:
-                    continue
-                state = visibility(
-                    hidden,
-                    "outside:folder:" + hashlib.sha256(str(pair[0]).encode()).hexdigest(),
-                    f"{pair[1].st_mtime_ns}:{pair[1].st_size}",
+            waiting, dismissed = _scan_outside_folder(root, recursive, errors, hidden)
+            # A file under two overlapping roots is listed once, where it is shown first.
+            waiting = [pair for pair in waiting if pair[0] not in claimed]
+            dismissed = [pair for pair in dismissed if pair[0] not in claimed]
+            # Dismissed files never use up the waiting window; callers that count or show them
+            # (build_queue) ask for them separately, bounded by the same limit. Ties break on
+            # path, so the order is stable.
+            waiting.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
+            read_deadline = time.monotonic() + OUTSIDE_SCAN_SECONDS
+            with _watched_dir(root) as dfd:
+                shown, unattempted = _read_folder_window(
+                    waiting, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors, attempts
                 )
-                (hidden_pairs if state is Visibility.HIDDEN else candidates).append(pair)
-            # Files already marked Done at their current version do not use up the window, so
-            # finishing a page always exposes the next one. Ties break on path, so order is stable.
-            candidates.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
-            if len(candidates) > _OUTSIDE_LIMIT:
-                errors.append(
-                    f"outside: {root.name}: folder limit, showing the newest {_OUTSIDE_LIMIT}; "
-                    f"{len(candidates) - _OUTSIDE_LIMIT} older files are waiting. "
-                    "Finish or hide items to bring them into view"
-                )
-                if unread is not None:
-                    unread[0] += len(candidates) - _OUTSIDE_LIMIT  # waiting, never read
-            # Hidden files never use up the waiting window; callers that count or show them
-            # (build_queue) ask for them separately, bounded by the same limit.
-            window = candidates[:_OUTSIDE_LIMIT]
-            if read_budget is not None:
-                room = max(0, read_budget - len(items))
-                if len(window) > room:
-                    if unread is not None:
-                        unread[0] += len(window) - room
-                    window = window[:room]
-            if with_hidden:
-                hidden_pairs.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
-                window = window + hidden_pairs[:_OUTSIDE_LIMIT]
-            for f, st in window:
-                try:
-                    item = _folder_outside_item(f, root, st)
-                    if item is not None:
-                        items.append(item)
-                        claimed.add(f)
-                except (OSError, ValueError) as exc:
-                    errors.append(f"outside: {f.name}: {type(exc).__name__}: {exc}")
+                if unattempted and len(shown) >= _OUTSIDE_LIMIT:
+                    errors.append(
+                        f"outside: {root.name}: folder limit, showing the newest {_OUTSIDE_LIMIT}; "
+                        f"{len(unattempted)} older files are waiting. "
+                        "Finish or hide items to bring them into view"
+                    )
+                omitted.update(f for f, _ in unattempted)
+                # Every file tried here (read or failed) belongs to this root, so an overlapping
+                # root neither lists it again nor spends the read budget on it again.
+                claimed.update(f for f, _ in waiting[: len(waiting) - len(unattempted)])
+                read_hidden: list[dict[str, Any]] = []
+                hidden_rest = dismissed
+                if with_hidden:
+                    dismissed.sort(key=lambda pair: (-pair[1].st_mtime_ns, str(pair[0])))
+                    read_hidden, hidden_rest = _read_folder_window(
+                        dismissed, root, dfd, _OUTSIDE_LIMIT, read_deadline, errors
+                    )
+                hidden_omitted.update(f for f, _ in hidden_rest)
+            for item in shown + read_hidden:
+                items.append(item)
+                claimed.add(Path(item["ref"]))
         except (OSError, ValueError, RuntimeError) as exc:
             errors.append(f"outside: {name.strip()}: {type(exc).__name__}: {exc}")
+    # What another root went on to read is not missing; what is left is counted once.
+    if unread is not None:
+        unread[0] += len(omitted - claimed)
+    if stats is not None:
+        stats["hidden_unread"] = stats.get("hidden_unread", 0) + len(hidden_omitted - claimed)
     for it in items:
         it["ask"] = it.get("text") or "(No text supplied.)"
         it["excerpt"] = _excerpt_head(it["ask"])
@@ -2851,6 +4310,68 @@ def outside_items(
             else "From a watched folder; act in the original app."
         )
     return items
+
+
+def outside_lookup(item_id: str, home: Path | None = None) -> dict[str, Any]:
+    """One current outside item by id, read directly rather than from the newest-200 poll window.
+
+    Raises ``ValueError`` for a malformed id, ``LookupError`` only when the item is confirmed
+    absent, and ``SourceUnavailable`` when it could not be read or its absence cannot be proved
+    (an unreadable folder, a corrupt record, a file that changed mid-read)."""
+    match = _FILED_ID.fullmatch(item_id or "")
+    if match:
+        f = _outside_dir(home) / (match.group(1) + ".json")
+        if f.is_symlink():
+            raise SourceUnavailable("filed outside record is not a regular file")
+        try:
+            rec = _read_json(f, strict=True)
+        except RuntimeError as exc:
+            raise SourceUnavailable(str(exc)) from exc
+        if not rec:
+            raise LookupError("outside item is no longer available")
+        if rec.get("id") != item_id or rec.get("origin") != "filed" or not isinstance(rec.get("text"), str):
+            raise SourceUnavailable("filed outside record is invalid; repair it")
+        return rec
+    if not _FOLDER_ID.fullmatch(item_id or ""):
+        raise ValueError("id must identify an outside item")
+    settings = _settings()  # one snapshot: the folders and the recursion flag cannot disagree
+    raw = settings.get("outside_dirs") or os.environ.get("UNBL0CK_OUTSIDE_DIRS", "")
+    recursive = outside_recursive(settings)
+    unreadable: list[str] = []
+    seen: set[Path] = set()
+    for name in str(raw).split(","):
+        if not name.strip():
+            continue
+        try:
+            root = Path(name.strip()).expanduser()
+            if not root.is_absolute():
+                raise ValueError("outside_dirs requires absolute paths")
+            root = root.resolve()
+            if root in seen:
+                continue
+            seen.add(root)
+            scan_errors: list[str] = []
+            with _watched_dir(root) as dfd:
+                found, _ = _scan_outside_folder(root, recursive, scan_errors)
+                for f, st in found:
+                    if "outside:folder:" + hashlib.sha256(str(f).encode()).hexdigest() != item_id:
+                        continue
+                    try:
+                        item = _folder_outside_item(f, root, st, dfd)
+                    except RecursionError as exc:
+                        raise SourceUnavailable("outside file could not be parsed: too deeply nested") from exc
+                    if item is None:
+                        raise SourceUnavailable("outside file changed while it was read; retry")
+                    return item
+            if scan_errors:  # a listing that failed must not look like "no match"
+                raise OSError(scan_errors[0])
+        except (LookupError, SourceUnavailable):
+            raise
+        except (OSError, ValueError, RuntimeError) as exc:
+            unreadable.append(f"{name.strip()}: {type(exc).__name__}")
+    if unreadable:
+        raise SourceUnavailable("a watched folder could not be read: " + "; ".join(unreadable))
+    raise LookupError("outside item is no longer available")
 
 
 def done_outside(
@@ -2867,10 +4388,15 @@ def done_outside(
     if match:
         with _state_lock(home):
             d = _outside_dir(home)
-            _purge_done(d)
+            cleanup_failed = _purge_logged(d)
             f = d / (match.group(1) + ".json")
-            rec = _read_json(f)
-            if not rec or f.is_symlink():
+            if f.is_symlink():
+                raise SourceUnavailable("filed outside record is not a regular file")
+            try:
+                rec = _read_json(f, strict=True)   # a corrupt record is a failure, not "gone"
+            except RuntimeError as exc:
+                raise SourceUnavailable(str(exc)) from exc
+            if not rec:
                 raise LookupError("Filed outside item no longer exists")
             if rec.get("version") != version:
                 raise RuntimeError(
@@ -2878,14 +4404,20 @@ def done_outside(
                 )
             if not _is_done(rec):
                 rec["done_at"] = time.time()
+                rec["done_token"] = uuid.uuid4().hex
                 _write_json(f, rec)
-                _purge_done(d)  # enforce the keep limit now that this one counts
+                # The Done is committed. Enforcing the keep limit is best effort: a failure there
+                # is reported in the reply, never as a failed Done the client could not undo.
+                cleanup_failed += _purge_logged(d)
             token = _done_token(rec)
-        return {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS, "token": token}
+        reply = {"ok": True, "done": True, "local_only": True, "undo_seconds": OUTSIDE_UNDO_SECONDS, "token": token}
+        if cleanup_failed:
+            reply["cleanup_failed"] = cleanup_failed
+        return reply
     if not _FOLDER_ID.fullmatch(item_id):
         raise ValueError("id must identify an outside item")
-    hide(item_id, version, home)
-    return {"ok": True, "hidden": True, "local_only": True}
+    token = hide(item_id, version, home)
+    return {"ok": True, "hidden": True, "local_only": True, "token": token}
 
 
 # --- the queue -----------------------------------------------------------------------------
@@ -2962,13 +4494,15 @@ NO_BLUF_SOURCES = ("prompt", "pairing")
 # one-line summary, "ask" is the TL;DR / follow-up panel (Kanban cards only: it needs a board
 # and task), "search" is the opt-in full-text search, which reads locally and never calls a
 # model. "cross_profile" marks sources the queue reads without filtering by profile: chats and
-# prompts from every profile under the Hermes home, and the shared filed-item folder and watched
-# folders (the queue has no reading profile; a filed item records its profile only for dedupe).
+# prompts from every profile under the Hermes home, Kanban (Hermes keeps one board store shared by
+# every profile), and the shared filed-item folder (the queue has no reading profile; a filed item
+# records its profile only for dedupe). Watched folders are the exception inside "outside": each
+# profile reads only the folders its own settings configure.
 # docs/architecture.md carries the same table and a test keeps the two equal.
 SURFACES = {
     "prompt": {"ask": False, "search": True, "cross_profile": True},
     "pairing": {"ask": False, "search": False, "cross_profile": True},
-    "kanban": {"ask": True, "search": False, "cross_profile": False},
+    "kanban": {"ask": True, "search": False, "cross_profile": True},
     "outside": {"ask": False, "search": True, "cross_profile": True},
     "chat": {"ask": False, "search": True, "cross_profile": True},
 }
@@ -3022,14 +4556,14 @@ CAPABILITIES: dict[str, dict[str, dict[str, str]]] = {
         "dismiss": _cap("supported"),
     },
     "chat": {
-        "context": _cap("missing", "the card shows the last message and its full text; a chat context panel is not built yet"),
+        "context": _cap("supported"),
         "model_help": _cap("missing", "only the one-line summary exists; TL;DR follow-ups are Kanban-only today"),
         "reply": _cap("restricted", "reply in the chat itself so that platform's own identity and authorization apply; UNBL0CK never sends for you"),
         "route": _cap("supported"),
         "dismiss": _cap("supported"),
     },
     "prompt": {
-        "context": _cap("restricted", "a live prompt shows only what Hermes already redacted; nothing more is read"),
+        "context": _cap("supported"),
         "model_help": _cap("restricted", "live prompts, including command approvals and password prompts, are never sent to a model"),
         "reply": _cap("restricted", "answer it where it was asked; approvals and passwords are never taken here"),
         "route": _cap("supported"),
@@ -3053,7 +4587,7 @@ CAPABILITIES: dict[str, dict[str, dict[str, str]]] = {
         "context": _cap("supported"),
         "model_help": _CAP_OUTSIDE_HELP,
         "reply": _CAP_OUTSIDE_REPLY,
-        "route": _cap("restricted", "watched files are read-only: UNBL0CK never edits, moves or deletes them"),
+        "route": _cap("supported"),
         "dismiss": _cap("supported"),
     },
 }
@@ -3075,6 +4609,8 @@ def build_queue(
     errors: list[str] = []
     items: list[dict[str, Any]] = []
     outside_source_failed = False
+    outside_stats: dict[str, int] = {}
+    outside_retained: dict[str, str] = {}  # Done records waiting out Undo: not shown, still known
     # One broken source must not hide the other; one broken board must not hide the
     # rest of Kanban (kanban_items records ``kanban[board]: …`` itself).
     try:
@@ -3085,8 +4621,14 @@ def build_queue(
         if note:
             errors.append(note)
     chat_coverage: dict[str, Any] | None = {}
+    unread_profiles: set[str] = set()
     try:
-        items.extend(chat_items(home, errors=errors, coverage=chat_coverage))
+        items.extend(
+            chat_items(
+                home, errors=errors, coverage=chat_coverage, unread_profiles=unread_profiles,
+                record_backfill=True,
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         chat_coverage = None  # a failed source is not "covered"
         errors.append(f"chat: {type(exc).__name__}: {exc}")
@@ -3099,12 +4641,19 @@ def build_queue(
     except Exception as exc:  # noqa: BLE001
         errors.append(f"pairing: {type(exc).__name__}: {exc}")
     try:
-        items.extend(outside_items(home, errors=errors, with_hidden=True))
+        items.extend(
+            outside_items(
+                home, errors=errors, retained=outside_retained, with_hidden=True, stats=outside_stats
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         outside_source_failed = True
         errors.append(f"outside: {type(exc).__name__}: {exc}")
-    if _SETTINGS_ERROR:
-        errors.append(_SETTINGS_ERROR)
+    # One settings snapshot (and the fault from that same refresh) for everything this response
+    # says about model use: the flags, the matrix, whether summaries are attached and the notes.
+    settings, settings_error = _settings_state()
+    if settings_error:
+        errors.append(settings_error)
     if chat_coverage is not None:
         # The reader returns normally after a corrupt database or unreadable settings and says
         # so only in `errors`; a window that was not fully read must not look like a complete one.
@@ -3117,14 +4666,22 @@ def build_queue(
         for source in ("kanban", "chat", "prompt", "pairing")
         if source in failed_sources
     )
+    # A chat the scan cap left unread was not observed: its cached summary stays for when it is.
+    preserve_prefixes += tuple(f"chat:{p}:" for p in sorted(unread_profiles))
     if outside_source_failed:
         preserve_prefixes += ("outside:",)
     else:
         # Folder ids are shared across profiles, but their configured folders are not.
         preserve_prefixes += ("outside:folder:",)
     try:
-        prune_blufs(items, home, preserve_prefixes=preserve_prefixes, observed_at=observed_at)
-    except (OSError, TimeoutError) as exc:
+        prune_blufs(
+            items + [{"id": i, "version": v} for i, v in outside_retained.items()],
+            home,
+            preserve_prefixes=preserve_prefixes,
+            observed_at=observed_at,
+        )
+    except (OSError, TimeoutError, RuntimeError) as exc:
+        # RuntimeError: a damaged cache is left for repair, not rewritten.
         log.warning(
             "unbl0ck: could not prune summary cache: %s: %s", type(exc).__name__, exc
         )
@@ -3144,7 +4701,14 @@ def build_queue(
             -(_num(i.get("since"))),
         )
     )
-    attach_blufs(shown, home)
+    if include_hidden and outside_stats.get("hidden_unread"):
+        errors.append(
+            f"outside: {outside_stats['hidden_unread']} hidden files are not listed "
+            f"(at most the newest {_OUTSIDE_LIMIT} per folder are shown)"
+        )
+    summaries_on = bluf_enabled(settings)
+    if summaries_on:
+        attach_blufs(shown, home)
     counts = {
         "asks": sum(1 for i in shown if i.get("tier") not in ("stuck", "answered")),
         "answered": sum(1 for i in shown if i.get("tier") == "answered"),
@@ -3157,20 +4721,22 @@ def build_queue(
         "generated_at": int(time.time()),
         "count": counts["asks"],
         "counts": counts,
-        "hidden": len(items) - len(shown),
+        "hidden": len(items) - len(shown) + outside_stats.get("hidden_unread", 0),
         "items": shown,
         "errors": errors,
-        "ask_enabled": ask_enabled(),
-        "bluf_enabled": bluf_enabled(),
-        "disclosure": disclosure_matrix(),
+        "ask_enabled": ask_enabled(settings),
+        "bluf_enabled": summaries_on,
+        "disclosure": disclosure_matrix(settings),
         "capabilities": CAPABILITIES,
-        "coverage": {"chat": chat_coverage, "not_covered": not_covered_notes(chat_coverage)},
+        "coverage": {"chat": chat_coverage, "not_covered": not_covered_notes(chat_coverage, settings)},
     }
 
 
-def not_covered_notes(chat_coverage: dict[str, Any] | None) -> list[str]:
+def not_covered_notes(
+    chat_coverage: dict[str, Any] | None, settings: dict[str, Any] | None = None
+) -> list[str]:
     """Fixed sentences (no card text) on what an empty queue does not prove."""
-    days = (chat_coverage or {}).get("window_days") or chat_window_days()
+    days = (chat_coverage or {}).get("window_days") or chat_window_days(settings)
     notes = [
         f"Chats older than {days} days are not read (setting chat_window_days, up to {CHAT_WINDOW_MAX_DAYS}).",
         "Requests in group chats are found only when the message names you; indirect or unnamed requests are not detected.",
@@ -3188,10 +4754,26 @@ def not_covered_notes(chat_coverage: dict[str, Any] | None) -> list[str]:
     return notes
 
 
+def coverage_gaps(queue: dict[str, Any]) -> list[str]:
+    """Fixed sentences for what the queue did not read, so a surface never says "nothing is
+    blocked" over a list that left chats unread. Counts only, no card text."""
+    cov = ((queue or {}).get("coverage") or {}).get("chat")
+    try:
+        omitted = int((cov or {}).get("sessions_omitted") or 0)
+    except (TypeError, ValueError):
+        omitted = 0
+    gaps = []
+    if omitted > 0:
+        gaps.append(f"{omitted} older chat session(s) were not read (scan limit {CHAT_SESSION_CAP} per profile).")
+    return gaps
+
+
 class UnblockFailed(RuntimeError):
     """The answer was written but the card could not be released; never claim otherwise."""
 
-    def __init__(self, task_id: str, comment_id: int | None):
+    def __init__(
+        self, task_id: str, comment_id: int | None, *, marker_full: bool = False
+    ):
         self.task_id = task_id
         self.comment_id = comment_id
         posted = (
@@ -3199,14 +4781,23 @@ class UnblockFailed(RuntimeError):
             if comment_id
             else "your answer is already posted"
         )
+        note = (
+            " Too many unfinished releases are waiting, so this one could not be remembered: "
+            "release the card on its board."
+            if marker_full
+            else " Retry the release from the queue."
+        )
         super().__init__(
-            f"{posted}, but card {task_id} could not be unblocked; it is still blocked. "
-            "Retry the release from the queue."
+            f"{posted}, but card {task_id} could not be unblocked; it is still blocked.{note}"
         )
 
 
 class StaleAnswer(RuntimeError):
     """The card was blocked again after the human read it."""
+
+
+class VersionRequired(RuntimeError):
+    """This installation requires the queue item version with every answer."""
 
 
 def _unblock_task_at_version(
@@ -3216,8 +4807,10 @@ def _unblock_task_at_version(
 
     Hermes' public helper owns its transaction, so calling it after a separate check leaves a
     race. Its transition rules are applied here with the same native helpers and SQL semantics.
+    Inside an open transaction (``answer_card``) this runs as a savepoint, so a failure here
+    undoes only the unblock and leaves the answer written before it.
     """
-    with kanban_db.write_txn(conn):
+    with kanban_db.write_txn(conn, allow_nested=True):
         current = kanban_db.get_task(conn, task_id)
         if current is None:
             raise LookupError(f"card {task_id} not found")
@@ -3226,8 +4819,8 @@ def _unblock_task_at_version(
         current_version = str(block.id if block else since)
         if current_version != version:
             raise StaleAnswer(
-                f"card {task_id} has a newer block; your answer was posted, but the new question "
-                "remains blocked; refresh to see it"
+                f"card {task_id} has a newer block; nothing was posted or released; "
+                "refresh to see the new question"
             )
 
         status = str(getattr(current.status, "value", current.status))
@@ -3273,6 +4866,52 @@ def _unblock_task_at_version(
         return True
 
 
+def _comments_since_block(
+    conn: Any, kanban_db: Any, task_id: str, since: int, block_id: int | None
+) -> list[tuple[str, str]]:
+    """``(author, body)`` of the comments made since the current block began, oldest first.
+
+    With the block's event id a comment counts when its ``commented`` event follows the block
+    (event ids keep their order within one second) or its time is strictly later; without it,
+    when it is at or after the block's second. Older blocks' comments never count."""
+    strict = block_id is not None
+    cut = (since or 0) + 1 if strict else (since or 0)
+    try:
+        rows = {
+            r[0]: (r[1], r[2])
+            for r in conn.execute(
+                "SELECT id, author, body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+                (task_id, cut),
+            ).fetchall()
+        }
+        if strict:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ?",
+                (task_id, block_id),
+            ).fetchone()[0]
+            if n:
+                for r in conn.execute(
+                    "SELECT id, author, body FROM task_comments WHERE task_id = ? "
+                    "ORDER BY id DESC LIMIT ?",
+                    (task_id, n),
+                ).fetchall():
+                    rows[r[0]] = (r[1], r[2])
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        comments = list(kanban_db.list_comments(conn, task_id))
+        keyed = [(getattr(c, "id", None) or i, c) for i, c in enumerate(comments, 1)]
+        rows = {k: (c.author, c.body) for k, c in keyed if c.created_at >= cut}
+        if strict:
+            n = sum(
+                1
+                for e in kanban_db.list_events(conn, task_id)
+                if getattr(e, "kind", None) == "commented"
+                and int(getattr(e, "id", 0) or 0) > block_id
+            )
+            for k, c in keyed[len(keyed) - n :] if n else []:
+                rows[k] = (c.author, c.body)
+    return [rows[k] for k in sorted(rows)]
+
+
 def answer_card(
     board: str,
     task_id: str,
@@ -3286,11 +4925,17 @@ def answer_card(
 
     *version* is the queue item's version the human read (the block event id). It is required to
     release; an answer is refused if the card has been blocked again since, so an answer to an old
-    question never releases a new one. The answer is posted first, so a resumed worker sees it;
-    Hermes owns the unblock transaction. A failed unblock is remembered, and a retry releases
-    without posting the answer twice. Triage cards (``block_loop_detected``) accept
-    the answer but cannot be released here.
+    question never releases a new one. The answer and the release are one write transaction: a
+    refused answer (stale version) leaves no comment behind, and a resumed worker always sees the
+    answer. A release that fails after the answer is written (it returns false or raises) is
+    remembered, and a retry releases without posting the answer twice; the marker is reserved
+    before anything is written, so a lock held by another writer cannot lose it. Triage cards
+    (``block_loop_detected``) accept the answer but cannot be released here.
     """
+    board = str(board or "").strip()
+    task_id = str(task_id or "").strip()
+    if not board or not task_id:
+        raise ValueError("board and task_id are required")
     from hermes_cli import kanban_db  # type: ignore
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
 
@@ -3299,85 +4944,142 @@ def answer_card(
         raise ValueError("answer text is required")
     if release and version is None:
         raise ValueError("queue version is required to release a card")
+    pending: dict[str, str] = {}
     if release:
         # Check recovery state before posting or releasing, so a damaged record cannot
         # turn a successful action into a late, misleading failure or be overwritten.
-        load_pending_releases(home, strict=True)
+        pending = load_pending_releases(home, strict=True)
     settings, settings_error = _settings_state()
     if settings_error:
         raise RuntimeError("could not read plugin settings; repair them before answering")
+    if version is None and answer_version_required(settings):
+        # Decided on the snapshot this write uses, before anything is reserved or written.
+        raise VersionRequired(
+            "this installation requires the queue item version with every answer"
+        )
     author = principal_author(settings)
     item_id = f"kanban:{board}:{task_id}"
+    version_s = str(version) if version is not None else None
     comment_id: int | None = None
     post_answer = False
-    with closing(kbc.connect(board=board)) as conn:
-        if kanban_db.get_task(conn, task_id) is None:
-            raise LookupError(f"card {task_id} not found on {board}")
-        with kanban_db.write_txn(conn, allow_nested=True):
-            # Re-read inside the write transaction: a concurrent unblock or answer must not
-            # slip between the check and the comment.
-            current = kanban_db.get_task(conn, task_id)
-            if current is None:
-                raise LookupError(f"card {task_id} not found on {board}")
-            check_answerable(task_id, current.status, release=release)
-            block = _latest_block(conn, kanban_db, task_id)
-            since = _block_since(block, current)
-            current_version = str(block.id if block else since)
-            if version is not None and str(version) != current_version:
-                raise StaleAnswer(
-                    f"card {task_id} was blocked again after you read it; refresh to see the new question"
-                )
-            # The same "answered since this block" test the queue uses.
-            already_answered = _answered_since(conn, kanban_db, task_id, author, since)
-            if already_answered:
-                if not release:
-                    raise RuntimeError(
-                        f"card {task_id} was already answered since it was blocked"
-                    )
-                if text:
-                    prior = kanban_db.list_comments(conn, task_id)
-                    post_answer = not any(
-                        str(getattr(c, "author", "")).casefold() == author.casefold()
-                        and str(getattr(c, "body", "")).strip() == text
-                        for c in prior
-                    )
-            elif not text:
-                raise ValueError("answer text is required")
-            else:
-                post_answer = True
-            # Post before releasing so a resumed worker always sees the answer. A retry after a
-            # failed release finds this comment and does not post it again.
-            if post_answer:
-                comment_id = kanban_db.add_comment(
-                    conn, task_id, author=author, body=text
-                )
-        released = False
-        if release:
-            release_failed = False
-            if _unblock_task_at_version(conn, kanban_db, task_id, current_version):
-                released = True
-            else:
-                latest = kanban_db.get_task(conn, task_id)
-                if (
-                    latest is None
-                    or str(getattr(latest.status, "value", latest.status))
-                    in HELD_STATUSES
-                ):
-                    release_failed = True
-                else:
-                    released = (
-                        True  # another actor released it; do not claim it was ours
-                    )
-            if release_failed:
-                try:
-                    _set_pending_release(item_id, current_version, home)
-                except Exception as exc:  # noqa: BLE001 - the unblock failure is what the caller must see
-                    log.warning("unbl0ck: could not record the retry marker: %s", type(exc).__name__)
-                raise UnblockFailed(task_id, comment_id)
+    marker_reserved = False  # the recovery marker for this block is recorded
+    marker_ours = False  # ... and this call recorded it (a refused call removes only its own)
+    marker_full = False
+    if release:
+        # Reserve the failed-release marker BEFORE anything is written: a marker that cannot
+        # be stored after the answer was posted would leave an answered card with no recovery
+        # state. A full store is not a reason to refuse the answer; it is reported afterwards.
+        if pending.get(item_id) == version_s:
+            marker_reserved = True
+        else:
             try:
-                _set_pending_release(item_id, None, home)
-            except Exception as exc:  # noqa: BLE001 - the card is released; a stale marker is not a failure
-                log.warning("unbl0ck: could not clear the retry marker: %s", type(exc).__name__)
+                _set_pending_release(item_id, version_s, home)
+                marker_reserved = marker_ours = True
+            except PendingReleaseFull:
+                marker_full = True
+    released = False
+    release_failed = False
+    release_error: BaseException | None = None
+    committed = False
+    try:
+        with closing(kbc.connect(board=board)) as conn:
+            if kanban_db.get_task(conn, task_id) is None:
+                raise LookupError(f"card {task_id} not found on {board}")
+            with kanban_db.write_txn(conn):
+                # Re-read inside the write transaction: a concurrent unblock or answer must not
+                # slip between the check and the comment, and the release below runs in this same
+                # transaction so a newer block cannot slip in between the comment and the release.
+                current = kanban_db.get_task(conn, task_id)
+                if current is None:
+                    raise LookupError(f"card {task_id} not found on {board}")
+                check_answerable(task_id, current.status, release=release)
+                block = _latest_block(conn, kanban_db, task_id)
+                since = _block_since(block, current)
+                current_version = str(block.id if block else since)
+                if version is not None and str(version) != current_version:
+                    raise StaleAnswer(
+                        f"card {task_id} was blocked again after you read it; nothing was posted "
+                        "or released; refresh to see the new question"
+                    )
+                # The same "answered since this block" test the queue uses.
+                already_answered = _answered_since(
+                    conn, kanban_db, task_id, author, since, block.id if block else None
+                )
+                if already_answered:
+                    if not release:
+                        raise RuntimeError(
+                            f"card {task_id} was already answered since it was blocked"
+                        )
+                    if text:
+                        # Only this block's comments: an earlier block's identical answer
+                        # is not this block's answer.
+                        prior = _comments_since_block(
+                            conn, kanban_db, task_id, since, block.id if block else None
+                        )
+                        post_answer = not any(
+                            str(a or "").casefold() == author.casefold()
+                            and str(b or "").strip() == text
+                            for a, b in prior
+                        )
+                elif not text:
+                    raise ValueError("answer text is required")
+                else:
+                    post_answer = True
+                # Post before releasing so a resumed worker always sees the answer. A retry after
+                # a failed release finds this comment and does not post it again.
+                if post_answer:
+                    comment_id = kanban_db.add_comment(
+                        conn, task_id, author=author, body=text
+                    )
+                if release:
+                    try:
+                        if _unblock_task_at_version(conn, kanban_db, task_id, current_version):
+                            released = True
+                        else:
+                            latest = kanban_db.get_task(conn, task_id)
+                            if (
+                                latest is None
+                                or str(getattr(latest.status, "value", latest.status))
+                                in HELD_STATUSES
+                            ):
+                                release_failed = True
+                            else:
+                                released = True  # another actor released it; not ours to claim
+                    except (StaleAnswer, LookupError):
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - reconciled like a false return
+                        # The unblock ran as a savepoint: only it is undone; the answer stays.
+                        release_failed = True
+                        release_error = exc
+                        log.warning(
+                            "unbl0ck: releasing %s failed after the answer was written: %s: %s",
+                            task_id,
+                            type(exc).__name__,
+                            exc,
+                        )
+            committed = True
+    finally:
+        if not committed and marker_ours:
+            # Nothing was written (stale, refused, unreadable): drop the marker reserved for it.
+            try:
+                _set_pending_release(item_id, None, home, expected=version_s)
+            except Exception:  # noqa: BLE001 - an inert marker (no answer exists) is harmless
+                log.warning("unbl0ck: could not remove an unused recovery marker for %s", item_id)
+    if release_failed:
+        raise UnblockFailed(
+            task_id, comment_id, marker_full=marker_full and not marker_reserved
+        ) from release_error
+    if release and marker_reserved:
+        # Only this block's own marker: one recorded for a newer block stays. The card is
+        # released; failing to tidy the marker must not turn that into a failed request.
+        try:
+            _set_pending_release(item_id, None, home, expected=version_s)
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "unbl0ck: released %s but could not clear its recovery marker",
+                item_id,
+                exc_info=True,
+            )
     return {
         "ok": True,
         "comment_id": comment_id,
@@ -3397,9 +5099,52 @@ def _event_payload(event: Any) -> dict[str, Any]:
     return dict(payload) if isinstance(payload, dict) else {}
 
 
+CARD_CONTEXT_EVENTS = 20
+CARD_CONTEXT_COMMENTS = 50
+CARD_CONTEXT_ATTACHMENTS = 50
+CARD_CONTEXT_GRAPH = 50
+
+
+def _newest_rows(
+    conn: Any, kanban_db: Any, table: str, cls: str, lister: str, task_id: str, limit: int
+) -> tuple[list[Any], int]:
+    """The newest *limit* rows of one card's table, oldest first, and the table's row count for
+    the card. The limit is applied by the query; the public lister is only the fallback."""
+    try:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            (task_id, limit),
+        ).fetchall()
+        return [getattr(kanban_db, cls).from_row(r) for r in reversed(rows)], int(total)
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        everything = list(getattr(kanban_db, lister)(conn, task_id))
+        return everything[-limit:], len(everything)
+
+
+def _latest_event_of_kind(conn: Any, kanban_db: Any, task_id: str, kind: str) -> Any | None:
+    try:
+        row = conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? AND kind = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (task_id, kind),
+        ).fetchone()
+        return kanban_db.Event.from_row(row) if row is not None else None
+    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
+        return next(
+            (e for e in reversed(list(kanban_db.list_events(conn, task_id))) if e.kind == kind), None
+        )
+
+
 def card_context(board: str, task_id: str) -> dict[str, Any]:
     """Read-only context for one Kanban card: description, comments, graph, workspace,
     recent events, last run, attachments and who filed it."""
+    board = str(board or "").strip()
+    task_id = str(task_id or "").strip()
+    if not board or not task_id:
+        raise ValueError("board and task_id are required")
     from hermes_cli import kanban_db  # type: ignore
     from hermes_cli import kanban_db_connect as kbc  # type: ignore
 
@@ -3407,32 +5152,42 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise LookupError(f"card {task_id} not found on {board}")
-        events = kanban_db.list_events(conn, task_id)
-        block = _latest_block_event(events)
+        # Bounded reads: a long-lived card has thousands of events and comments, and the
+        # decision context only needs the newest few, so the limit is applied in the query.
+        block = _latest_block(conn, kanban_db, task_id)
         block_payload = _event_payload(block) if block else {}
-        recent = events[-20:]
-        comments = kanban_db.list_comments(conn, task_id)[-50:]
+        recent, events_total = _newest_rows(
+            conn, kanban_db, "task_events", "Event", "list_events", task_id, CARD_CONTEXT_EVENTS
+        )
+        comments, comments_total = _newest_rows(
+            conn, kanban_db, "task_comments", "Comment", "list_comments", task_id, CARD_CONTEXT_COMMENTS
+        )
+        receipt_event = _latest_event_of_kind(conn, kanban_db, task_id, "pr_acceptance")
         graph = kanban_db.task_graph_context(conn, task_id)
-        attachments = kanban_db.list_attachments(conn, task_id)
+        attachments, attachments_total = _newest_rows(
+            conn, kanban_db, "task_attachments", "Attachment", "list_attachments", task_id,
+            CARD_CONTEXT_ATTACHMENTS,
+        )
         run = kanban_db.latest_run(conn, task_id)
 
     pr = None
     contract = getattr(task, "completion_contract", None)
     if isinstance(contract, str) and _PR_LIKE.match(contract):
         pr = {"reference": contract}
-    for event in reversed(events):
-        if event.kind == "pr_acceptance":
-            receipt = _event_payload(event)
-            pr = {
-                **receipt,
-                "reference": pr.get("reference") if pr else None,
-                "since": event.created_at,
-            }
-            break
+    if receipt_event is not None:
+        receipt = _event_payload(receipt_event)
+        pr = {
+            **receipt,
+            "reference": pr.get("reference") if pr else None,
+            "since": receipt_event.created_at,
+        }
 
     body = getattr(task, "body", None)
     return {
         "id": f"kanban:{board}:{task_id}",
+        # The version the queue shows for this card (the latest block event), so Ask can
+        # refuse a question about a card that was blocked again after the human read it.
+        "version": str(block.id if block else _block_since(block, task)),
         "board": board,
         "task_id": task_id,
         "title": task.title,
@@ -3476,8 +5231,13 @@ def card_context(board: str, task_id: str) -> dict[str, Any]:
             for c in comments
         ],
         "graph": {
-            "parents": list(graph.get("parents") or []),
-            "children": list(graph.get("children") or []),
+            "parents": list(graph.get("parents") or [])[:CARD_CONTEXT_GRAPH],
+            "children": list(graph.get("children") or [])[:CARD_CONTEXT_GRAPH],
+        },
+        "omitted": {
+            "events": max(0, events_total - len(recent)),
+            "comments": max(0, comments_total - len(comments)),
+            "attachments": max(0, attachments_total - len(attachments)),
         },
         "events": [
             {
@@ -3871,6 +5631,38 @@ def _ask_harmless_secret_value(value: Any) -> bool:
     )
 
 
+_ASK_NUMERIC_SECRET_WORDS = frozenset(
+    {
+        "password",
+        "passwd",
+        "passphrase",
+        "pwd",
+        "pw",
+        "secret",
+        "api_key",
+        "access_key",
+        "secret_key",
+        "private_key",
+        "credential",
+        "storepass",
+    }
+)
+
+
+def _ask_numeric_credential(key: str, value: Any, word: str) -> bool:
+    """A number or digit-only string under an exact credential key (``password=123456``) is the
+    credential itself. Counts under other keys (``password_attempts: 3``) are not."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        digits = True
+    elif isinstance(value, str):
+        digits = bool(re.fullmatch(r"\d+", value.strip().strip("\"' ")))
+    else:
+        return False
+    return digits and word in _ASK_NUMERIC_SECRET_WORDS and _ask_secret_key_is_exact(key)
+
+
 def _ask_path_field_value(key: str, value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -3916,7 +5708,7 @@ def _ask_is_secret_key(key: str, value: Any = None) -> bool:
     word = _ask_secret_word(key)
     if word is None:
         return False
-    if _ask_harmless_secret_value(value):
+    if _ask_harmless_secret_value(value) and not _ask_numeric_credential(key, value, word):
         return False
     if _ask_path_field_value(key, value):
         return False
@@ -4411,19 +6203,44 @@ def _ask_redact_short_password_flags(text: str) -> str:
     return _ASK_SHORT_PASSWORD_FLAG.sub(replace, text)
 
 
+def _ask_withhold_unscanned(rest: str) -> str:
+    """The scan budget ran out: text that could hold a credential is withheld, not copied."""
+    def risky(chunk: str) -> bool:
+        return bool(_ASK_SECRET_KEY_RE.search(chunk) or "\\u" in chunk)
+
+    out: list[str] = []
+    i = 0
+    scans = 0
+    while i < len(rest):
+        if rest[i] in "{[":
+            scans += 1
+            if scans > 256:  # still cheap and still closed: the remainder is withheld if it could matter
+                out.append("[redacted: too much structured text to scan]" if risky(rest[i:]) else rest[i:])
+                break
+            end = _ask_json_container_end(rest, i)
+            if end is not None and risky(rest[i:end]):
+                out.append("[redacted]")
+                i = end
+                continue
+        out.append(rest[i])
+        i += 1
+    return "".join(out)
+
+
 def _ask_redact_embedded_json(text: str) -> str:
     """Redact valid JSON objects embedded in prose or escaped JSON log strings."""
-    if not _ASK_SECRET_KEY_RE.search(text):
+    # A key spelled with escapes (``"\\u0070assword"``) has no literal credential word, so
+    # any escape sequence also sends the text through the decoder.
+    if not _ASK_SECRET_KEY_RE.search(text) and "\\u" not in text:
         return text
     decoder = json.JSONDecoder()
     out: list[str] = []
     i = 0
-    attempts = 0
+    failures = 0  # decodes that found nothing; successes advance and cost only their own length
     while i < len(text):
         if text[i] == '"' and text[i + 1 : i + 2] in ("{", "["):
-            attempts += 1
-            if attempts > 128:
-                out.append(text[i:])
+            if failures > 128:
+                out.append(_ask_withhold_unscanned(text[i:]))
                 break
             try:
                 value, end = decoder.raw_decode(text, i)
@@ -4433,6 +6250,7 @@ def _ask_redact_embedded_json(text: str) -> str:
                 continue
             except ValueError:
                 value = None
+                failures += 1
             if isinstance(value, str) and value.lstrip().startswith(("{", "[")):
                 try:
                     embedded = json.loads(value)
@@ -4455,10 +6273,10 @@ def _ask_redact_embedded_json(text: str) -> str:
                         )
                     i = end
                     continue
+            failures += 1
         if text[i] in "{[":
-            attempts += 1
-            if attempts > 128:
-                out.append(text[i:])
+            if failures > 128:
+                out.append(_ask_withhold_unscanned(text[i:]))
                 break
             try:
                 value, end = decoder.raw_decode(text, i)
@@ -4468,6 +6286,7 @@ def _ask_redact_embedded_json(text: str) -> str:
                 continue
             except ValueError:
                 value = None
+                failures += 1
             if isinstance(value, (dict, list)):
                 try:
                     safe = _ask_card_view(value)
@@ -4500,50 +6319,93 @@ def _ask_redact(text: str) -> str:
 
 
 ASK_CARD_CONTEXT_LIMIT = 24000
+_ASK_FIELD_CAP = 8000  # one field never takes more than this of the card budget
+_ASK_CUT = "…[truncated]"
+# The decision comes first when the budget runs out; the description comes last.
+_ASK_VIEW_PRIORITY = {
+    "title": 0,
+    "block": 1,
+    "status": 2,
+    "comments": 3,
+    "last_run": 4,
+    "events": 5,
+    "result": 6,
+    "last_failure_error": 6,
+    "body": 9,
+}
+
+
+def _ask_workspace_paths(value: Any) -> tuple[str, ...]:
+    workspace = value.get("workspace") if isinstance(value, dict) else None
+    path = workspace.get("path") if isinstance(workspace, dict) else None
+    if isinstance(path, str) and len(path.strip().rstrip("/")) > 1:
+        return (path.strip().rstrip("/"),)
+    return ()
 
 
 def _ask_card_view(
-    value: Any, _key: str = "", _text_budget: list[int] | None = None
+    value: Any,
+    _key: str = "",
+    _text_budget: list[int] | None = None,
+    _scrub: tuple[str, ...] | None = None,
 ) -> Any:
     """A copy of the card fit to send to an LLM: no workspace path, no home dir, no secrets.
 
     The operator asked about the card, not about their filesystem or credentials, so the Ask
     payload keeps the decision context (title, body, block reason, comments, branch, errors)
-    and drops or redacts what could leak (F4)."""
+    and drops or redacts what could leak (F4). The workspace path is removed wherever it is
+    repeated; text budgeted by priority, newest list entries first, cut fields end in a marker."""
+    if _scrub is None:
+        _scrub = _ask_workspace_paths(value)
     if isinstance(value, dict):
-        out: dict[str, Any] = {}
         named_secret = any(
             str(field).casefold() in {"name", "key"}
             and isinstance(field_value, str)
             and _ask_secret_word(field_value) is not None
             for field, field_value in value.items()
         )
-        for k, v in value.items():
+        keys = list(value)
+        if _text_budget is not None:
+            keys.sort(key=lambda k: _ASK_VIEW_PRIORITY.get(str(k), 8))
+        done: dict[Any, Any] = {}
+        for k in keys:
+            v = value[k]
             if _key == "workspace" and k == "path":
                 continue
             key = str(k)
             if named_secret and key.casefold() in {"value", "val", "default"}:
-                out[k] = "[redacted]"
-                continue
-            if _ask_is_secret_key(key, v):
-                out[k] = "[redacted]"
-                continue
-            out[k] = _ask_card_view(v, key, _text_budget)
-        return out
+                done[k] = "[redacted]"
+            elif _ask_is_secret_key(key, v):
+                done[k] = "[redacted]"
+            else:
+                done[k] = _ask_card_view(v, key, _text_budget, _scrub)
+        return {k: done[k] for k in value if k in done}
     if isinstance(value, (list, tuple)):
-        return [_ask_card_view(v, _key, _text_budget) for v in value]
+        if _text_budget is None:
+            return [_ask_card_view(v, _key, None, _scrub) for v in value]
+        # Newest entries are last; they are budgeted first.
+        return [_ask_card_view(v, _key, _text_budget, _scrub) for v in reversed(value)][::-1]
     if isinstance(value, str):
-        if _text_budget is not None:
-            remaining = max(0, _text_budget[0])
-            if len(value) > remaining:
-                value = value[:remaining]
+        for path in _scrub:
+            value = value.replace(path, "[workspace]")
+        remaining = None if _text_budget is None else max(0, _text_budget[0])
+        if remaining == 0:
+            return _ASK_CUT if value else value  # nothing left to spend; skip the redaction work
+        # Redact the whole string, then cut it to the budget: a secret straddling the cut
+        # is replaced as a whole instead of being left as a readable fragment.
+        value = _ask_redact(value)
+        if remaining is not None:
+            cap = min(remaining, _ASK_FIELD_CAP)
+            if len(value) > cap:
+                value = value[: max(0, cap - len(_ASK_CUT))] + _ASK_CUT
             _text_budget[0] = remaining - len(value)
-        return _ask_redact(value)
+        return value
     return value
 
 
 # Whole-prompt cap for Ask (system + card context + history), in characters.
 ASK_PROMPT_BUDGET = 40000
+ASK_TURN_LIMIT = 20_000  # one chat turn; the same limit the Ask API accepts (plugin_api.MAX_TEXT)
 
 
 ASK_HISTORY_TURNS = 6  # default number of prior chat turns sent with an Ask
@@ -4554,7 +6416,7 @@ def ask_history_turns(settings: dict[str, Any] | None = None) -> int:
     raw = (settings if settings is not None else _settings()).get("ask_history_turns")
     try:
         n = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return ASK_HISTORY_TURNS
     return n if n > 0 else ASK_HISTORY_TURNS
 
@@ -4562,14 +6424,34 @@ def ask_history_turns(settings: dict[str, Any] | None = None) -> int:
 def build_ask_messages(
     card: dict[str, Any], history: Iterable[dict[str, Any]], turns: int | None = None
 ) -> list[dict[str, str]]:
-    """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns."""
-    context = json.dumps(
-        _ask_card_view(card, _text_budget=[ASK_CARD_CONTEXT_LIMIT]),
-        ensure_ascii=False,
-        default=str,
-    )
-    if len(context) > ASK_CARD_CONTEXT_LIMIT:
-        context = context[:ASK_CARD_CONTEXT_LIMIT] + "…[truncated]"
+    """System prompt + card data (untrusted, path- and secret-redacted) + the client's prior turns.
+
+    The operator's newest turn is sent whole (up to the API's own limit); the card data takes
+    the room that is left, and always stays valid JSON."""
+    recent = list(history)[-(ask_history_turns() if turns is None else turns) :]
+    turn_list: list[tuple[str, str]] = []
+    for item in recent:
+        role = item.get("role") if isinstance(item, dict) else None
+        content = item.get("content") if isinstance(item, dict) else None
+        if role in ("user", "assistant") and isinstance(content, str):
+            content = content.strip()[:ASK_TURN_LIMIT]
+            if content:
+                turn_list.append((role, content))
+    newest = len(turn_list[-1][1]) if turn_list else 0
+    frame = len(ASK_SYSTEM) + 400  # the wrapper text around the card data
+    card_limit = max(2000, min(ASK_CARD_CONTEXT_LIMIT, ASK_PROMPT_BUDGET - frame - newest))
+    budget = card_limit
+    for _ in range(8):
+        context = json.dumps(
+            _ask_card_view(card, _text_budget=[budget]), ensure_ascii=False, default=str
+        )
+        if len(context) <= card_limit:
+            break
+        budget = max(0, budget - (len(context) - card_limit) - 1)  # escapes made it longer
+    else:
+        context = json.dumps(
+            {"id": str(card.get("id", "")) if isinstance(card, dict) else "", "note": "card data omitted: too large"}
+        )
     messages: list[dict[str, str]] = [
         {"role": "system", "content": ASK_SYSTEM},
         {
@@ -4582,21 +6464,12 @@ def build_ask_messages(
     ]
     used = sum(len(m["content"]) for m in messages)
     kept: list[dict[str, str]] = []
-    for item in reversed(
-        list(history)[-(ask_history_turns() if turns is None else turns) :]
-    ):  # newest first
-        role = item.get("role") if isinstance(item, dict) else None
-        content = item.get("content") if isinstance(item, dict) else None
-        if role not in ("user", "assistant") or not isinstance(content, str):
-            continue
-        content = content.strip()[:8000]
-        if not content:
-            continue
+    for role, content in reversed(turn_list):  # newest first
         room = ASK_PROMPT_BUDGET - used
         if len(content) > room:
             if kept or room <= 0:
                 break
-            content = content[:room]  # the newest turn is always sent, trimmed to fit
+            content = content[: max(0, room - len(_ASK_CUT))] + _ASK_CUT  # never silent
         kept.append({"role": role, "content": content})
         used += len(content)
     messages.extend(reversed(kept))
@@ -4606,28 +6479,88 @@ def build_ask_messages(
 # --- Pocket pack (TV / X55 card format) ----------------------------------------------------
 
 
+_SUDO_WITHHELD = "A password prompt is waiting. Its text is not shown here; answer it where it was asked."
+POCKET_PROMPT_CHARS = 4000  # one card's prompt
+POCKET_TOTAL_PROMPT_CHARS = 20000  # all prompts in one pack
+
+
+# Queue errors are plain strings that start with the source they came from. Not every one means a
+# source could not be read: some say a listing was cut at its limit, and some are about cleanup or
+# stored state. Only a read failure is an "unread source".
+_READ_SOURCES = ("kanban", "chat", "prompt", "pairing", "outside")
+_CAPACITY_NOTICES = ("agent-filed items are waiting (limit",)  # every record was read
+_LISTING_CUT_NOTICES = (  # records exist that the list does not show
+    "folder limit, showing the newest",
+    "filed entries; only the first",
+    "hidden files are not listed",
+)
+_STATE_NOTICES = ("could not remove", "retention cleanup", "invalid done_at")
+
+
+def unread_sources(errors: list[str] | None) -> int:
+    """How many sources (a Kanban board, a profile's chats, pairing, prompts, outside) could not be
+    read, counted once per source however many messages it produced. A capacity warning, a
+    cleanup problem or a cut listing is not an unread source."""
+    sources = set()
+    for error in errors or ():
+        text = str(error)
+        head = text.split(":", 1)[0]
+        if head.split("[", 1)[0] not in _READ_SOURCES:
+            continue
+        if any(m in text for m in _CAPACITY_NOTICES + _LISTING_CUT_NOTICES + _STATE_NOTICES):
+            continue
+        sources.add(head)
+    return len(sources)
+
+
+def listing_cut(errors: list[str] | None) -> bool:
+    """True when a source says some of its records are not in the list."""
+    return any(m in str(e) for e in errors or () for m in _LISTING_CUT_NOTICES)
+
+
 def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     """The queue in the Pocket card format, for gadgets that opt in. Written next to the
-    plugin's data, never over the gadget plugin's own pocket-pack.json."""
+    plugin's data, never over the gadget plugin's own pocket-pack.json.
+
+    Prompt text is bounded per card and in total; a cut prompt, a source that was already cut
+    and cards left out are each reported, so ``complete`` is true only when nothing was lost."""
     now = int(time.time())
+    limit = max(0, int(limit))  # a negative slice would select all but the last ask
     cards = []
     asks = [it for it in queue["items"] if it.get("tier") not in ("stuck", "answered")]
+    spent = 0
     for it in asks[:limit]:
         if it["source"] == "kanban":
-            options = [
-                {
-                    "label": "Answer + unblock",
-                    "send": f"Answer and unblock {it['task_id']}",
-                    "effect": "Card resumes",
-                    "tone": "primary",
-                },
-                {
-                    "label": "Keep hold",
-                    "send": f"Keep {it['task_id']} blocked",
-                    "effect": "No change",
-                    "tone": "neutral",
-                },
-            ]
+            # Name the board and the block the answer is for, so a later block is not answered
+            # by an old instruction.
+            where_card = f"{it['task_id']} on board {it.get('board') or 'default'} (block {it.get('version') or 'unknown'})"
+            keep = {
+                "label": "Keep hold",
+                "send": f"Keep {where_card} blocked",
+                "effect": "No change",
+                "tone": "neutral",
+            }
+            if str(getattr(it.get("status"), "value", it.get("status"))) == CardStatus.TRIAGE.value:
+                # A block loop is not ours to release; the unblock would be refused.
+                options = [
+                    {
+                        "label": "Answer, keep blocked",
+                        "send": f"Answer {where_card}; keep it blocked",
+                        "effect": "Your answer is posted",
+                        "tone": "primary",
+                    },
+                    keep,
+                ]
+            else:
+                options = [
+                    {
+                        "label": "Answer + unblock",
+                        "send": f"Answer and unblock {where_card}",
+                        "effect": "Card resumes",
+                        "tone": "primary",
+                    },
+                    keep,
+                ]
         elif it["source"] == "pairing":
             options = [
                 {
@@ -4684,16 +6617,27 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
                     "tone": "primary",
                 }
             ]
+        prompt = str(it["ask"] or "")
+        if it.get("kind") == "sudo":
+            prompt = _SUDO_WITHHELD  # a password prompt stays where it was asked and in Desktop
+        cut = bool(it.get("ask_truncated") or it.get("truncated"))
+        room = min(POCKET_PROMPT_CHARS, max(0, POCKET_TOTAL_PROMPT_CHARS - spent))
+        if len(prompt) > room:
+            prompt = prompt[: max(0, room - len(_ASK_CUT))] + _ASK_CUT
+            cut = True
+        spent += len(prompt)
         cards.append(
             {
                 "id": it["id"],
                 "kind": "decide",
                 "title": it["title"][:90],
-                "short": (it.get("bluf") or it["ask"])[:160],
+                "short": (_SUDO_WITHHELD if it.get("kind") == "sudo" else (it.get("bluf") or it["ask"]))[:160],
                 "choices": [o["label"] for o in options],
                 "task_id": it.get("task_id", ""),
                 "options": options,
-                "prompt": it["ask"],
+                "prompt": prompt,
+                "truncated": cut,
+                "warning": "The text was cut; open the original to read all of it." if cut else "",
                 "why_now": it["why"],
                 "owner": it.get("owner") or "",
                 "authority": pocket_authority(),
@@ -4709,12 +6653,13 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
         "expires_at": now + 3600,
         "mode": "unblock",
         "cards": cards,
-        # False when a source could not be read: an empty pack is then not "nothing needs you".
-        "complete": not queue.get("errors"),
+        # False when a source could not be read or a card was cut or left out: an empty pack is
+        # then not "nothing needs you".
+        "complete": not unread_sources(queue.get("errors")) and not listing_cut(queue.get("errors")) and len(asks) <= len(cards) and not any(c["truncated"] for c in cards),
         # What this pack leaves out, as counts only; the original surface has the rest.
         "omitted": {
-            "unread_sources": len(queue.get("errors") or []),
-            "asks": max(0, len(asks) - limit),
+            "unread_sources": unread_sources(queue.get("errors")),
+            "asks": max(0, len(asks) - len(cards)),
             "stuck": sum(1 for it in queue["items"] if it.get("tier") == "stuck"),
             "answered": sum(1 for it in queue["items"] if it.get("tier") == "answered"),
             "see": "Open UNBL0CK in Hermes Desktop",
@@ -4722,7 +6667,11 @@ def pocket_pack(queue: dict[str, Any], limit: int = 6) -> dict[str, Any]:
     }
 
 
-def write_pocket_pack(queue: dict[str, Any], home: Path | None = None) -> Path:
+def write_pocket_pack(
+    queue: dict[str, Any], home: Path | None = None, *, pack: dict[str, Any] | None = None
+) -> Path:
+    """Write *pack* when the caller already built it (so the file and the HTTP response are
+    the same object), otherwise build one from *queue*."""
     p = data_dir(home) / "pocket-pack.json"
-    _write_json(p, pocket_pack(queue))
+    _write_json(p, pack if pack is not None else pocket_pack(queue))
     return p

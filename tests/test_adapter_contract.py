@@ -16,6 +16,11 @@ spec.loader.exec_module(ac)
 ACCT = ("gmail", "acct-1")
 
 
+def reconcile(local, batch, accounts=(ACCT,)):
+    """The contract requires an account scope; these tests read one account unless they say otherwise."""
+    return ac.reconcile(local, batch, accounts=accounts)
+
+
 def item(ext="m1", seq=1, rev="r1", state=ac.OPEN, provider="gmail", account="acct-1"):
     return ac.ExternalItem(provider, account, ext, seq, rev, state)
 
@@ -46,42 +51,42 @@ class FakeAdapter:
 
 class Rules(unittest.TestCase):
     def test_new_item_is_added_and_a_done_one_is_not(self):
-        self.assertEqual(ops(ac.reconcile({}, ac.ChangeBatch(items=(item(),), cursor="c1"))), ["add"])
-        self.assertEqual(ops(ac.reconcile({}, ac.ChangeBatch(items=(item(state=ac.DONE),)))), [])
+        self.assertEqual(ops(reconcile({}, ac.ChangeBatch(items=(item(),), cursor="c1"))), ["add"])
+        self.assertEqual(ops(reconcile({}, ac.ChangeBatch(items=(item(state=ac.DONE),)))), ["track_done"])
 
     def test_duplicate_events_are_no_ops_across_and_within_batches(self):
         local = {key(): ac.Local(seq=1, revision="r1")}
-        self.assertEqual(ops(ac.reconcile(local, ac.ChangeBatch(items=(item(),)))), [])
-        self.assertEqual(ops(ac.reconcile({}, ac.ChangeBatch(items=(item(), item())))), ["add"])
+        self.assertEqual(ops(reconcile(local, ac.ChangeBatch(items=(item(),)))), [])
+        self.assertEqual(ops(reconcile({}, ac.ChangeBatch(items=(item(), item())))), ["add"])
 
     def test_an_older_revision_never_overwrites_a_newer_one(self):
         local = {key(): ac.Local(seq=5, revision="r5")}
-        plan = ac.reconcile(local, ac.ChangeBatch(items=(item(seq=3, rev="r3"),)))
+        plan = reconcile(local, ac.ChangeBatch(items=(item(seq=3, rev="r3"),)))
         self.assertEqual(ops(plan), ["ignore_stale"])
 
     def test_changed_draft_updates_and_resurfaces_what_the_human_dealt_with(self):
         local = {key(): ac.Local(seq=1, revision="r1", acted_revision="r1")}
-        plan = ac.reconcile(local, ac.ChangeBatch(items=(item(seq=2, rev="r2"),)))
+        plan = reconcile(local, ac.ChangeBatch(items=(item(seq=2, rev="r2"),)))
         self.assertEqual(ops(plan), ["update", "resurface"])
         untouched = {key(): ac.Local(seq=1, revision="r1")}
-        self.assertEqual(ops(ac.reconcile(untouched, ac.ChangeBatch(items=(item(seq=2, rev="r2"),)))), ["update"])
+        self.assertEqual(ops(reconcile(untouched, ac.ChangeBatch(items=(item(seq=2, rev="r2"),)))), ["update"])
 
     def test_external_completion_is_verified_and_reopen_resurfaces(self):
         local = {key(): ac.Local(seq=1, revision="r1")}
-        self.assertEqual(ops(ac.reconcile(local, ac.ChangeBatch(items=(item(seq=2, rev="r2", state=ac.DONE),)))),
+        self.assertEqual(ops(reconcile(local, ac.ChangeBatch(items=(item(seq=2, rev="r2", state=ac.DONE),)))),
                          ["complete_verified"])
         done = {key(): ac.Local(seq=2, revision="r2", state=ac.DONE, evidence=ac.VERIFIED)}
-        plan = ac.reconcile(done, ac.ChangeBatch(items=(item(seq=3, rev="r3"),)))
+        plan = reconcile(done, ac.ChangeBatch(items=(item(seq=3, rev="r3"),)))
         self.assertEqual(ops(plan), ["reopen", "update"])
 
     def test_a_filed_claim_is_not_verified_completion(self):
         asserted = {key(): ac.Local(seq=1, revision="r1", state=ac.DONE, evidence=ac.ASSERTED)}
         # The provider still shows it open (a newer read): the claim is contradicted, not honoured.
-        plan = ac.reconcile(asserted, ac.ChangeBatch(items=(item(seq=2, rev="r1"),)))
+        plan = reconcile(asserted, ac.ChangeBatch(items=(item(seq=2, rev="r1"),)))
         self.assertIn("contradicted", ops(plan))
         self.assertNotIn("complete_verified", ops(plan))
         # Only the provider saying done at the same revision upgrades the evidence.
-        plan = ac.reconcile(asserted, ac.ChangeBatch(items=(item(seq=1, rev="r1", state=ac.DONE),)))
+        plan = reconcile(asserted, ac.ChangeBatch(items=(item(seq=1, rev="r1", state=ac.DONE),)))
         self.assertEqual(ops(plan), ["verify_done"])
         self.assertNotEqual(ac.completion_label(ac.ASSERTED), ac.completion_label(ac.VERIFIED))
         self.assertIn("not confirmed", ac.completion_label(ac.ASSERTED))
@@ -89,31 +94,31 @@ class Rules(unittest.TestCase):
 
     def test_deletion_removes_once_and_absence_is_not_deletion(self):
         local = {key(): ac.Local(seq=1, revision="r1")}
-        self.assertEqual(ops(ac.reconcile(local, ac.ChangeBatch(items=(item(seq=2, state=ac.DELETED),)))), ["remove"])
+        self.assertEqual(ops(reconcile(local, ac.ChangeBatch(items=(item(seq=2, state=ac.DELETED),)))), ["remove"])
         gone = {key(): ac.Local(seq=1, revision="r1", state="gone")}
-        self.assertEqual(ops(ac.reconcile(gone, ac.ChangeBatch(items=(item(seq=2, state=ac.DELETED),)))), [])
-        self.assertEqual(ops(ac.reconcile(local, ac.ChangeBatch(items=(), cursor="c9"))), [])  # not in the batch: untouched
+        self.assertEqual(ops(reconcile(gone, ac.ChangeBatch(items=(item(seq=2, state=ac.DELETED),)))), ["advance"])
+        self.assertEqual(ops(reconcile(local, ac.ChangeBatch(items=(), cursor="c9"))), [])  # not in the batch: untouched
 
     def test_revoked_access_holds_items_and_completes_nothing(self):
         local = {key("a"): ac.Local(seq=1, revision="r1"), key("b"): ac.Local(seq=1, revision="r1", state=ac.DONE, evidence=ac.ASSERTED),
                  ("gmail", "other-acct", "z"): ac.Local(seq=1, revision="r1")}
-        plan = ac.reconcile(local, ac.ChangeBatch(status="access_revoked", cursor="ignored"), accounts=[ACCT])
+        plan = reconcile(local, ac.ChangeBatch(status="access_revoked", cursor="ignored"), accounts=[ACCT])
         self.assertEqual(sorted((a.op, a.key[2]) for a in plan.actions), [("hold", "a"), ("hold", "b")])
         self.assertIsNone(plan.cursor)
 
     def test_a_held_item_is_released_when_reads_work_again(self):
         local = {key(): ac.Local(seq=1, revision="r1", state="held")}
-        self.assertEqual(ops(ac.reconcile(local, ac.ChangeBatch(items=(item(),), cursor="c"))), ["release_hold"])
+        self.assertEqual(ops(reconcile(local, ac.ChangeBatch(items=(item(),), cursor="c"))), ["release_hold"])
 
     def test_rate_limit_changes_nothing_and_keeps_the_cursor(self):
         local = {key(): ac.Local(seq=1, revision="r1")}
-        plan = ac.reconcile(local, ac.ChangeBatch(status="rate_limited", retry_after=30.0,
+        plan = reconcile(local, ac.ChangeBatch(status="rate_limited", retry_after=30.0,
                                                   items=(item(seq=9, rev="r9", state=ac.DONE),), cursor="c-new"))
         self.assertEqual((plan.actions, plan.cursor, plan.retry_after), ([], None, 30.0))
 
     def test_conflicting_edit_is_reported_and_nothing_is_written(self):
         local = {key(): ac.Local(seq=1, revision="r1", pending_edit=True)}
-        plan = ac.reconcile(local, ac.ChangeBatch(items=(item(seq=2, rev="r2"),)))
+        plan = reconcile(local, ac.ChangeBatch(items=(item(seq=2, rev="r2"),)))
         self.assertEqual(ops(plan), ["conflict", "update"])
         self.assertFalse(any(a.op in ("write", "send", "reply") for a in plan.actions))
 
@@ -122,14 +127,15 @@ class Rules(unittest.TestCase):
                                ac.ChangeBatch(items=(item(),), cursor="c1")])
         cursor = None
         for _ in range(2):
-            plan = ac.reconcile({}, adapter.read_changes(cursor))
+            plan = reconcile({}, adapter.read_changes(cursor))
             cursor = plan.cursor or cursor
         self.assertEqual((adapter.cursors, cursor), ([None, None], "c1"))
 
     def test_items_with_the_same_external_id_in_two_accounts_are_distinct(self):
         a, b = item(account="acct-1"), item(account="acct-2")
         self.assertNotEqual(a.key, b.key)
-        plan = ac.reconcile({a.key: ac.Local(seq=1, revision="r1")}, ac.ChangeBatch(items=(a, b)))
+        plan = reconcile({a.key: ac.Local(seq=1, revision="r1")}, ac.ChangeBatch(items=(a, b)),
+                         accounts=[ACCT, ("gmail", "acct-2")])
         self.assertEqual([x.key for x in plan.actions], [b.key])
 
     def test_reading_never_implies_writing(self):

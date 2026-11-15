@@ -22,6 +22,29 @@ from test_needs import needs  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def run_workers(argvs, timeout):
+    """Start every worker and always reap them all, even when one fails or hangs."""
+    procs = []
+    try:
+        for argv in argvs:
+            procs.append(subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+        results = []
+        deadline = time.monotonic() + timeout
+        for p in procs:
+            _, err = p.communicate(timeout=max(0.01, deadline - time.monotonic()))
+            results.append((p.returncode, err.decode()[-400:]))
+        return results
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+        for p in procs:
+            try:
+                p.communicate(timeout=10)
+            except Exception:  # noqa: BLE001 - reaping is best effort
+                pass
+
+
 class FakeMsvcrt(types.SimpleNamespace):
     """LK_NBLCK fails with OSError while another descriptor holds the byte; LK_UNLCK frees it."""
 
@@ -129,14 +152,12 @@ class ConcurrentProcesses(unittest.TestCase):
     def test_hidden_cache_releases_and_filed_records_lose_nothing(self):
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
-            procs = [
-                subprocess.Popen([sys.executable, "-c", WORKER, str(ROOT), str(home), f"p{n}", str(self.EACH)],
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            argvs = [
+                [sys.executable, "-c", WORKER, str(ROOT), str(home), f"p{n}", str(self.EACH)]
                 for n in range(self.PROCS)
             ]
-            for p in procs:
-                _, err = p.communicate(timeout=120)
-                self.assertEqual(p.returncode, 0, err.decode()[-400:])
+            for code, err in run_workers(argvs, 120):
+                self.assertEqual(code, 0, err)
             want = self.PROCS * self.EACH
             self.assertEqual(len(needs.load_hidden(home)), want)
             self.assertEqual(len(needs.load_blufs(home)), want)
