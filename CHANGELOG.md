@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **CI checks that a fix's new tests need the fix (#71).** On a pull request, each commit whose subject starts with `fix` has its newly added tests run against the parent commit's code; a test that passes there guards nothing, and the job fails. `.github/scripts/new_tests_bite.py` runs the same check locally.
 - **Every state-folder listing reads at most 1,000 entries and says when it stops (#70).** Live prompts, pairing requests and profile folders used an unbounded listing, so a folder full of files made each poll read every record. They now share the bounded listing the filed outside records already used, and a cut listing adds a `listing_cut` notice so the queue does not claim to be complete.
 - **Ask sends a fixed list of card fields (#71).** It used to send a redacted copy of the whole card, so any new field Hermes added reached the model unless a rule removed it. Ask now builds its payload from named fields only; event payloads, attachments, the graph and the workspace path are never sent, and a field that holds a container where Hermes stores text is sent as `[not text]`. JSON found inside text again loses its own workspace path.
 - **A nested watched file is read from the watched folder's descriptor (#70).** Each subfolder is opened in turn without following a link, so a subfolder swapped for a link after the containment check fails the read instead of redirecting it outside the folder.

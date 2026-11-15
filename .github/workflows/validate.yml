@@ -10,6 +10,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: plugin
+          fetch-depth: 0  # the regression-test check reads the pull request's commits
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.14"
@@ -37,6 +38,12 @@ jobs:
           HERMES_HOME="$RUNNER_TEMP/hermes-test-home" ../.hermes-runtime/.venv/bin/python -m pytest -q -rs -p no:cacheprovider tests 2>&1 | tee ../test.log
           # Hermes is installed in this job, so the Hermes-equivalence test runs here: any skip is a failure.
           if grep -q "^SKIPPED" ../test.log; then grep "^SKIPPED" ../test.log; echo "::error::tests were skipped; the gate needs every test to run"; exit 1; fi
+      - name: Each new regression test fails without its fix (pull requests only)
+        if: github.event_name == 'pull_request'
+        working-directory: plugin
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: HERMES_HOME="$RUNNER_TEMP/hermes-bite-home" ../.hermes-runtime/.venv/bin/python .github/scripts/new_tests_bite.py --base "origin/$BASE_REF"
       - name: Real validator receipt (no credentials)
         run: |
           mkdir -p receipts

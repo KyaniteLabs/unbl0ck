@@ -19,7 +19,9 @@ hermes plugins validate . --json
 ```
 
 All collected tests must run; any skip fails the hosted gate. Inspect the validator's
-JSON `ok` value and warnings, rather than treating an exited command as proof. Run
+JSON `ok` value and warnings, rather than treating an exited command as proof. For a
+`fix` commit, `python .github/scripts/new_tests_bite.py --base <base>` checks that its new
+tests fail without the fix (CI runs it on pull requests). Run
 `actionlint .github/workflows/*.yml` for workflow changes. Audit the exact outgoing diff
 for secrets and private environment details before pushing or posting evidence.
 
