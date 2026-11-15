@@ -468,20 +468,60 @@ def _names_open_file(fd: int, p: Path) -> bool:
         return False
 
 
-def _read_plain_bytes_st(p: Path, limit: int | None = None) -> tuple[bytes, os.stat_result]:
-    """Read a regular file's exact bytes without following a link or blocking on a FIFO or
-    device, refusing one larger than *limit* (before reading when ``fstat`` already says so, and
-    by the bytes actually read when it grew). Returns the bytes with the ``fstat`` of the very
-    descriptor they were read from, so a caller that caches by file signature caches the
-    signature of what it read, not of whatever a later path lookup finds."""
-    limit = MAX_STATE_BYTES if limit is None else limit
-    fd = os.open(p, os.O_RDONLY | _NOFOLLOW | _NONBLOCK)
+def _pinned_open(p: Path, flags: int, *, create: bool = False) -> tuple[int, os.stat_result]:
+    """Open the regular file *p* names itself: never through a link, never blocking on a FIFO
+    or device, and only while the path still names the descriptor's file afterwards. Returns
+    the descriptor with its ``fstat``. ``create`` makes a missing file with ``O_EXCL``, which
+    refuses any link at the name, so nothing is ever created through a link even where
+    ``O_NOFOLLOW`` does not exist."""
+    flags |= _NOFOLLOW | _NONBLOCK
+    if create:
+        try:
+            fd = os.open(p, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            fd = os.open(p, flags)
+    else:
+        fd = os.open(p, flags)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise UnsafeStateFile("not a regular file", "not_regular")
+            raise UnsafeStateFile(f"{p.name} is not a regular file", "not_regular")
         if not _names_open_file(fd, p):
-            raise UnsafeStateFile("not the file that was opened (a link or a swapped path)", "changed")
+            raise UnsafeStateFile(f"{p.name} is not the file that was opened (a link or a swapped path)", "changed")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, st
+
+
+def _finite(value: Any) -> float | None:
+    """*value* as a finite number, or None for anything else: a non-number, NaN, infinity or a
+    JSON integer past the float range (which raises ``OverflowError``, not ``ValueError``)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _json_loads_safe(raw: str | bytes) -> Any:
+    """``json.loads`` whose too-deeply-nested input fails as a ``ValueError`` like any other
+    damaged record, not as a ``RecursionError`` that escapes per-record handling."""
+    try:
+        return json.loads(raw)
+    except RecursionError as exc:
+        raise ValueError("too deeply nested") from exc
+
+
+def _read_plain_bytes_st(p: Path, limit: int | None = None) -> tuple[bytes, os.stat_result]:
+    """Read a regular file's exact bytes through :func:`_pinned_open`, refusing one larger than
+    *limit* (before reading when ``fstat`` already says so, and by the bytes actually read when
+    it grew). Returns the bytes with the ``fstat`` of the very descriptor they were read from,
+    so a caller that caches by file signature caches the signature of what it read, not of
+    whatever a later path lookup finds."""
+    limit = MAX_STATE_BYTES if limit is None else limit
+    fd, st = _pinned_open(p, os.O_RDONLY)
+    try:
         if st.st_size > limit:
             raise UnsafeStateFile("too large to be a state file", "too_large")
         with os.fdopen(fd, "rb", closefd=False) as fh:
@@ -516,7 +556,7 @@ def _read_json(
     """Read one JSON object. A strict read also checks every entry with *entry_ok*, so a record
     in a shape this version does not write is refused rather than rewritten."""
     try:
-        data = json.loads(_read_plain_text(p))
+        data = _json_loads_safe(_read_plain_text(p))
         if not isinstance(data, dict):
             raise ValueError("expected a JSON object")
         if strict and entry_ok is not None and not all(entry_ok(v) for v in data.values()):
@@ -2639,11 +2679,7 @@ WAIT_MAX_AGE = (
 
 
 def _num(value: Any) -> float:
-    try:
-        number = float(value or 0)
-    except (TypeError, ValueError, OverflowError):  # OverflowError: a JSON integer past the float range
-        return 0.0
-    return number if math.isfinite(number) else 0.0  # NaN/inf are not times
+    return _finite(value or 0) or 0.0  # NaN, inf and overflowing integers are not times
 
 
 def _waits_dir(home: Path | None = None, *, create: bool = True) -> Path:
