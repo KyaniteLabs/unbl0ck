@@ -900,6 +900,9 @@ function rememberAnswerDraft(id, text, version) {
 // again. `gen` identifies the latest request so an old response cannot overwrite newer work.
 const ASK_SESSION_TTL = 30 * 60 * 1000
 const askSessions = new Map()
+// Request tokens come from one counter for the whole page. A per-card counter restarted at 1 when a
+// cache entry expired or was evicted, so a request still outstanding could match a newer one.
+let askGenSeq = 0
 function readAskSession(id) {
   const cutoff = Date.now() - ASK_SESSION_TTL
   for (const [key, s] of askSessions) if (s.at < cutoff) askSessions.delete(key)
@@ -1122,7 +1125,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false 
     if (!retry && !preset) setAskInput('')
     setAskBusy(true)
     setAskError('')
-    const gen = (readAskSession(item.id)?.gen || 0) + 1
+    const gen = ++askGenSeq
     const mine = () => readAskSession(item.id)?.gen === gen
     updateAskSession(item.id, { msgs: next, version: item.version, running: true, error: '', gen,
       job: retry && !askStale && askJob?.version === item.version ? askJob : null })
@@ -1472,7 +1475,9 @@ function Page({ ctx, refresh }) {
   const undoHide = async (u) => {
     if (!u || undoBusy) return
     setUndoBusy(true)
-    const drop = () => $undo.set(($undo.get() || []).filter(x => x.id !== u.id))
+    // A late response may only touch its own dismissal: the same item can resurface and be dismissed again meanwhile.
+    const same = x => x.id === u.id && x.at === u.at
+    const drop = () => $undo.set(($undo.get() || []).filter(x => !same(x)))
     try {
       const r = await ctx.rest('/unhide', { method: 'POST', body: { id: u.id } })
       drop()
@@ -1484,7 +1489,7 @@ function Page({ ctx, refresh }) {
       await refresh()
     } catch (e) {
       // Keep a failed restoration for another full retry window, marked so it reads as retryable.
-      $undo.set(($undo.get() || []).map(x => (x.id === u.id ? { ...u, at: Date.now(), failed: true } : x)))
+      $undo.set(($undo.get() || []).map(x => (same(x) ? { ...u, at: Date.now(), failed: true } : x)))
       host.notifyError(e, 'UNBL0CK: could not undo')
     } finally {
       setUndoBusy(false)

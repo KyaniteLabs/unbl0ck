@@ -109,6 +109,38 @@ const render=()=>{cursor=0;return store.Item({ctx,item:it,n:1,refresh,askEnabled
 })().catch(e=>{console.error(e);process.exitCode=1});
 """)
 
+    def test_request_token_does_not_repeat_after_the_session_expires(self):
+        self.run_views(r"""
+const resolvers=[];
+const ctx={rest:url=>new Promise(r=>{if(url==='/card/ask')resolvers.push(r);else r({})})};
+const v1={...item,id:'kanban:default:ask6',version:'1'};
+const v2={...v1,version:'2'};
+const render=it=>{cursor=0;return store.Item({ctx,item:it,n:1,refresh,askEnabled:true})};
+(async()=>{
+ render(v1);
+ const old=find(render(v1),'TL;DR').onClick();
+ await new Promise(r=>setTimeout(r,5));
+ // the cache entry expires (or is evicted) while the first request is still outstanding
+ store.clearAskSession(v1.id);
+ state=[];
+ render(v2);
+ const fresh=find(render(v2),'TL;DR').onClick();
+ await new Promise(r=>setTimeout(r,5));
+ assert.equal(store.readAskSession(v1.id).version,'2');
+ const newGen=store.readAskSession(v1.id).gen;
+ resolvers[0]({ok:true,reply:'STALE ADVICE'});
+ await old;
+ const s=store.readAskSession(v1.id);
+ assert.equal(s.running,true,'the newer request still owns the session');
+ assert.equal(s.version,'2');
+ assert.equal(s.gen,newGen);
+ assert.ok(!s.msgs.some(m=>m.content==='STALE ADVICE'),'the old reply never enters the new conversation');
+ resolvers[1]({ok:true,reply:'FRESH'});
+ await fresh;
+ assert.ok(store.readAskSession(v1.id).msgs.some(m=>m.content==='FRESH'));
+})().catch(e=>{console.error(e);process.exitCode=1});
+""")
+
     def test_failed_request_is_remembered_with_its_error_and_retryable(self):
         self.run_views(r"""
 const ctx={rest:async()=>{throw new Error('model down')}};
