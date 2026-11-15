@@ -1599,6 +1599,9 @@ def chat_items(
                         "owner": profile,
                         "priority": 0,
                         "since": int(ts or 0),
+                        # Found only because chat_window_days reaches past the default window:
+                        # listed, but never sent to a model without a deliberate action.
+                        **({"backfilled": True} if (ts or 0) < time.time() - CHAT_WINDOW_DAYS * 86400 else {}),
                     }
                 )
     return items
@@ -2008,6 +2011,7 @@ def search_text(query: Any) -> dict[str, Any]:
         return visibility(hidden, item_id, version) is not Visibility.HIDDEN
 
     unread = [0]
+    chat_cov: dict[str, Any] = {}
     readers = (
         (
             "outside",
@@ -2018,7 +2022,8 @@ def search_text(query: Any) -> dict[str, Any]:
         (
             "chat",
             lambda errs: chat_items(
-                home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS, visible=visible
+                home, errors=errs, full=True, full_limit=SEARCH_MAX_ITEMS, visible=visible,
+                coverage=chat_cov,
             ),
         ),
         (
@@ -2071,7 +2076,8 @@ def search_text(query: Any) -> dict[str, Any]:
         "items_cut": cut,
         "skipped_private": private,
         "errors": errors,
-        "partial": bool(not_searched or cut or errors),
+        "chat_sessions_unread": int(chat_cov.get("sessions_omitted") or 0),
+        "partial": bool(not_searched or cut or errors or chat_cov.get("sessions_omitted")),
         "limits": {"items_per_source": SEARCH_MAX_ITEMS, "chars_per_item": SEARCH_MAX_CHARS},
     }
 
@@ -2730,6 +2736,11 @@ def build_queue(
         errors.append(f"outside: {type(exc).__name__}: {exc}")
     if _SETTINGS_ERROR:
         errors.append(_SETTINGS_ERROR)
+    if chat_coverage is not None:
+        # The reader returns normally after a corrupt database or unreadable settings and says
+        # so only in `errors`; a window that was not fully read must not look like a complete one.
+        chat_coverage["errors"] = sum(1 for e in errors if e.split(":", 1)[0].split("[", 1)[0] == "chat")
+        chat_coverage["failed"] = bool(chat_coverage["errors"])
     hidden = load_hidden(home, errors=errors)
     failed_sources = {error.split(":", 1)[0].split("[", 1)[0] for error in errors}
     preserve_prefixes = tuple(
@@ -2798,6 +2809,10 @@ def not_covered_notes(chat_coverage: dict[str, Any] | None) -> list[str]:
     ]
     if chat_coverage is None:
         notes.insert(0, "Chats could not be read this time, so no chat window applies.")
+    elif chat_coverage.get("failed"):
+        notes.insert(0, "Some chats could not be read this time, so this list may be missing asks from them.")
+        if chat_coverage.get("sessions_omitted"):
+            notes.insert(1, f"{chat_coverage['sessions_omitted']} older chat sessions were not read (scan limit {CHAT_SESSION_CAP} per profile).")
     elif chat_coverage.get("sessions_omitted"):
         notes.insert(0, f"{chat_coverage['sessions_omitted']} older chat sessions were not read (scan limit {CHAT_SESSION_CAP} per profile).")
     return notes
