@@ -3789,13 +3789,15 @@ NO_BLUF_SOURCES = ("prompt", "pairing")
 # one-line summary, "ask" is the TL;DR / follow-up panel (Kanban cards only: it needs a board
 # and task), "search" is the opt-in full-text search, which reads locally and never calls a
 # model. "cross_profile" marks sources the queue reads without filtering by profile: chats and
-# prompts from every profile under the Hermes home, and the shared filed-item folder and watched
-# folders (the queue has no reading profile; a filed item records its profile only for dedupe).
+# prompts from every profile under the Hermes home, Kanban (Hermes keeps one board store shared by
+# every profile), and the shared filed-item folder (the queue has no reading profile; a filed item
+# records its profile only for dedupe). Watched folders are the exception inside "outside": each
+# profile reads only the folders its own settings configure.
 # docs/architecture.md carries the same table and a test keeps the two equal.
 SURFACES = {
     "prompt": {"ask": False, "search": True, "cross_profile": True},
     "pairing": {"ask": False, "search": False, "cross_profile": True},
-    "kanban": {"ask": True, "search": False, "cross_profile": False},
+    "kanban": {"ask": True, "search": False, "cross_profile": True},
     "outside": {"ask": False, "search": True, "cross_profile": True},
     "chat": {"ask": False, "search": True, "cross_profile": True},
 }
@@ -3939,8 +3941,11 @@ def build_queue(
     except Exception as exc:  # noqa: BLE001
         outside_source_failed = True
         errors.append(f"outside: {type(exc).__name__}: {exc}")
-    if _SETTINGS_ERROR:
-        errors.append(_SETTINGS_ERROR)
+    # One settings snapshot (and the fault from that same refresh) for everything this response
+    # says about model use: the flags, the matrix, whether summaries are attached and the notes.
+    settings, settings_error = _settings_state()
+    if settings_error:
+        errors.append(settings_error)
     if chat_coverage is not None:
         # The reader returns normally after a corrupt database or unreadable settings and says
         # so only in `errors`; a window that was not fully read must not look like a complete one.
@@ -3993,7 +3998,8 @@ def build_queue(
             f"outside: {outside_stats['hidden_unread']} hidden files are not listed "
             f"(at most the newest {_OUTSIDE_LIMIT} per folder are shown)"
         )
-    if bluf_enabled():
+    summaries_on = bluf_enabled(settings)
+    if summaries_on:
         attach_blufs(shown, home)
     counts = {
         "asks": sum(1 for i in shown if i.get("tier") not in ("stuck", "answered")),
@@ -4010,17 +4016,19 @@ def build_queue(
         "hidden": len(items) - len(shown) + outside_stats.get("hidden_unread", 0),
         "items": shown,
         "errors": errors,
-        "ask_enabled": ask_enabled(),
-        "bluf_enabled": bluf_enabled(),
-        "disclosure": disclosure_matrix(),
+        "ask_enabled": ask_enabled(settings),
+        "bluf_enabled": summaries_on,
+        "disclosure": disclosure_matrix(settings),
         "capabilities": CAPABILITIES,
-        "coverage": {"chat": chat_coverage, "not_covered": not_covered_notes(chat_coverage)},
+        "coverage": {"chat": chat_coverage, "not_covered": not_covered_notes(chat_coverage, settings)},
     }
 
 
-def not_covered_notes(chat_coverage: dict[str, Any] | None) -> list[str]:
+def not_covered_notes(
+    chat_coverage: dict[str, Any] | None, settings: dict[str, Any] | None = None
+) -> list[str]:
     """Fixed sentences (no card text) on what an empty queue does not prove."""
-    days = (chat_coverage or {}).get("window_days") or chat_window_days()
+    days = (chat_coverage or {}).get("window_days") or chat_window_days(settings)
     notes = [
         f"Chats older than {days} days are not read (setting chat_window_days, up to {CHAT_WINDOW_MAX_DAYS}).",
         "Requests in group chats are found only when the message names you; indirect or unnamed requests are not detected.",

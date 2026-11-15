@@ -79,11 +79,11 @@ turns the matching columns off in the payload and in behavior.
 | --- | --- | --- | --- | --- |
 | `prompt` | no | no | yes | yes |
 | `pairing` | no | no | no | yes |
-| `kanban` | yes | yes | no | no |
+| `kanban` | yes | yes | no | yes |
 | `outside` | yes | no | yes | yes |
 | `chat` | yes | no | yes | yes |
 
-Notes. `outside` covers agent-filed items and watched-folder files; both are read for every profile (filed items live in one shared folder; the filing profile is recorded as provenance and scopes `dedupe_key`). Full-text search reads
+Notes. `outside` covers agent-filed items and watched-folder files. Filed items live in one shared folder, so every profile reads them (the filing profile is recorded as provenance and scopes `dedupe_key`); that is what the `outside` row's yes means. Watched folders are not shared that way: each profile's process reads only the `outside_dirs` its own settings configure, so two profiles read different folders unless they configure the same ones. `kanban` is read across profiles because Hermes keeps one Kanban store shared by every profile; a blocked card is visible from all of them. Full-text search reads
 local text and never calls a model; it skips password prompts and returns ids, versions and
 counts only. Summaries and Ask run the card text, comments and owner through the same
 redaction (secrets, home directory and workspace path); the operator's own typed Ask
@@ -105,6 +105,8 @@ as private. Settings and source files remain owned by their original application
 | State | Lifetime and ownership |
 | --- | --- |
 | `hidden.json` | Version-specific hides, capped at 1,000 (the oldest dismissal goes first), plus Not for me and Done on watched-folder files, capped separately at 5,000 per watched folder (the per-folder scan bound; up to 8 folders) so paging progress is not evicted, and always kept under the 16 MiB state limit by dropping the oldest; a hide for a version older than the card's current one is refused; shared by local operator surfaces |
+| `chat-backfill.json` | The oldest time a queue read reached and the ids (at most 1,000) of chats only a widened `chat_window_days` found, so they are never summarized automatically; no chat text |
+| `.state.lock` | Empty owner-only (0600) lock file that serializes writes to the files above across threads and processes; holds no data |
 | `pending-release.json` | Recovery state for comments whose release remains unfinished, capped at 1,000; a new marker is refused and reported when full, and an older version never replaces a newer one; a release reserves its marker before the answer is written, so a failed or raised release is always recoverable |
 | `outside/*.json` | Owner-only agent-filed records, capped at 200; visible to every profile, with `dedupe_key` private to the filing profile unless `dedupe_scope` is `global` |
 | `waits/*.json` | Owner-only live prompt records, removed on resolution/expiry/dead process |
