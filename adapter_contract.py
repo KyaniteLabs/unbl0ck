@@ -145,7 +145,9 @@ def _valid_seq(seq: Any) -> bool:
 def reconcile(local: Mapping[Key, Local], batch: ChangeBatch, accounts: Iterable[tuple[str, str]] = ()) -> Plan:
     """Turn one batch into actions. Pure: no I/O, no clock. The account scope (``accounts`` or
     ``batch.accounts``) is required for every read except a rate limit: a failed batch carries no
-    items, so the scope is the only way to know whose items to hold."""
+    items, so the scope is the only way to know whose items to hold. The events of an ``ok`` batch
+    are applied one by one in the order received, so a batch ends exactly where the same events
+    delivered one batch each would end."""
     plan = Plan()
     if batch.status == RATE_LIMITED:
         plan.retry_after = batch.retry_after
@@ -168,7 +170,7 @@ def reconcile(local: Mapping[Key, Local], batch: ChangeBatch, accounts: Iterable
         plan.omitted = None
         plan.stop_reason = "error"
         return plan  # an unknown status is a failure, never a success
-    winners: dict[Key, ExternalItem] = {}
+    state = dict(local)
     rejected = 0
     for item in batch.items:
         if (item.provider, item.account) not in scope:
@@ -179,16 +181,13 @@ def reconcile(local: Mapping[Key, Local], batch: ChangeBatch, accounts: Iterable
             plan.actions.append(Action("reject_item", item.key, "seq must be a non-negative integer"))
             rejected += 1
             continue
-        prev = winners.get(item.key)
-        if prev is None or item.seq > prev.seq:
-            winners[item.key] = item
-        elif item.seq == prev.seq and (item.revision != prev.revision or item.state != prev.state):
-            plan.actions.append(Action("seq_collision", item.key, "same seq, different content; the first was kept"))
-    for item in winners.values():  # one event per item: the newest wins, so a batch folds into one state
-        plan.actions.extend(_one(item, local.get(item.key)))
-    plan.actions.extend(Action("release_hold", k, "reads work again") for k, v in local.items()
-                        if (k[0], k[1]) in scope and k not in winners and _releases(v, None, batch.complete and not rejected))
+        cur = state.get(item.key)
+        acts = _one(item, cur)
+        plan.actions.extend(acts)
+        state.update(apply({} if cur is None else {item.key: cur}, Plan(acts)))
     plan.complete = batch.complete and not rejected
+    plan.actions.extend(Action("release_hold", k, "reads work again") for k, v in state.items()
+                        if (k[0], k[1]) in scope and _releases(v, None, plan.complete))
     if not plan.complete:
         plan.omitted = None if batch.omitted is None and not batch.complete else (batch.omitted or 0) + rejected
         reasons = [r for r in (batch.stop_reason or (None if batch.complete else "unspecified"),
@@ -235,36 +234,50 @@ def _view(cur: Local) -> tuple[str, str | None]:
     return (DONE if cur.evidence else OPEN) if cur.state == "held" else cur.state, cur.evidence
 
 
+def _same_seq_conflict(item: ExternalItem, cur: Local) -> bool:
+    """An event at the stored seq must repeat what the provider said at that seq: same revision
+    and the same state. An agent's claim or a guessed completion is not a provider state, so the
+    provider showing that item open or done at the same seq contradicts or upgrades it instead."""
+    if item.seq != cur.seq:
+        return False
+    if item.revision != cur.revision:
+        return True
+    if cur.state == "gone":
+        return item.state not in (DELETED, LEFT_VIEW)
+    if _hold(cur) == LEFT_VIEW:
+        return item.state != LEFT_VIEW
+    state, ev = _view(cur)
+    if item.state in (DELETED, LEFT_VIEW) or state == OPEN:
+        return item.state != state
+    return ev == VERIFIED and item.state != DONE
+
 
 def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
     k, s, r = item.key, item.seq, item.revision
-    if item.state not in ITEM_STATES:
-        # Neither open work nor a deletion: report it and change nothing but the watermark.
-        if cur is not None and s < cur.seq:
-            return [Action("ignore_stale", k)]
-        return [Action("unknown_state", k, "the provider reported a state this contract does not know; nothing changed",
-                       seq=s if cur is not None else None)]
-    guessed = item.confidence != CONFIRMED
+    known, guessed = item.state in ITEM_STATES, item.confidence != CONFIRMED
     ev = HEURISTIC if guessed else VERIFIED
     if cur is None:
+        if not known or item.state == LEFT_VIEW:  # no card, but a later older event must stay stale
+            return [Action("watermark", k, "no card: only the sequence is kept", seq=s, revision=r if known else None)]
         if item.state == DELETED:
             return [Action("tombstone", k, "deleted at the provider; the sequence is kept", seq=s, revision=r)]
         if item.state == DONE:
             return [Action("track_done", k, "already done at the provider; no card", seq=s, revision=r, evidence=ev)]
-        return [] if item.state == LEFT_VIEW else [Action("add", k, seq=s, revision=r)]
+        return [Action("add", k, seq=s, revision=r)]
     out: list[Action] = [Action("release_hold", k)] if _releases(cur, item, False) else []
     if s < cur.seq:
         return out + [Action("ignore_stale", k)]
-    if s == cur.seq and r != cur.revision:
-        return out + [Action("seq_collision", k, "same seq, different revision; the stored one was kept")]
+    if not known:  # neither open work nor a deletion: report it and change nothing but the watermark
+        return [Action("unknown_state", k, "the provider reported a state this contract does not know", seq=s)]
+    if _same_seq_conflict(item, cur):
+        return out + [Action("seq_collision", k, "same seq, different content; the stored one was kept")]
+    newer = [Action("advance", k, seq=s, revision=r)] if s > cur.seq else []  # same content, newer seq
     state, cur_ev = _view(cur)
     edit = cur.pending_edit
     conflict = Action("conflict", k, "changed at the provider while a local edit is unsent; nothing was written")
     if cur.state == "gone":
         if item.state in (DELETED, LEFT_VIEW):
-            return [Action("advance", k, seq=s, revision=r)] if s > cur.seq else []
-        if s == cur.seq:
-            return [Action("seq_collision", k, "a deleted item came back at the same seq")]
+            return newer
         out.append(Action("restore", k, "back at the provider", seq=s, revision=r))
         if item.state == DONE:
             out.append(Action("complete_unconfirmed" if guessed else "complete_verified", k, seq=s, revision=r, evidence=ev))
@@ -275,14 +288,14 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
         return out + [Action("remove", k, "deleted at the provider", seq=s, revision=r)]
     if item.state == LEFT_VIEW:
         if _hold(cur) == LEFT_VIEW:
-            return [Action("advance", k, seq=s, revision=r)] if s > cur.seq else []
+            return newer
         return [Action("hold", k, "no longer listed where it was read; existence is not confirmed", seq=s, revision=r,
                        hold=LEFT_VIEW)]
     if item.state == DONE:
         if state == DONE and _RANK.get(cur_ev, 0) >= _RANK[ev]:
             if r != cur.revision:
                 return out + [Action("update", k, r, seq=s, revision=r)]
-            return out + ([Action("advance", k, seq=s, revision=r)] if s > cur.seq else [])
+            return out + newer
         if edit:
             out.append(conflict)
         if state == DONE and cur_ev == ASSERTED and r == cur.revision and not guessed:
@@ -294,8 +307,6 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
     if state == DONE:
         if cur_ev in (ASSERTED, HEURISTIC):
             out.append(Action("contradicted", k, "an agent said done; the provider still shows it open", seq=s, revision=r))
-        elif s == cur.seq:
-            return out + [Action("seq_collision", k, "open and done at the same seq")]
         else:
             out.append(Action("reopen", k, "reopened at the provider", seq=s, revision=r))
     if r != cur.revision:
@@ -304,9 +315,7 @@ def _one(item: ExternalItem, cur: Local | None) -> list[Action]:
         out.append(Action("update", k, r, seq=s, revision=r))
         if cur.acted_revision is not None and cur.acted_revision != r:
             out.append(Action("resurface", k, "changed since you dealt with it"))
-    elif s > cur.seq and not any(a.seq is not None for a in out):
-        out.append(Action("advance", k, seq=s, revision=r))  # a newer seq with the same content still moves the watermark
-    return out
+    return out if any(a.seq is not None for a in out) else out + newer
 
 
 def _advance(cur: Local, a: Action) -> Local:
@@ -316,14 +325,16 @@ def _advance(cur: Local, a: Action) -> Local:
     return replace(cur, seq=a.seq, revision=cur.revision if a.revision is None else a.revision)
 
 
+_NEW = {"add": OPEN, "tombstone": "gone", "watermark": "gone", "track_done": DONE}  # actions that create a stored row
+
+
 def apply(local: Mapping[Key, Local], plan: Plan) -> dict[Key, Local]:
     """Reference model of what a store does with a plan. Pure; tests use it to replay batches."""
     out = dict(local)
     for a in plan.actions:
         cur = out.get(a.key) if a.key else None
-        if a.op in ("add", "tombstone", "track_done") and cur is None:
-            out[a.key] = Local(a.seq, a.revision or "", {"add": OPEN, "tombstone": "gone", "track_done": DONE}[a.op],
-                               a.evidence if a.op == "track_done" else None)
+        if a.op in _NEW and cur is None:
+            out[a.key] = Local(a.seq, a.revision or "", _NEW[a.op], a.evidence if a.op == "track_done" else None)
             continue
         if cur is None:
             continue

@@ -49,6 +49,13 @@ def replay(batches, local=None):
 
 
 class Contract(unittest.TestCase):
+    def test_an_untracked_item_that_left_its_view_or_has_an_unknown_state_keeps_its_watermark(self):
+        """R5-api-009: an older open after an untracked left_view or unknown state is stale."""
+        for state in (ac.LEFT_VIEW, "cancelled"):
+            local, plans = replay([batch(it(seq=5, rev="r5", state=state)), batch(it(seq=3, rev="r3"))])
+            self.assertEqual(ops(plans[1]), ["ignore_stale"], state)
+            self.assertNotEqual(local[K].state, ac.OPEN, state)
+
     def test_a_left_view_hold_stores_its_revision_so_a_replay_is_a_duplicate(self):
         """R5-api-010: seq and revision move together, also for a hold."""
         local, plans = replay([batch(it(seq=2, rev="r2", state=ac.LEFT_VIEW))] * 2, {K: ac.Local(1, "r1")})
@@ -68,6 +75,33 @@ class Contract(unittest.TestCase):
         self.assertFalse(local[K].held)
         self.assertEqual(local[K].seq, 5)
 
+    def test_a_reopen_inside_a_batch_discards_the_older_verified_evidence(self):
+        """R5-api-013: one batch ends where the same events in two batches end."""
+        start = {K: ac.Local(1, "r1", ac.DONE, ac.VERIFIED)}
+        events = [it(seq=2, rev="r2"), it(seq=3, rev="r2", state=ac.DONE, confidence=ac.GUESSED)]
+        one, _ = replay([batch(*events)], start)
+        two, _ = replay([batch(e) for e in events], start)
+        self.assertEqual(one[K].evidence, ac.HEURISTIC)
+        self.assertEqual(one, two)
+
+    def test_a_confirmed_completion_after_a_guess_at_the_same_seq_upgrades_inside_a_batch(self):
+        """R5-api-014: equal seq and content with a stronger completion is applied, not dropped."""
+        events = [it(seq=2, state=ac.DONE, confidence=ac.GUESSED), it(seq=2, state=ac.DONE)]
+        one, _ = replay([batch(*events)])
+        two, _ = replay([batch(e) for e in events])
+        self.assertEqual(one[K].evidence, ac.VERIFIED)
+        self.assertEqual(one, two)
+
+    def test_a_different_state_at_the_same_seq_collides_inside_and_across_batches(self):
+        """R5-api-015: one equal-seq rule; the first state seen is kept either way."""
+        for second in (ac.DONE, ac.DELETED):
+            events = [it(seq=1), it(seq=1, state=second)]
+            one, p1 = replay([batch(*events)])
+            two, p2 = replay([batch(e) for e in events])
+            self.assertIn("seq_collision", ops(p1[0]), second)
+            self.assertEqual(ops(p2[1]), ["seq_collision"], second)
+            self.assertEqual(one, two, second)
+            self.assertEqual(two[K].state, ac.OPEN, second)
 
 
 hc = _load("unbl0ck_host_compat_r5a", "scripts/host_compat.py")

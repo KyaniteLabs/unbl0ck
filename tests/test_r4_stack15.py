@@ -107,12 +107,12 @@ class Failures(unittest.TestCase):  # 15-004, class G
 class Folding(unittest.TestCase):  # 15-005, class A/M
     def test_an_add_then_a_delete_in_one_batch_leaves_a_tombstone(self):
         local, plans = replay([batch(it(seq=1), it(seq=2, rev="r2", state=ac.DELETED))])
-        self.assertEqual(ops(plans[0]), ["tombstone"])
-        self.assertEqual(local[k()].state, "gone")
+        self.assertEqual(ops(plans[0]), ["add", "remove"])  # applied in order, as two batches would be
+        self.assertEqual((local[k()].state, local[k()].seq), ("gone", 2))
 
     def test_two_new_revisions_in_one_batch_add_once_at_the_newest(self):
         local, plans = replay([batch(it(seq=1, rev="r1"), it(seq=2, rev="r2"))])
-        self.assertEqual(ops(plans[0]), ["add"])
+        self.assertEqual(ops(plans[0]), ["add", "update"])
         self.assertEqual((local[k()].seq, local[k()].revision), (2, "r2"))
 
     def test_the_order_inside_a_batch_does_not_matter(self):
@@ -223,8 +223,9 @@ class Unknown(unittest.TestCase):  # 15-013
             self.assertEqual(ac.apply(local, plan)[k()].state, ac.DONE, state)
 
     def test_an_unrecognised_state_for_an_untracked_item_adds_nothing(self):
-        self.assertEqual(ops(ac.reconcile({}, batch(it(state="cancelled")))), ["unknown_state"])
-        self.assertEqual(ac.apply({}, ac.reconcile({}, batch(it(state="cancelled")))), {})
+        plan = ac.reconcile({}, batch(it(state="cancelled")))
+        self.assertEqual(ops(plan), ["watermark"])  # only the sequence is kept; no card
+        self.assertEqual(ac.apply({}, plan)[k()].state, "gone")
 
 
 class Heuristic(unittest.TestCase):  # 15-014, class I/G
@@ -294,7 +295,9 @@ class LeftView(unittest.TestCase):  # 15-020, class G
         self.assertFalse(local[k()].held)
 
     def test_leaving_the_view_never_creates_a_card(self):
-        self.assertEqual(ops(ac.reconcile({}, batch(it(state=ac.LEFT_VIEW)))), [])
+        plan = ac.reconcile({}, batch(it(state=ac.LEFT_VIEW)))
+        self.assertEqual(ops(plan), ["watermark"])  # only the sequence is kept; no card
+        self.assertEqual(ac.apply({}, plan)[k()].state, "gone")
 
 
 class Imap(unittest.TestCase):  # 15-019
@@ -350,7 +353,8 @@ class Stateful(unittest.TestCase):  # 15-021, class L
 
     def test_revisions_inside_a_batch_then_the_next_batch_repeating_them(self):
         local, plans = replay([batch(it(seq=1, rev="r1"), it(seq=2, rev="r2")), batch(it(seq=1, rev="r1"), it(seq=2, rev="r2"))])
-        self.assertEqual([ops(p) for p in plans], [["add"], []])
+        self.assertEqual([ops(p) for p in plans], [["add", "update"], ["ignore_stale"]])
+        self.assertEqual((local[k()].seq, local[k()].revision), (2, "r2"))
 
     def test_a_rejected_batch_changes_nothing_in_the_replay(self):
         local, _ = replay([batch(it(seq=1))])
