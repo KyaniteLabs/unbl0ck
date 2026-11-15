@@ -227,6 +227,69 @@ class PublishVerifiesWhatItInstalled(Profiles):
                         "a forged queued record must not report that resubmitting is safe")
 
 
+class ParentSwapAndLinkedRecords(rec.RecoveryBase):
+    """R5-jobs-005 and R5-jobs-011 (class C)."""
+
+    def test_a_parent_swapped_for_a_link_before_the_open_is_not_followed(self):
+        base = Path(self.tmp.name) / "swap"
+        parent, child, foreign = base / "par", base / "par" / "ask", base / "foreign"
+        (foreign / "ask").mkdir(parents=True, mode=0o700)
+        child.mkdir(parents=True, mode=0o700)
+        journal = jobs.AskJournal(lambda: child, lambda: True, self.clock)
+        real_open, swapped = os.open, []
+
+        def opening(path, flags, *a, **kw):
+            if not swapped and kw.get("dir_fd") is None and Path(str(path)) in (parent, child):
+                swapped.append(1)
+                os.rename(parent, base / "par.moved")
+                os.symlink(foreign, parent)
+            return real_open(path, flags, *a, **kw)
+
+        with patch("os.open", opening):
+            wrote = journal.write(J1, {"state": "queued", "started": self.clock(), "card": "c"})
+        self.assertTrue(swapped)
+        self.assertFalse(wrote)
+        self.assertEqual(list((foreign / "ask").iterdir()), [], "nothing may be written through the swapped parent")
+
+    def test_a_linked_record_is_refused_even_without_O_NOFOLLOW(self):
+        self.dir.mkdir(parents=True, mode=0o700)
+        target = Path(self.tmp.name) / "elsewhere.json"
+        target.write_text(json.dumps({"v": 1, "job": J1, "state": "done", "started": self.clock(),
+                                      "card": "c", "reply": "FOREIGN REPLY"}))
+        os.chmod(target, 0o600)
+        os.symlink(target, self.dir / f"{J1}.json")
+        with patch.object(os, "O_NOFOLLOW", 0):
+            got = self.journal.read(J1)
+        self.assertTrue(got.get("corrupt"), got)
+        self.assertNotIn("FOREIGN REPLY", json.dumps(got))
+
+
+class HugeIntegersAreImplausibleNotFatal(rec.RecoveryBase):
+    """R5-jobs-013 (class G)."""
+
+    def put(self, **over):
+        self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        body = {"v": 1, "job": J1, "state": "queued", "started": self.clock(), "card": "c"}
+        body.update(over)
+        path = self.dir / f"{J1}.json"
+        path.write_text(json.dumps(body))
+        os.chmod(path, 0o600)
+
+    def test_a_huge_start_time_reads_as_unknown(self):
+        self.put(started=10**1000)
+        st = self.jobs.get(J1)
+        self.assertEqual(jobs.ASK_WIRE[st["status"]], "unknown")
+
+    def test_a_huge_owner_pid_is_not_a_live_owner(self):
+        self.put(owner={"pid": 10**1000, "inst": "other"})
+        st = self.jobs.get(J1)
+        self.assertEqual(jobs.ASK_WIRE[st["status"]], "not_submitted")
+
+    def test_a_huge_settled_time_does_not_abort_the_settled_limit(self):
+        self.put(state="done", settled_at=10**1000, reply="r")
+        self.assertEqual(self.journal.enforce_settled(0, keep=lambda j: False), 1)
+
+
 try:
     import fastapi
     from fastapi.testclient import TestClient

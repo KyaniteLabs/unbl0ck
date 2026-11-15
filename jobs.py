@@ -190,6 +190,16 @@ class JournalConflict(Exception):
     """A guarded write found another worker's record where it expected its own (or none)."""
 
 
+def _finite(x: Any) -> bool:
+    """A real, finite number (not a bool). An integer too large for a float is not finite here."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:
+        return False
+
+
 def _reject_constant(name: str) -> Any:
     raise ValueError(f"non-finite number {name} is not valid in a record")
 
@@ -259,7 +269,8 @@ class AskJournal:
             return None, "none"
         d = Path(d)
         nofollow = getattr(os, "O_NOFOLLOW", 0)
-        fd = None
+        dirflag = getattr(os, "O_DIRECTORY", 0)
+        fd = pfd = None
         try:
             if create:
                 try:
@@ -270,35 +281,49 @@ class AskJournal:
                     if not stat.S_ISDIR(parent_kind):  # a link here would send the new directory elsewhere
                         self.failures += 1
                         return None, "unavailable"
-                try:
-                    os.mkdir(d, 0o700)
-                except FileExistsError:
-                    pass
             for p in (d.parent, d):  # a link in either place is never followed
-                if not stat.S_ISDIR(os.lstat(p).st_mode):
+                try:
+                    kind = os.lstat(p).st_mode
+                except FileNotFoundError:
+                    if create and p == d:
+                        break  # created below, relative to the parent descriptor
+                    raise
+                if not stat.S_ISDIR(kind):
                     self.failures += 1
                     return None, "unavailable"
-            fd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow)
-            seen, again = os.fstat(fd), os.lstat(d)
+            # The parent is opened once and checked against its own entry; the journal directory is
+            # then opened relative to that descriptor, so a parent swapped for a link after the
+            # checks cannot send the open (or any later write) to another directory.
+            pfd = os.open(d.parent, os.O_RDONLY | dirflag | nofollow)
+            pseen, pagain = os.fstat(pfd), os.lstat(d.parent)
+            if (pseen.st_ino, pseen.st_dev) != (pagain.st_ino, pagain.st_dev):
+                raise PermissionError("the parent directory changed")
+            if create:
+                try:
+                    os.mkdir(d.name, 0o700, dir_fd=pfd)
+                except FileExistsError:
+                    pass
+            fd = os.open(d.name, os.O_RDONLY | dirflag | nofollow, dir_fd=pfd)
+            seen, again = os.fstat(fd), os.stat(d.name, dir_fd=pfd, follow_symlinks=False)
             if (seen.st_ino, seen.st_dev) != (again.st_ino, again.st_dev) or seen.st_uid != os.geteuid():
                 raise PermissionError("not our directory")
             if seen.st_mode & 0o077:
                 os.fchmod(fd, 0o700)
-            return fd, "ok"
+            out, fd = fd, None
+            return out, "ok"
         except FileNotFoundError:
-            if fd is not None:
-                os.close(fd)
             return None, "missing"
         except NotADirectoryError:
-            if fd is not None:
-                os.close(fd)
             self.failures += 1
             return None, "missing"  # a path component is a file: nothing can be stored there
         except OSError:
-            if fd is not None:
-                os.close(fd)
             self.failures += 1
             return None, "unavailable"
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if pfd is not None:
+                os.close(pfd)
 
     @contextlib.contextmanager
     def _session(self, create: bool = False, d: Optional[Path] = None):
@@ -361,8 +386,8 @@ class AskJournal:
             return False
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
+        except (ProcessLookupError, OverflowError, ValueError):
+            return False  # no such process (or not a process id at all)
         except PermissionError:
             return True
         except OSError:
@@ -382,6 +407,9 @@ class AskJournal:
             st = os.fstat(rfd)
             if not stat.S_ISREG(st.st_mode) or st.st_size > self.MAX_RECORD_BYTES or st.st_uid != os.geteuid():
                 return {"corrupt": True}  # a link, FIFO, other owner or too big: never read into memory
+            entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if (entry.st_ino, entry.st_dev) != (st.st_ino, st.st_dev):
+                return {"corrupt": True}  # the entry is a link (or was swapped): not the file that was opened
             if st.st_mode & 0o022:
                 return {"corrupt": True}  # somebody else could have written it
             if st.st_mode & 0o044:
@@ -418,7 +446,7 @@ class AskJournal:
         if "card" not in data or not isinstance(data["card"], (str, type(None))):
             return False
         started = data.get("started")
-        if isinstance(started, bool) or not isinstance(started, (int, float)) or not math.isfinite(started):
+        if not _finite(started):
             return False
         return started <= self._clock() + self.FUTURE_SLACK_S
 
@@ -783,7 +811,7 @@ class AskJournal:
                     rec = self._read_fd(fd, name, stem) if self._valid(stem) else None
                     if rec and not rec.get("corrupt") and rec.get("state") in ("done", "error"):
                         at = rec.get("settled_at")
-                        settled.append((at if isinstance(at, (int, float)) and math.isfinite(at) else rec["started"], stem))
+                        settled.append((at if _finite(at) else rec["started"], stem))
             except OSError:
                 self.failures += 1
                 return 0
