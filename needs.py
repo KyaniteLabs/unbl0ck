@@ -172,7 +172,9 @@ def ask_persist_replies(settings: dict[str, Any] | None = None) -> bool:
 
 
 def ask_journal_dir(home: Path | None = None) -> Path:
-    return data_dir(home) / "ask"
+    """Ask restart markers, one directory per profile: a job id from one profile means nothing
+    to another, even though the plugin data directory is shared across profiles."""
+    return data_dir(home) / "ask" / _profile_of(home or hermes_home())
 
 
 CHAT_WINDOW_DAYS = 14

@@ -202,22 +202,25 @@ class AskJournal:
         except Exception:  # noqa: BLE001 - a settings fault must not break Ask
             return False
 
-    def write(self, job: str, rec: dict[str, Any]) -> None:
+    def write(self, job: str, rec: dict[str, Any]) -> bool:
+        """True when the record is on disk. False when it is not (or no journal is available)."""
         d = self._dir(create=True)
         if d is None or not self._valid(job):
-            return
+            return False
         tmp = d / f".{job}.tmp"
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump({"v": 1, "job": job, **rec}, fh, ensure_ascii=False)
             os.replace(tmp, d / f"{job}.json")
+            return True
         except OSError:
             self.failures += 1
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
                 pass
+            return False
 
     def read(self, job: str) -> Optional[dict[str, Any]]:
         """The record, ``{"corrupt": True}`` when unreadable, or None when absent."""
@@ -253,6 +256,13 @@ class AskJournal:
             return False
         except OSError:
             self.failures += 1
+            return False
+
+    def has_files(self) -> bool:
+        d = self._dir()
+        try:
+            return d is not None and any(f.suffix == ".json" or f.name.endswith(".tmp") for f in d.iterdir())
+        except OSError:
             return False
 
     def prune(self, ttl: float, keep: Callable[[str], bool] = lambda job: False) -> int:
@@ -314,6 +324,8 @@ class AskJobs:
         self._jobs: dict[str, dict[str, Any]] = {}
         self._journal = journal
         self._last_prune = float("-inf")
+        self._bg_every: Optional[float] = None
+        self._timer: Optional[threading.Timer] = None
 
     def get(self, job: str) -> Optional[dict[str, Any]]:
         with self._lock:
@@ -372,17 +384,28 @@ class AskJobs:
             self._jobs[job] = {"status": AskState.PENDING, "started": now, "card": card}
             if self._journal:
                 self._journal.write(job, {"state": "queued", "started": now, "card": card})
+                self._arm()
 
-    def mark_sent(self, job: str) -> None:
-        """Record, durably, that the model call is about to start (before it starts)."""
+    def mark_sent(self, job: str) -> bool:
+        """Record, durably, that the model call is about to start (before it starts).
+
+        False means the caller must not call the model: the "sent" marker could not be written
+        and the older "queued" marker could not be removed, so after a restart the job would
+        claim that nothing was sent and offer a safe resubmit although the model may have run."""
         with self._lock:
             st = self._jobs.get(job)
             if st is None or st["status"] is not AskState.PENDING:
-                return
+                return False
             st["sent"] = True
-            if self._journal:
-                self._journal.write(job, {"state": "sent", "started": st["started"], "card": st.get("card"),
-                                          "sent_at": self._clock()})
+            if not self._journal:
+                return True
+            if self._journal.write(job, {"state": "sent", "started": st["started"], "card": st.get("card"),
+                                         "sent_at": self._clock()}):
+                return True
+            # Could not record it. A stale "queued" marker would turn into a false not_submitted,
+            # so remove it: an unknown job is reported as unknown, never as safe to resend.
+            self._journal.delete(job)
+            return self._journal.read(job) is None
 
     def discard(self, job: str) -> bool:
         """Delete a job and its journal file at the caller's request, whatever its state."""
@@ -453,6 +476,39 @@ class AskJobs:
         if self._journal and now - self._last_prune >= self.PRUNE_EVERY_S:
             self._last_prune = now
             self._journal.prune(self.TTL_S, keep=lambda j: j in self._jobs)
+
+    def housekeeping(self) -> None:
+        """Expire jobs and prune the journal now, without waiting for another Ask."""
+        with self._lock:
+            self._last_prune = float("-inf")
+            self._expire()
+
+    def start_background(self, every_s: float = 60.0) -> None:
+        """Run housekeeping on a daemon timer while anything remains to expire.
+
+        A private answer saved for a restart must not outlive its retention because nobody
+        asked again. The timer re-arms only while jobs or journal files exist."""
+        with self._lock:
+            self._bg_every = every_s
+            self._arm()
+
+    def _arm(self) -> None:
+        every = getattr(self, "_bg_every", None)
+        if every is None or getattr(self, "_timer", None) is not None:
+            return
+        t = threading.Timer(every, self._tick)
+        t.daemon = True
+        self._timer = t
+        t.start()
+
+    def _tick(self) -> None:
+        try:
+            self.housekeeping()
+        finally:
+            with self._lock:
+                self._timer = None
+                if self._jobs or (self._journal and self._journal.has_files()):
+                    self._arm()
 
     def __len__(self) -> int:
         return len(self._jobs)

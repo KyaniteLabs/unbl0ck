@@ -189,6 +189,7 @@ def _checked_card_ref(id_: str, board: str, task_id: str) -> tuple[str, str]:
 @router.get("/queue")
 def queue():
     n = _needs()
+    _ASK_JOBS.housekeeping()   # saved Ask records expire even when nobody asks again
     q = n.build_queue()
     ctx = _loaded_ctx()
     if q.get("bluf_enabled"):
@@ -339,7 +340,8 @@ def card_ask(body: CardAsk):
     if not _ASK_SLOTS.acquire(blocking=False):
         raise HTTPException(status_code=429, detail="Ask is busy. Retry when an active answer finishes.", headers={"Retry-After": "15"})
     try:
-        _ASK_JOBS.create(job, card=body.id or None)
+        # The canonical card identity from the validated board/task pair, never the optional raw id.
+        _ASK_JOBS.create(job, card=f"kanban:{board}:{task_id}")
         _ASK_POOL.submit(_run_with_slot, _ASK_SLOTS, _run_ask, job, ctx, messages)
     except Exception as exc:
         _ASK_SLOTS.release()
@@ -368,12 +370,15 @@ def _ask_keep_replies() -> bool:
 
 
 _ASK_JOBS = jobs.AskJobs(journal=jobs.AskJournal(_ask_journal_dir, _ask_keep_replies))
+_ASK_JOBS.start_background()
 _ASK_SLOTS = threading.BoundedSemaphore(4)
 
 
 def _run_ask(job: str, ctx: Any, messages: list[dict[str, str]]) -> None:
     # Durable marker first: after a crash from here on the outcome is unknown, never "resend".
-    _ASK_JOBS.mark_sent(job)
+    if not _ASK_JOBS.mark_sent(job):
+        _ASK_JOBS.fail(job, "could not record the request, so it was not sent")
+        return
     try:
         result = ctx.llm.complete(
             messages,
