@@ -2635,7 +2635,8 @@ WAIT_LOST_LIMIT = 1000
 _WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
 # Faults pushed out of the full list: (home, id) -> what failed; clears are still retried.
 _WAIT_FAULTS_LOST: dict[tuple[str, str], str] = {}
-_WAIT_FAULTS_DROPPED: dict[str, tuple[int, float]] = {}
+# home -> [second, faults dropped in it], oldest first: each drop expires on its own after WAIT_MAX_AGE.
+_WAIT_FAULTS_DROPPED: dict[str, collections.deque[list[int]]] = {}
 # Hooks and polls in one process settle a prompt one at a time: a retry in flight must not
 # recreate a record that a clear has just removed.
 _WAIT_FAULT_LOCK = threading.RLock()
@@ -2680,7 +2681,7 @@ def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) ->
             while len(_WAIT_FAULTS_LOST) > WAIT_LOST_LIMIT:
                 h, r = next(iter(_WAIT_FAULTS_LOST))
                 del _WAIT_FAULTS_LOST[(h, r)]
-                _WAIT_FAULTS_DROPPED[h] = (_dropped(h) + 1, time.time())
+                _note_dropped(h)
                 _journal_fault(Path(h), r, None)
             _journal_fault(home, rid, what)
             raise
@@ -2688,11 +2689,27 @@ def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) ->
             _journal_fault(home, rid, None)
 
 
+def _note_dropped(home: str) -> None:
+    _dropped(home)  # expire old drops first
+    now = int(time.time())
+    drops = _WAIT_FAULTS_DROPPED.setdefault(home, collections.deque())
+    if drops and drops[-1][0] == now:
+        drops[-1][1] += 1
+    else:
+        drops.append([now, 1])  # at most one entry per second, so WAIT_MAX_AGE entries per home
+
+
 def _dropped(home: str) -> int:
-    """Faults *home* dropped past WAIT_LOST_LIMIT; a home whose latest drop is past WAIT_MAX_AGE is forgotten."""
-    for h in [h for h, (_, t) in _WAIT_FAULTS_DROPPED.items() if time.time() - t >= WAIT_MAX_AGE]:
-        del _WAIT_FAULTS_DROPPED[h]
-    return _WAIT_FAULTS_DROPPED.get(home, (0, 0.0))[0]
+    """Faults *home* dropped past WAIT_LOST_LIMIT in the last WAIT_MAX_AGE; older drops are forgotten
+    one by one, and a home with none left is removed."""
+    now = time.time()
+    for h in list(_WAIT_FAULTS_DROPPED):
+        drops = _WAIT_FAULTS_DROPPED[h]
+        while drops and now - drops[0][0] >= WAIT_MAX_AGE:
+            drops.popleft()
+        if not drops:
+            del _WAIT_FAULTS_DROPPED[h]
+    return sum(n for _, n in _WAIT_FAULTS_DROPPED.get(home, ()))
 
 
 def _apply_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
