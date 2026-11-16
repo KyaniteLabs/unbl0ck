@@ -35,6 +35,12 @@ class BlankTurns(unittest.TestCase):
             _add_blanks(home, "s0", [" " * (needs.CHAT_READ_BYTES + 10)])
             self.assertEqual([i["session_id"] for i in needs.chat_items(home)], ["s0"])
 
+    def test_a_long_message_with_a_blank_tail_is_still_the_latest_turn(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(needs, "_settings", settings()):
+            home = make_chats(Path(d), [("s0", "cli", "dm", "u", 1, ASK)])
+            _add_blanks(home, "s0", ["done." + " " * (needs.CHAT_READ_BYTES + 10)])
+            self.assertEqual(needs.chat_items(home), [])
+
 
 if __name__ == "__main__":
     unittest.main()
