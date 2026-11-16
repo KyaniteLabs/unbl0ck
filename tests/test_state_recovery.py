@@ -28,6 +28,9 @@ SECRET = "SECRET-card-title-9f3a"
 APPLIES = rec.fcntl is not None
 
 
+# The recovery tool opens the state folder by directory descriptor; where the platform has none
+# (Windows) it refuses every command by design (operator guide, #43).
+@unittest.skipUnless(rec._DIR_FD, "the recovery tool refuses on a platform without directory descriptors (#43)")
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
