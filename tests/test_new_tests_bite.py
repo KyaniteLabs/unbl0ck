@@ -47,6 +47,16 @@ class TheBiteCheck(unittest.TestCase):
                                          "tests/test_mod.py": "from mod import f\n\ndef test_f():\n    assert f() == 2\n"})
         self.assertEqual(self.check()[0], 0)
 
+    def test_a_test_that_fails_only_in_a_subtest_on_the_parent_bites(self):
+        """#73: pytest reports a test whose only failures are subtests as passed too, so a test that
+        bit through a subtest was reported as passing without its fix."""
+        test = ("import unittest\nfrom mod import f\n\n\nclass T(unittest.TestCase):\n"
+                "    def test_f(self):\n        for n in (1, 2):\n            with self.subTest(n=n):\n"
+                "                self.assertEqual(f(), 2)\n")
+        self.commit("fix: f returns 2", {"mod.py": "def f():\n    return 2\n", "tests/test_sub.py": test})
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
+
     def test_a_toothless_test_beside_a_collection_error_is_caught(self):
         """#81 review: a test importing a module the fix adds fails to collect on the parent, and that
         stopped the run before the toothless test ran, so the check passed."""
