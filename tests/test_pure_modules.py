@@ -16,7 +16,7 @@ ALLOWED_IMPORTS = {"__future__", "collections", "html", "html.parser", "json", "
 EXCEPTIONS = {"redact.py": {"os": {"os.path.expanduser"}}}
 # Builtins that reach outside the process or around this scan; named at all, not only called,
 # so ``reader = open`` is caught too.
-IO_NAMES = {"__builtins__", "open", "input", "exec", "eval", "__import__", "globals", "breakpoint"}
+IO_NAMES = {"__builtins__", "print", "open", "input", "exec", "eval", "__import__", "globals", "breakpoint"}
 # Attributes of an imported module that read or write a file, the process or the network
 # (json.load); json.loads and json.dumps work on strings and stay allowed.
 IO_ATTRS = {"open", "load", "dump", "read_text", "read_bytes", "write_text", "write_bytes", "urlopen", "system"}
@@ -50,6 +50,7 @@ def violations(source: str, name: str = "") -> list[str]:
             mod = "." * node.level + (node.module or "")
             if mod not in ALLOWED_IMPORTS:  # an exception module is used by its dotted name only
                 found.append(mod)
+            found += [f"from {mod} import {a.name}" for a in node.names if a.name in IO_ATTRS | IO_NAMES]
         elif isinstance(node, ast.Name) and node.id in IO_NAMES:
             found.append(f"{node.id} at line {node.lineno}")
         elif isinstance(node, ast.Name) and node.id in exceptions:
@@ -96,10 +97,18 @@ def patched_on_needs(sources: dict[str, str] | None = None) -> set[str]:
         tree = ast.parse(text, fname)
         aliases = _needs_aliases(tree) | {"needs"}
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not node.args:
+            if not isinstance(node, ast.Call):
                 continue
             func = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
-            first, rest = node.args[0], node.args[1:]
+            kw = {k.arg: k.value for k in node.keywords}
+            if func == "multiple" and node.args and isinstance(node.args[0], ast.Name) and node.args[0].id in aliases:
+                names |= {k for k in kw if k}
+                continue
+            # patch(target=...), patch.object(needs, attribute=...) and setattr's own keywords.
+            args = [*node.args, *(kw[k] for k in ("target", "attribute", "name") if k in kw)]
+            if not args:
+                continue
+            first, rest = args[0], args[1:]
             if func in ("setattr", "object") and rest and isinstance(rest[0], ast.Constant):
                 if isinstance(first, ast.Name) and first.id in aliases:
                     names.add(rest[0].value)
@@ -127,6 +136,9 @@ class PureModules(unittest.TestCase):
             "import os as o\no.system('x')\n",
             "import codecs\ncodecs.open('f')\n",
             "f = __builtins__['open']\n",
+            "print('debug')\n",
+            "from json import load\nload(x)\n",
+            "from json import load as l\n",
         ):
             with self.subTest(source=source):
                 self.assertNotEqual(violations(source, "redact.py"), [])
@@ -139,9 +151,11 @@ class PureModules(unittest.TestCase):
         sources = {
             "a.py": 'monkeypatch.setattr("needs._a", f)\npatch("pkg.needs._b", f)\n',
             "b.py": "import needs as n\npatch.object(n, '_c', f)\nm = n\nmonkeypatch.setattr(m, '_d', f)\n",
+            "d.py": 'import needs\npatch(target="needs._e", new=f)\npatch.object(needs, attribute="_f", new=f)\n'
+            'patch.multiple(needs, _g=f, _h=f)\n',
             "c.py": 'patch("otherneeds._x", f)\npatch.object(other, "_y", f)\n',
         }
-        self.assertEqual(patched_on_needs(sources), {"_a", "_b", "_c", "_d"})
+        self.assertEqual(patched_on_needs(sources), {"_a", "_b", "_c", "_d", "_e", "_f", "_g", "_h"})
 
     def test_the_pure_modules_are_shipped(self):
         shipped = {p.name for p in plugin_modules()}
