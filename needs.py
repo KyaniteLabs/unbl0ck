@@ -1954,7 +1954,27 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # sits at the end of a turn, so a longer message is read from its end.
 CHAT_READ_CHARS = 100_000
 CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_CHARS characters
-CHAT_BLANK_ROWS = 20  # newest space-only messages passed over to find the latest turn
+
+
+def _spaces_only(conn: sqlite3.Connection, rowid: Any, raw: bytes, length: int, budget: list[int]) -> bool:
+    """Is the stored message all spaces? *raw* is its tail; the rest is read backward from the end
+    only while the tail stays blank, each byte charged to the poll's *budget*. When the budget runs
+    out the message counts as not blank, so it is the latest turn and its ask is looked for there."""
+    if raw.strip(b" "):
+        return False
+    with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
+        end = length - len(raw)
+        while end > 0:
+            if budget[0] <= 0:
+                return False
+            size = min(end, 1 << 20)
+            blob.seek(end - size)
+            part = blob.read(size)
+            budget[0] -= len(part)
+            if part.strip(b" "):
+                return False
+            end -= size
+    return True
 
 
 def _text_digest(length: Any, text: str) -> str:
@@ -2248,7 +2268,7 @@ def chat_items(
                 "AND role IN ('user','assistant') AND typeof(content) IN ('text','blob') "
                 + ("AND COALESCE(display_kind,'') != 'hidden' " if "display_kind" in mcols else "")
                 + ("AND COALESCE(active,1)=1 " if "active" in mcols else "")
-                + "ORDER BY timestamp DESC, id DESC LIMIT ?"
+                + "ORDER BY timestamp DESC, id DESC"  # read row by row until a message is not blank
             )
             for sid, title, platform, chat_type, user_id, display_name in sessions:
                 platform = str(platform or "")
@@ -2265,9 +2285,9 @@ def chat_items(
                     cov["skipped_other_owner"] += 1
                     continue
                 try:
-                    for mid, rowid, role, ts in conn.execute(last_sql, (sid, CHAT_BLANK_ROWS)).fetchall():
+                    for mid, rowid, role, ts in conn.execute(last_sql, (sid,)):
                         raw, length = _read_text(conn, "messages", "content", rowid, CHAT_READ_BYTES, tail=True)
-                        if raw.strip(b" ") or length > len(raw):
+                        if not _spaces_only(conn, rowid, raw, length, hash_budget):
                             break  # the newest message that is not blank
                     else:
                         continue
