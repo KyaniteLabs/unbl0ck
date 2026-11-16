@@ -55,6 +55,13 @@ def added_tests(commit: str) -> list[str]:
     return ids
 
 
+def still_passing(out: str, ids: list[str]) -> list[str]:
+    """The ids pytest's ``-rA`` summary *out* reports passing. A test whose only failures are
+    subtests is reported PASSED as well: a failed subtest bites."""
+    return [i for i in ids if re.search(rf"^PASSED {re.escape(i)}\b", out, re.M)
+            and not re.search(rf"^SUBFAILED.* {re.escape(i)}\b", out, re.M)]
+
+
 def passing_on_parent(commit: str, ids: list[str]) -> list[str]:
     with tempfile.TemporaryDirectory() as tmp:
         wt = str(Path(tmp) / "wt")
@@ -74,9 +81,7 @@ def passing_on_parent(commit: str, ids: list[str]) -> list[str]:
                      *(i for i in ids if i.startswith(f"{path}::"))],
                     cwd=wt, capture_output=True, text=True,
                 ).stdout
-            # A test whose only failures are subtests is reported PASSED as well: a failed subtest bites.
-            return [i for i in ids if re.search(rf"^PASSED {re.escape(i)}\b", out, re.M)
-                    and not re.search(rf"^SUBFAILED.* {re.escape(i)}\b", out, re.M)]
+            return still_passing(out, ids)
         finally:
             git("worktree", "remove", "--force", wt)
 

@@ -1,5 +1,6 @@
 """The CI check that a fix's new tests fail without the fix, run on small throwaway repositories."""
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -12,6 +13,22 @@ SCRIPT = Path(__file__).resolve().parents[1] / ".github" / "scripts" / "new_test
 ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
 OLD_TESTS = "".join(f"def test_old_{i}():\n    assert {i} == {i}\n\n\n" for i in range(12))
+
+
+class TheSummaryParser(unittest.TestCase):
+    """#73 review: whether a run reports SUBFAILED depends on the installed pytest, so the parser is
+    also tested on fixed output."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("new_tests_bite", SCRIPT)
+        self.bite = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.bite)
+
+    def test_a_test_with_a_failed_subtest_is_not_passing(self):
+        out = ("SUBFAILED[n=1] tests/test_sub.py::T::test_f - AssertionError\n"
+               "PASSED tests/test_sub.py::T::test_f\nPASSED tests/test_sub.py::T::test_g\n")
+        ids = ["tests/test_sub.py::T::test_f", "tests/test_sub.py::T::test_g"]
+        self.assertEqual(self.bite.still_passing(out, ids), ["tests/test_sub.py::T::test_g"])
 
 
 class TheBiteCheck(unittest.TestCase):

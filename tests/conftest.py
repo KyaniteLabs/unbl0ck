@@ -14,14 +14,20 @@ def _stop_ask_timers():
     """After each test, stop the Ask cleanup timer of every loaded API module: a timer left armed
     can write into a later test's temporary directory while it is removed (#73)."""
     yield
+    tables = []
     for mod in list(sys.modules.values()):
         try:
-            timer = getattr(getattr(mod, "_ASK_JOBS", None), "_timer", None)
+            table = getattr(mod, "_ASK_JOBS", None)
         except Exception:  # noqa: BLE001 - a lazy module may raise anything on attribute access
             continue
-        if isinstance(timer, threading.Timer):
-            timer.cancel()
-            timer.join(5)
+        if table is not None and hasattr(table, "_bg_every"):
+            table._bg_every = None  # a callback already running must not arm another timer
+            tables.append(table)
+    for t in threading.enumerate():  # the armed timer, and a callback that cleared it before sweeping
+        if isinstance(t, threading.Timer) and any(getattr(t.function, "__self__", None) is x for x in tables):
+            t.cancel()
+            if t is not threading.current_thread():
+                t.join(5)
 
 
 def ask_gen(table, job):
