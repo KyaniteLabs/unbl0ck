@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import needs
+from _shipped import plugin_modules
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "desktop" / "src" / "plugin.src.js"
@@ -71,13 +72,9 @@ def test_u9_source_and_build_default_to_off():
 
 # --- U8
 ROLE_WORD = re.compile(r"\bCEO\b", re.IGNORECASE)
-SHIPPED = [
-    "needs.py",
-    "jobs.py",
-    "__init__.py",
+SHIPPED = [str(p.relative_to(ROOT)) for p in plugin_modules()] + [
     "plugin.yaml",
     "README.md",
-    "dashboard/plugin_api.py",
     "desktop/src/plugin.src.js",
     "desktop/plugin.js",
 ]

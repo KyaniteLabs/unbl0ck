@@ -10,6 +10,8 @@ and performs explicit human-selected actions; it does not run a separate service
 | `__init__.py` | Registration, local/messaging slash command, CLI, filing tool and prompt hooks |
 | `needs.py` | Settings, five source collectors, detection, versioned mutations, the Ask payload, persisted state and Pocket pack |
 | `redact.py` | Second-line secret redaction of text and of JSON inside text (pure; loaded by `needs.py`) |
+| `gates.py` | Gate-phrase grammar: when an approval or decision phrase is negated or glued into a longer token (pure; loaded by `needs.py`, which builds the patterns from settings) |
+| `mailtext.py` | Readable text from saved web pages and exported mail: an inert HTML reader that keeps only what a browser would show (pure; loaded by `needs.py`, which opens the file) |
 | `jobs.py` | Summary and Ask lifecycle tables (in memory), the Ask restart journal (one small file per job), locks, expiry and bounded result retention |
 | `dashboard/plugin_api.py` | Validated HTTP inputs, background execution, capacity admission and explicit HTTP failure contracts |
 | `desktop/src/plugin.src.js` | Desktop queue, local drafts, actions, recovery controls and host SDK integration |
@@ -88,7 +90,7 @@ turns the matching columns off in the payload and in behavior.
 
 Notes. `outside` covers agent-filed items and watched-folder files. Filed items live in one shared folder, so every profile reads them (the filing profile is recorded as provenance and scopes `dedupe_key`); that is what the `outside` row's yes means. Watched folders are not shared that way: each profile's process reads only the `outside_dirs` its own settings configure, so two profiles read different folders unless they configure the same ones. `kanban` is read across profiles because Hermes keeps one Kanban store shared by every profile; a blocked card is visible from all of them. Full-text search reads
 local text and never calls a model; it skips password prompts and returns ids, versions and
-counts only. Ask sends only the card fields named in `_ask_card_payload`, never event payloads,
+counts only. Ask sends only the card fields named in `ASK_CARD_VIEW` (pinned by `tests/test_ask_card_view.py`), never event payloads,
 attachments or linked cards. Summaries and Ask run the card text, comments and owner through the same
 redaction (secrets, home directory and workspace path); the operator's own typed Ask
 question is sent as typed. Password prompts and pairing codes are never summarized, asked
