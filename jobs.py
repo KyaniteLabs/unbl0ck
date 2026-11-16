@@ -63,6 +63,11 @@ except ImportError:  # pragma: no cover - not available off POSIX
     fcntl = None  # type: ignore[assignment]
 
 
+# Whether this host opens files relative to a directory descriptor (not on Windows). Read once,
+# at import, so a test or a wrapper that replaces os.open does not change the answer.
+_DIR_FD = os.open in os.supports_dir_fd
+
+
 class IllegalTransition(RuntimeError):
     """A job was asked to move between two states that are not connected."""
 
@@ -272,6 +277,11 @@ class AskJournal:
             if d is None:
                 return None, "none"
         d = Path(d)
+        if not _DIR_FD or not hasattr(os, "geteuid"):
+            # A host without directory fds or POSIX owners (Windows) cannot prove the journal is
+            # ours: say "unavailable" rather than fail with an AttributeError mid-read (#43).
+            self.failures += 1
+            return None, "unavailable"
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
         pfd = fd = None
         try:
