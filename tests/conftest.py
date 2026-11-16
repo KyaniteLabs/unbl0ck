@@ -2,7 +2,26 @@
 
 import contextlib
 import os
+import sys
+import threading
 from unittest.mock import patch
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _stop_ask_timers():
+    """After each test, stop the Ask cleanup timer of every loaded API module: a timer left armed
+    can write into a later test's temporary directory while it is removed (#73)."""
+    yield
+    for mod in list(sys.modules.values()):
+        try:
+            timer = getattr(getattr(mod, "_ASK_JOBS", None), "_timer", None)
+        except Exception:  # noqa: BLE001 - a lazy module may raise anything on attribute access
+            continue
+        if isinstance(timer, threading.Timer):
+            timer.cancel()
+            timer.join(5)
 
 
 def ask_gen(table, job):
