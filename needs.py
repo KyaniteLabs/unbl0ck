@@ -1484,15 +1484,6 @@ def _same_author(a: Any, b: Any) -> bool:
 
 PLACEMENT_WORK = 100_000  # rows one placement check may read before it reports incomplete coverage
 
-# Kanban writes a few comments with no ``commented`` event of their own (each is logged by another
-# event kind: specified, decomposed, reconciled, an ancestor reopening). They are never an answer and
-# they never take part in pairing comments with events.
-UNLOGGED_COMMENT = re.compile(  # matched at the start: a long note is read cut
-    r"Specified \u2014 updated |Decomposed into |reconciliation: card was 'running' with no valid claim"
-    r"|Invalidated: ancestor "
-)
-
-
 class PlacementIncomplete(RuntimeError):
     """A card has more comments or events than one placement check reads."""
 
@@ -1506,14 +1497,18 @@ def _budgeted(rows: Iterable[Any]) -> Iterable[Any]:
         yield row
 
 
-def _author_events_after(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> Iterable[int]:
+def _author_events_after(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> Iterable[Any]:
     """The logged ``len`` of each ``commented`` event of *author* after the block (every one when
-    there is none), oldest first, streamed under the placement work budget."""
+    there is none), oldest first, streamed under the placement work budget. A payload is read as
+    its first 4096 bytes, never SQLite's whole value."""
     try:
-        rows: Iterable[Any] = conn.execute(
-            "SELECT substr(payload, 1, 4096) FROM task_events WHERE task_id = ? AND kind = 'commented' "
-            "AND id > ? ORDER BY id", (task_id, block_id or 0))
-    except sqlite3.Error:  # schema drift: the public API
+        rows: Iterable[Any] = (
+            (_read_text(conn, "task_events", "payload", r, 4096)[0],)
+            for (r,) in conn.execute(
+                "SELECT rowid FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ? "
+                "ORDER BY id", (task_id, block_id or 0))
+        )
+    except Exception:  # noqa: BLE001 - schema drift: the public API
         rows = ((e.payload,) for e in kanban_db.list_events(conn, task_id)
                 if e.kind == "commented" and e.id > (block_id or 0))
     for (raw,) in _budgeted(rows):
@@ -1522,45 +1517,66 @@ def _author_events_after(conn: Any, kanban_db: Any, task_id: str, author: str, b
             yield payload.get("len")
 
 
-def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> bool:
-    """Has *author* commented since the block began: one of their ``commented`` events is later
-    than the block's. The one test for "answered", used by the queue and by answer_card; a comment
-    no event records never answers, so the card stays in front of you. Raises PlacementIncomplete
-    past the work budget."""
-    return next(iter(_author_events_after(conn, kanban_db, task_id, author, block_id)), None) is not None
-
-
-def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
-    """Has *author* posted *text* since the block began? Kanban writes each comment with its
-    ``commented`` event in one transaction, so with k of the author's events after the block, the
-    author's k newest logged comments are exactly their comments since the block. Comments Kanban
-    logs another way are skipped. Kanban stores the body stripped. Raises PlacementIncomplete past
-    the work budget."""
-    k = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, block_id))
-    if not k:
-        return False
-    wanted = {text, text.strip()}
-    room = 4 * max(len(text), 512) + 1  # tells a longer body and an unlogged shape apart
+def _author_comments_newest(conn: Any, kanban_db: Any, task_id: str, author: str, room: int) -> Iterable[str]:
+    """The bodies of *author*'s comments on a card, newest first, each read as at most *room*
+    bytes, streamed under the placement work budget."""
     try:
         rows: Iterable[Any] = (
             (a, lambda r=r: _read_text(conn, "task_comments", "body", r, room)[0])
             for r, a in conn.execute(
                 "SELECT rowid, author FROM task_comments WHERE task_id = ? ORDER BY id DESC", (task_id,))
         )
-    except sqlite3.Error:  # schema drift: the public API
+    except Exception:  # noqa: BLE001 - schema drift: the public API
         listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: -(getattr(c, "id", 0) or 0))
         rows = ((c.author, lambda c=c: str(c.body).encode("utf-8", "replace")) for c in listed)
-    for author_, body in _budgeted(rows):
-        if not _same_author(author_, author):
-            continue
-        shown = bytes(body() or b"").decode("utf-8", "replace")
-        if UNLOGGED_COMMENT.match(shown):
-            continue
-        if shown in wanted:
-            return True
-        k -= 1
+    for a, body in _budgeted(rows):
+        if _same_author(a, author):
+            yield bytes(body() or b"").decode("utf-8", "replace")
+
+
+def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> bool:
+    """Has *author* commented since the block began: one of their ``commented`` events is later
+    than the block's. The one test for "answered", used by the queue and by answer_card; a comment
+    no event records never answers, so the card stays in front of you. Raises PlacementIncomplete
+    past the work budget."""
+    for _ in _author_events_after(conn, kanban_db, task_id, author, block_id):
+        return True  # an event logs no length when Kanban's payload has none: its presence answers
+    return False
+
+
+def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
+    """Has *author* posted *text* since the block began? Kanban writes each comment with its
+    ``commented`` event in one transaction and stores the body stripped. When every one of the
+    author's comments has its event, their k newest comments are exactly the k their events after
+    the block logged. Kanban also writes a few comments with no event (a triage card's "Specified"
+    note); then each event's logged length decides: the author's k newest comments of that length
+    are the ones their k events of that length after the block logged. Raises PlacementIncomplete
+    past the work budget."""
+    after = [0, 0]  # the author's events after the block, and those of len(text)
+    for n in _author_events_after(conn, kanban_db, task_id, author, block_id):
+        after[0] += 1
+        after[1] += n == len(text)
+    if not after[0]:
+        return False
+    logged = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, None))
+    room = 4 * len(text) + 1  # tells a longer body
+    if logged == sum(1 for _ in _author_comments_newest(conn, kanban_db, task_id, author, 1)):
+        wanted, k = {text, text.strip()}, after[0]
+        for body in _author_comments_newest(conn, kanban_db, task_id, author, room):
+            if body in wanted:
+                return True
+            k -= 1
+            if not k:
+                return False
+        return False
+    k = after[1]
+    for body in _author_comments_newest(conn, kanban_db, task_id, author, room):
         if not k:
             return False
+        if len(body) == len(text):
+            if body == text:
+                return True
+            k -= 1
     return False
 
 

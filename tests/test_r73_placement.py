@@ -75,6 +75,22 @@ class AnAnswerIsPairedWithItsEvent(KanbanAnswerCase):
             with self.assertRaises(needs.PlacementIncomplete):
                 needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved")
 
+    def test_a_logged_comment_shaped_like_a_kanban_note_is_still_paired(self):
+        """#73 review: an operator comment that starts like a note Kanban writes unlogged is logged,
+        and an answer from before the block is not this block's answer."""
+        task = self.card()
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "Approved")  # before the current block
+            kanban_db.unblock_task(c, task)
+        self.reblock(task)
+        block = self.block(task)
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "Decomposed into two options; choose B")
+        with self.conn() as c:
+            self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved"))
+            self.assertTrue(needs._answered_with(
+                c, kanban_db, task, "operator", block.id, "Decomposed into two options; choose B"))
+
 
 if __name__ == "__main__":
     unittest.main()
