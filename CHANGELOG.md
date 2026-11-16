@@ -1,7 +1,23 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 (2026-11-15)
 
+Known gaps: the Windows paths (state lock, Ask journal, recovery tool) have not run on a real Windows host (#43, #35, #48); real Outlook, Gmail and Plaud export fixtures, the provider wave and live accounts, a packaged Desktop run and an independent Security verdict are still outside this repository (#38, #39, #42, #44).
+
+- **Kanban answers stay placed however many comments follow (#73).** An answer is placed by its own `commented` event, so it is no longer lost behind a 500-row window or confused with a comment from before the block, including when Kanban adds a note with no event. A card past 100,000 rows of history stays in the queue and the poll reports incomplete coverage.
+- **A chat's latest turn is found past any run of blank messages (#73).** The lookback past blank or space-only messages has no row cap; every blank message read is charged to the poll's read budget, so a long reply with a blank tail still counts as the latest turn, and the poll says when the budget ran out.
+- **Chat versions charge every hashed byte and a targeted read accepts a cut version (#73).** Past the hash budget the cut version is used, and reading one card's text accepts either version.
+- **A cut chat message is redacted with the text just before the cut (#73).** Up to 16 KiB before the cut is redacted with it, so a label such as `password:` before the cut still redacts the value after it. Text from before the cut is never shown.
+- **Each dropped live-prompt fault expires on its own (#73).** The newest fault no longer keeps older ones alive.
+- **An unreadable state store names the tool that repairs it (#48).** A damaged `hidden.json`, `pending-release.json` or `bluf.json` now says to run `python3 recovery.py diagnose`.
+- **Full-text search names the sources it never looks in (#45).** The result lists `sources_not_searched` (Kanban and pairing), and the Desktop summary says so, so a miss there does not read as "not found".
+- **Desktop shows what can leave this machine (#42).** A panel under the queue lists, per source, whether its text may go to the model provider for TL;DR summaries or Ask, from the live disclosure matrix.
+- **The Ask journal reports "unavailable" on a host without POSIX owners (#43).** On Windows it raised mid-read; it now counts a fault and says unavailable.
+- **Supported hosts, install, upgrade and rollback are documented (#44).** The operator guide has a host table and the steps, including preserving state before a change and checking it after.
+- **The exported-mail docs say the tests use synthetic messages (#38).** They no longer claim captured Outlook, Gmail or Thunderbird exports are tested.
+- **Keys that redact to the same text no longer drop a value (#79).** A colliding key gets a `#` suffix, so the model sees both values.
+- **`needs.py` is split into `redact.py`, `gates.py` and `mailtext.py`, and the Ask card view is one declared table (#71).** Behaviour is unchanged; a differential run over 4,000 generated cards matched the old payload key for key.
+- **CI lints with ruff, and the tests gained Hypothesis state machines, a features map and a shared redaction check (#71).** `docs/FEATURES.md` maps each behaviour to the tests that pin it; a test keeps it current. The bite check also counts a test that fails only in a subtest.
 - **CI type-checks the shipped code (#71).** A `typecheck` job runs mypy 1.18.2 and fails on any error not in `.github/mypy-baseline.txt`. The baseline holds the 69 errors present when the job was added; each was read and is a value checked elsewhere that mypy cannot see, not a defect.
 - **CI checks that a fix's new tests need the fix (#71).** On a pull request, each commit whose subject starts with `fix` has its newly added tests run against the parent commit's code; a test that passes there guards nothing, and the job fails. `.github/scripts/new_tests_bite.py` runs the same check locally.
 - **Every state-folder listing reads at most 1,000 entries and says when it stops (#70).** Live prompts, pairing requests and profile folders used an unbounded listing, so a folder full of files made each poll read every record. They now share the bounded listing the filed outside records already used, and a cut listing adds a `listing_cut` notice so the queue does not claim to be complete.
