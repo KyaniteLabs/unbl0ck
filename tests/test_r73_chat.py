@@ -41,6 +41,29 @@ class BlankTurns(unittest.TestCase):
             _add_blanks(home, "s0", ["done." + " " * (needs.CHAT_READ_BYTES + 10)])
             self.assertEqual(needs.chat_items(home), [])
 
+    def test_the_blank_lookback_charges_every_read_and_says_when_it_stopped(self):
+        """#73 review: each blank message's first read counts against the poll's byte budget."""
+        budget = 10_000
+        read = [0]
+        real = needs._read_text
+
+        def counting(conn, table, *args, **kwargs):
+            raw, length = real(conn, table, *args, **kwargs)
+            if table == "messages":
+                read[0] += len(raw)
+            return raw, length
+
+        with tempfile.TemporaryDirectory() as d, patch.object(needs, "_settings", settings()), patch.object(
+            needs, "CHAT_HASH_BYTES", budget
+        ), patch.object(needs, "_read_text", counting):
+            home = make_chats(Path(d), [("s0", "cli", "dm", "u", 1, ASK)])
+            _add_blanks(home, "s0", [" " * 1000] * 50)
+            cov, errors = {}, []
+            needs.chat_items(home, coverage=cov, errors=errors)
+            self.assertLessEqual(read[0], budget + 1000)
+            self.assertEqual(cov.get("blank_lookback_cut"), 1)
+            self.assertTrue(errors)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1969,17 +1969,19 @@ CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_
 CHAT_LEAD_CHARS = 16_384
 
 
-def _spaces_only(conn: sqlite3.Connection, rowid: Any, raw: bytes, length: int, budget: list[int]) -> bool:
-    """Is the stored message all spaces? *raw* is its tail; the rest is read backward from the end
-    only while the tail stays blank, each byte charged to the poll's *budget*. When the budget runs
-    out the message counts as not blank, so it is the latest turn and its ask is looked for there."""
+def _spaces_only(conn: sqlite3.Connection, rowid: Any, raw: bytes, length: int, budget: list[int]) -> bool | None:
+    """Is the stored message all spaces? *raw* is its tail, already read; it and the rest, read
+    backward from the end only while it stays blank, are charged to the poll's *budget*. None when
+    the budget ran out first: the message then counts as not blank, so it is the latest turn and its
+    ask is looked for there, and the caller reports the lookback as cut."""
     if raw.strip(b" "):
         return False
+    budget[0] -= len(raw)
     with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
         end = length - len(raw)
         while end > 0:
             if budget[0] <= 0:
-                return False
+                return None
             size = min(end, 1 << 20)
             blob.seek(end - size)
             part = blob.read(size)
@@ -1987,7 +1989,7 @@ def _spaces_only(conn: sqlite3.Connection, rowid: Any, raw: bytes, length: int, 
             if part.strip(b" "):
                 return False
             end -= size
-    return True
+    return True if budget[0] > 0 else None
 
 
 def _text_digest(length: Any, text: str) -> str:
@@ -2333,7 +2335,15 @@ def chat_items(
                 try:
                     for mid, rowid, role, ts in conn.execute(last_sql, (sid,)):
                         raw, length = _read_text(conn, "messages", "content", rowid, CHAT_READ_BYTES, tail=True)
-                        if not _spaces_only(conn, rowid, raw, length, hash_budget):
+                        blank = _spaces_only(conn, rowid, raw, length, hash_budget)
+                        if blank is None:
+                            cov["blank_lookback_cut"] = cov.get("blank_lookback_cut", 0) + 1
+                            if errors is not None and cov["blank_lookback_cut"] == 1:
+                                errors.append(
+                                    "chat: blank messages used up this poll's read budget; a chat's "
+                                    "latest turn may be a blank message"
+                                )
+                        if not blank:
                             break  # the newest message that is not blank
                     else:
                         continue
