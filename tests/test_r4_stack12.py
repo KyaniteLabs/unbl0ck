@@ -218,6 +218,12 @@ class SearchFlagIsWhatSearchDoes(HomeCase):
         # Not only "no match": the readers of the sources that say no are never consulted.
         self.assertEqual(set(result["searched"]), {"outside", "chat", "prompt"})
 
+    def test_the_result_names_the_sources_it_never_searches(self):
+        """#45: a miss on a Kanban or pairing card is not "not found": the result names those sources."""
+        self.populate()
+        result = needs.search_text(NEEDLE)
+        self.assertEqual(result.get("sources_not_searched"), ["kanban", "pairing"])
+
     def test_flipping_one_search_flag_makes_the_comparison_fail(self):
         """The test above is not a constant: a flag that disagrees with the search breaks it."""
         self.populate()

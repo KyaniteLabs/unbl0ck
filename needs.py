@@ -3194,6 +3194,9 @@ def search_text(query: Any) -> dict[str, Any]:
         "matches": matches,
         "searched": searched,
         "not_searched": not_searched,
+        # Sources whose cards are never full-text searched, by design (issue #45): the result says
+        # so rather than letting a miss there read as "not found".
+        "sources_not_searched": sorted(s for s, row in SURFACES.items() if not row["search"]),
         "items_cut": cut,
         "skipped_private": private,
         "errors": errors,

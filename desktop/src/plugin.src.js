@@ -1746,6 +1746,7 @@ function Page({ ctx, refresh, scope = '' }) {
     const parts = [`full text searched ${Object.entries(h.searched || {}).map(([s, n]) => `${n} ${s}`).join(', ') || 'nothing'}`]
     const miss = Object.entries(h.not_searched || {}).map(([s, n]) => `${n} ${s} not searched (limit ${h.limits.items_per_source} per source)`)
     if (miss.length) parts.push(miss.join(', '))
+    if ((h.sources_not_searched || []).length) parts.push(`${h.sources_not_searched.join(' and ')} cards are not full-text searched`)
     if (h.chat_sessions_unread) parts.push(`${h.chat_sessions_unread} older chat session(s) not read (scan limit)`)
     if (h.items_cut) parts.push(`${h.items_cut} long item(s) searched only to ${h.limits.chars_per_item} characters`)
     if (h.skipped_private) parts.push(`${h.skipped_private} password prompt(s) never searched`)
