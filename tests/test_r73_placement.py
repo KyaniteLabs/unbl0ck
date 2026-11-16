@@ -1,6 +1,8 @@
 """#73: an answer is placed by pairing each comment with its own event, not by length or a row cap."""
 
+import time
 import unittest
+from unittest.mock import patch
 
 from test_r4_stack01d_kanban import HERMES_ERROR, KanbanAnswerCase, kanban_db, needs
 
@@ -16,7 +18,7 @@ class AnAnswerIsPairedWithItsEvent(KanbanAnswerCase):
         block = self.block(task)
         with self.conn() as c:
             kanban_db.add_comment(c, task, "operator", "Approved")
-            for i in range(needs.PLACEMENT_ROWS + 1):
+            for i in range(501):
                 kanban_db.add_comment(c, task, "worker", f"progress {i}")
         with self.conn() as c:
             self.assertTrue(needs._answered_since(c, kanban_db, task, "operator", block.id))
@@ -42,6 +44,36 @@ class AnAnswerIsPairedWithItsEvent(KanbanAnswerCase):
         with self.conn() as c:
             self.assertTrue(needs._answered_with(c, kanban_db, task, "operator", block.id, "Nop"))
             self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Yes"))
+
+    def test_an_unlogged_triage_note_does_not_unplace_the_answer(self):
+        """#73 review: Kanban writes a triage card's "Specified" note with no ``commented`` event."""
+        task = self.card()
+        block = self.block(task)
+        with self.conn() as c:
+            kanban_db._insert_comment(
+                c, task, "operator", "Specified \u2014 updated title and promoted to todo.", int(time.time()))
+            c.commit()
+            kanban_db.add_comment(c, task, "operator", "Approved")
+            for i in range(501):
+                kanban_db.add_comment(c, task, "worker", f"progress {i}")
+        with self.conn() as c:
+            self.assertTrue(needs._answered_since(c, kanban_db, task, "operator", block.id))
+            self.assertTrue(needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved"))
+            self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Rejected"))
+
+    def test_a_card_past_the_work_budget_reports_incomplete_coverage(self):
+        """#73 review: a placement check reads at most PLACEMENT_WORK rows and says when it stopped."""
+        task = self.card()
+        block = self.block(task)
+        with self.conn() as c:
+            for i in range(5):
+                kanban_db.add_comment(c, task, "worker", f"progress {i}")
+            kanban_db.add_comment(c, task, "operator", "Approved")
+        with self.conn() as c, patch.object(needs, "PLACEMENT_WORK", 3):
+            with self.assertRaises(needs.PlacementIncomplete):
+                needs._answered_since(c, kanban_db, task, "operator", block.id)
+            with self.assertRaises(needs.PlacementIncomplete):
+                needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved")
 
 
 if __name__ == "__main__":
