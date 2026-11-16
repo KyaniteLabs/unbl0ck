@@ -40,6 +40,12 @@ class Clock:
         return self.t
 
 
+# The Ask journal needs directory descriptors and POSIX owners; elsewhere (Windows) it reports
+# "unavailable" by design, which tests/test_journal_non_posix.py pins (#43).
+POSIX_JOURNAL = jobs._DIR_FD and hasattr(os, "geteuid")
+
+
+@unittest.skipUnless(POSIX_JOURNAL, "the Ask journal is POSIX-only; Windows reports it unavailable (#43)")
 class RecoveryBase(unittest.TestCase):
     keep = False
 
@@ -605,6 +611,7 @@ class Housekeeping(RecoveryBase):
             t.cancel()
 
 
+@unittest.skipUnless(POSIX_JOURNAL, "the Ask journal is POSIX-only; Windows reports it unavailable (#43)")
 class ProfileDirectory(unittest.TestCase):
     def test_each_profile_gets_its_own_journal_directory(self):
         from unittest.mock import patch

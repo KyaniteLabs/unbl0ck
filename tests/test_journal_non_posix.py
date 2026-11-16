@@ -16,12 +16,14 @@ class NonPosixHost(unittest.TestCase):
         self.journal = jobs.AskJournal(lambda: Path(self.tmp.name) / "ask")
 
     def test_no_posix_owner_is_unavailable_not_a_crash(self):
-        real = os.geteuid
-        del os.geteuid
+        real = getattr(os, "geteuid", None)  # Windows has no geteuid to remove
+        if real is not None:
+            del os.geteuid
         try:
             fd, status = self.journal._acquire(True, None)
         finally:
-            os.geteuid = real
+            if real is not None:
+                os.geteuid = real
         self.assertEqual((fd, status), (None, "unavailable"))
         self.assertEqual(self.journal.failures, 1)
 

@@ -132,11 +132,18 @@ A row that was run fills the revision cell as `source <commit> / Hermes <version
 | Windows cross-process state lock | not run | not recorded | not recorded | not run |
 | Independent Security acceptance for the exact head | not run | not recorded | not recorded | not run |
 
+The `platform-state` CI job now runs `tests/test_state_lock_platforms.py`,
+`tests/test_r4_stack16.py`, `tests/test_ask_job_recovery.py`,
+`tests/test_journal_non_posix.py` and `tests/test_state_recovery.py` on
+`windows-latest` and `macos-latest` with Python 3.14. It installs pytest and
+hypothesis without Hermes; the Ask API tests retain their existing skip when
+FastAPI is absent. Adding this job does not record a Windows or macOS result.
+
 ## Acceptance still requiring live evidence
 
 The rendered harness exercises host SDK contracts, not a complete packaged Electron
 application. Live external chat providers, production mail applications, real model
-providers, Windows cross-process concurrency (the lock is only simulated), and every Hermes version are not covered
+providers, Windows/macOS platform behavior, and every Hermes version are not covered
 by these results. Use the actual supported host for release acceptance.
 
 The Security bridge is built and locally tested but not activated. At this observation
