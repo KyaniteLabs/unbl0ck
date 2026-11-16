@@ -2075,8 +2075,9 @@ def _open_chat_db(db: Path) -> sqlite3.Connection:
 def _redact_with_lead(conn: sqlite3.Connection, rowid: Any, length: int, raw: bytes, shown: str) -> str:
     """The redacted read end of a cut message, redacted together with up to CHAT_LEAD_CHARS characters
     before it: a value just past the cut whose label lies before it is then redacted. *shown* is the
-    read end redacted alone; the result is the same length from the end of the joined redaction, so
-    it shows no more of the message than *shown* did, give or take what redaction shortened."""
+    read end redacted alone. The result is the end of *shown* that the joined redaction agrees with:
+    never more of the message than *shown*, never any text from before the cut (a redaction that
+    shortens the joined text cannot pull the lead in), and nothing the joined redaction hid."""
     room = (CHAT_READ_CHARS + CHAT_LEAD_CHARS) * 4
     whole = length <= len(raw)
     if not whole:
@@ -2086,7 +2087,8 @@ def _redact_with_lead(conn: sqlite3.Connection, rowid: Any, length: int, raw: by
     if not whole or len(text) > CHAT_READ_CHARS + CHAT_LEAD_CHARS:
         text = _drop_cut(text[-(CHAT_READ_CHARS + CHAT_LEAD_CHARS):], True)
     joined = _ask_redact(text.replace("\x00", " "))
-    return joined[max(0, len(joined) - len(shown)):]
+    agreed = len(os.path.commonprefix([joined[::-1], shown[::-1]]))
+    return shown[len(shown) - agreed:]
 
 
 def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:

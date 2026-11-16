@@ -30,6 +30,17 @@ class CutLabel(unittest.TestCase):
                 self.assertNotIn(SECRET, item["ask"] + item["text"])
                 self.assertIn("Should I open the PR now?", item["ask"])
 
+    def test_text_before_the_cut_never_shows_when_redaction_shortens_the_read_end(self):
+        """#73 review: a quoted value that starts before the cut and runs past it redacts to a short
+        placeholder; the read end must not then be refilled with text from before the cut."""
+        before = "PRIVATE_NOTE\npassword=\""
+        message = "x " * (needs.CHAT_READ_BYTES // 2) + before + "a " * 50010 + "\"\n" + ASK
+        with tempfile.TemporaryDirectory() as d, patch.object(needs, "_settings", settings()):
+            home = make_chats(Path(d), [("s0", "cli", "dm", "u", 1, message)])
+            (item,) = needs.chat_items(home, full=True)
+            self.assertNotIn("PRIVATE_NOTE", item["ask"] + item["text"])
+            self.assertIn("Should I open the PR now?", item["ask"])
+
 
 if __name__ == "__main__":
     unittest.main()
