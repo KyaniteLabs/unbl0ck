@@ -14,3 +14,10 @@ class RecoveryHint(HomeCase):
                 self.assertIn("recovery.py diagnose", errors[0])
                 with self.assertRaisesRegex(RuntimeError, "recovery.py diagnose"):
                     needs._read_json(p, strict=True)
+
+    def test_another_unreadable_record_does_not(self):
+        p = needs.data_dir(self.home) / "other.json"
+        p.write_text("{damaged")
+        errors: list[str] = []
+        needs._read_json(p, errors=errors)
+        self.assertNotIn("recovery.py", errors[0])
