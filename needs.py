@@ -29,6 +29,7 @@ from __future__ import annotations
 import collections
 import errno
 import hashlib
+import itertools
 import math
 import json
 import logging
@@ -2018,13 +2019,27 @@ def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, ov
     and the end read here (an edit between them is not seen); every hashed byte is charged."""
     if not over:
         return f"{mid}:{_text_digest(length, text)}"
-    digest = hashlib.sha256(f"{length}\0".encode())
+    if length > budget[0]:
+        return _chat_cut_version(conn, mid, length, text, budget)
+    digest = hashlib.sha256()
     rowid = conn.execute("SELECT rowid FROM messages WHERE id=?", (mid,)).fetchone()[0]
     with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
-        blocks = iter(lambda: blob.read(1 << 20), b"")
-        for part in blocks if length <= budget[0] else (blob.read(1 << 16), text.encode("utf-8", "replace")):
+        for part in itertools.chain([f"{length}\0".encode()], iter(lambda: blob.read(1 << 20), b"")):
             digest.update(part)
             budget[0] -= len(part)
+    return f"{mid}:{digest.hexdigest()[:12]}"
+
+
+def _chat_cut_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, budget: list[int]) -> str:
+    """The version a cut message gets once the poll's hash budget has run out: its length, first
+    64 KiB and the end read here. Charged to *budget* like a whole hash."""
+    digest = hashlib.sha256()
+    rowid = conn.execute("SELECT rowid FROM messages WHERE id=?", (mid,)).fetchone()[0]
+    with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
+        start = blob.read(1 << 16)
+    for part in (f"{length}\0".encode(), start, text.encode("utf-8", "replace")):
+        digest.update(part)
+        budget[0] -= len(part)
     return f"{mid}:{digest.hexdigest()[:12]}"
 
 
@@ -2310,6 +2325,9 @@ def chat_items(
                     cov["skipped_group_unnamed"] += 1
                     continue
                 version = _chat_version(conn, mid, length, retained, over, hash_budget)
+                # A queue build that ran past its hash budget gave this cut message its short
+                # version; one targeted read has a fresh budget, so it accepts either.
+                cut_version = _chat_cut_version(conn, mid, length, retained, [0]) if only and over else None
                 if visible is not None and not visible(f"chat:{profile}:{sid}", version):
                     continue  # dismissed at this version: it must not use up a full-text budget
                 bot_chat = title in CHAT_TITLES
@@ -2327,6 +2345,7 @@ def chat_items(
                         # The message row id and a digest of the text: Hermes can rewrite a
                         # message in place, and the row id alone would not change.
                         "version": version,
+                        **({"cut_version": cut_version} if cut_version else {}),
                         "source": "chat",
                         "profile": profile,
                         "session_id": sid,
@@ -2932,7 +2951,7 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
         raise LookupError(f"{source} item is no longer available")
     if item.get("kind") == "sudo":
         raise PermissionError("password prompts are never expanded")
-    if item.get("version") != version:
+    if version not in (item.get("version"), item.get("cut_version")) or not version:
         raise StaleAnswer("item changed; refresh the queue")
     return {
         "id": item_id,
