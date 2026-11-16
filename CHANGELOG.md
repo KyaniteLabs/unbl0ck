@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 (2026-11-15)
+## 0.6.1 (2026-11-15)
 
 Known gaps: the Windows paths (state lock, Ask journal, recovery tool) have not run on a real Windows host (#43, #35, #48); real Outlook, Gmail and Plaud export fixtures, the provider wave and live accounts, a packaged Desktop run and an independent Security verdict are still outside this repository (#38, #39, #42, #44).
 
