@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
+from _shipped import plugin_modules  # noqa: E402
 from test_needs import needs  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,8 +29,7 @@ HOST_ROOTS = ("hermes_cli", "hermes_constants", "gateway")
 
 def source_files():
     """Every shipped Python file that can reach into Hermes (tests are not shipped)."""
-    files = [ROOT / n for n in ("needs.py", "jobs.py", "recovery.py", "adapter_contract.py", "__init__.py")]
-    files += [ROOT / "dashboard" / "plugin_api.py"]
+    files = plugin_modules()
     files += sorted((ROOT / "scripts").glob("*.py"))
     return [f for f in files if f.exists() and f.name != "host_compat.py"]
 
