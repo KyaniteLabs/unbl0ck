@@ -4893,19 +4893,45 @@ def _fit(text: str, room: int) -> str:
     return text[: room - len(_ASK_CUT)] + _ASK_CUT if room > len(_ASK_CUT) else text[:room]
 
 
+# The card view Ask sends (#71): every card field that may reach the model, in the order the budget
+# is spent (the decision first, the description last). A field not named here never reaches the
+# model: event payloads, attachments, linked cards, the workspace path and anything Hermes adds
+# later. Each row is (key, shape, path, fields): "field" is one value at *path*, "part" a dict of
+# the named *fields* of the dict at *path*, "rows" the named *fields* of each row of the list at *path*.
+ASK_CARD_VIEW: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("id", "field", ("id",), ()),
+    ("title", "field", ("title",), ()),
+    ("block", "part", ("block",), ("reason", "kind", "recurrences", "limit", "since")),
+    ("status", "field", ("status",), ()),
+    ("priority", "field", ("priority",), ()),
+    ("assignee", "field", ("assignee",), ()),
+    ("created_by", "field", ("created_by",), ()),
+    ("consecutive_failures", "field", ("consecutive_failures",), ()),
+    ("comments", "rows", ("comments",), ("author", "body", "created_at")),
+    ("last_run", "part", ("last_run",), ("status", "outcome", "summary", "error", "ended_at")),
+    ("events", "rows", ("events",), ("kind", "created_at")),
+    ("branch", "field", ("workspace", "branch"), ()),
+    ("pr", "field", ("pr", "reference"), ()),
+    ("omitted", "part", ("omitted",), ("events", "comments", "attachments")),
+    ("result", "field", ("result",), ()),
+    ("last_failure_error", "field", ("last_failure_error",), ()),
+    ("body", "field", ("body",), ()),
+)
+
+
 def _ask_card_payload(card: Any, budget: int) -> dict[str, Any]:
-    """The card fields Ask sends, each named here: raw event payloads, attachments, the graph and
-    the workspace path never reach the model (#71). Text has the workspace path replaced, is
-    redacted whole and then cut to what is left of *budget*, spent in the order written: the
-    decision first, the description last, newest comments and events before older ones."""
+    """The card fields named in ``ASK_CARD_VIEW``, and nothing else. Text has the workspace path
+    replaced, is redacted whole and then cut to what is left of *budget*, spent in the table's
+    order, newest comments and events before older ones."""
     card = card if isinstance(card, dict) else {}
-
-    def part(name: str) -> dict[str, Any]:
-        value = card.get(name)
-        return value if isinstance(value, dict) else {}
-
     scrub = _ask_workspace_path(card)
     left = [budget]
+
+    def at(path: tuple[str, ...]) -> Any:
+        value: Any = card
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
+        return value
 
     def text(value: Any) -> Any:
         if value is None or isinstance(value, (bool, int, float)):
@@ -4921,23 +4947,17 @@ def _ask_card_payload(card: Any, budget: int) -> dict[str, Any]:
         left[0] -= len(value)
         return value
 
-    def newest_first(rows: Any, fields: tuple[str, ...]) -> list[dict[str, Any]]:
-        rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
-        return [{f: text(r.get(f)) for f in fields} for r in reversed(rows)][::-1]
-
-    block, run = part("block"), part("last_run")
-    view = {"id": text(card.get("id")), "title": text(card.get("title"))}
-    view["block"] = {f: text(block.get(f)) for f in ("reason", "kind", "recurrences", "limit", "since")}
-    for f in ("status", "priority", "assignee", "created_by", "consecutive_failures"):
-        view[f] = text(card.get(f))
-    view["comments"] = newest_first(card.get("comments"), ("author", "body", "created_at"))
-    view["last_run"] = {f: text(run.get(f)) for f in ("status", "outcome", "summary", "error", "ended_at")}
-    view["events"] = newest_first(card.get("events"), ("kind", "created_at"))
-    view["branch"] = text(part("workspace").get("branch"))
-    view["pr"] = text(part("pr").get("reference"))
-    view["omitted"] = {f: text(part("omitted").get(f)) for f in ("events", "comments", "attachments")}
-    for f in ("result", "last_failure_error", "body"):
-        view[f] = text(card.get(f))
+    view: dict[str, Any] = {}
+    for key, shape, path, fields in ASK_CARD_VIEW:
+        value = at(path)
+        if shape == "field":
+            view[key] = text(value)
+        elif shape == "part":
+            part = value if isinstance(value, dict) else {}
+            view[key] = {f: text(part.get(f)) for f in fields}
+        else:  # rows: spend on the newest first, send in the card's order
+            rows = [r for r in value if isinstance(r, dict)] if isinstance(value, list) else []
+            view[key] = [{f: text(r.get(f)) for f in fields} for r in reversed(rows)][::-1]
     return view
 
 
