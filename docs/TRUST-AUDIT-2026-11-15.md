@@ -30,7 +30,7 @@ An outside audit found 15 gaps in how UNBL0CK checks its own guarantees (#71). T
 | 5 | No feature list or driver | Fixed: `docs/FEATURES.md` |
 | 6 | No property-based tests for the state machines | Fixed: Hypothesis state machines for Ask jobs and for outside Done, Not for me and Undo |
 | 7 | Skip directives across many test files | Reviewed, rejected as a defect: each skip is a platform or optional-dependency guard, and CI fails on any skipped test |
-| 8 | `needs.py` is one large module; the "only one `subprocess` use" README claim is unchecked | Claim now checked (see 2). Partly fixed: secret redaction (about 1,000 lines) moved to `redact.py`. Other sections stay for now, because tests patch names such as `_settings` and `hermes_home` on `needs`; moving them first needs those tests to patch the new module |
+| 8 | `needs.py` is one large module; the "only one `subprocess` use" README claim is unchecked | Claim now checked (see 2). Partly fixed: the pure sections moved out: secret redaction (about 1,000 lines) to `redact.py`, the gate-phrase grammar to `gates.py` and the HTML and mail text reader to `mailtext.py`, each held pure by `tests/test_pure_modules.py`. The stateful sections stay, because tests patch names such as `_settings` and `hermes_home` on `needs` and a moved caller would not see the patch |
 | 9 | Repeated `kanban_db` imports | Unused imports removed in 16 files. The repeated `kanban_db` imports in `dashboard/plugin_api.py` are lazy imports of an optional Hermes module, kept and exempted in `ruff.toml` |
 | 10 | CANON rules are prose only | Rejected for now: CANON is a design guide for people, not a machine-checkable rule set |
 | 11 | Bare `# noqa: BLE001` | Fixed: every production suppression gives its reason |

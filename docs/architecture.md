@@ -10,6 +10,8 @@ and performs explicit human-selected actions; it does not run a separate service
 | `__init__.py` | Registration, local/messaging slash command, CLI, filing tool and prompt hooks |
 | `needs.py` | Settings, five source collectors, detection, versioned mutations, the Ask payload, persisted state and Pocket pack |
 | `redact.py` | Second-line secret redaction of text and of JSON inside text (pure; loaded by `needs.py`) |
+| `gates.py` | Gate-phrase grammar: when an approval or decision phrase is negated or glued into a longer token (pure; loaded by `needs.py`, which builds the patterns from settings) |
+| `mailtext.py` | Readable text from saved web pages and exported mail: an inert HTML reader that keeps only what a browser would show (pure; loaded by `needs.py`, which opens the file) |
 | `jobs.py` | Summary and Ask lifecycle tables (in memory), the Ask restart journal (one small file per job), locks, expiry and bounded result retention |
 | `dashboard/plugin_api.py` | Validated HTTP inputs, background execution, capacity admission and explicit HTTP failure contracts |
 | `desktop/src/plugin.src.js` | Desktop queue, local drafts, actions, recovery controls and host SDK integration |
