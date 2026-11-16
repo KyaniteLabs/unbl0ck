@@ -516,9 +516,17 @@ except ImportError:  # pragma: no cover
 class Api(unittest.TestCase):
     def load(self):
         api = _load(f"ub_api_r5j_{id(self)}", "dashboard/plugin_api.py")
-        timer = api._ASK_JOBS._timer
-        if timer is not None:
-            self.addCleanup(timer.cancel)
+
+        def stop():
+            # Read the table and its timer at cleanup, not at load: a test may swap in its own
+            # table, and a timer armed later must not write into a temp dir being removed.
+            api._ASK_JOBS._bg_every = None
+            timer = api._ASK_JOBS._timer
+            if timer is not None:
+                timer.cancel()
+                timer.join(5)
+
+        self.addCleanup(stop)
         return api
 
     def test_importing_the_api_starts_no_cleanup_timer(self):
