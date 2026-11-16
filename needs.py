@@ -277,10 +277,16 @@ def _patterns(
         r"|^\W*please (approve|decide|choose|pick|confirm|sign)"
         r"|(awaiting|waiting (on|for)|needs?|requires?|blocked (on|pending)|pending) your "
         r"(approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
-        r"|({P}|{C}) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
+        r"|({P}|{C}) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign|run|paste|install|execute)"
+        r"|({P}|{C})(['’]s)? (?:\w+ ){0,2}(pick|ruling|verdict)"
+        r"|({P}|{C}) (decides|chooses|picks)"
+        r"|until (?:the )?({P}|{C}) gives the go"
+        r"|({P}|{C})['’]s (?:explicit |final )?(decision|approval|answer)"
+        r"|(decision|approval|answer) to ({P}|{C}|principal|human)"
+        r"|missing input\s*[=:]\s*({P}|{C}|principal|human)"
         r"|(which|what) (one|option|choice) do you (prefer|want|choose)"
         r"|human[- ]gate"
-        r"|([A-Za-z]+/)?(operator|owner|{C}|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
+        r"|({C}|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
         r"|({P}|{C}|principal) (approved|authorized|authorised|signed off)"
         r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,20}(route|access|path|executor)"
         r"|(credentials?|api[- ]?keys?|tokens?) (are |is )?(dead|expired|missing|needed|required|revoked))\b",
@@ -288,6 +294,15 @@ def _patterns(
     )
     # Weaker cue, trusted only together with an explicit needs_input kind.
     pats["_NAMES"] = _c(r"\b({P}|{C}|principal|human)\b", re.IGNORECASE)
+    pats["_INPUT_NAMES"] = _c(
+        r"\b(?:(?:which|what) [^.;!?]{0,50}\b(?:should|does|would) ({P}|{C}|principal|human) "
+        r"|(?:only )?({P}|{C}|principal|human) can (?:give|decide|approve|answer)"
+        r"|({P}|{C}|principal|human) has (?:the )?(?:\w+ ){0,2}(?:choice|decision|call)"
+        r"|(?:ask|input from) ({P}|{C}|principal|human))\b", re.IGNORECASE)
+    pats["_OWNER_GATE"] = _c(
+        r"\b(?:operator|owner) (?:input|decision|approval|answer|call) (?:is |are )?(?:needed|required)\b",
+        re.IGNORECASE,
+    )
     # The supervisor/ops "stop" style blocks name the principal without asking anything.
     pats["_ORDER"] = _c(
         r"^\s*({P}|{C})\s+(\d{1,2}:\d{2}|says|said|orders?|ordered)\b", re.IGNORECASE
@@ -1347,9 +1362,37 @@ def kanban_needs_you(reason: str, kind: str | None) -> str | None:
             if _YOUR_GATE.search(reason)
             else None
         )
+    owner_gate = pats["_OWNER_GATE"]
+    # Generic owner wording is not a principal ask when a different owner is identified.
+    other_owner = re.search(r"\b(?:card|org|organization|repository|repo) owner\b|\b\w+/(?:owner|operator)\b", reason, re.IGNORECASE)
+    owner_from = re.search(r"\b(?:owner|operator) [^.;!?]{0,40}\bfrom (\w+)", reason, re.IGNORECASE)
+    if owner_from and owner_from.group(1).lower() not in {
+        n.lower() for n in principal_names() + role_words() + ["principal", "human", "you"]
+    }:
+        other_owner = owner_from
+    named_owner = re.search(r"\b\w+['’]s (?:owner|operator)\b", reason, re.IGNORECASE)
+    if named_owner:
+        other_owner = named_owner
+    if not other_owner and any(
+        not _gates._match_is_negated(reason, m) and _gates._match_is_standalone(reason, m)
+        for m in owner_gate.finditer(reason)
+    ):
+        return "Block reason names a decision for you"
+    # Require both an agent-side inability and an explicit remaining human handoff.
+    # A mere mention of sudo, or another seat's assignment, is not an ask.
+    agent_cannot = re.search(
+        r"\b(?:we|i|the agent|this seat) (?:cannot|can not|are not allowed to) (?:run|execute|install)\b"
+        r"|\bpolicy denies (?:it )?to this seat\b", reason, re.IGNORECASE,
+    )
+    handoff = re.search(
+        r"\bone paste finishes\b|\b(?:you|the human) (?:must|to) (?:paste|run|execute|install)\b",
+        reason, re.IGNORECASE,
+    )
+    if agent_cannot and handoff and re.search(r"\b(?:root|sudo)\b", reason, re.IGNORECASE) and not _gates._match_is_negated(reason, handoff):
+        return "Hands-on step for you; see the block reason"
     if _any_gate(reason, pats):
         return "Block reason names a decision for you"
-    if (kind or "") == "needs_input" and _any_name(reason, pats):
+    if (kind or "") == "needs_input" and _any_name(reason, {**pats, "_NAMES": pats["_INPUT_NAMES"]}):
         return "Blocked for your input"
     return None
 
@@ -1759,7 +1802,12 @@ def kanban_items(
                     block = _latest_block(conn, kanban_db, task.id)
                     payload = (block.payload or {}) if block else {}
                     reason = str(payload.get("reason") or "")
-                    why = kanban_needs_you(reason, payload.get("kind"))
+                    detection_reason = reason
+                    if not reason.strip() or reason.strip() == "initial_status":
+                        detection_reason = f"{task.title}\n{getattr(task, 'body', '') or ''}"
+                    why = kanban_needs_you(detection_reason, payload.get("kind"))
+                    if why:
+                        reason = detection_reason
                     tier = "ask"
                     if not why:
                         # Anything blocked is a NEED to unblock. No ask for the principal was
@@ -5434,3 +5482,4 @@ def write_pocket_pack(
     p = data_dir(home) / "pocket-pack.json"
     _write_json(p, pack if pack is not None else pocket_pack(queue))
     return p
+
