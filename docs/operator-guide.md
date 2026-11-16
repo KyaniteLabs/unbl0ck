@@ -235,6 +235,41 @@ report.
 | Ask fault | The model, its capacity, or transport failed | Retry. A transport retry resumes the same job; after a restart the card says `unknown` or `not sent` and Retry is your decision to ask again. |
 | Security reconciliation pending | A signed request has no authenticated current verdict | Follow the [Security recovery procedure](security-review-link.md). An acknowledgement is not an approval. |
 
+## Supported hosts
+
+| Host | Status | Evidence |
+| --- | --- | --- |
+| Hermes `0.23.0` (CI pins commit `2bd378e`) | Supported | Full test suite and `hermes plugins validate` on every pull request |
+| Hermes newer than `0.23.0` | Expected to work | Not tested in CI; the queue reports `host: this Hermes lacks N of the M interfaces UNBL0CK uses` instead of failing deep in a read |
+| Hermes older than `0.23.0` | Not supported | |
+| Linux | Supported | CI runs on Ubuntu |
+| macOS | Expected to work | Same POSIX code paths as Linux (`fcntl` lock, `ps` for process start times); no CI job |
+| Windows | Unverified | The state lock and owner-only file modes are implemented but have not run on a real Windows host; keep to one writer and an owner-only Hermes home. `recovery.py` refuses to run there |
+| Python | `3.14` in CI | The version Hermes `0.23.0` runs on |
+
+The Packaged Desktop app, live chat and model providers, and a recorded install,
+upgrade and rollback run are not yet covered; see `docs/verification.md`.
+
+## Install, upgrade and roll back
+
+UNBL0CK's state lives under `<HERMES_HOME>/plugin-data/unbl0ck/`, apart from the plugin
+code, so replacing the code keeps your hidden cards, cached summaries and pending releases.
+
+1. **Before an upgrade or rollback,** keep a copy of each state store:
+   `python3 recovery.py preserve hidden`, then the same for `pending-release` and `bluf`.
+2. **Install:** `hermes plugins install unbl0ck`, then restart the gateway so live-prompt
+   hooks load.
+3. **Upgrade:** `hermes plugins update unbl0ck`, then restart the gateway.
+4. **Roll back:** reinstall the previous release over the current one by its full commit:
+   `hermes plugins install unbl0ck --force --ref <40-character commit>` (on a Hermes whose
+   `plugins install` offers `--ref`), then restart the gateway.
+5. **After any of these,** run `python3 recovery.py diagnose`. If a store is reported
+   unreadable, restore the copy from step 1 with `python3 recovery.py restore <store> <file> --apply`.
+
+If `diagnose` reports a store as valid JSON in a shape this version does not read
+(`unsupported_schema`) after a rollback, the newer release wrote it: restore the copy from
+step 1 rather than editing the file.
+
 ## Repair corrupt state
 
 Run these on the machine that owns the Hermes home. Output is counts, sizes and fixed
