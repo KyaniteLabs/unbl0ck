@@ -279,10 +279,12 @@ def _patterns(
         r"(approval|decision|call|word|go|ok|sign[- ]?off|review|answer|reply|input|choice)"
         r"|({P}|{C}) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign|run|paste|install|execute)"
         r"|({P}|{C})(['’]s)? (?:\w+ ){0,2}(pick|ruling|verdict)"
+        r"(?![^.;!?\n]{0,60}\b(?:was|is|has been) (?:sent|implemented|completed|resolved)\b)"
         r"|({P}|{C}) (decides|chooses|picks)"
         r"|until (?:the )?({P}|{C}) gives the go"
         r"|({P}|{C})['’]s (?:explicit |final )?(decision|approval|answer)"
         r"|(decision|approval|answer) to ({P}|{C}|principal|human)"
+        r"(?![^.;!?\n]{0,60}\b(?:was|is|has been) (?:sent|implemented|completed|resolved)\b)"
         r"|missing input\s*[=:]\s*({P}|{C}|principal|human)"
         r"|(which|what) (one|option|choice) do you (prefer|want|choose)"
         r"|human[- ]gate"
@@ -1365,10 +1367,11 @@ def kanban_needs_you(reason: str, kind: str | None) -> str | None:
     owner_gate = pats["_OWNER_GATE"]
     # Generic owner wording is not a principal ask when a different owner is identified.
     other_owner = re.search(r"\b(?:card|org|organization|repository|repo) owner\b|\b\w+/(?:owner|operator)\b", reason, re.IGNORECASE)
-    owner_from = re.search(r"\b(?:owner|operator) [^.;!?]{0,40}\bfrom (\w+)", reason, re.IGNORECASE)
-    if owner_from and owner_from.group(1).lower() not in {
-        n.lower() for n in principal_names() + role_words() + ["principal", "human", "you"]
-    }:
+    owner_from = re.search(r"\b(?:owner|operator) [^.;!?]{0,40}\bfrom (.+)", reason, re.IGNORECASE)
+    if owner_from and not any(
+        re.match(re.escape(n) + r"(?![\w/\\@-])", owner_from.group(1), re.IGNORECASE)
+        for n in principal_names() + role_words() + ["principal", "human", "you"]
+    ):
         other_owner = owner_from
     named_owner = re.search(r"\b\w+['’]s (?:owner|operator)\b", reason, re.IGNORECASE)
     if named_owner:
@@ -1385,7 +1388,8 @@ def kanban_needs_you(reason: str, kind: str | None) -> str | None:
         r"|\bpolicy denies (?:it )?to this seat\b", reason, re.IGNORECASE,
     )
     handoff = re.search(
-        r"\bone paste finishes\b|\b(?:you|the human) (?:must|to) (?:paste|run|execute|install)\b",
+        r"\bone paste finishes\b|\b(?:you|the human) (?:must|to) (?:paste|run|execute|install)\b"
+        r"|\bplease (?:paste|run|execute|install) (?:the |this )?(?:staged )?(?:command|installer|step)\b",
         reason, re.IGNORECASE,
     )
     if agent_cannot and handoff and re.search(r"\b(?:root|sudo)\b", reason, re.IGNORECASE) and not _gates._match_is_negated(reason, handoff):

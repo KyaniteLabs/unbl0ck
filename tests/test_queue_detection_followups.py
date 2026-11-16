@@ -68,3 +68,20 @@ class QueueDetectionFollowups(unittest.TestCase):
 
     def test_completed_delivery_is_not_an_outstanding_decision(self):
         self.assertIsNone(needs.kanban_needs_you('The decision was sent to Ada yesterday; waiting on CI.', 'needs_input'))
+
+    def test_multiword_principal_is_not_another_owner(self):
+        from unittest.mock import patch
+        with patch.object(needs, '_settings', lambda: {'principal_name': 'Ada Lovelace'}):
+            self.assertTrue(needs.kanban_needs_you('Owner decision needed from Ada Lovelace.', None))
+            self.assertIsNone(needs.kanban_needs_you('Owner decision needed from Ada Other.', None))
+
+    def test_explicit_please_handoff_after_agent_inability(self):
+        self.assertTrue(needs.kanban_needs_you('We cannot run sudo. Please run the staged command.', 'capability'))
+
+    def test_completed_new_gate_phrases_do_not_queue(self):
+        for reason in [
+            'The decision to Ada was sent yesterday; waiting on CI.',
+            "Ada's previous ruling was implemented. Waiting on CI.",
+        ]:
+            with self.subTest(reason=reason):
+                self.assertIsNone(needs.kanban_needs_you(reason, 'needs_input'))
