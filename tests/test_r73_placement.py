@@ -116,6 +116,50 @@ class AnAnswerIsPairedWithItsEvent(KanbanAnswerCase):
             self.assertTrue(needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved"))
             self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Rejected"))
 
+    def test_an_edited_answer_and_a_note_do_not_place_an_older_same_length_answer(self):
+        """#73 review: a pre-block answer is not placed when the post-block one of the same length
+        was edited and Kanban wrote a note."""
+        task = self.card()
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "Approved")  # before the current block
+            kanban_db.unblock_task(c, task)
+        self.reblock(task)
+        block = self.block(task)
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "Rejected")
+            c.execute("UPDATE task_comments SET body = 'Needs revisions' WHERE body = 'Rejected'")
+            kanban_db._insert_comment(
+                c, task, "operator", "Specified \u2014 updated title and promoted to todo.", int(time.time()))
+            c.commit()
+        with self.conn() as c:
+            self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved"))
+
+    def test_a_note_never_stands_in_for_a_logged_answer_of_its_length(self):
+        """#73 review: text equal to a note Kanban wrote is not proof the author posted it."""
+        note = "Decomposed into 2 child card(s)."
+        task = self.card()
+        block = self.block(task)
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "x" * len(note))
+            kanban_db._insert_comment(c, task, "operator", note, int(time.time()))
+            c.commit()
+        with self.conn() as c:
+            self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, note))
+            self.assertTrue(needs._answered_with(c, kanban_db, task, "operator", block.id, "x" * len(note)))
+
+    def test_an_event_with_no_payload_neither_crashes_nor_answers(self):
+        """#73 review: a NULL event payload is read as no author, not a crash of the board scan."""
+        task = self.card()
+        block = self.block(task)
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) VALUES(?, 'commented', NULL, ?)",
+                (task, int(time.time())))
+            c.commit()
+        with self.conn() as c:
+            self.assertFalse(needs._answered_since(c, kanban_db, task, "operator", block.id))
+            self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1497,21 +1497,47 @@ def _budgeted(rows: Iterable[Any]) -> Iterable[Any]:
         yield row
 
 
+# The comments Kanban writes with no ``commented`` event of their own (kanban_db's
+# _insert_comment callers). Kanban never edits or deletes a comment.
+UNLOGGED_COMMENT = re.compile(
+    "Specified \u2014 updated |Decomposed into |reconciliation: card was 'running' with no valid claim"
+    "|Invalidated: ancestor "
+)
+
+
+def _readable(values: Iterable[Any]) -> Iterable[Any]:
+    """*values*, with a read that fails part way reported as incomplete placement, not a crash."""
+    it = iter(values)
+    while True:
+        try:
+            value = next(it)
+        except StopIteration:
+            return
+        except sqlite3.Error as exc:
+            raise PlacementIncomplete(f"a comment could not be read ({exc}); your answer was not placed") from exc
+        yield value
+
+
+def _bounded_value(conn: Any, table: str, column: str, rowid: Any, kind: str, room: int) -> bytes | None:
+    """The first *room* bytes of a stored text or blob; None for a NULL or any other type."""
+    return _read_text(conn, table, column, rowid, room)[0] if kind in ("text", "blob") else None
+
+
 def _author_events_after(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> Iterable[Any]:
     """The logged ``len`` of each ``commented`` event of *author* after the block (every one when
     there is none), oldest first, streamed under the placement work budget. A payload is read as
     its first 4096 bytes, never SQLite's whole value."""
     try:
-        rows: Iterable[Any] = (
-            (_read_text(conn, "task_events", "payload", r, 4096)[0],)
-            for (r,) in conn.execute(
-                "SELECT rowid FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ? "
-                "ORDER BY id", (task_id, block_id or 0))
+        payloads: Iterable[Any] = (
+            _bounded_value(conn, "task_events", "payload", r, t, 4096)
+            for r, t in conn.execute(
+                "SELECT rowid, typeof(payload) FROM task_events WHERE task_id = ? AND kind = 'commented' "
+                "AND id > ? ORDER BY id", (task_id, block_id or 0))
         )
     except Exception:  # noqa: BLE001 - schema drift: the public API
-        rows = ((e.payload,) for e in kanban_db.list_events(conn, task_id)
-                if e.kind == "commented" and e.id > (block_id or 0))
-    for (raw,) in _budgeted(rows):
+        payloads = (e.payload for e in kanban_db.list_events(conn, task_id)
+                    if e.kind == "commented" and e.id > (block_id or 0))
+    for raw in _budgeted(_readable(payloads)):
         payload = _json_payload(raw)
         if _same_author(payload.get("author"), author):
             yield payload.get("len")
@@ -1522,16 +1548,21 @@ def _author_comments_newest(conn: Any, kanban_db: Any, task_id: str, author: str
     bytes, streamed under the placement work budget."""
     try:
         rows: Iterable[Any] = (
-            (a, lambda r=r: _read_text(conn, "task_comments", "body", r, room)[0])
-            for r, a in conn.execute(
-                "SELECT rowid, author FROM task_comments WHERE task_id = ? ORDER BY id DESC", (task_id,))
+            (a, lambda r=r, t=t: _bounded_value(conn, "task_comments", "body", r, t, room))
+            for r, a, t in conn.execute(
+                "SELECT rowid, author, typeof(body) FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+                (task_id,))
         )
     except Exception:  # noqa: BLE001 - schema drift: the public API
         listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: -(getattr(c, "id", 0) or 0))
-        rows = ((c.author, lambda c=c: str(c.body).encode("utf-8", "replace")) for c in listed)
-    for a, body in _budgeted(rows):
+        rows = ((c.author, lambda c=c: str(c.body or "").encode("utf-8", "replace")) for c in listed)
+    for a, body in _budgeted(_readable(rows)):
         if _same_author(a, author):
-            yield bytes(body() or b"").decode("utf-8", "replace")
+            try:
+                raw = body()
+            except sqlite3.Error as exc:
+                raise PlacementIncomplete(f"a comment could not be read ({exc}); your answer was not placed") from exc
+            yield bytes(raw or b"").decode("utf-8", "replace")
 
 
 def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> bool:
@@ -1545,38 +1576,45 @@ def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_
 
 
 def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
-    """Has *author* posted *text* since the block began? Kanban writes each comment with its
-    ``commented`` event in one transaction and stores the body stripped. When every one of the
-    author's comments has its event, their k newest comments are exactly the k their events after
-    the block logged. Kanban also writes a few comments with no event (a triage card's "Specified"
-    note); then each event's logged length decides: the author's k newest comments of that length
-    are the ones their k events of that length after the block logged. Raises PlacementIncomplete
-    past the work budget."""
-    after = [0, 0]  # the author's events after the block, and those of len(text)
-    for n in _author_events_after(conn, kanban_db, task_id, author, block_id):
-        after[0] += 1
-        after[1] += n == len(text)
-    if not after[0]:
+    """Has *author* surely posted *text* since the block began? True only with proof, so a "no"
+    at worst posts the answer twice and never hides it. Kanban writes each comment with its
+    ``commented`` event and never edits or deletes one, so the author's comments pair in order
+    with their events, apart from the notes Kanban writes with no event. When the author's
+    unlogged comments are exactly their notes, the k comments left after skipping the notes,
+    newest first, are the k their events after the block logged. Otherwise only the author's k
+    newest comments surely came after the block. Raises PlacementIncomplete past the work budget."""
+    k = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, block_id))
+    if not k:
         return False
     logged = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, None))
-    room = 4 * len(text) + 1  # tells a longer body
-    if logged == sum(1 for _ in _author_comments_newest(conn, kanban_db, task_id, author, 1)):
-        wanted, k = {text, text.strip()}, after[0]
-        for body in _author_comments_newest(conn, kanban_db, task_id, author, room):
-            if body in wanted:
-                return True
-            k -= 1
-            if not k:
-                return False
-        return False
-    k = after[1]
-    for body in _author_comments_newest(conn, kanban_db, task_id, author, room):
-        if not k:
+    room = max(4 * len(text) + 1, 256)  # tells a longer body, and holds a note's opening
+
+    def newest() -> Iterable[str]:
+        return _author_comments_newest(conn, kanban_db, task_id, author, room)
+
+    total = notes = 0
+    for body in newest():
+        total += 1
+        notes += bool(UNLOGGED_COMMENT.match(body))
+    unlogged = total - logged
+    if unlogged < 0:
+        return False  # a comment is gone: Kanban did not do that, so nothing pairs for sure
+    wanted, left = {text, text.strip()}, k
+    exact = unlogged in (0, notes)  # every comment pairs, or every unlogged one is a note
+    for body in newest():
+        if UNLOGGED_COMMENT.match(body):
+            if exact and unlogged:
+                continue  # one of Kanban's own notes
+            if not exact:
+                left -= 1  # it may be a note that equals the text: never proof
+                if not left:
+                    return False
+                continue
+        if body in wanted:
+            return True
+        left -= 1
+        if not left:
             return False
-        if len(body) == len(text):
-            if body == text:
-                return True
-            k -= 1
     return False
 
 
