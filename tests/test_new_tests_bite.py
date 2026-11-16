@@ -1,5 +1,6 @@
 """The CI check that a fix's new tests fail without the fix, run on small throwaway repositories."""
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -12,6 +13,22 @@ SCRIPT = Path(__file__).resolve().parents[1] / ".github" / "scripts" / "new_test
 ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
 OLD_TESTS = "".join(f"def test_old_{i}():\n    assert {i} == {i}\n\n\n" for i in range(12))
+
+
+class TheSummaryParser(unittest.TestCase):
+    """#73 review: whether a run reports SUBFAILED depends on the installed pytest, so the parser is
+    also tested on fixed output."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("new_tests_bite", SCRIPT)
+        self.bite = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.bite)
+
+    def test_a_test_with_a_failed_subtest_is_not_passing(self):
+        out = ("SUBFAILED[n=1] tests/test_sub.py::T::test_f - AssertionError\n"
+               "PASSED tests/test_sub.py::T::test_f\nPASSED tests/test_sub.py::T::test_g\n")
+        ids = ["tests/test_sub.py::T::test_f", "tests/test_sub.py::T::test_g"]
+        self.assertEqual(self.bite.still_passing(out, ids), ["tests/test_sub.py::T::test_g"])
 
 
 class TheBiteCheck(unittest.TestCase):
@@ -46,6 +63,16 @@ class TheBiteCheck(unittest.TestCase):
         self.commit("fix: f returns 2", {"mod.py": "def f():\n    return 2\n",
                                          "tests/test_mod.py": "from mod import f\n\ndef test_f():\n    assert f() == 2\n"})
         self.assertEqual(self.check()[0], 0)
+
+    def test_a_test_that_fails_only_in_a_subtest_on_the_parent_bites(self):
+        """#73: pytest reports a test whose only failures are subtests as passed too, so a test that
+        bit through a subtest was reported as passing without its fix."""
+        test = ("import unittest\nfrom mod import f\n\n\nclass T(unittest.TestCase):\n"
+                "    def test_f(self):\n        for n in (1, 2):\n            with self.subTest(n=n):\n"
+                "                self.assertEqual(f(), 2)\n")
+        self.commit("fix: f returns 2", {"mod.py": "def f():\n    return 2\n", "tests/test_sub.py": test})
+        code, out = self.check()
+        self.assertEqual(code, 0, out)
 
     def test_a_toothless_test_beside_a_collection_error_is_caught(self):
         """#81 review: a test importing a module the fix adds fails to collect on the parent, and that

@@ -33,7 +33,7 @@ class Placement(KanbanAnswerCase):
             c.execute("UPDATE task_comments SET created_at = ? WHERE task_id = ?", (int(block.created_at) - 10, task))
             c.execute(
                 "INSERT INTO task_comments(task_id, author, body, created_at) VALUES(?,?,?,?)",
-                (task, "operator", "No", int(block.created_at) - 20),
+                (task, "operator", "Specified \u2014 updated title and promoted to todo.", int(block.created_at) - 20),
             )
             c.commit()
         self.answer(task, "Approved", release=True, version=str(block.id))

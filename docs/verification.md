@@ -8,7 +8,7 @@ separate gates. A skipped test, queued request or receiver acknowledgement is no
 
 Use Python 3.14 and the Hermes revision pinned in
 [`validate.yml`](../.github/workflows/validate.yml). Install Hermes from its own frozen
-lockfile and run the plugin tests in that environment, with pytest 8.4.2. Use a disposable
+lockfile and run the plugin tests in that environment, with pytest 9.1.1. Use a disposable
 Hermes home containing no credentials or operator data.
 
 ```sh

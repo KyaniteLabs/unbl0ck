@@ -29,6 +29,7 @@ from __future__ import annotations
 import collections
 import errno
 import hashlib
+import itertools
 import math
 import json
 import logging
@@ -1481,43 +1482,147 @@ def _same_author(a: Any, b: Any) -> bool:
     return str(a or "").strip().casefold() == str(b or "").strip().casefold()
 
 
-PLACEMENT_ROWS = 500  # newest rows one placement check reads; past them it finds no answer
+PLACEMENT_WORK = 100_000  # rows one placement check may read before it reports incomplete coverage
+
+class PlacementIncomplete(RuntimeError):
+    """A card has more comments or events than one placement check reads."""
 
 
-def _comment_events(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> list[Any]:
-    """The logged ``len`` of each ``commented`` event of *author* after the block (all when there is
-    none), newest first. Kanban writes a comment with its event in one transaction and ids only grow."""
+def _budgeted(rows: Iterable[Any]) -> Iterable[Any]:
+    for n, row in enumerate(rows):
+        if n >= PLACEMENT_WORK:
+            raise PlacementIncomplete(
+                f"more than {PLACEMENT_WORK} comments to check for your answer; it was not placed"
+            )
+        yield row
+
+
+# The comments Kanban writes with no ``commented`` event of their own (kanban_db's
+# _insert_comment callers). Kanban never edits or deletes a comment.
+UNLOGGED_COMMENT = re.compile(
+    "Specified \u2014 updated |Decomposed into |reconciliation: card was 'running' with no valid claim"
+    "|Invalidated: ancestor "
+)
+
+
+def _readable(values: Iterable[Any]) -> Iterable[Any]:
+    """*values*, with a read that fails part way reported as incomplete placement, not a crash."""
+    it = iter(values)
+    while True:
+        try:
+            value = next(it)
+        except StopIteration:
+            return
+        except sqlite3.Error as exc:
+            raise PlacementIncomplete(f"a comment could not be read ({exc}); your answer was not placed") from exc
+        yield value
+
+
+def _bounded_value(conn: Any, table: str, column: str, rowid: Any, kind: str, room: int) -> bytes | None:
+    """The first *room* bytes of a stored text or blob; None for a NULL or any other type."""
+    return _read_text(conn, table, column, rowid, room)[0] if kind in ("text", "blob") else None
+
+
+def _author_events_after(
+    conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, unknown: list[int] | None = None
+) -> Iterable[Any]:
+    """The logged ``len`` of each ``commented`` event of *author* after the block (every one when
+    there is none), oldest first, streamed under the placement work budget. A payload is read as
+    its first 4096 bytes, never SQLite's whole value; an event whose author cannot be read (NULL,
+    malformed or longer than that) is counted in *unknown*."""
     try:
-        rows = conn.execute(
-            "SELECT rowid FROM task_events WHERE task_id = ? AND kind = 'commented' AND id > ? "
-            "ORDER BY id DESC LIMIT ?", (task_id, block_id or 0, PLACEMENT_ROWS)).fetchall()
-        rows = [_read_text(conn, "task_events", "payload", r, 4096) for (r,) in rows]  # an author and a length
-    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        rows = [(e.payload, 0) for e in kanban_db.list_events(conn, task_id)[::-1] if e.kind == "commented" and e.id > (block_id or 0)]
-    payloads = (_json_payload(p) for p, _ in rows[:PLACEMENT_ROWS])
-    return [p.get("len") for p in payloads if _same_author(p.get("author"), author)]
+        payloads: Iterable[Any] = (
+            _bounded_value(conn, "task_events", "payload", r, t, 4096)
+            for r, t in conn.execute(
+                "SELECT rowid, typeof(payload) FROM task_events WHERE task_id = ? AND kind = 'commented' "
+                "AND id > ? ORDER BY id", (task_id, block_id or 0))
+        )
+    except Exception:  # noqa: BLE001 - schema drift: the public API
+        payloads = (e.payload for e in kanban_db.list_events(conn, task_id)
+                    if e.kind == "commented" and e.id > (block_id or 0))
+    for raw in _budgeted(_readable(payloads)):
+        payload = _json_payload(raw)
+        if not isinstance(payload.get("author"), str):
+            if unknown is not None:
+                unknown[0] += 1
+        elif _same_author(payload.get("author"), author):
+            yield payload.get("len")
+
+
+def _author_comments_newest(conn: Any, kanban_db: Any, task_id: str, author: str, room: int) -> Iterable[str]:
+    """The bodies of *author*'s comments on a card, newest first, each read as at most *room*
+    bytes, streamed under the placement work budget."""
+    try:
+        rows: Iterable[Any] = (
+            (a, lambda r=r, t=t: _bounded_value(conn, "task_comments", "body", r, t, room))
+            for r, a, t in conn.execute(
+                "SELECT rowid, author, typeof(body) FROM task_comments WHERE task_id = ? ORDER BY id DESC",
+                (task_id,))
+        )
+    except Exception:  # noqa: BLE001 - schema drift: the public API
+        listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: -(getattr(c, "id", 0) or 0))
+        rows = ((c.author, lambda c=c: str(c.body or "").encode("utf-8", "replace")) for c in listed)
+    for a, body in _budgeted(_readable(rows)):
+        if _same_author(a, author):
+            try:
+                raw = body()
+            except sqlite3.Error as exc:
+                raise PlacementIncomplete(f"a comment could not be read ({exc}); your answer was not placed") from exc
+            yield bytes(raw or b"").decode("utf-8", "replace")
 
 
 def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> bool:
     """Has *author* commented since the block began: one of their ``commented`` events is later
     than the block's. The one test for "answered", used by the queue and by answer_card; a comment
-    no event records never answers, so the card stays in front of you."""
-    return bool(_comment_events(conn, kanban_db, task_id, author, block_id))
+    no event records never answers, so the card stays in front of you. Raises PlacementIncomplete
+    past the work budget."""
+    for _ in _author_events_after(conn, kanban_db, task_id, author, block_id):
+        return True  # an event logs no length when Kanban's payload has none: its presence answers
+    return False
 
 
 def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
-    """Has *author* posted *text* since the block began? Each event logs its comment's length, so the
-    k events of that length after the block logged the author's k newest comments of that length."""
-    k = _comment_events(conn, kanban_db, task_id, author, block_id).count(len(text))
-    try:
-        rows = conn.execute(
-            "SELECT rowid, author FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT ?", (task_id, PLACEMENT_ROWS)).fetchall()
-        rows = [(a, _read_text(conn, "task_comments", "body", r, 4 * len(text) + 1)[0]) for r, a in rows]  # tells a longer body
-    except Exception:  # noqa: BLE001 - schema drift: fall back to the public API
-        listed = sorted(kanban_db.list_comments(conn, task_id), key=lambda c: -(getattr(c, "id", 0) or 0))
-        rows = [(c.author, str(c.body).encode("utf-8", "replace")) for c in listed]
-    bodies = (bytes(b or b"").decode("utf-8", "replace") for a, b in rows[:PLACEMENT_ROWS] if _same_author(a, author))
-    return text in [b for b in bodies if len(b) == len(text)][:k]
+    """Has *author* surely posted *text* since the block began? True only with proof, so a "no"
+    at worst posts the answer twice and never hides it. Kanban writes each comment with its
+    ``commented`` event and never edits or deletes one, so the author's comments pair in order
+    with their events, apart from the notes Kanban writes with no event. When the author's
+    unlogged comments are exactly their notes, the k comments left after skipping the notes,
+    newest first, are the k their events after the block logged. Otherwise only the author's k
+    newest comments surely came after the block. Raises PlacementIncomplete past the work budget."""
+    k = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, block_id))
+    if not k:
+        return False
+    unknown = [0]  # events whose author cannot be read: any one may be this author's
+    logged = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, None, unknown))
+    room = max(4 * len(text) + 1, 256)  # tells a longer body, and holds a note's opening
+
+    def newest() -> Iterable[str]:
+        return _author_comments_newest(conn, kanban_db, task_id, author, room)
+
+    total = notes = 0
+    for body in newest():
+        total += 1
+        notes += bool(UNLOGGED_COMMENT.match(body))
+    unlogged = total - logged
+    if unlogged < 0:
+        return False  # a comment is gone: Kanban did not do that, so nothing pairs for sure
+    wanted, left = {text, text.strip()}, k
+    exact = not unknown[0] and unlogged in (0, notes)  # every comment pairs, or every unlogged one is a note
+    for body in newest():
+        if UNLOGGED_COMMENT.match(body):
+            if exact and unlogged:
+                continue  # one of Kanban's own notes
+            if not exact:
+                left -= 1  # it may be a note that equals the text: never proof
+                if not left:
+                    return False
+                continue
+        if body in wanted:
+            return True
+        left -= 1
+        if not left:
+            return False
+    return False
 
 
 class CardStatus(str, Enum):
@@ -1663,7 +1768,13 @@ def kanban_items(
                     # Answered cards leave the queue in both tiers, so a card the queue shows
                     # is exactly a card answer_card accepts.
                     version = str(block.id if block else since)
-                    if _answered_since(conn, kanban_db, task.id, author, block.id if block else None):
+                    try:
+                        answered = _answered_since(conn, kanban_db, task.id, author, block.id if block else None)
+                    except PlacementIncomplete as exc:
+                        answered = False  # the card stays in front of you
+                        if errors is not None:
+                            errors.append(f"kanban[{board}]: {task.id}: {exc}")
+                    if answered:
                         if pending is None:
                             pending = load_pending_releases(errors=errors)
                         if pending.get(f"kanban:{board}:{task.id}") == version:
@@ -1914,7 +2025,32 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # sits at the end of a turn, so a longer message is read from its end.
 CHAT_READ_CHARS = 100_000
 CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_CHARS characters
-CHAT_BLANK_ROWS = 20  # newest space-only messages passed over to find the latest turn
+# Characters before a cut message's read end that are redacted with it, so a credential whose label
+# lies before the cut is still recognised; only the read end is shown.
+CHAT_LEAD_CHARS = 16_384
+
+
+def _spaces_only(conn: sqlite3.Connection, rowid: Any, raw: bytes, length: int, budget: list[int]) -> bool | None:
+    """Is the stored message all spaces? *raw* is its tail, already read; it and the rest, read
+    backward from the end only while it stays blank, are charged to the poll's *budget*. None when
+    the budget ran out first: the message then counts as not blank, so it is the latest turn and its
+    ask is looked for there, and the caller reports the lookback as cut."""
+    if raw.strip(b" "):
+        return False
+    budget[0] -= len(raw)
+    with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
+        end = length - len(raw)
+        while end > 0:
+            if budget[0] <= 0:
+                return None
+            size = min(end, 1 << 20)
+            blob.seek(end - size)
+            part = blob.read(size)
+            budget[0] -= len(part)
+            if part.strip(b" "):
+                return False
+            end -= size
+    return True if budget[0] > 0 else None
 
 
 def _text_digest(length: Any, text: str) -> str:
@@ -1958,13 +2094,27 @@ def _chat_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, ov
     and the end read here (an edit between them is not seen); every hashed byte is charged."""
     if not over:
         return f"{mid}:{_text_digest(length, text)}"
-    digest = hashlib.sha256(f"{length}\0".encode())
+    if length > budget[0]:
+        return _chat_cut_version(conn, mid, length, text, budget)
+    digest = hashlib.sha256()
     rowid = conn.execute("SELECT rowid FROM messages WHERE id=?", (mid,)).fetchone()[0]
     with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
-        blocks = iter(lambda: blob.read(1 << 20), b"")
-        for part in blocks if length <= budget[0] else (blob.read(1 << 16), text.encode("utf-8", "replace")):
+        for part in itertools.chain([f"{length}\0".encode()], iter(lambda: blob.read(1 << 20), b"")):
             digest.update(part)
             budget[0] -= len(part)
+    return f"{mid}:{digest.hexdigest()[:12]}"
+
+
+def _chat_cut_version(conn: sqlite3.Connection, mid: Any, length: int, text: str, budget: list[int]) -> str:
+    """The version a cut message gets once the poll's hash budget has run out: its length, first
+    64 KiB and the end read here. Charged to *budget* like a whole hash."""
+    digest = hashlib.sha256()
+    rowid = conn.execute("SELECT rowid FROM messages WHERE id=?", (mid,)).fetchone()[0]
+    with conn.blobopen("messages", "content", rowid, readonly=True) as blob:
+        start = blob.read(1 << 16)
+    for part in (f"{length}\0".encode(), start, text.encode("utf-8", "replace")):
+        digest.update(part)
+        budget[0] -= len(part)
     return f"{mid}:{digest.hexdigest()[:12]}"
 
 
@@ -1992,6 +2142,25 @@ def _open_chat_db(db: Path) -> sqlite3.Connection:
     finally:
         os.close(fd)
     return conn
+
+
+def _redact_with_lead(conn: sqlite3.Connection, rowid: Any, length: int, raw: bytes, shown: str) -> str:
+    """The redacted read end of a cut message, redacted together with up to CHAT_LEAD_CHARS characters
+    before it: a value just past the cut whose label lies before it is then redacted. *shown* is the
+    read end redacted alone. The result is the end of *shown* that the joined redaction agrees with:
+    never more of the message than *shown*, never any text from before the cut (a redaction that
+    shortens the joined text cannot pull the lead in), and nothing the joined redaction hid."""
+    room = (CHAT_READ_CHARS + CHAT_LEAD_CHARS) * 4
+    whole = length <= len(raw)
+    if not whole:
+        raw, _ = _read_text(conn, "messages", "content", rowid, room, tail=True)
+        whole = length <= len(raw)
+    text = raw.decode("utf-8", "replace")
+    if not whole or len(text) > CHAT_READ_CHARS + CHAT_LEAD_CHARS:
+        text = _drop_cut(text[-(CHAT_READ_CHARS + CHAT_LEAD_CHARS):], True)
+    joined = _ask_redact(text.replace("\x00", " "))
+    agreed = len(os.path.commonprefix([joined[::-1], shown[::-1]]))
+    return shown[len(shown) - agreed:]
 
 
 def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
@@ -2208,7 +2377,7 @@ def chat_items(
                 "AND role IN ('user','assistant') AND typeof(content) IN ('text','blob') "
                 + ("AND COALESCE(display_kind,'') != 'hidden' " if "display_kind" in mcols else "")
                 + ("AND COALESCE(active,1)=1 " if "active" in mcols else "")
-                + "ORDER BY timestamp DESC, id DESC LIMIT ?"
+                + "ORDER BY timestamp DESC, id DESC"  # read row by row until a message is not blank
             )
             for sid, title, platform, chat_type, user_id, display_name in sessions:
                 platform = str(platform or "")
@@ -2225,9 +2394,17 @@ def chat_items(
                     cov["skipped_other_owner"] += 1
                     continue
                 try:
-                    for mid, rowid, role, ts in conn.execute(last_sql, (sid, CHAT_BLANK_ROWS)).fetchall():
+                    for mid, rowid, role, ts in conn.execute(last_sql, (sid,)):
                         raw, length = _read_text(conn, "messages", "content", rowid, CHAT_READ_BYTES, tail=True)
-                        if raw.strip(b" ") or length > len(raw):
+                        blank = _spaces_only(conn, rowid, raw, length, hash_budget)
+                        if blank is None:
+                            cov["blank_lookback_cut"] = cov.get("blank_lookback_cut", 0) + 1
+                            if errors is not None and cov["blank_lookback_cut"] == 1:
+                                errors.append(
+                                    "chat: blank messages used up this poll's read budget; a chat's "
+                                    "latest turn may be a blank message"
+                                )
+                        if not blank:
                             break  # the newest message that is not blank
                     else:
                         continue
@@ -2250,12 +2427,17 @@ def chat_items(
                     cov["skipped_group_unnamed"] += 1
                     continue
                 version = _chat_version(conn, mid, length, retained, over, hash_budget)
+                # A queue build that ran past its hash budget gave this cut message its short
+                # version; one targeted read has a fresh budget, so it accepts either.
+                cut_version = _chat_cut_version(conn, mid, length, retained, [0]) if only and over else None
                 if visible is not None and not visible(f"chat:{profile}:{sid}", version):
                     continue  # dismissed at this version: it must not use up a full-text budget
                 bot_chat = title in CHAT_TITLES
                 # Redact the whole turn before it is cut to an excerpt: the cut keeps the tail,
                 # so a long secret would otherwise leave a readable fragment.
                 shown = _ask_redact(content)
+                if over:
+                    shown = _redact_with_lead(conn, rowid, length, raw, shown)
                 where_ = (
                     "Bot Chat"
                     if bot_chat
@@ -2267,6 +2449,7 @@ def chat_items(
                         # The message row id and a digest of the text: Hermes can rewrite a
                         # message in place, and the row id alone would not change.
                         "version": version,
+                        **({"cut_version": cut_version} if cut_version else {}),
                         "source": "chat",
                         "profile": profile,
                         "session_id": sid,
@@ -2534,7 +2717,8 @@ WAIT_LOST_LIMIT = 1000
 _WAIT_FAULTS: dict[tuple[str, str], tuple[str, dict[str, Any] | None]] = {}
 # Faults pushed out of the full list: (home, id) -> what failed; clears are still retried.
 _WAIT_FAULTS_LOST: dict[tuple[str, str], str] = {}
-_WAIT_FAULTS_DROPPED: dict[str, tuple[int, float]] = {}
+# home -> [second, faults dropped in it], oldest first: each drop expires on its own after WAIT_MAX_AGE.
+_WAIT_FAULTS_DROPPED: dict[str, collections.deque[list[int]]] = {}
 # Hooks and polls in one process settle a prompt one at a time: a retry in flight must not
 # recreate a record that a clear has just removed.
 _WAIT_FAULT_LOCK = threading.RLock()
@@ -2579,7 +2763,7 @@ def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) ->
             while len(_WAIT_FAULTS_LOST) > WAIT_LOST_LIMIT:
                 h, r = next(iter(_WAIT_FAULTS_LOST))
                 del _WAIT_FAULTS_LOST[(h, r)]
-                _WAIT_FAULTS_DROPPED[h] = (_dropped(h) + 1, time.time())
+                _note_dropped(h)
                 _journal_fault(Path(h), r, None)
             _journal_fault(home, rid, what)
             raise
@@ -2587,11 +2771,27 @@ def _settle_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) ->
             _journal_fault(home, rid, None)
 
 
+def _note_dropped(home: str) -> None:
+    _dropped(home)  # expire old drops first
+    now = int(time.time())
+    drops = _WAIT_FAULTS_DROPPED.setdefault(home, collections.deque())
+    if drops and drops[-1][0] == now:
+        drops[-1][1] += 1
+    else:
+        drops.append([now, 1])  # at most one entry per second, so WAIT_MAX_AGE entries per home
+
+
 def _dropped(home: str) -> int:
-    """Faults *home* dropped past WAIT_LOST_LIMIT; a home whose latest drop is past WAIT_MAX_AGE is forgotten."""
-    for h in [h for h, (_, t) in _WAIT_FAULTS_DROPPED.items() if time.time() - t >= WAIT_MAX_AGE]:
-        del _WAIT_FAULTS_DROPPED[h]
-    return _WAIT_FAULTS_DROPPED.get(home, (0, 0.0))[0]
+    """Faults *home* dropped past WAIT_LOST_LIMIT in the last WAIT_MAX_AGE; older drops are forgotten
+    one by one, and a home with none left is removed."""
+    now = time.time()
+    for h in list(_WAIT_FAULTS_DROPPED):
+        drops = _WAIT_FAULTS_DROPPED[h]
+        while drops and now - drops[0][0] >= WAIT_MAX_AGE:
+            drops.popleft()
+        if not drops:
+            del _WAIT_FAULTS_DROPPED[h]
+    return sum(n for _, n in _WAIT_FAULTS_DROPPED.get(home, ()))
 
 
 def _apply_wait(home: Path, rid: str, what: str, rec: dict[str, Any] | None) -> None:
@@ -2872,7 +3072,7 @@ def source_text(item_id: str, version: str) -> dict[str, Any]:
         raise LookupError(f"{source} item is no longer available")
     if item.get("kind") == "sudo":
         raise PermissionError("password prompts are never expanded")
-    if item.get("version") != version:
+    if version not in (item.get("version"), item.get("cut_version")) or not version:
         raise StaleAnswer("item changed; refresh the queue")
     return {
         "id": item_id,

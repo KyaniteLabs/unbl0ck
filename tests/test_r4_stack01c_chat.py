@@ -39,7 +39,8 @@ class BoundedRead(HomeCase):
         real = needs._ask_redact
         with patch.object(needs, "_ask_redact", lambda text: seen.append(len(text)) or real(text)):
             (item,) = needs.chat_items(self.home, full=True)
-        self.assertTrue(seen and max(seen) <= needs.CHAT_READ_CHARS, seen)
+        # The read end plus the lead redacted with it (#73), never the whole message.
+        self.assertTrue(seen and max(seen) <= needs.CHAT_READ_CHARS + needs.CHAT_LEAD_CHARS, seen)
         self.assertTrue(item["ask"].endswith(ASK))
         self.assertTrue(item["ask_truncated"])
         self.assertTrue(item["text_cut"])
