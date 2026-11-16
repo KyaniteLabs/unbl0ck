@@ -91,6 +91,31 @@ class AnAnswerIsPairedWithItsEvent(KanbanAnswerCase):
             self.assertTrue(needs._answered_with(
                 c, kanban_db, task, "operator", block.id, "Decomposed into two options; choose B"))
 
+    def test_unlogged_notes_after_the_answer_neither_hide_it_nor_pair_an_older_answer(self):
+        """#73 review: every note Kanban writes with no event, written after the answer, leaves the
+        answer placed and an answer from before the block unplaced."""
+        task = self.card()
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "Rejected")  # before the current block
+            kanban_db.unblock_task(c, task)
+        self.reblock(task)
+        block = self.block(task)
+        notes = (
+            "Specified \u2014 updated title and promoted to todo.",
+            "Decomposed into 2 child card(s).",
+            "reconciliation: card was 'running' with no valid claim; reset to ready.",
+            "Invalidated: ancestor card was reopened.",
+        )
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "Approved")
+            for note in notes:
+                kanban_db._insert_comment(c, task, "operator", note, int(time.time()))
+            c.commit()
+        with self.conn() as c:
+            self.assertTrue(needs._answered_since(c, kanban_db, task, "operator", block.id))
+            self.assertTrue(needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved"))
+            self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Rejected"))
+
 
 if __name__ == "__main__":
     unittest.main()
