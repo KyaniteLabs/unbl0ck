@@ -4,9 +4,9 @@ explicit, bounded, read-only action that says what it covered and what it did no
 import importlib.util
 import json
 import os
-import subprocess
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -387,6 +387,19 @@ class DesktopSearchPreservesState(unittest.TestCase):
         for fn in ("const clearFilters", "const changeQuery"):
             line = s[s.index(fn):].split("\n", 1)[0]
             self.assertIn("searchGen.current += 1", line)
+
+    def test_the_summary_names_the_sources_never_full_text_searched(self):
+        """#45: the line under a full-text search says which sources it never looks in."""
+        s = (ROOT / "desktop/src/plugin.src.js").read_text()
+        start = s.index("const fullSummary = h => {")
+        end = s.index("\n  }\n", start) + 4
+        script = (
+            "const q = {items: [], at: 1};\n" + s[start:end] + "\n"
+            "console.log(fullSummary({searched: {chat: 1}, not_searched: {}, limits: {}, queueAt: 1,"
+            " sources_not_searched: ['kanban', 'pairing']}))"
+        )
+        out = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True).stdout
+        self.assertIn("kanban and pairing cards are not full-text searched", out)
 
     def test_cards_stay_mounted_by_id_so_their_state_survives_a_search(self):
         s = (ROOT / "desktop/src/plugin.src.js").read_text()

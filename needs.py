@@ -582,6 +582,11 @@ def _read_plain_text(p: Path, limit: int | None = None, errors: str = "strict") 
     return _read_plain_text_st(p, limit, errors)[0]
 
 
+# The stores recovery.py can diagnose, preserve and restore (issue #48): their read errors say so.
+RECOVERABLE_STORES = frozenset({"hidden.json", "pending-release.json", "bluf.json"})
+RECOVERY_HINT = "; run `python3 recovery.py diagnose` next to needs.py"
+
+
 def _read_json(
     p: Path,
     *,
@@ -604,10 +609,11 @@ def _read_json(
         log.warning(
             "unbl0ck: ignoring unreadable %s: %s: %s", p.name, type(exc).__name__, exc
         )
+        hint = RECOVERY_HINT if p.name in RECOVERABLE_STORES else ""
         if errors is not None:
-            errors.append(f"{source}: {p.name}: {type(exc).__name__}; could not read record")
+            errors.append(f"{source}: {p.name}: {type(exc).__name__}; could not read record{hint}")
         if strict:
-            raise RuntimeError(f"could not read {p.name}; repair the record before changing it") from exc
+            raise RuntimeError(f"could not read {p.name}; repair the record before changing it{hint}") from exc
         return {}
     return data
 
@@ -3188,6 +3194,9 @@ def search_text(query: Any) -> dict[str, Any]:
         "matches": matches,
         "searched": searched,
         "not_searched": not_searched,
+        # Sources whose cards are never full-text searched, by design (issue #45): the result says
+        # so rather than letting a miss there read as "not found".
+        "sources_not_searched": sorted(s for s, row in SURFACES.items() if not row["search"]),
         "items_cut": cut,
         "skipped_private": private,
         "errors": errors,

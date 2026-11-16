@@ -1747,6 +1747,7 @@ function Page({ ctx, refresh, scope = '' }) {
     const parts = [`full text searched ${Object.entries(h.searched || {}).map(([s, n]) => `${n} ${s}`).join(', ') || 'nothing'}`]
     const miss = Object.entries(h.not_searched || {}).map(([s, n]) => `${n} ${s} not searched (limit ${h.limits.items_per_source} per source)`)
     if (miss.length) parts.push(miss.join(', '))
+    if ((h.sources_not_searched || []).length) parts.push(`${h.sources_not_searched.join(' and ')} cards are not full-text searched`)
     if (h.chat_sessions_unread) parts.push(`${h.chat_sessions_unread} older chat session(s) not read (scan limit)`)
     if (h.items_cut) parts.push(`${h.items_cut} long item(s) searched only to ${h.limits.chars_per_item} characters`)
     if (h.skipped_private) parts.push(`${h.skipped_private} password prompt(s) never searched`)
@@ -1899,7 +1900,8 @@ function Page({ ctx, refresh, scope = '' }) {
           verdict === 'clear'
             ? jsxs('div', { className: 'ub-clear', children: [jsx('b', { children: '● ALL CLEAR' }), jsx('span', { children: 'No card, outside item, chat, prompt or pairing request is waiting on you.' })] })
             : null,
-          !q.loading ? coverageNote(q) : null
+          !q.loading ? coverageNote(q) : null,
+          !q.loading ? disclosureNote(q) : null
         ]
       })
       ] })
@@ -1946,6 +1948,22 @@ function coverageNote(q) {
   return jsxs('details', { className: 'ub-coverage', open: omittedChats(q) > 0, children: [
     jsx('summary', { children: (days ? `Chats checked: last ${days} days. ` : '') + 'What this list does not cover' }),
     ...notes.map(line => jsx('p', { key: line, children: line }))
+  ] })
+}
+
+// What may leave this machine: per source, whether its text can go to the model provider now
+// (the queue's live disclosure matrix, issue #42). Booleans only; never item text.
+function disclosureNote(q) {
+  const rows = Array.isArray(q && q.disclosure) ? q.disclosure.filter(r => r && typeof r.source === 'string') : []
+  if (!rows.length) return null
+  const line = r => {
+    const uses = [r.summary && 'TL;DR summaries', r.ask && 'Ask'].filter(Boolean)
+    return `${r.source}: ${uses.length ? `text may go to the model provider for ${uses.join(' and ')}` : 'text is never sent to the model provider'}`
+  }
+  const sent = rows.filter(r => r.summary || r.ask).length
+  return jsxs('details', { className: 'ub-coverage ub-disclosure', children: [
+    jsx('summary', { children: sent ? `What can leave this machine: ${sent} of ${rows.length} sources` : 'Nothing here is sent to a model provider' }),
+    ...rows.map(r => jsx('p', { key: r.source, children: line(r) }))
   ] })
 }
 
