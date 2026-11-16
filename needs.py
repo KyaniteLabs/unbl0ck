@@ -1955,6 +1955,9 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
 # sits at the end of a turn, so a longer message is read from its end.
 CHAT_READ_CHARS = 100_000
 CHAT_READ_BYTES = CHAT_READ_CHARS * 4  # the most bytes that can hold CHAT_READ_CHARS characters
+# Characters before a cut message's read end that are redacted with it, so a credential whose label
+# lies before the cut is still recognised; only the read end is shown.
+CHAT_LEAD_CHARS = 16_384
 
 
 def _spaces_only(conn: sqlite3.Connection, rowid: Any, raw: bytes, length: int, budget: list[int]) -> bool:
@@ -2067,6 +2070,23 @@ def _open_chat_db(db: Path) -> sqlite3.Connection:
     finally:
         os.close(fd)
     return conn
+
+
+def _redact_with_lead(conn: sqlite3.Connection, rowid: Any, length: int, raw: bytes, shown: str) -> str:
+    """The redacted read end of a cut message, redacted together with up to CHAT_LEAD_CHARS characters
+    before it: a value just past the cut whose label lies before it is then redacted. *shown* is the
+    read end redacted alone; the result is the same length from the end of the joined redaction, so
+    it shows no more of the message than *shown* did, give or take what redaction shortened."""
+    room = (CHAT_READ_CHARS + CHAT_LEAD_CHARS) * 4
+    whole = length <= len(raw)
+    if not whole:
+        raw, _ = _read_text(conn, "messages", "content", rowid, room, tail=True)
+        whole = length <= len(raw)
+    text = raw.decode("utf-8", "replace")
+    if not whole or len(text) > CHAT_READ_CHARS + CHAT_LEAD_CHARS:
+        text = _drop_cut(text[-(CHAT_READ_CHARS + CHAT_LEAD_CHARS):], True)
+    joined = _ask_redact(text.replace("\x00", " "))
+    return joined[max(0, len(joined) - len(shown)):]
 
 
 def _chat_full_fields(shown: str, over: bool) -> dict[str, Any]:
@@ -2334,6 +2354,8 @@ def chat_items(
                 # Redact the whole turn before it is cut to an excerpt: the cut keeps the tail,
                 # so a long secret would otherwise leave a readable fragment.
                 shown = _ask_redact(content)
+                if over:
+                    shown = _redact_with_lead(conn, rowid, length, raw, shown)
                 where_ = (
                     "Bot Chat"
                     if bot_chat
