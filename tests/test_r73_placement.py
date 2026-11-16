@@ -30,6 +30,19 @@ class AnAnswerIsPairedWithItsEvent(KanbanAnswerCase):
         with self.conn() as c:
             self.assertTrue(needs._answered_with(c, kanban_db, task, "operator", block.id, "  Approved  "))
 
+    def test_a_same_length_comment_before_the_block_is_not_the_answer(self):
+        task = self.card()
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "Yes")  # before the current block
+            kanban_db.unblock_task(c, task)
+        self.reblock(task)
+        block = self.block(task)
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "Nop")
+        with self.conn() as c:
+            self.assertTrue(needs._answered_with(c, kanban_db, task, "operator", block.id, "Nop"))
+            self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Yes"))
+
 
 if __name__ == "__main__":
     unittest.main()
