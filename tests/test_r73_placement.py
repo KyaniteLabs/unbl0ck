@@ -160,6 +160,20 @@ class AnAnswerIsPairedWithItsEvent(KanbanAnswerCase):
             self.assertFalse(needs._answered_since(c, kanban_db, task, "operator", block.id))
             self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved"))
 
+    def test_an_event_whose_author_cannot_be_read_disables_exact_pairing(self):
+        """#73 review: an event read without its author may be this author's, so a logged
+        note-shaped answer is not skipped as one of Kanban's notes."""
+        task = self.card()
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator" + " " * 4096, "Approved")  # before the current block
+            kanban_db.unblock_task(c, task)
+        self.reblock(task)
+        block = self.block(task)
+        with self.conn() as c:
+            kanban_db.add_comment(c, task, "operator", "Decomposed into two options; choose B")
+        with self.conn() as c:
+            self.assertFalse(needs._answered_with(c, kanban_db, task, "operator", block.id, "Approved"))
+
 
 if __name__ == "__main__":
     unittest.main()

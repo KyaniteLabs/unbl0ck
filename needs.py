@@ -1523,10 +1523,13 @@ def _bounded_value(conn: Any, table: str, column: str, rowid: Any, kind: str, ro
     return _read_text(conn, table, column, rowid, room)[0] if kind in ("text", "blob") else None
 
 
-def _author_events_after(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> Iterable[Any]:
+def _author_events_after(
+    conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, unknown: list[int] | None = None
+) -> Iterable[Any]:
     """The logged ``len`` of each ``commented`` event of *author* after the block (every one when
     there is none), oldest first, streamed under the placement work budget. A payload is read as
-    its first 4096 bytes, never SQLite's whole value."""
+    its first 4096 bytes, never SQLite's whole value; an event whose author cannot be read (NULL,
+    malformed or longer than that) is counted in *unknown*."""
     try:
         payloads: Iterable[Any] = (
             _bounded_value(conn, "task_events", "payload", r, t, 4096)
@@ -1539,7 +1542,10 @@ def _author_events_after(conn: Any, kanban_db: Any, task_id: str, author: str, b
                     if e.kind == "commented" and e.id > (block_id or 0))
     for raw in _budgeted(_readable(payloads)):
         payload = _json_payload(raw)
-        if _same_author(payload.get("author"), author):
+        if not isinstance(payload.get("author"), str):
+            if unknown is not None:
+                unknown[0] += 1
+        elif _same_author(payload.get("author"), author):
             yield payload.get("len")
 
 
@@ -1586,7 +1592,8 @@ def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_i
     k = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, block_id))
     if not k:
         return False
-    logged = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, None))
+    unknown = [0]  # events whose author cannot be read: any one may be this author's
+    logged = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, None, unknown))
     room = max(4 * len(text) + 1, 256)  # tells a longer body, and holds a note's opening
 
     def newest() -> Iterable[str]:
@@ -1600,7 +1607,7 @@ def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_i
     if unlogged < 0:
         return False  # a comment is gone: Kanban did not do that, so nothing pairs for sure
     wanted, left = {text, text.strip()}, k
-    exact = unlogged in (0, notes)  # every comment pairs, or every unlogged one is a note
+    exact = not unknown[0] and unlogged in (0, notes)  # every comment pairs, or every unlogged one is a note
     for body in newest():
         if UNLOGGED_COMMENT.match(body):
             if exact and unlogged:
