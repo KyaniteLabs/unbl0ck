@@ -1498,16 +1498,56 @@ def _comment_events(conn: Any, kanban_db: Any, task_id: str, author: str, block_
     return [p.get("len") for p in payloads if _same_author(p.get("author"), author)]
 
 
+def _paired_after(conn: Any, task_id: str, author: str, block_id: int | None) -> int | None:
+    """The id of *author*'s first comment after the block, 0 when they have none, or None when the
+    pairing cannot be trusted. Kanban's add_comment writes a comment and its ``commented`` event in
+    one transaction, so the author's n-th comment is the one their n-th event logged. Kanban also
+    writes a few comments with no event (a triage card's "Specified" note); when the author's
+    comment and event counts differ, the caller falls back to matching by logged length."""
+    events = [
+        i for i, p in conn.execute(
+            "SELECT id, substr(payload, 1, 4096) FROM task_events WHERE task_id = ? AND kind = 'commented' "
+            "ORDER BY id", (task_id,))
+        if _same_author(_json_payload(p).get("author"), author)
+    ]
+    comments = [
+        i for i, a in conn.execute("SELECT id, author FROM task_comments WHERE task_id = ? ORDER BY id", (task_id,))
+        if _same_author(a, author)
+    ]
+    if len(events) != len(comments):
+        return None
+    return next((c for e, c in zip(events, comments) if e > (block_id or 0)), 0)
+
+
+def _paired_after_or_none(conn: Any, task_id: str, author: str, block_id: int | None) -> int | None:
+    try:
+        return _paired_after(conn, task_id, author, block_id)
+    except Exception:  # noqa: BLE001 - schema drift or no comments table: the length match decides
+        return None
+
+
 def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None) -> bool:
     """Has *author* commented since the block began: one of their ``commented`` events is later
     than the block's. The one test for "answered", used by the queue and by answer_card; a comment
     no event records never answers, so the card stays in front of you."""
+    first = _paired_after_or_none(conn, task_id, author, block_id)
+    if first is not None:
+        return first > 0
     return bool(_comment_events(conn, kanban_db, task_id, author, block_id))
 
 
 def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
-    """Has *author* posted *text* since the block began? Each event logs its comment's length, so the
-    k events of that length after the block logged the author's k newest comments of that length."""
+    """Has *author* posted *text* since the block began? Paired exactly when Kanban's counts allow
+    (Kanban stores the body stripped); otherwise each event logs its comment's length, so the k events
+    of that length after the block logged the author's k newest comments of that length."""
+    first = _paired_after_or_none(conn, task_id, author, block_id)
+    if first is not None:
+        if not first:
+            return False
+        rows = conn.execute(
+            "SELECT author FROM task_comments WHERE task_id = ? AND id >= ? AND body IN (?, ?)",
+            (task_id, first, text, text.strip()))
+        return any(_same_author(a, author) for (a,) in rows)
     k = _comment_events(conn, kanban_db, task_id, author, block_id).count(len(text))
     try:
         rows = conn.execute(
