@@ -355,7 +355,7 @@ says to act; headers can be forged, and the label never makes the text trusted.
 
 | Format | Read? | Notes |
 | --- | --- | --- |
-| `.eml` | Yes | Subject, recipient, plain body, else inert text from the HTML body. Outlook "Save As", Gmail and Thunderbird exports are covered by tests. |
+| `.eml` | Yes | Subject, recipient, plain body, else inert text from the HTML body. Tested with synthetic messages shaped like Outlook "Save As" (`X-Unsent`) and Gmail (plain and HTML alternatives with an inline image) exports, and with Thunderbird's draft header (`X-Mozilla-Draft-Info`); no captured real export is in the tests yet. |
 | `.md` | Yes | Read as notes; first non-empty line is the title. |
 | `.txt` | Yes | Read as notes (for example transcript exports). |
 | `.msg` | No | Outlook binary format. Save as `.eml` instead. |
