@@ -4257,20 +4257,16 @@ def done_outside(
 # tree of every shipped file and keeps this table equal to what the code actually imports and
 # calls (a name in a comment is not a dependency). A dotted entry is a method of a class in the
 # same module. ``Comment``, ``Attachment`` and ``list_attachments`` are reached by name only on a
-# schema-drift fallback path, so they are not required. The installer script's webhook helpers
-# are listed because that script needs them on the same host.
+# schema-drift fallback path, so they are not required. No private host helpers are required.
 HOST_API = {
     "hermes_cli.kanban_db": (
         "Event", "add_comment", "board_exists", "get_task", "latest_run",
-        "list_comments", "list_events", "list_tasks", "task_graph_context", "write_txn",
-        "_append_event", "_landing_status_after_parents",
-        "_reclaim_dangling_run", "_resume_status_from_events",
+        "list_comments", "list_events", "list_tasks", "task_graph_context", "unblock_task",
+        "write_txn",
     ),
     "hermes_cli.kanban_db_connect": ("connect",),
     "hermes_cli.kanban_db_boards": ("list_boards",),
     "hermes_cli.config": ("load_config_readonly",),
-    "hermes_cli.profiles": ("profile_exists",),
-    "hermes_cli.webhook": ("_mutate_subscriptions", "_subscriptions_path"),
     "hermes_constants": ("get_hermes_home",),
     "gateway.pairing": ("PairingStore", "PairingStore.list_pending"),
 }
@@ -4660,14 +4656,15 @@ class VersionRequired(RuntimeError):
 def _unblock_task_at_version(
     conn: Any, kanban_db: Any, task_id: str, version: str
 ) -> bool:
-    """Perform Hermes' native unblock transition in the same txn as its version check.
+    """Check the block version, then let the public host API own the transition.
 
-    Hermes' public helper owns its transaction, so calling it after a separate check leaves a
-    race. Its transition rules are applied here with the same native helpers and SQL semantics.
-    Inside an open transaction (``answer_card``) this runs as a savepoint, so a failure here
-    undoes only the unblock and leaves the answer written before it.
+    The legacy public helper owns a non-nestable transaction. A narrow race remains
+    between this check committing and that helper acquiring its write transaction:
+    another actor could re-block the card there. Do not copy private host transition
+    rules to close that gap. A future public conditional-unblock API needs explicit
+    compatibility and episode-token handling before it can replace this path.
     """
-    with kanban_db.write_txn(conn, allow_nested=True):
+    with kanban_db.write_txn(conn):
         current = kanban_db.get_task(conn, task_id)
         if current is None:
             raise LookupError(f"card {task_id} not found")
@@ -4676,51 +4673,12 @@ def _unblock_task_at_version(
         current_version = str(block.id if block else since)
         if current_version != version:
             raise StaleAnswer(
-                f"card {task_id} has a newer block; nothing was posted or released; "
-                "refresh to see the new question"
+                f"card {task_id} has a newer block; refresh before releasing it"
             )
-
         status = str(getattr(current.status, "value", current.status))
         if status not in {"blocked", "scheduled"}:
             return False
-        now = int(time.time())
-        resume_status = (
-            kanban_db._resume_status_from_events(conn, task_id)
-            if status == "blocked"
-            else "ready"
-        )
-        kanban_db._reclaim_dangling_run(
-            conn,
-            task_id,
-            statuses=("blocked", "scheduled"),
-            now=now,
-            note="invariant recovery on unblock",
-        )
-        landing_status = kanban_db._landing_status_after_parents(conn, task_id)
-        new_status = (
-            "review"
-            if landing_status == "ready" and resume_status == "review"
-            else landing_status
-        )
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
-            (new_status, task_id),
-        )
-        if cur.rowcount != 1:
-            return False
-        kanban_db._append_event(
-            conn,
-            task_id,
-            "unblocked",
-            (
-                {"status": new_status, "resume_status": resume_status}
-                if new_status != "ready" or resume_status != "ready"
-                else None
-            ),
-        )
-        return True
+    return bool(kanban_db.unblock_task(conn, task_id))
 
 
 def _json_payload(raw: Any) -> dict[str, Any]:
@@ -4743,10 +4701,11 @@ def answer_card(
     """Unblock through native Kanban, then comment as the principal if asked.
 
     *version* is the queue item's version the human read (the block event id). It is required to
-    release; an answer is refused if the card has been blocked again since, so an answer to an old
-    question never releases a new one. The answer and the release are one write transaction: a
-    refused answer (stale version) leaves no comment behind, and a resumed worker always sees the
-    answer. A release that fails after the answer is written (it returns false or raises) is
+    release. An already-stale answer is refused before posting a comment. The answer is
+    committed first so a resumed worker sees it, then the version is checked again before
+    calling the public unblock API in its own transaction. The legacy API leaves a narrow
+    check-to-unblock race (see ``_unblock_task_at_version``); this is not an atomic release.
+    A release that fails after the answer is committed (it returns false or raises) is
     remembered, and a retry releases without posting the answer twice; the marker is reserved
     before anything is written, so a lock held by another writer cannot lose it. Triage cards
     (``block_loop_detected``) accept the answer but cannot be released here.
@@ -4802,9 +4761,8 @@ def answer_card(
             if kanban_db.get_task(conn, task_id) is None:
                 raise LookupError(f"card {task_id} not found on {board}")
             with kanban_db.write_txn(conn):
-                # Re-read inside the write transaction: a concurrent unblock or answer must not
-                # slip between the check and the comment, and the release below runs in this same
-                # transaction so a newer block cannot slip in between the comment and the release.
+                # Check and comment together; the public unblock API must run only after
+                # this transaction commits, because it owns a non-nestable transaction.
                 current = kanban_db.get_task(conn, task_id)
                 if current is None:
                     raise LookupError(f"card {task_id} not found on {board}")
@@ -4838,33 +4796,31 @@ def answer_card(
                     comment_id = kanban_db.add_comment(
                         conn, task_id, author=author, body=text
                     )
-                if release:
-                    try:
-                        if _unblock_task_at_version(conn, kanban_db, task_id, current_version):
-                            released = True
-                        else:
-                            latest = kanban_db.get_task(conn, task_id)
-                            if (
-                                latest is None
-                                or str(getattr(latest.status, "value", latest.status))
-                                in HELD_STATUSES
-                            ):
-                                release_failed = True
-                            else:
-                                released = True  # another actor released it; not ours to claim
-                    except (StaleAnswer, LookupError):
-                        raise
-                    except Exception as exc:  # noqa: BLE001 - reconciled like a false return
-                        # The unblock ran as a savepoint: only it is undone; the answer stays.
-                        release_failed = True
-                        release_error = exc
-                        log.warning(
-                            "unbl0ck: releasing %s failed after the answer was written: %s: %s",
-                            task_id,
-                            type(exc).__name__,
-                            exc,
-                        )
             committed = True
+            if release:
+                try:
+                    if _unblock_task_at_version(conn, kanban_db, task_id, current_version):
+                        released = True
+                    else:
+                        latest = kanban_db.get_task(conn, task_id)
+                        if (
+                            latest is None
+                            or str(getattr(latest.status, "value", latest.status))
+                            in HELD_STATUSES
+                        ):
+                            release_failed = True
+                        else:
+                            released = True  # another actor released it; not ours to claim
+                except Exception as exc:  # noqa: BLE001 - reconciled like a false return
+                    # The answer is already durable; keep its recovery marker for a retry.
+                    release_failed = True
+                    release_error = exc
+                    log.warning(
+                        "unbl0ck: releasing %s failed after the answer was written: %s: %s",
+                        task_id,
+                        type(exc).__name__,
+                        exc,
+                    )
     finally:
         if not committed and reserved is not None and reserved[1]:
             # Nothing was written (stale, refused, unreadable): drop the marker this call

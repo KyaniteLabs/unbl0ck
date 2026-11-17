@@ -48,7 +48,7 @@ does not prove focus, accessible controls or the operator journey in a browser.
 | Ask restart recovery | `test_ask_job_recovery`, `test_desktop_ask_recovery` | Restart before send, after send, after completion (with and without answer persistence) and after failure; repeated polling; TTL, cap and settled eviction; corrupt, foreign and symlinked markers; 0600/0700 modes; no answer text on disk by default; card isolation; delete; the provider is never called by recovery |
 | Summary / Ask | `test_bluf*`, `test_ask_job`, `test_ask_privacy`, `test_state_machines`, rendered operator checks | Bounded admission; reasoning stripped; lost terminal response can be collected with no second model POST |
 | Config read failure and repair | `test_failure_quality`, independent actual Hermes parser probes | Raised, marked-dictionary and import failures fail closed, both cold and after a good config; concurrent refresh shares one settled read; another caller's repair cannot erase an in-flight fault |
-| Security relay / installer | `test_security_review`, workflow lint | Native signature/limiter compatibility; pending stays non-green; exact authenticated current review required; foreign routes preserved |
+| Security relay / setup instructions | `test_security_review`, workflow lint | Native signature/limiter compatibility; pending stays non-green; exact authenticated current review required; private installer absent; public CLI instructions supplied |
 
 ## Observed evidence: 2026-11-13
 
@@ -112,9 +112,8 @@ row is filled only from such a record plus the source commit that was tested: a 
 name the source commit, the Hermes version and release date, and the UTC time stays "not run".
 
 Interfaces taken from Hermes that are not documented plugin APIs are listed in
-`needs.HOST_API` (six of them are private helpers: four in `kanban_db`, two in the webhook
-module the installer script uses; the gateway pairing store and its `list_pending` method are
-listed too) and a test reads the syntax tree of every shipped file and keeps that list equal to
+`needs.HOST_API` (none are private helpers; the gateway pairing store and its
+`list_pending` method are listed too) and a test reads the syntax tree of every shipped file and keeps that list equal to
 what the source imports and calls. A name that appears only in a comment is not a dependency. If an upgrade removes one and
 a Kanban board then fails to read, the queue adds a single
 `host: this Hermes lacks N of the M interfaces UNBL0CK uses (...)` line to its errors instead

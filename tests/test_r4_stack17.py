@@ -68,10 +68,8 @@ class InventoryIsComplete(unittest.TestCase):
     def test_the_pairing_store_is_listed_without_installer_dependencies(self):
         self.assertIn("PairingStore", needs.HOST_API["gateway.pairing"])
         self.assertIn("PairingStore.list_pending", needs.HOST_API["gateway.pairing"])
-        self.assertEqual(
-            set(needs.HOST_API["hermes_cli.webhook"]), {"_mutate_subscriptions", "_subscriptions_path"}
-        )
-        self.assertEqual(set(needs.HOST_API["hermes_cli.profiles"]), {"profile_exists"})
+        self.assertNotIn("hermes_cli.webhook", needs.HOST_API)
+        self.assertNotIn("hermes_cli.profiles", needs.HOST_API)
 
     def test_a_missing_pairing_store_makes_the_host_incompatible(self):
         r = needs.host_compat(loader_without(gateway_pairing=["PairingStore"]))
@@ -85,7 +83,8 @@ class InventoryIsComplete(unittest.TestCase):
 
     def test_removed_webhook_helpers_do_not_break_compatibility(self):
         r = needs.host_compat(loader_without(hermes_cli_webhook=["_mutate_subscriptions"]))
-        self.assertEqual(r["missing"], ["hermes_cli.webhook._mutate_subscriptions"])
+        self.assertEqual(r["missing"], [])
+        self.assertTrue(r["ok"])
 
     @unittest.skipUnless(HERMES, "Hermes is not importable here")
     def test_the_real_host_interfaces_are_present(self):

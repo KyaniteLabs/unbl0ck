@@ -632,8 +632,9 @@ class FakeKanban(unittest.TestCase):
             raise needs.StaleAnswer("newer block")
 
         self.release_behavior = stale_after_comment
-        with self.assertRaises(needs.StaleAnswer):
+        with self.assertRaises(needs.UnblockFailed) as failure:
             needs.answer_card("factory", "t_1", "Go with A", release=True, version="11")
+        self.assertIsInstance(failure.exception.__cause__, needs.StaleAnswer)
         self.assertEqual(
             self.calls, [("comment", "t_1", "ada", "Go with A"), ("unblock", "t_1")]
         )

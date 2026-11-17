@@ -19,7 +19,7 @@ and performs explicit human-selected actions; it does not run a separate service
 | `recovery.py` | Operator CLI: diagnose the shared state files, preserve their bytes, restore a verified backup; counts only, never clears a lock |
 | `adapter_contract.py` | Plan-only vocabulary and reconciliation rules for a future provider adapter; pure code, reads nothing, not wired into the queue (see [provider-integrations.md](provider-integrations.md)) |
 | `scripts/security_review.py` | Trusted CI relay and authenticated GitHub verdict reconciliation |
-| `scripts/install_security_review_route.py` | Owner-run installation of one native Hermes subscription |
+| `docs/security-review-prompt.txt` | Prompt template for owner-run public Hermes webhook subscription |
 
 ## Read and write boundaries
 
@@ -60,7 +60,7 @@ control and are not a standalone public API.
 | `GET /card/ask/{job}` | Pending or repeatably readable result; terminal model errors use 502; a job recovered after a restart as `unknown` or `not_submitted` uses 409; a missing `card` is 400 and a mismatched `card` is 404 |
 | `GET /card/ask/{job}?poll=true&card=<id>` | Same job, with every outcome encoded for the client: `state` is `pending`, `complete`, `failed`, `unknown` or `not_submitted` (`resubmit_safe` only when nothing was sent) |
 | `DELETE /card/ask/{job}?card=<id>` | Deletes the job and its restart marker now; `card` is required and must match; if the marker cannot be removed the call fails and cleanup retries until storage is writable |
-| `POST /kanban/answer` | Versioned native comment and optional release; stale version 409 with no comment or release; empty version 400; unversioned comment-only answers still work for older callers (response `versioned:false`, `Warning: 299` header) unless `require_answer_version` is on (428, nothing written, decided on the same settings snapshot the write uses; a release without a version stays 400); the response reports the block `version` applied; settings uncertainty prevents writes |
+| `POST /kanban/answer` | Versioned native comment and optional release; already-stale version 409 with no comment or release; a re-block detected after the answer commits returns 409 with the answer retained for recovery; empty version 400; unversioned comment-only answers still work for older callers (response `versioned:false`, `Warning: 299` header) unless `require_answer_version` is on (428, nothing written, decided on the same settings snapshot the write uses; a release without a version stays 400); the response reports the block `version` applied; settings uncertainty prevents writes |
 | `POST /hide`, `POST /unhide` | Hide a specific version; restore by ID (also restores a filed record marked done; `restored:false` when nothing was restorable). Identifiers (and `board`/`task_id` on `/card`, `/kanban/answer`, `/outside/done`) are limited to 300 characters with no control characters, including the C1 range and line/paragraph separators (400); a malformed or non-Kanban `id`, or one that disagrees with `board`/`task_id` (the same board spelled differently, such as `DEFAULT`, agrees), is rejected instead of retargeted |
 | `POST /outside/done` | Local, reversible Done: mark a filed record done (kept up to 15 minutes, at most 25) or hide a folder item version; `local_only:true`; nothing is sent or completed externally |
 | `GET /pack`, `POST /pack` | Read pack representation, or explicitly write it |
@@ -128,9 +128,14 @@ as private. Settings and source files remain owned by their original application
 | Ask conversations | Desktop session memory, 100 entries, 30 minutes after last activity; question version and outstanding job retained; never written to disk |
 | Display preferences | Effects and sound only, in Desktop localStorage |
 
-An answer with release is one Kanban write transaction: a stale version is refused (409) with no comment
-written, and a release that fails after the answer is written (false or an error) leaves the comment and a
-recovery marker for the retry. Duplicate detection looks only at comments made since the current block.
+The version check and answer use one Kanban write transaction: an already-stale version
+is refused (409) with no comment written. The answer commits before release, so a resumed
+worker sees it. A second version check precedes the public `kanban_db.unblock_task` call,
+which owns its own transaction. The legacy public API leaves a narrow race between that
+check and the unblock: another actor can re-block the card in that gap. This is not an
+atomic compare-and-unblock guarantee. A changed version detected after posting, or another
+release failure, leaves the durable answer and its recovery marker; refresh before retrying.
+Duplicate detection looks only at comments made since the current block.
 
 Shared read-modify-write stores for hidden, summary, pending-release and filed state
 use thread locks and atomic replacement, plus one cross-process lock on
