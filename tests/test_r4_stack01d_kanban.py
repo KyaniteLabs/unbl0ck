@@ -112,8 +112,8 @@ class HistoricalAnswersAreNotDuplicates(KanbanAnswerCase):
         self.assertEqual(self.bodies(task), ["A", "B", "A"])
 
 
-class AnswerAndReleaseAreOneWrite(KanbanAnswerCase):
-    def test_a_reblock_after_the_comment_never_leaves_a_comment_behind_a_409(self):
+class AnswerAndPublicReleaseTransactions(KanbanAnswerCase):
+    def test_reblock_after_comment_commit_is_reported_as_failed_release(self):
         """01-080 (class B): StaleAnswer means no comment was written."""
         task = self.card()
         version = self.version(task)
@@ -264,7 +264,7 @@ class RecoveryMarkerIsReservedFirst(KanbanAnswerCase):
         self.answer(task, "Go", release=True)
         self.assertEqual(needs.load_pending_releases(self.home), {})
 
-    def test_a_refused_answer_removes_the_marker_it_reserved(self):
+    def test_a_release_refused_after_posting_keeps_answer_and_marker(self):
         task = self.card()
         version = self.version(task)
         with patch.object(needs, "_unblock_task_at_version", side_effect=needs.StaleAnswer("newer")):
@@ -286,7 +286,7 @@ class RecoveryMarkerIsReservedFirst(KanbanAnswerCase):
 
 
 class AnswerDocs(unittest.TestCase):
-    def test_the_architecture_guide_describes_the_one_transaction_answer(self):
+    def test_the_architecture_guide_describes_public_release_race(self):
         """01-080/01-081/01-087 (class I): the documented contract is the implemented one."""
         text = (Path(__file__).resolve().parents[1] / "docs" / "architecture.md").read_text()
         self.assertIn("one Kanban write transaction", text)

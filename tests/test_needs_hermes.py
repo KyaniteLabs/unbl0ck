@@ -117,7 +117,7 @@ class RealHermesRelease(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = previous_home
 
-    def test_stale_answer_cannot_release_a_newer_block(self):
+    def test_reblock_after_answer_commit_refuses_release_and_keeps_answer(self):
         previous_home = os.environ.get("HERMES_HOME")
         with tempfile.TemporaryDirectory() as directory:
             os.environ["HERMES_HOME"] = directory

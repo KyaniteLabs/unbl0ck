@@ -85,7 +85,7 @@ class TheTableIsTheCode(unittest.TestCase):
         listed = {m: set(n) for m, n in needs.HOST_API.items()}
         self.assertEqual(used, listed)
 
-    def test_private_names_are_counted(self):
+    def test_no_private_host_names_remain(self):
         privates = {n for names in needs.HOST_API.values() for n in names if n.startswith("_")}
         self.assertEqual(
             privates,
@@ -104,7 +104,7 @@ class Report(unittest.TestCase):
         self.assertEqual((r["ok"], r["missing"], r["modules_missing"]), (True, [], []))
         self.assertEqual(needs.host_compat_note(r), "")
 
-    def test_a_renamed_private_function_is_named(self):
+    def test_a_missing_public_function_is_named(self):
         def load(module):
             mod = self.full()
             if module == "hermes_cli.kanban_db":

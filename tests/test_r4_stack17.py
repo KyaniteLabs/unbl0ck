@@ -65,7 +65,7 @@ class InventoryIsComplete(unittest.TestCase):
                         missed.append(p.name)
         self.assertEqual(sorted(set(missed)), [])
 
-    def test_the_pairing_store_and_the_installer_helpers_are_listed(self):
+    def test_the_pairing_store_is_listed_without_installer_dependencies(self):
         self.assertIn("PairingStore", needs.HOST_API["gateway.pairing"])
         self.assertIn("PairingStore.list_pending", needs.HOST_API["gateway.pairing"])
         self.assertEqual(
@@ -83,12 +83,12 @@ class InventoryIsComplete(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertEqual(r["missing"], ["gateway.pairing.PairingStore.list_pending"])
 
-    def test_a_removed_webhook_helper_is_named(self):
+    def test_removed_webhook_helpers_do_not_break_compatibility(self):
         r = needs.host_compat(loader_without(hermes_cli_webhook=["_mutate_subscriptions"]))
         self.assertEqual(r["missing"], ["hermes_cli.webhook._mutate_subscriptions"])
 
     @unittest.skipUnless(HERMES, "Hermes is not importable here")
-    def test_the_real_pairing_store_and_webhook_helpers_are_present(self):
+    def test_the_real_host_interfaces_are_present(self):
         r = needs.host_compat()
         self.assertEqual(r["missing"], [], r)
         self.assertEqual(r["checked"], sum(len(n) for n in needs.HOST_API.values()))
