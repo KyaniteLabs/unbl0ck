@@ -2621,7 +2621,7 @@ def pairing_items(
                     "title": f"{who} wants to talk to {bot} on {_platform_label(platform)}",
                     "ask": (
                         "They messaged the bot and got a pairing code. Nothing they send reaches an agent "
-                        "until you approve them on the dashboard's Pairing page or with hermes pairing approve."
+                        "until you approve them on the dashboard's Pairing page."
                     ),
                     "approve_command": approve,
                     "why": f"The request expires in {minutes} min"
