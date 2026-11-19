@@ -4625,7 +4625,8 @@ class UnblockFailed(RuntimeError):
     """The answer was written but the card could not be released; never claim otherwise."""
 
     def __init__(
-        self, task_id: str, comment_id: int | None, *, marker_full: bool = False
+        self, task_id: str, comment_id: int | None, *,
+        marker_full: bool = False, stale: bool = False,
     ):
         self.task_id = task_id
         self.comment_id = comment_id
@@ -4634,12 +4635,15 @@ class UnblockFailed(RuntimeError):
             if comment_id
             else "your answer is already posted"
         )
-        note = (
-            " Too many unfinished releases are waiting, so this one could not be remembered: "
-            "release the card on its board."
-            if marker_full
-            else " Retry the release from the queue."
-        )
+        if stale:
+            note = " The card has a newer block. Refresh the queue to see the new question."
+        elif marker_full:
+            note = (
+                " Too many unfinished releases are waiting, so this one could not be remembered: "
+                "release the card on its board."
+            )
+        else:
+            note = " Retry the release from the queue."
         super().__init__(
             f"{posted}, but card {task_id} could not be unblocked; it is still blocked.{note}"
         )
@@ -4698,7 +4702,7 @@ def answer_card(
     version: str | None = None,
     home: Path | None = None,
 ) -> dict[str, Any]:
-    """Unblock through native Kanban, then comment as the principal if asked.
+    """Post the principal's answer, then release through native Kanban if requested.
 
     *version* is the queue item's version the human read (the block event id). It is required to
     release. An already-stale answer is refused before posting a comment. The answer is
@@ -4831,7 +4835,9 @@ def answer_card(
                 log.warning("unbl0ck: could not remove an unused recovery marker for %s", item_id)
     if release_failed:
         raise UnblockFailed(
-            task_id, comment_id, marker_full=marker_full and not marker_reserved
+            task_id, comment_id,
+            marker_full=marker_full and not marker_reserved,
+            stale=isinstance(release_error, StaleAnswer),
         ) from release_error
     if release and marker_reserved:
         # Only this block's own marker: one recorded for a newer block stays. The card is

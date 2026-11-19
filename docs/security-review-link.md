@@ -53,15 +53,18 @@ changes are needed by this patch.
    Hermes before proceeding; the plugin no longer edits that store or installs routes.
 
    ```sh
+   review_prompt=$(cat docs/security-review-prompt.txt) &&
+   [ -n "$review_prompt" ] &&
    hermes webhook subscribe github-pr-security \
      --route-profile security \
      --events security_review_requested \
      --description "Commit-bound GitHub PR Security review requests" \
-     --prompt "$(cat docs/security-review-prompt.txt)" \
+     --prompt "$review_prompt" \
      --deliver log
    ```
 
-   Run this interactively in a private terminal, not CI or a recorded session. Hermes
+   Run this from the UNBL0CK checkout in a private terminal. The command stops if
+   the prompt file is missing, unreadable, or empty. Hermes
    generates and prints a signing secret; securely transfer it to the repository secret
    below, then clear the terminal output. Do not pass a secret in command-line arguments
    or paste it into a PR. The existing Security profile and enabled webhook gateway are

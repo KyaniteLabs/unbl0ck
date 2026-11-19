@@ -172,6 +172,8 @@ class RealHermesRelease(unittest.TestCase):
                             release=True, version=old_version, home=Path(directory),
                         )
                     self.assertIsInstance(failure.exception.__cause__, needs.StaleAnswer)
+                    self.assertIn("refresh", str(failure.exception).lower())
+                    self.assertNotIn("retry the release", str(failure.exception).lower())
                 finally:
                     kanban_db.write_txn = original_write_txn
 

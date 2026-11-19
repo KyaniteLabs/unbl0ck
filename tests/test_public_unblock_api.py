@@ -1,5 +1,9 @@
 """Public-host API contract; SQLite models the host's non-nestable transactions."""
+import re
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -73,6 +77,35 @@ class PublicWebhookInstructions(unittest.TestCase):
         self.assertIn('hermes webhook subscribe', instructions)
         self.assertIn('--route-profile security', instructions)
         self.assertTrue((root / 'docs/security-review-prompt.txt').is_file())
+
+    @unittest.skipUnless(shutil.which("sh"), "the documented setup command uses a POSIX shell")
+    def test_webhook_setup_requires_a_readable_nonempty_prompt(self):
+        root = Path(__file__).resolve().parents[1]
+        instructions = (root / "docs/security-review-link.md").read_text()
+        command = next(
+            block for block in re.findall(r"```sh\n(.*?)```", instructions, re.DOTALL)
+            if "hermes webhook subscribe" in block
+        )
+        shell = "hermes() { printf '%s\\n' \"$@\"; }\n" + command
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_file = Path(directory) / "docs/security-review-prompt.txt"
+            prompt_file.parent.mkdir()
+            for text in (None, ""):
+                with self.subTest(prompt=text):
+                    if text is not None:
+                        prompt_file.write_text(text)
+                    result = subprocess.run(
+                        ["sh", "-c", shell], cwd=directory, capture_output=True, text=True, check=False
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, "")
+            prompt_file.write_text("Review {head_sha}")
+            result = subprocess.run(
+                ["sh", "-c", shell], cwd=directory, capture_output=True, text=True, check=True
+            )
+            args = result.stdout.splitlines()
+            self.assertEqual(args[:3], ["webhook", "subscribe", "github-pr-security"])
+            self.assertEqual(args[args.index("--prompt") + 1], "Review {head_sha}")
 
 
 if __name__ == '__main__':
