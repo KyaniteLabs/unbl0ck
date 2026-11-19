@@ -1039,7 +1039,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     setAnswer(text)
     setAnswerStamp(stamp)
   }
-  const [busy, setBusy] = useState(false)
+  const [localBusy, setBusy] = useState(false)
+  const busy = localBusy || actionErrors.get(askId)?.pending === true
   const [, setActionErrorRevision] = useState(0)
   // A queue poll can remount this card before its action finishes. Read the current
   // error on every render so a later refresh sees the result from the old instance.
@@ -1178,11 +1179,16 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
   // onOk runs the moment the request succeeded, before the queue refresh: a slow or hung
   // refresh must not delay Undo or draft clearing, which only depend on the request result.
   const run = async (fn, okFor, cue = 'ok', onOk = null) => {
+    if (actionErrors.get(askId)?.pending) return null
     setBusy(true)
-    const action = { message: '', at: Date.now() }
+    const action = { message: '', at: Date.now(), pending: true }
     actionErrors.delete(askId)
     actionErrors.set(askId, action)
-    while (actionErrors.size > 100) actionErrors.delete(actionErrors.keys().next().value)
+    while (actionErrors.size > 100) {
+      const settled = Array.from(actionErrors).find(([, entry]) => !entry.pending)
+      if (!settled) break
+      actionErrors.delete(settled[0])
+    }
     try {
       const r = await fn()
       if (onOk) onOk(r)
@@ -1193,6 +1199,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
         host.notify({ kind: 'success', message: okFor(r) })
         await new Promise(res => setTimeout(res, reducedMotion() ? 0 : 650))
       }
+      action.pending = false
       await refresh()
       return r
     } catch (e) {
@@ -1206,9 +1213,11 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       host.notifyError(e, 'UNBL0CK: that did not go through')
       // An answer may have been posted before its release failed. Re-read the source so
       // recovery actions and changed questions appear without waiting for the next poll.
+      action.pending = false
       await refresh()
       return null
     } finally {
+      action.pending = false
       if (actionErrors.get(askId) === action && !action.message) actionErrors.delete(askId)
       setBusy(false)
     }

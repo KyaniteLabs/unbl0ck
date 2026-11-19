@@ -12,7 +12,8 @@ from test_operator_recovery import HARNESS, ROOT
 RELEASE_FLOW = r"""
 const base = process.argv[2]
 const taskId = process.argv[3]
-const pollDuringRelease = process.argv[4] === 'poll-during-release'
+const checkDuplicate = process.argv[4] === 'poll-pending-retry'
+const pollDuringRelease = process.argv[4] === 'poll-during-release' || checkDuplicate
 const answerFirst = process.argv[4] === 'keep-blocked' || pollDuringRelease
 const markerFull = process.argv[4] === 'marker-full'
 let failureArrived
@@ -20,8 +21,10 @@ let returnFailure
 const waitingForFailure = new Promise(resolve => { failureArrived = resolve })
 const delayedFailure = new Promise(resolve => { returnFailure = resolve })
 let failureDetail
+let releasePosts = 0
 const ctx = {
   rest: async (path, options = {}) => {
+    if (path === '/kanban/answer' && options.body?.release) releasePosts++
     const response = await fetch(base + path, {
       method: options.method,
       headers: { 'Content-Type': 'application/json' },
@@ -67,7 +70,12 @@ const render = () => {
     await Promise.race([waitingForFailure, action.then(() => assert.fail('expected a delayed release error'))])
     await reload()
     assert.equal(current?.tier, 'release_failed')
-    render()
+    const release = find(render(), 'Release (unbl0ck)')
+    if (checkDuplicate) {
+      assert.equal(release.disabled, true, 'the remounted card still has a pending release')
+      await release.onClick()
+      assert.equal(releasePosts, 1, 'a second click must not post while the first request is pending')
+    }
     returnFailure()
   }
   await action
@@ -168,3 +176,7 @@ def test_desktop_retains_release_failure_after_regrouping(tmp_path, monkeypatch,
 
 def test_desktop_poll_during_release_does_not_lose_failure(tmp_path, monkeypatch):
     run_desktop_release_flow(tmp_path, monkeypatch, "poll-during-release")
+
+
+def test_desktop_poll_during_release_cannot_send_a_second_request(tmp_path, monkeypatch):
+    run_desktop_release_flow(tmp_path, monkeypatch, "poll-pending-retry")
