@@ -1000,6 +1000,25 @@ function withinDeadline(t0, step) {
   )
 }
 
+function actionErrorText(error) {
+  const fallback = 'Could not confirm the action. Check the refreshed card before trying again.'
+  const raw = typeof error === 'string' ? error : error?.message
+  if (typeof raw !== 'string' || !raw.trim()) return fallback
+  const message = raw.replace(/^Error invoking remote method '[^']+': Error: /, '')
+  // Desktop's REST bridge prefixes backend errors with the HTTP status.
+  const response = message.match(/^([45]\d\d):\s*([\s\S]*)$/)
+  if (response) {
+    try {
+      const detail = JSON.parse(response[2])?.detail
+      if (typeof detail === 'string' && detail.trim() && detail.length <= 350) return detail
+    } catch {
+      // An intermediary can return a non-JSON error body.
+    }
+    return `Hermes returned HTTP ${response[1]}. ${fallback}`
+  }
+  return message.length <= 350 ? message : fallback
+}
+
 function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false, scope = '' }) {
   const askId = askKey(scope, item.id)
   const ctxNow = cardStamp(item)
@@ -1013,6 +1032,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     setAnswerStamp(stamp)
   }
   const [busy, setBusy] = useState(false)
+  const [actionError, setActionError] = useState('')
   const [open, setOpen] = useState(false)
   const [done, setDone] = useState(false)
   const [detailOpen, setDetailOpen] = useState(false)
@@ -1148,6 +1168,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
   // refresh must not delay Undo or draft clearing, which only depend on the request result.
   const run = async (fn, okFor, cue = 'ok', onOk = null) => {
     setBusy(true)
+    setActionError('')
     try {
       const r = await fn()
       if (onOk) onOk(r)
@@ -1163,6 +1184,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     } catch (e) {
       sfx.play('err')
       petEmit('err')
+      setActionError(actionErrorText(e))
       host.notifyError(e, 'UNBL0CK: that did not go through')
       // An answer may have been posted before its release failed. Re-read the source so
       // recovery actions and changed questions appear without waiting for the next poll.
@@ -1639,7 +1661,10 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
           ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This message is longer than 20,000 characters. Only the beginning is shown; the end, which may hold the question, is in the original chat.' })
           : null,
         isOutside && item.truncated ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This export exceeds 256 KiB. Only the beginning is shown; read the complete text in the original app.' }) : null,
-        jsx('div', { className: 'ub-act', children: actions }),
+        jsx('div', { className: 'ub-act', children: [
+          actionError ? jsx('div', { className: 'ub-fault', role: 'alert', children: actionError }) : null,
+          ...actions
+        ] }),
         helpLimit,
         detailNode || askNode ? jsxs('div', { className: 'ub-detail', children: [detailNode, askNode] }) : null
       ]
