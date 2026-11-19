@@ -914,6 +914,13 @@ function rememberAnswerDraft(id, text, stamp) {
   while (answerDrafts.size > 100) answerDrafts.delete(answerDrafts.keys().next().value)
 }
 
+// A release failure can move a card into a different section and remount its controls.
+const actionErrors = new Map()
+function readActionError(id) {
+  const action = actionErrors.get(id)
+  return action && Date.now() - action.at < ANSWER_DRAFT_TTL ? action.message : ''
+}
+
 // Ask conversations follow the same session-memory policy as answer drafts: they survive
 // filtering, a source outage and route remounts (the card unmounting) but never a reload,
 // and nothing is written to disk. 30 minutes, 100 conversations. The model reply of a
@@ -960,6 +967,7 @@ function endAskScope(scope) {
   if (keep.length !== ($undo.get?.() || []).length) $undo.set(keep)
   for (const key of [...askSessions.keys()]) if (key.startsWith(`${scope}|`)) askSessions.delete(key)
   for (const key of [...answerDrafts.keys()]) if (key.startsWith(`${scope}|`)) answerDrafts.delete(key)
+  for (const key of actionErrors.keys()) if (key.startsWith(`${scope}|`)) actionErrors.delete(key)
   for (const key of [...askLatest.keys()]) if (key.startsWith(`${scope}|`)) askLatest.delete(key)
 }
 // The one stamp everything bound to a card compares: block version plus card text (the version does
@@ -1032,7 +1040,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     setAnswerStamp(stamp)
   }
   const [busy, setBusy] = useState(false)
-  const [actionError, setActionError] = useState('')
+  const [actionError, setActionError] = useState(readActionError(askId))
   const [open, setOpen] = useState(false)
   const [done, setDone] = useState(false)
   const [detailOpen, setDetailOpen] = useState(false)
@@ -1169,6 +1177,10 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
   const run = async (fn, okFor, cue = 'ok', onOk = null) => {
     setBusy(true)
     setActionError('')
+    const action = { message: '', at: Date.now() }
+    actionErrors.delete(askId)
+    actionErrors.set(askId, action)
+    while (actionErrors.size > 100) actionErrors.delete(actionErrors.keys().next().value)
     try {
       const r = await fn()
       if (onOk) onOk(r)
@@ -1184,13 +1196,18 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     } catch (e) {
       sfx.play('err')
       petEmit('err')
-      setActionError(actionErrorText(e))
+      if (actionErrors.get(askId) === action) {
+        action.message = actionErrorText(e)
+        action.at = Date.now()
+        setActionError(action.message)
+      }
       host.notifyError(e, 'UNBL0CK: that did not go through')
       // An answer may have been posted before its release failed. Re-read the source so
       // recovery actions and changed questions appear without waiting for the next poll.
       await refresh()
       return null
     } finally {
+      if (actionErrors.get(askId) === action && !action.message) actionErrors.delete(askId)
       setBusy(false)
     }
   }
@@ -1795,7 +1812,7 @@ function Page({ ctx, refresh, scope = '' }) {
             ? jsx('details', {
                 className: 'ub-group',
                 hidden: !items.some(i => visibleIds.has(i.id)),
-                open: filtered ? true : undefined,
+                open: filtered || items.some(i => readActionError(askKey(scope, i.id))) ? true : undefined,
                 children: [jsx('summary', {
                   className: 'ub-sec',
                   style: { cursor: 'pointer', listStyle: 'none' },

@@ -4,12 +4,16 @@ import socket
 import subprocess
 from threading import Thread
 
+import pytest
+
 from test_operator_recovery import HARNESS, ROOT
 
 
 RELEASE_FLOW = r"""
 const base = process.argv[2]
 const taskId = process.argv[3]
+const answerFirst = process.argv[4] === 'keep-blocked'
+const markerFull = process.argv[4] === 'marker-full'
 let failureDetail
 const ctx = {
   rest: async (path, options = {}) => {
@@ -29,8 +33,12 @@ const ctx = {
 }
 let current
 const reload = async () => {
+  const group = card => (card?.tier === 'answered' ? 'answered' : 'asks')
+  const before = group(current)
   const queue = await ctx.rest('/queue')
   current = queue.items.find(card => card.task_id === taskId)
+  // Desktop renders answered cards under a different parent. React remounts on that move.
+  if (before !== group(current)) state = []
 }
 const render = () => {
   cursor = 0
@@ -41,18 +49,34 @@ const render = () => {
   await reload()
   assert.equal(current?.tier, 'ask')
   all(render()).find(node => node?.type === 'textarea').props.onChange({ target: { value: 'Blue' } })
-  await find(render(), 'Answer + unbl0ck').onClick()
-  assert.equal(current?.tier, 'release_failed')
+  if (answerFirst) {
+    await find(render(), 'Answer, keep blocked').onClick()
+    assert.equal(current?.tier, 'answered')
+  }
+  await find(render(), answerFirst ? 'Release (unbl0ck)' : 'Answer + unbl0ck').onClick()
+  assert.equal(current?.tier, markerFull ? 'answered' : 'release_failed')
   const alert = all(render()).find(node => node?.props?.role === 'alert')
-  assert.match(failureDetail, /answer was posted.*could not be unblocked/i)
+  assert.match(failureDetail, /answer (was posted|is already posted).*could not be unblocked/i)
   assert.equal(alert?.props.children, failureDetail)
+  if (markerFull) {
+    assert.match(failureDetail, /release the card on its board/i)
+    const cardState = state
+    state = []
+    cursor = 0
+    const readValue = env.useValue
+    env.useValue = key => key === 'queue' ? { items: [current], count: 0, errors: [], loading: true } : readValue(key)
+    const answeredGroup = all(Page({ ctx, refresh: reload })).find(node => node?.type === 'details')
+    assert.equal(answeredGroup?.props.open, true, 'the group containing the error must be expanded')
+    env.useValue = readValue
+    state = cardState
+  }
   await find(render(), 'Release (unbl0ck)').onClick()
   assert.equal(current, undefined, 'the refreshed queue must remove the released card')
 })().catch(error => { console.error(error); process.exitCode = 1 })
 """
 
 
-def test_desktop_shows_backend_release_failure_and_retries_without_duplicate_answer(tmp_path, monkeypatch):
+def run_desktop_release_flow(tmp_path, monkeypatch, first_action):
     import uvicorn
     from fastapi import FastAPI
     from hermes_cli import kanban_db, kanban_db_connect
@@ -61,9 +85,15 @@ def test_desktop_shows_backend_release_failure_and_retries_without_duplicate_ans
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban"))
-    monkeypatch.setattr(plugin_api._needs(), "_settings", lambda: {
+    needs = plugin_api._needs()
+    monkeypatch.setattr(needs, "_settings", lambda: {
         "principal_name": "operator", "comment_author": "operator", "bluf_enabled": False,
     })
+    if first_action == "marker-full":
+        def full_store(*args, **kwargs):
+            raise needs.PendingReleaseFull("recovery store full")
+
+        monkeypatch.setattr(needs, "_set_pending_release", full_store)
     with kanban_db_connect.connect(board="default") as conn:
         task = kanban_db.create_task(conn, title="Choose a color", body="", assignee="worker")
         task_id = getattr(task, "id", task)
@@ -92,7 +122,10 @@ def test_desktop_shows_backend_release_failure_and_retries_without_duplicate_ans
         thread.start()
         try:
             result = subprocess.run(
-                ["node", "-e", HARNESS + RELEASE_FLOW, str(ROOT / "desktop/plugin.js"), url, task_id],
+                [
+                    "node", "-e", HARNESS + RELEASE_FLOW, str(ROOT / "desktop/plugin.js"),
+                    url, task_id, first_action,
+                ],
                 capture_output=True, text=True, timeout=30, check=False,
             )
         finally:
@@ -105,3 +138,12 @@ def test_desktop_shows_backend_release_failure_and_retries_without_duplicate_ans
         assert [(entry.author, entry.body) for entry in kanban_db.list_comments(conn, task_id)] == [
             ("operator", "Blue"),
         ]
+
+
+def test_desktop_shows_backend_release_failure_and_retries_without_duplicate_answer(tmp_path, monkeypatch):
+    run_desktop_release_flow(tmp_path, monkeypatch, "answer-and-release")
+
+
+@pytest.mark.parametrize("first_action", ["keep-blocked", "marker-full"])
+def test_desktop_retains_release_failure_after_regrouping(tmp_path, monkeypatch, first_action):
+    run_desktop_release_flow(tmp_path, monkeypatch, first_action)
