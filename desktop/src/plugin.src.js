@@ -915,6 +915,7 @@ function rememberAnswerDraft(id, text, stamp) {
 
 // A release failure can move a card into a different section and remount its controls.
 const actionErrors = new Map()
+const pendingReleaseActions = new Map()
 function readActionError(id) {
   const action = actionErrors.get(id)
   return action && Date.now() - action.at < ANSWER_DRAFT_TTL ? action.message : ''
@@ -967,6 +968,7 @@ function endAskScope(scope) {
   for (const key of [...askSessions.keys()]) if (key.startsWith(`${scope}|`)) askSessions.delete(key)
   for (const key of [...answerDrafts.keys()]) if (key.startsWith(`${scope}|`)) answerDrafts.delete(key)
   for (const key of actionErrors.keys()) if (key.startsWith(`${scope}|`)) actionErrors.delete(key)
+  for (const key of pendingReleaseActions.keys()) if (key.startsWith(`${scope}|`)) pendingReleaseActions.delete(key)
   for (const key of [...askLatest.keys()]) if (key.startsWith(`${scope}|`)) askLatest.delete(key)
 }
 // The one stamp everything bound to a card compares: block version plus card text (the version does
@@ -1039,7 +1041,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     setAnswerStamp(stamp)
   }
   const [localBusy, setBusy] = useState(false)
-  const busy = localBusy || actionErrors.get(askId)?.pending === true
+  const busy = localBusy || pendingReleaseActions.has(askId)
   const [, setActionErrorRevision] = useState(0)
   // A queue poll can remount this card before its action finishes. Read the current
   // error on every render so a later refresh sees the result from the old instance.
@@ -1177,17 +1179,17 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
 
   // onOk runs the moment the request succeeded, before the queue refresh: a slow or hung
   // refresh must not delay Undo or draft clearing, which only depend on the request result.
-  const run = async (fn, okFor, cue = 'ok', onOk = null) => {
-    if (actionErrors.get(askId)?.pending) return null
+  const run = async (fn, okFor, cue = 'ok', onOk = null, releases = false) => {
+    if (pendingReleaseActions.has(askId)) return null
     setBusy(true)
-    const action = { message: '', at: Date.now(), pending: true }
+    const action = { message: '', at: Date.now() }
+    if (releases) pendingReleaseActions.set(askId, action)
+    const settleRelease = () => {
+      if (pendingReleaseActions.get(askId) === action) pendingReleaseActions.delete(askId)
+    }
     actionErrors.delete(askId)
     actionErrors.set(askId, action)
-    while (actionErrors.size > 100) {
-      const settled = Array.from(actionErrors).find(([, entry]) => !entry.pending)
-      if (!settled) break
-      actionErrors.delete(settled[0])
-    }
+    while (actionErrors.size > 100) actionErrors.delete(actionErrors.keys().next().value)
     try {
       const r = await fn()
       if (onOk) onOk(r)
@@ -1198,7 +1200,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
         host.notify({ kind: 'success', message: okFor(r) })
         await new Promise(res => setTimeout(res, reducedMotion() ? 0 : 650))
       }
-      action.pending = false
+      settleRelease()
       await refresh()
       return r
     } catch (e) {
@@ -1212,11 +1214,11 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       host.notifyError(e, 'UNBL0CK: that did not go through')
       // An answer may have been posted before its release failed. Re-read the source so
       // recovery actions and changed questions appear without waiting for the next poll.
-      action.pending = false
+      settleRelease()
       await refresh()
       return null
     } finally {
-      action.pending = false
+      settleRelease()
       if (actionErrors.get(askId) === action && !action.message) actionErrors.delete(askId)
       setBusy(false)
     }
@@ -1237,7 +1239,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       'ok',
       // A source fault can remount this card and accept a newer draft while this
       // request is in flight. Its late completion owns only the submitted record.
-      r => { if (r && answerDrafts.get(askId) === submittedDraft) updateAnswer('') }
+      r => { if (r && answerDrafts.get(askId) === submittedDraft) updateAnswer('') },
+      release
     )
     return result
   }
@@ -1250,7 +1253,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
         method: 'POST',
         body: { board: item.board, task_id: item.task_id, text: '', release: true, version: item.version }
       }),
-      r => (r && r.released ? `Unblocked ${item.task_id}` : `Could not unblock ${item.task_id}`)
+      r => (r && r.released ? `Unblocked ${item.task_id}` : `Could not unblock ${item.task_id}`),
+      'ok', null, true
     )
   const dismiss = async (path, kind, cue, took) => {
     const seq = ++undoSeq
