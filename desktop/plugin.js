@@ -1040,7 +1040,10 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     setAnswerStamp(stamp)
   }
   const [busy, setBusy] = useState(false)
-  const [actionError, setActionError] = useState(readActionError(askId))
+  const [, setActionErrorRevision] = useState(0)
+  // A queue poll can remount this card before its action finishes. Read the current
+  // error on every render so a later refresh sees the result from the old instance.
+  const actionError = readActionError(askId)
   const [open, setOpen] = useState(false)
   const [done, setDone] = useState(false)
   const [detailOpen, setDetailOpen] = useState(false)
@@ -1176,7 +1179,6 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
   // refresh must not delay Undo or draft clearing, which only depend on the request result.
   const run = async (fn, okFor, cue = 'ok', onOk = null) => {
     setBusy(true)
-    setActionError('')
     const action = { message: '', at: Date.now() }
     actionErrors.delete(askId)
     actionErrors.set(askId, action)
@@ -1199,7 +1201,7 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       if (actionErrors.get(askId) === action) {
         action.message = actionErrorText(e)
         action.at = Date.now()
-        setActionError(action.message)
+        setActionErrorRevision(revision => revision + 1)
       }
       host.notifyError(e, 'UNBL0CK: that did not go through')
       // An answer may have been posted before its release failed. Re-read the source so

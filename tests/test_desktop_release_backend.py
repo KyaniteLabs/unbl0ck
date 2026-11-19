@@ -12,8 +12,13 @@ from test_operator_recovery import HARNESS, ROOT
 RELEASE_FLOW = r"""
 const base = process.argv[2]
 const taskId = process.argv[3]
-const answerFirst = process.argv[4] === 'keep-blocked'
+const pollDuringRelease = process.argv[4] === 'poll-during-release'
+const answerFirst = process.argv[4] === 'keep-blocked' || pollDuringRelease
 const markerFull = process.argv[4] === 'marker-full'
+let failureArrived
+let returnFailure
+const waitingForFailure = new Promise(resolve => { failureArrived = resolve })
+const delayedFailure = new Promise(resolve => { returnFailure = resolve })
 let failureDetail
 const ctx = {
   rest: async (path, options = {}) => {
@@ -26,6 +31,10 @@ const ctx = {
     const body = await response.text()
     if (!response.ok) {
       failureDetail = JSON.parse(body).detail
+      if (pollDuringRelease) {
+        failureArrived()
+        await delayedFailure
+      }
       throw new Error("Error invoking remote method 'hermes:api': Error: " + response.status + ": " + body)
     }
     return JSON.parse(body)
@@ -53,7 +62,15 @@ const render = () => {
     await find(render(), 'Answer, keep blocked').onClick()
     assert.equal(current?.tier, 'answered')
   }
-  await find(render(), answerFirst ? 'Release (unbl0ck)' : 'Answer + unbl0ck').onClick()
+  const action = find(render(), answerFirst ? 'Release (unbl0ck)' : 'Answer + unbl0ck').onClick()
+  if (pollDuringRelease) {
+    await Promise.race([waitingForFailure, action.then(() => assert.fail('expected a delayed release error'))])
+    await reload()
+    assert.equal(current?.tier, 'release_failed')
+    render()
+    returnFailure()
+  }
+  await action
   assert.equal(current?.tier, markerFull ? 'answered' : 'release_failed')
   const alert = all(render()).find(node => node?.props?.role === 'alert')
   assert.match(failureDetail, /answer (was posted|is already posted).*could not be unblocked/i)
@@ -147,3 +164,7 @@ def test_desktop_shows_backend_release_failure_and_retries_without_duplicate_ans
 @pytest.mark.parametrize("first_action", ["keep-blocked", "marker-full"])
 def test_desktop_retains_release_failure_after_regrouping(tmp_path, monkeypatch, first_action):
     run_desktop_release_flow(tmp_path, monkeypatch, first_action)
+
+
+def test_desktop_poll_during_release_does_not_lose_failure(tmp_path, monkeypatch):
+    run_desktop_release_flow(tmp_path, monkeypatch, "poll-during-release")
