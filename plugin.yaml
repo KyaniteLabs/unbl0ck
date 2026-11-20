@@ -69,6 +69,10 @@ config_schema:
     type: int
     default: 14
     description: "How many days back chats are read for unanswered asks (1 to 90; anything else uses 14). Widening it is a read-only backfill of the same local chat database: nothing is sent to a model, and a chat that is older than 14 days or older than any earlier read is listed but never summarized automatically, even when summaries are on (a small file, chat-backfill.json, remembers the oldest time read and the ids of such chats; no chat text), chats are read in place, at most 500 sessions per profile per refresh, and hidden or answered items stay hidden. The queue reports the window it actually used."
+  stale_ask_days:
+    type: float
+    default: 7
+    description: "How many days a Kanban ask stays counted. A block older than this with no card comments or events inside the window, or one that old whose card owner commented after the block, stops counting as needing you and is listed as stuck with its age (re-block the card to bring it back). Zero or less disables aging; anything the reader cannot convert uses 7."
   outside_dirs:
     type: str
     default: ""

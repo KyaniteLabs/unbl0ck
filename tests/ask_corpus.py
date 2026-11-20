@@ -54,7 +54,9 @@ CASES = [
     ("en-group-everyone", "chat", "Everyone: reply with your vote, A or B.", None, True, ("telegram", "en", "none", "group")),
     # --- kanban block reasons -------------------------------------------------------------
     ("kb-needs-input-name", "kanban", "Needs your decision on the vendor", "needs_input", True, ("kanban", "en", "named", "direct")),
-    ("kb-needs-input-role", "kanban", "Operator input is needed", "needs_input", True, ("kanban", "en", "role", "direct")),
+    # Role-addressed: "operator" names a fleet operator, not the principal (the
+    # 2026-11-20 over-count card); an install that means the principal sets role_words.
+    ("kb-needs-input-role", "kanban", "Operator input is needed", "needs_input", False, ("kanban", "en", "role", "relayed")),
     ("kb-needs-input-gate", "kanban", "Human gate: approve the migration", "needs_input", True, ("kanban", "en", "role", "direct")),
     ("kb-credentials", "kanban", "API key expired, credentials needed", "needs_input", True, ("kanban", "en", "none", "direct")),
     ("kb-stuck-technical", "kanban", "Tests fail on the arm64 runner", None, False, ("kanban", "en", "none", "stuck")),

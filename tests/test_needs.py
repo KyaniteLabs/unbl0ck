@@ -741,6 +741,12 @@ class FakeKanban(unittest.TestCase):
             types.SimpleNamespace(author="ada", created_at=150, body="noted")
         ]
         self.assertEqual(needs.kanban_items(boards=["factory"]), [])
+        # The same answered card leaves the queue even when its ask is old enough to
+        # age out: an answer always wins over staleness.
+        self.events = [
+            block_event(created_at=time.time() - 9 * 86400),
+        ]
+        self.assertEqual(needs.kanban_items(boards=["factory"]), [])
 
     def test_triage_cannot_be_released(self):
         self.task = task(status="triage")
@@ -832,13 +838,68 @@ class QueueKanban(unittest.TestCase):
         self.assertIn("capability", needs.stuck_reason("x", "capability", ev))
 
     def test_operator_and_credential_phrasing_detected(self):
+        # "Operator/Owner input is needed" addresses a fleet operator, not the principal
+        # (an install that addresses its principal that way sets role_words); the
+        # authorized-noun next to what it gates and dead credentials still ask.
         for reason in [
-            "Operator input is needed to reconcile the judge",
             "Ada approved this last week",
             "npm credentials are dead",
             "needs an authorized host route",
         ]:
             self.assertTrue(needs.kanban_needs_you(reason, None), reason)
+        for reason in [
+            "Operator input is needed to reconcile the judge",
+            "Owner decision is needed before the merge",
+            "needs an authorized root deployment route",
+        ]:
+            self.assertIsNone(needs.kanban_needs_you(reason, None), reason)
+
+    def test_role_addressed_live_reasons_are_not_asks(self):
+        # Real block reasons from the 2026-11-20 over-count (each addressed another
+        # seat or described deployment mechanics), with positive controls after.
+        cases = [
+            (
+                "Liam/operator input is needed to reconcile a contradictory goal judge",
+                "needs_input",
+            ),
+            (
+                "Option B needs an authorized root deployment route: simon cannot write "
+                "/srv/chamber/operator/work, and installed fleet-opd has no install/ACL/mount "
+                "operation and excludes chamber units. Liam must identify the execution "
+                "principal/route; installed withdrawal resolver also remains pre-PR26.",
+                "capability",
+            ),
+            ("Product must own and record rulings", "needs_input"),
+        ]
+        for reason, kind in cases:
+            self.assertIsNone(needs.kanban_needs_you(reason, kind), reason)
+        for reason, kind in [
+            ("Ada must approve the publish before it lands", None),
+            ("Publication hold. Stay blocked. CEO item 39.", "needs_input"),
+            ("Repair the key binding (credential surface, CEO-gated).", "capability"),
+        ]:
+            self.assertTrue(needs.kanban_needs_you(reason, kind), reason)
+        # The same genuine ask addressed as the live panel's principal ("Simon").
+        self.assertTrue(
+            needs._any_gate(
+                "Simon must approve the publish before it lands",
+                needs._patterns(["Simon"], ["CEO"]),
+            )
+        )
+
+    def test_generic_name_words_need_an_address(self):
+        # "principal"/"human" as common nouns are not asks; as an address they still are.
+        for reason in [
+            "the execution principal/route must be identified by Liam",
+            "Finish needs a decision/access only a human can give: no model credential",
+        ]:
+            self.assertIsNone(needs.kanban_needs_you(reason, "needs_input"), reason)
+        for reason in [
+            "waiting on the human to decide the lane",
+            "blocked pending the principal's decision on spend",
+            "the human must decide the lane",
+        ]:
+            self.assertTrue(needs.kanban_needs_you(reason, "needs_input"), reason)
 
 
 class CardContext(unittest.TestCase):
@@ -995,6 +1056,145 @@ class PrincipalName(unittest.TestCase):
                 else:
                     os.environ[key] = value
             needs._settings = orig
+
+
+class StaleAskAging(unittest.TestCase):
+    """Old, quiet or owner-superseded asks stop counting against the principal (AC2)."""
+
+    def setUp(self):
+        day = 86400
+        now = time.time()
+        self.now, self.day = now, day
+        self.task = task(task_id="t_old", assignee="platform", created_at=now - 9 * day)
+        self.block = types.SimpleNamespace(
+            id=11,
+            kind="blocked",
+            created_at=now - 8 * day,
+            payload={
+                "reason": "Awaiting Ada's approval to publish",
+                "kind": "needs_input",
+                "recurrences": 1,
+            },
+        )
+        self.comments = []
+        kdb = fake_db(
+            get_task=lambda c, t: self.task if t == "t_old" else None,
+            list_tasks=lambda c, status=None: (
+                [self.task] if status == "blocked" else []
+            ),
+            list_events=lambda c, t: [self.block]
+            + [
+                types.SimpleNamespace(
+                    id=100 + i,
+                    kind="commented",
+                    created_at=x.created_at,
+                    payload={"author": x.author, "len": len(x.body)},
+                )
+                for i, x in enumerate(self.comments)
+            ],
+            list_comments=lambda c, t: self.comments,
+        )
+        self.stack = fake_hermes(kdb, fake_connect())
+        self.stack.__enter__()
+        self.addCleanup(self.stack.__exit__, None, None, None)
+        # The answered path reads the pending-release state under HERMES_HOME.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.saved_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(Path(self.tmp.name))
+        if self.saved_home is not None:
+            self.addCleanup(os.environ.__setitem__, "HERMES_HOME", self.saved_home)
+        else:
+            self.addCleanup(os.environ.pop, "HERMES_HOME", None)
+
+    def queue(self):
+        return needs.kanban_items(boards=["factory"])
+
+    def test_old_quiet_ask_ages_out_unless_the_card_stays_alive(self):
+        # The biting half: an 8-day-old ask with no card activity in the window stops
+        # counting and moves to the stuck tier with its age. The guards: recent activity,
+        # a zero threshold and an unreadable timestamp each keep it an ask.
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "stuck")
+        self.assertIn("No card activity", it["why"])
+        self.assertIn("7-day window", it["why"])
+        self.comments = [
+            types.SimpleNamespace(
+                author="liam", created_at=self.now - self.day, body="checking in"
+            )
+        ]
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        settings = mock.patch.object(
+            needs,
+            "_settings",
+            lambda: {
+                "principal_name": "Ada",
+                "comment_author": "ada",
+                "stale_ask_days": 0,
+            },
+        )
+        self.comments = []
+        with settings:
+            (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.block.created_at = 100
+        self.task.created_at = 100
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+
+    def test_old_ask_superseded_by_its_owner_but_a_fresh_one_still_asks(self):
+        # The biting half: an 8-day-old ask whose owner commented after the block steps
+        # aside. The guard: a fresh block with the same owner comment stays an ask.
+        self.comments = [
+            types.SimpleNamespace(
+                author="platform",
+                created_at=self.now - 3 * self.day,
+                body="incident healed",
+            )
+        ]
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "stuck")
+        self.assertIn("owner commented", it["why"])
+        self.block.created_at = self.now - self.day
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+
+
+class QueueWarnings(unittest.TestCase):
+    """The queue says when its own counts could be misread (AC4)."""
+
+    def _env(self, **extra):
+        base = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "UNBL0CK_PRINCIPAL")
+        }
+        base.update(extra)
+        return base
+
+    def test_missing_principal_and_board_pins_each_warn(self):
+        with mock.patch.dict(os.environ, self._env(), clear=True):
+            (warning,) = needs._queue_warnings({})
+            self.assertIn("principal_name", warning)
+        with mock.patch.dict(
+            os.environ, self._env(HERMES_KANBAN_DB="/tmp/x.db"), clear=True
+        ):
+            (warning,) = needs._queue_warnings({"principal_name": "Ada"})
+            self.assertIn("HERMES_KANBAN_DB", warning)
+        with mock.patch.dict(
+            os.environ, self._env(HERMES_KANBAN_BOARD="factory"), clear=True
+        ):
+            (warning,) = needs._queue_warnings({"principal_name": "Ada"})
+            self.assertIn("HERMES_KANBAN_BOARD", warning)
+
+    def test_clean_environment_warns_about_nothing(self):
+        with mock.patch.dict(os.environ, self._env(), clear=True):
+            self.assertEqual(
+                needs._queue_warnings({"principal_name": "Ada", "comment_author": "ada"}),
+                [],
+            )
 
 
 if __name__ == "__main__":

@@ -184,6 +184,27 @@ def chat_window_days(settings: dict[str, Any] | None = None) -> int:
     return raw
 
 
+STALE_ASK_DAYS = 7  # an ask older than this, with nothing happening on the card, goes stale
+_EPOCH_FLOOR = 1_000_000_000  # 2001-09-09: a "created_at" older than this is not a real timestamp
+
+
+def stale_ask_days(settings: dict[str, Any] | None = None) -> float:
+    """How many days an unanswered ask stays an ask (setting ``stale_ask_days``): 7 by default.
+
+    Zero or negative disables aging. A value the reader cannot convert uses the default,
+    like the other setting readers, so a bad value can neither hide asks nor crash the queue."""
+    raw = (settings if settings is not None else _settings()).get("stale_ask_days")
+    if isinstance(raw, str):
+        text = raw.strip()
+        try:
+            raw = float(text) if text.isascii() and len(text) <= 8 else None
+        except ValueError:
+            raw = None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return float(STALE_ASK_DAYS)
+    return float(raw)
+
+
 def outside_recursive(settings: dict[str, Any] | None = None) -> bool:
     """Whether watched folders also read nested folders (``outside_recursive``, off by default)."""
     raw = (settings if settings is not None else _settings()).get("outside_recursive", False)
@@ -280,14 +301,32 @@ def _patterns(
         r"|({P}|{C}) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
         r"|(which|what) (one|option|choice) do you (prefer|want|choose)"
         r"|human[- ]gate"
-        r"|([A-Za-z]+/)?(operator|owner|{C}|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
+        # Role-addressed asks name another seat's role (operator/owner input, an
+        # authorized deployment route), not the principal; only the configured role
+        # words and "principal" gate here. An install whose principal is addressed
+        # as "the operator" sets the role_words setting instead.
+        r"|([A-Za-z]+/)?({C}|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
         r"|({P}|{C}|principal) (approved|authorized|authorised|signed off)"
-        r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,20}(route|access|path|executor)"
+        # The authorized-noun must sit next to the thing it gates ("authorized host
+        # route"); one intervening word ("authorized root deployment route") is
+        # deployment mechanics addressed to whoever runs the deploy.
+        r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,6}(route|access|path|executor)"
         r"|(credentials?|api[- ]?keys?|tokens?) (are |is )?(dead|expired|missing|needed|required|revoked))\b",
         re.IGNORECASE,
     )
-    # Weaker cue, trusted only together with an explicit needs_input kind.
-    pats["_NAMES"] = _c(r"\b({P}|{C}|principal|human)\b", re.IGNORECASE)
+    # Weaker cue, trusted only together with an explicit needs_input kind. The
+    # configured names and role words match anywhere; the generic words "principal"
+    # and "human" only as an address ("the human must decide", "waiting on the
+    # principal"), never as a common noun ("the execution principal", "only a human
+    # can give").
+    pats["_NAMES"] = _c(
+        r"\b(?:{P}|{C})\b"
+        r"|\b(?:the |your )?(?:principal|human)(?:['’]s)?[ \t]+(?:must|should|shall|will|needs?|has|to"
+        r" (?:approve|decide|confirm|choose|pick|sign|reply|answer|give|authorize)|input|decision|approval"
+        r"|answer|word|go|call|sign[- ]?off)\b"
+        r"|\b(?:waiting|waits|awaiting|needs?|requires?|blocked(?:[ ]on)?|pending)\b[^.\n]{0,20}\b(?:the )?(?:principal|human)\b",
+        re.IGNORECASE,
+    )
     # The supervisor/ops "stop" style blocks name the principal without asking anything.
     pats["_ORDER"] = _c(
         r"^\s*({P}|{C})\s+(\d{1,2}:\d{2}|says|said|orders?|ordered)\b", re.IGNORECASE
@@ -1631,6 +1670,60 @@ def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_i
     return False
 
 
+def _newest_event_at(conn: Any, kanban_db: Any, task_id: str) -> float | None:
+    """When the newest event of any kind landed on the card, or None when that cannot be read."""
+    try:
+        row = conn.execute(
+            "SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        return float(row[0]) if row and row[0] else None
+    except Exception:  # noqa: BLE001 - schema drift: the public API
+        times = [getattr(e, "created_at", None) for e in kanban_db.list_events(conn, task_id)]
+        times = [float(t) for t in times if isinstance(t, (int, float))]
+        return max(times) if times else None
+
+
+def _stale_ask(conn: Any, kanban_db: Any, task: Any, block: Any, since: Any) -> str | None:
+    """Why an old ask no longer counts against the principal, or None while it still counts.
+
+    An ask ages out when its block is older than ``stale_ask_days`` days and nothing has
+    happened on the card inside that window; an ask that old whose owner commented after
+    the block steps aside the same way (the owner took the question over, the way a
+    healed incident is retired by the seat that reported it). Both demotions keep the
+    card listed in the stuck tier with its age, so they are visible and reversible by
+    re-blocking. A timestamp this old box cannot read never ages an ask out. Raises
+    PlacementIncomplete past the work budget."""
+    days = stale_ask_days()
+    if days <= 0:
+        return None
+    now = time.time()
+    try:
+        began = float(since)
+    except (TypeError, ValueError):
+        return None
+    if began < _EPOCH_FLOOR or now - began <= days * 86400:
+        return None  # not a readable timestamp, or the ask is still fresh
+    age = f"{(now - began) / 86400:.0f} days"
+    newest = _newest_event_at(conn, kanban_db, task.id)
+    if newest is None or now - newest > days * 86400:
+        return (
+            f"No card activity inside the {days:g}-day window and the ask is {age} old; "
+            "re-block the card if it still needs you"
+        )
+    owner = str(getattr(task, "assignee", "") or "").strip()
+    if owner and any(
+        True
+        for _ in _author_events_after(
+            conn, kanban_db, task.id, owner, block.id if block else None
+        )
+    ):
+        return (
+            f"The card's owner commented after this {age}-old ask; "
+            "re-block the card if it still needs you"
+        )
+    return None
+
+
 class CardStatus(str, Enum):
     """The Kanban card statuses UNBL0CK acts on (Kanban owns the full set and every write).
 
@@ -1798,6 +1891,18 @@ def kanban_items(
                             why = "You answered and kept it blocked; release it when it is ready"
                         else:
                             continue  # answered triage card: nothing left for you to do here
+                    if tier == "ask":
+                        try:
+                            stale = _stale_ask(conn, kanban_db, task, block, since)
+                        except PlacementIncomplete as exc:
+                            stale = None  # the ask stays in front of you
+                            if errors is not None:
+                                errors.append(f"kanban[{board}]: {task.id}: {exc}")
+                        if stale:
+                            # An aged-out or superseded ask is still a blocked card: it moves
+                            # to the stuck tier with its age instead of counting against you.
+                            tier = "stuck"
+                            why = stale
                     items.append(
                         {
                             "id": f"kanban:{board}:{task.id}",
@@ -4445,6 +4550,26 @@ def capability_key(item: dict[str, Any]) -> str:
     return source if source in CAPABILITIES else ""
 
 
+def _queue_warnings(settings: dict[str, Any] | None = None) -> list[str]:
+    """Fixed sentences for a queue whose counts a reader could misread twice over:
+    no principal configured (asks that name the principal go undetected), or a board
+    pin in the environment (every board label resolves to that one database)."""
+    warnings: list[str] = []
+    if not principal_names(settings):
+        warnings.append(
+            "No principal name is configured, so asks that name the principal cannot be "
+            "detected; set plugins.entries.unbl0ck.settings.principal_name."
+        )
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        value = os.environ.get(var)
+        if value:
+            warnings.append(
+                f"{var}={value!r} pins the board set this queue reads; "
+                "per-board counts may collapse onto that one database."
+            )
+    return warnings
+
+
 def build_queue(
     home: Path | None = None, *, include_hidden: bool = False, record: bool = True
 ) -> dict[str, Any]:
@@ -4509,6 +4634,7 @@ def build_queue(
     settings, settings_error = _settings_state()
     if settings_error:
         errors.append(settings_error)
+    queue_warnings = _queue_warnings(settings)
     if chat_coverage is not None:
         # The reader returns normally after a corrupt database or unreadable settings and says
         # so only in `errors`; a window that was not fully read must not look like a complete one.
@@ -4581,6 +4707,7 @@ def build_queue(
         "hidden": len(items) - len(shown) + outside_stats.get("hidden_unread", 0),
         "items": shown,
         "errors": errors,
+        "warnings": queue_warnings,
         "ask_enabled": ask_enabled(settings),
         "bluf_enabled": summaries_on,
         "disclosure": disclosure_matrix(settings),
