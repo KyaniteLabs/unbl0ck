@@ -1678,9 +1678,12 @@ def _newest_event_at(conn: Any, kanban_db: Any, task_id: str) -> float | None:
         ).fetchone()
         return float(row[0]) if row and row[0] else None
     except Exception:  # noqa: BLE001 - schema drift: the public API
-        times = [getattr(e, "created_at", None) for e in kanban_db.list_events(conn, task_id)]
-        times = [float(t) for t in times if isinstance(t, (int, float))]
-        return max(times) if times else None
+        stamps = [
+            float(created)
+            for e in kanban_db.list_events(conn, task_id)
+            if isinstance(created := getattr(e, "created_at", None), (int, float))
+        ]
+        return max(stamps) if stamps else None
 
 
 def _stale_ask(conn: Any, kanban_db: Any, task: Any, block: Any, since: Any) -> str | None:
