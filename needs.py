@@ -184,6 +184,30 @@ def chat_window_days(settings: dict[str, Any] | None = None) -> int:
     return raw
 
 
+STALE_ASK_DAYS = 7  # an ask older than this is flagged with its age; age alone never drops it
+_EPOCH_FLOOR = 1_000_000_000  # 2001-09-09: a "created_at" older than this is not a real timestamp
+
+
+def stale_ask_days(settings: dict[str, Any] | None = None) -> float:
+    """How many days an ask takes to be flagged old (setting ``stale_ask_days``): 7 by default.
+
+    Age never removes an ask: it stays counted and is marked ``stale`` with its age once it
+    passes this many days. Only the card's owner saying so explicitly (``superseded by
+    t_<id>`` or ``not-<principal>:``) steps an ask aside. Zero or negative disables the
+    flagging. A value the reader cannot convert uses the default, like the other setting
+    readers, so a bad value can neither hide asks nor crash the queue."""
+    raw = (settings if settings is not None else _settings()).get("stale_ask_days")
+    if isinstance(raw, str):
+        text = raw.strip()
+        try:
+            raw = float(text) if text.isascii() and len(text) <= 8 else None
+        except ValueError:
+            raw = None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return float(STALE_ASK_DAYS)
+    return float(raw)
+
+
 def outside_recursive(settings: dict[str, Any] | None = None) -> bool:
     """Whether watched folders also read nested folders (``outside_recursive``, off by default)."""
     raw = (settings if settings is not None else _settings()).get("outside_recursive", False)
@@ -280,14 +304,32 @@ def _patterns(
         r"|({P}|{C}) (must|to) (approve|decide|choose|pick|confirm|review|answer|reply|open|click|sign)"
         r"|(which|what) (one|option|choice) do you (prefer|want|choose)"
         r"|human[- ]gate"
-        r"|([A-Za-z]+/)?(operator|owner|{C}|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
+        # Role-addressed asks name another seat's role (operator/owner input, an
+        # authorized deployment route), not the principal; only the configured role
+        # words and "principal" gate here. An install whose principal is addressed
+        # as "the operator" sets the role_words setting instead.
+        r"|([A-Za-z]+/)?({C}|principal) (input|decision|approval|answer|call) (is |are )?(needed|required)"
         r"|({P}|{C}|principal) (approved|authorized|authorised|signed off)"
-        r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,20}(route|access|path|executor)"
+        # The authorized-noun must sit next to the thing it gates ("authorized host
+        # route"); one intervening word ("authorized root deployment route") is
+        # deployment mechanics addressed to whoever runs the deploy.
+        r"|(authorized|authorised|approved|permitted) (host|root|repository|repo|publishing|writer)\b[^.\n]{0,6}(route|access|path|executor)"
         r"|(credentials?|api[- ]?keys?|tokens?) (are |is )?(dead|expired|missing|needed|required|revoked))\b",
         re.IGNORECASE,
     )
-    # Weaker cue, trusted only together with an explicit needs_input kind.
-    pats["_NAMES"] = _c(r"\b({P}|{C}|principal|human)\b", re.IGNORECASE)
+    # Weaker cue, trusted only together with an explicit needs_input kind. The
+    # configured names and role words match anywhere; the generic words "principal"
+    # and "human" only as an address ("the human must decide", "waiting on the
+    # principal"), never as a common noun ("the execution principal", "only a human
+    # can give").
+    pats["_NAMES"] = _c(
+        r"\b(?:{P}|{C})\b"
+        r"|\b(?:the |your )?(?:principal|human)(?:['’]s)?[ \t]+(?:must|should|shall|will|needs?|has|to"
+        r" (?:approve|decide|confirm|choose|pick|sign|reply|answer|give|authorize)|input|decision|approval"
+        r"|answer|word|go|call|sign[- ]?off)\b"
+        r"|\b(?:waiting|waits|awaiting|needs?|requires?|blocked(?:[ ]on)?|pending)\b[^.\n]{0,20}\b(?:the )?(?:principal|human)\b",
+        re.IGNORECASE,
+    )
     # The supervisor/ops "stop" style blocks name the principal without asking anything.
     pats["_ORDER"] = _c(
         r"^\s*({P}|{C})\s+(\d{1,2}:\d{2}|says|said|orders?|ordered)\b", re.IGNORECASE
@@ -1587,20 +1629,31 @@ def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_
     return False
 
 
-def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
-    """Has *author* surely posted *text* since the block began? True only with proof, so a "no"
-    at worst posts the answer twice and never hides it. Kanban writes each comment with its
-    ``commented`` event and never edits or deletes one, so the author's comments pair in order
-    with their events, apart from the notes Kanban writes with no event. When the author's
-    unlogged comments are exactly their notes, the k comments left after skipping the notes,
-    newest first, are the k their events after the block logged. Otherwise only the author's k
-    newest comments surely came after the block. Raises PlacementIncomplete past the work budget."""
+def _first_in_comments_after(
+    conn: Any,
+    kanban_db: Any,
+    task_id: str,
+    author: str,
+    block_id: int | None,
+    room: int,
+    want: Callable[[str], Any],
+) -> Any:
+    """The first non-None ``want(body)`` among *author*'s comments that surely came after the
+    block began, newest first.
+
+    Kanban writes each comment with its ``commented`` event and never edits or deletes one,
+    so the author's comments pair in order with their events, apart from the notes Kanban
+    writes with no event. When the author's unlogged comments are exactly their notes, the k
+    comments left after skipping the notes, newest first, are the k their events after the
+    block logged. Otherwise only the author's k newest comments surely came after the block.
+    None when nothing matches, when the author did not comment after the block, or when
+    nothing pairs for sure; a miss at worst leaves the card in front of you. Raises
+    PlacementIncomplete past the work budget."""
     k = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, block_id))
     if not k:
-        return False
+        return None
     unknown = [0]  # events whose author cannot be read: any one may be this author's
     logged = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, None, unknown))
-    room = max(4 * len(text) + 1, 256)  # tells a longer body, and holds a note's opening
 
     def newest() -> Iterable[str]:
         return _author_comments_newest(conn, kanban_db, task_id, author, room)
@@ -1611,24 +1664,111 @@ def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_i
         notes += bool(UNLOGGED_COMMENT.match(body))
     unlogged = total - logged
     if unlogged < 0:
-        return False  # a comment is gone: Kanban did not do that, so nothing pairs for sure
-    wanted, left = {text, text.strip()}, k
+        return None  # a comment is gone: Kanban did not do that, so nothing pairs for sure
+    left = k
     exact = not unknown[0] and unlogged in (0, notes)  # every comment pairs, or every unlogged one is a note
     for body in newest():
         if UNLOGGED_COMMENT.match(body):
             if exact and unlogged:
                 continue  # one of Kanban's own notes
             if not exact:
-                left -= 1  # it may be a note that equals the text: never proof
+                left -= 1  # it may be a note that carries what is wanted: never proof
                 if not left:
-                    return False
+                    return None
                 continue
-        if body in wanted:
-            return True
+        found = want(body)
+        if found is not None:
+            return found
         left -= 1
         if not left:
-            return False
-    return False
+            return None
+    return None
+
+
+def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
+    """Has *author* surely posted *text* since the block began? True only with proof, so a "no"
+    at worst posts the answer twice and never hides it. The comments are paired with the events
+    after the block the one way :func:`_first_in_comments_after` describes. Raises
+    PlacementIncomplete past the work budget."""
+    wanted = {text, text.strip()}
+    room = max(4 * len(text) + 1, 256)  # tells a longer body, and holds a note's opening
+    return (
+        _first_in_comments_after(
+            conn,
+            kanban_db,
+            task_id,
+            author,
+            block_id,
+            room,
+            lambda body: True if body in wanted else None,
+        )
+        is not None
+    )
+
+
+# An owner's comment retires an ask only when it says so explicitly; age and bare nudges
+# never do (a quiet 19-day ask is the point of the panel, not noise). A negated or
+# questioned mention ("not superseded by t_x", "is this superseded by t_x?") is not one.
+SUPERSEDED_BY_MARKER = re.compile(r"\bsuperseded[\s_-]*by\b[\s:>#]*t_[0-9a-f]{4,}", re.IGNORECASE)
+_NEGATED_BEFORE = re.compile(r"\b(?:not|never)\s*$|n't\s*$")
+AUTOMATED_OWNERS = frozenset({"fleet-doctor", "kanban-link"})  # never retire an ask, marker or not
+AUTOMATED_COMMENT = re.compile(r"\u23f1 Epoch estimate\b|\[epoch:estimate\b", re.IGNORECASE)
+
+
+def _superseded_marker(body: str, names: Iterable[str]) -> str | None:
+    """The explicit supersession marker *body* carries, or None when it carries none.
+
+    ``superseded by t_<id>`` in any of its spellings — stated, not negated and not asked
+    as a question — or ``not-<principal>:`` for a configured principal, and never inside a
+    comment an automated tool writes (the epoch estimator's banner), because automation
+    must not retire the principal's asks."""
+    if AUTOMATED_COMMENT.search(body):
+        return None
+    for line in body.splitlines():
+        hit = SUPERSEDED_BY_MARKER.search(line)
+        if not hit:
+            continue
+        before, after = line[: hit.start()].lower(), line[hit.end() :]
+        if _NEGATED_BEFORE.search(before) or after.lstrip(" \t,.;:)'\"*").startswith("?"):
+            continue  # "not superseded by t_x" / "superseded by t_x?" is not an explicit signal
+        return hit.group(0).strip()
+    lowered = body.lower()
+    for name in names:
+        token = str(name).strip().lower()
+        if token and f"not-{token}:" in lowered:
+            return f"not-{token}:"
+    return None
+
+
+def _superseded_ask(conn: Any, kanban_db: Any, task: Any, block: Any) -> str | None:
+    """Why an ask no longer counts although its card still sits blocked, or None while it counts.
+
+    Only the card's owner can retire an ask, and only by saying so explicitly in a comment
+    that surely came after the block: ``superseded by t_<id>`` or ``not-<principal>:``. Age
+    never retires an ask, a bare owner comment is a nudge or a packet carry, not a handover,
+    and neither an automated owner (fleet-doctor, kanban-link) nor a comment an automated
+    tool wrote (the epoch estimator) retires one either. A retired ask moves to the stuck
+    tier, so the drop is visible and reversible by re-blocking the card. Raises
+    PlacementIncomplete past the work budget."""
+    owner = str(getattr(task, "assignee", "") or "").strip()
+    if not owner or owner.lower() in AUTOMATED_OWNERS:
+        return None
+    names = principal_names()
+    marker = _first_in_comments_after(
+        conn,
+        kanban_db,
+        task.id,
+        owner,
+        block.id if block else None,
+        4096,
+        lambda body: _superseded_marker(body, names),
+    )
+    if marker is None:
+        return None
+    return (
+        f"The card's owner marked this ask superseded ({marker}); "
+        "re-block the card if it still needs you"
+    )
 
 
 class CardStatus(str, Enum):
@@ -1761,6 +1901,7 @@ def kanban_items(
                     reason = str(payload.get("reason") or "")
                     why = kanban_needs_you(reason, payload.get("kind"))
                     tier = "ask"
+                    stale = False
                     if not why:
                         # Anything blocked is a NEED to unblock. No ask for the principal was
                         # recorded, so say why it is stuck instead of dropping it silently.
@@ -1798,29 +1939,55 @@ def kanban_items(
                             why = "You answered and kept it blocked; release it when it is ready"
                         else:
                             continue  # answered triage card: nothing left for you to do here
-                    items.append(
-                        {
-                            "id": f"kanban:{board}:{task.id}",
-                            "version": version,
-                            "source": "kanban",
-                            "board": board,
-                            "task_id": task.id,
-                            "title": task.title,
-                            "ask": reason,
-                            "why": why,
-                            "tier": tier,
-                            "owner": task.assignee,
-                            "priority": task.priority,
-                            "status": task.status,
-                            "block_kind": payload.get("kind")
-                            or getattr(task, "block_kind", None),
-                            "block_recurrences": payload.get("recurrences")
-                            or getattr(task, "block_recurrences", 0),
-                            "since": since,
-                            "comments_sig": _comments_sig(conn, kanban_db, task.id),
-                            "body_sig": _digest(getattr(task, "body", "")),
-                        }
-                    )
+                    if tier == "ask":
+                        try:
+                            superseded = _superseded_ask(conn, kanban_db, task, block)
+                        except PlacementIncomplete as exc:
+                            superseded = None  # the ask stays in front of you
+                            if errors is not None:
+                                errors.append(f"kanban[{board}]: {task.id}: {exc}")
+                        if superseded:
+                            # The owner explicitly retired the ask: it moves to the stuck
+                            # tier, visible and reversible by re-blocking the card.
+                            tier = "stuck"
+                            why = superseded
+                        else:
+                            # Age never removes an ask: the oldest asks are the ones that
+                            # most need the principal's eyes. Past stale_ask_days the ask
+                            # stays counted and is flagged with its age instead.
+                            days = stale_ask_days()
+                            try:
+                                began = float(since)
+                            except (TypeError, ValueError):
+                                began = 0.0
+                            age = (time.time() - began) / 86400
+                            if days > 0 and began >= _EPOCH_FLOOR and age > days:
+                                stale = True
+                                why = f"{why} ({age:.0f} days old)"
+                    item = {
+                        "id": f"kanban:{board}:{task.id}",
+                        "version": version,
+                        "source": "kanban",
+                        "board": board,
+                        "task_id": task.id,
+                        "title": task.title,
+                        "ask": reason,
+                        "why": why,
+                        "tier": tier,
+                        "owner": task.assignee,
+                        "priority": task.priority,
+                        "status": task.status,
+                        "block_kind": payload.get("kind")
+                        or getattr(task, "block_kind", None),
+                        "block_recurrences": payload.get("recurrences")
+                        or getattr(task, "block_recurrences", 0),
+                        "since": since,
+                        "comments_sig": _comments_sig(conn, kanban_db, task.id),
+                        "body_sig": _digest(getattr(task, "body", "")),
+                    }
+                    if stale:
+                        item["stale"] = True
+                    items.append(item)
         except Exception as exc:  # noqa: BLE001 - per-board failure must be visible
             if errors is not None:
                 errors.append(f"kanban[{board}]: {type(exc).__name__}: {exc}")
@@ -4445,6 +4612,26 @@ def capability_key(item: dict[str, Any]) -> str:
     return source if source in CAPABILITIES else ""
 
 
+def _queue_warnings(settings: dict[str, Any] | None = None) -> list[str]:
+    """Fixed sentences for a queue whose counts a reader could misread twice over:
+    no principal configured (asks that name the principal go undetected), or a board
+    pin in the environment (every board label resolves to that one database)."""
+    warnings: list[str] = []
+    if not principal_names(settings):
+        warnings.append(
+            "No principal name is configured, so asks that name the principal cannot be "
+            "detected; set plugins.entries.unbl0ck.settings.principal_name."
+        )
+    for var in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        value = os.environ.get(var)
+        if value:
+            warnings.append(
+                f"{var}={value!r} pins the board set this queue reads; "
+                "per-board counts may collapse onto that one database."
+            )
+    return warnings
+
+
 def build_queue(
     home: Path | None = None, *, include_hidden: bool = False, record: bool = True
 ) -> dict[str, Any]:
@@ -4509,6 +4696,7 @@ def build_queue(
     settings, settings_error = _settings_state()
     if settings_error:
         errors.append(settings_error)
+    queue_warnings = _queue_warnings(settings)
     if chat_coverage is not None:
         # The reader returns normally after a corrupt database or unreadable settings and says
         # so only in `errors`; a window that was not fully read must not look like a complete one.
@@ -4581,6 +4769,7 @@ def build_queue(
         "hidden": len(items) - len(shown) + outside_stats.get("hidden_unread", 0),
         "items": shown,
         "errors": errors,
+        "warnings": queue_warnings,
         "ask_enabled": ask_enabled(settings),
         "bluf_enabled": summaries_on,
         "disclosure": disclosure_matrix(settings),

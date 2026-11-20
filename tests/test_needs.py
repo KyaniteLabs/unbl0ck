@@ -741,6 +741,12 @@ class FakeKanban(unittest.TestCase):
             types.SimpleNamespace(author="ada", created_at=150, body="noted")
         ]
         self.assertEqual(needs.kanban_items(boards=["factory"]), [])
+        # The same answered card leaves the queue even when its ask is old enough to
+        # age out: an answer always wins over staleness.
+        self.events = [
+            block_event(created_at=time.time() - 9 * 86400),
+        ]
+        self.assertEqual(needs.kanban_items(boards=["factory"]), [])
 
     def test_triage_cannot_be_released(self):
         self.task = task(status="triage")
@@ -832,13 +838,68 @@ class QueueKanban(unittest.TestCase):
         self.assertIn("capability", needs.stuck_reason("x", "capability", ev))
 
     def test_operator_and_credential_phrasing_detected(self):
+        # "Operator/Owner input is needed" addresses a fleet operator, not the principal
+        # (an install that addresses its principal that way sets role_words); the
+        # authorized-noun next to what it gates and dead credentials still ask.
         for reason in [
-            "Operator input is needed to reconcile the judge",
             "Ada approved this last week",
             "npm credentials are dead",
             "needs an authorized host route",
         ]:
             self.assertTrue(needs.kanban_needs_you(reason, None), reason)
+        for reason in [
+            "Operator input is needed to reconcile the judge",
+            "Owner decision is needed before the merge",
+            "needs an authorized root deployment route",
+        ]:
+            self.assertIsNone(needs.kanban_needs_you(reason, None), reason)
+
+    def test_role_addressed_live_reasons_are_not_asks(self):
+        # Real block reasons from the 2026-11-20 over-count (each addressed another
+        # seat or described deployment mechanics), with positive controls after.
+        cases = [
+            (
+                "Liam/operator input is needed to reconcile a contradictory goal judge",
+                "needs_input",
+            ),
+            (
+                "Option B needs an authorized root deployment route: simon cannot write "
+                "/srv/chamber/operator/work, and installed fleet-opd has no install/ACL/mount "
+                "operation and excludes chamber units. Liam must identify the execution "
+                "principal/route; installed withdrawal resolver also remains pre-PR26.",
+                "capability",
+            ),
+            ("Product must own and record rulings", "needs_input"),
+        ]
+        for reason, kind in cases:
+            self.assertIsNone(needs.kanban_needs_you(reason, kind), reason)
+        for reason, kind in [
+            ("Ada must approve the publish before it lands", None),
+            ("Publication hold. Stay blocked. CEO item 39.", "needs_input"),
+            ("Repair the key binding (credential surface, CEO-gated).", "capability"),
+        ]:
+            self.assertTrue(needs.kanban_needs_you(reason, kind), reason)
+        # The same genuine ask addressed as the live panel's principal ("Simon").
+        self.assertTrue(
+            needs._any_gate(
+                "Simon must approve the publish before it lands",
+                needs._patterns(["Simon"], ["CEO"]),
+            )
+        )
+
+    def test_generic_name_words_need_an_address(self):
+        # "principal"/"human" as common nouns are not asks; as an address they still are.
+        for reason in [
+            "the execution principal/route must be identified by Liam",
+            "Finish needs a decision/access only a human can give: no model credential",
+        ]:
+            self.assertIsNone(needs.kanban_needs_you(reason, "needs_input"), reason)
+        for reason in [
+            "waiting on the human to decide the lane",
+            "blocked pending the principal's decision on spend",
+            "the human must decide the lane",
+        ]:
+            self.assertTrue(needs.kanban_needs_you(reason, "needs_input"), reason)
 
 
 class CardContext(unittest.TestCase):
@@ -995,6 +1056,227 @@ class PrincipalName(unittest.TestCase):
                 else:
                     os.environ[key] = value
             needs._settings = orig
+
+
+class SupersededAsks(unittest.TestCase):
+    """Age never removes an ask; only the owner's explicit marker retires it (AC2, amended).
+
+    A card also stops asking when it leaves the blocked/triage statuses the queue lists, or
+    when its block is re-issued with a reason that no longer asks — both inherent to
+    ``kanban_items`` (only ``QUEUE_STATUSES`` are listed, only the latest block is judged),
+    so they predate this fix and are not re-pinned here; the marker-predates-block guard
+    below covers the re-issue pairing that this fix owns.
+    """
+
+    def setUp(self):
+        day = 86400
+        now = time.time()
+        self.now, self.day = now, day
+        self.task = task(task_id="t_old", assignee="platform", created_at=now - 9 * day)
+        self.block = types.SimpleNamespace(
+            id=11,
+            kind="blocked",
+            created_at=now - 8 * day,
+            payload={
+                "reason": "Awaiting Ada's approval to publish",
+                "kind": "needs_input",
+                "recurrences": 1,
+            },
+        )
+        self.comments = []
+        kdb = fake_db(
+            get_task=lambda c, t: self.task if t == "t_old" else None,
+            list_tasks=lambda c, status=None: (
+                [self.task] if status == "blocked" else []
+            ),
+            list_events=lambda c, t: [self.block]
+            + [
+                types.SimpleNamespace(
+                    id=100 + i,
+                    kind="commented",
+                    created_at=x.created_at,
+                    payload={"author": x.author, "len": len(x.body)},
+                )
+                for i, x in enumerate(self.comments)
+            ],
+            list_comments=lambda c, t: self.comments,
+        )
+        self.stack = fake_hermes(kdb, fake_connect())
+        self.stack.__enter__()
+        self.addCleanup(self.stack.__exit__, None, None, None)
+        # The answered path reads the pending-release state under HERMES_HOME.
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.saved_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(Path(self.tmp.name))
+        if self.saved_home is not None:
+            self.addCleanup(os.environ.__setitem__, "HERMES_HOME", self.saved_home)
+        else:
+            self.addCleanup(os.environ.pop, "HERMES_HOME", None)
+
+    def queue(self):
+        return needs.kanban_items(boards=["factory"])
+
+    def test_old_ask_stays_counted_and_is_flagged_with_its_age(self):
+        # The biting half: an 8-day-old quiet ask keeps counting — age never removes an
+        # ask — and is flagged stale with its age in why. The guards: a zero threshold, a
+        # fresh block and an unreadable timestamp each leave the ask unflagged.
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.assertIs(it.get("stale"), True)
+        self.assertIn("days old)", it["why"])
+        settings = mock.patch.object(
+            needs,
+            "_settings",
+            lambda: {"principal_name": "Ada", "comment_author": "ada", "stale_ask_days": 0},
+        )
+        with settings:
+            (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.assertNotIn("stale", it)
+        self.block.created_at = self.now - self.day
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.assertNotIn("stale", it)
+        self.block.created_at = 100
+        self.task.created_at = 100
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.assertNotIn("stale", it)
+
+    def test_an_owners_bare_comment_keeps_the_ask(self):
+        # Round-1 defect, live class (t_3e48f4d6 and friends): owners comment to nudge,
+        # re-prep or carry a packet item while the ask stands. A bare comment never retires
+        # the ask, however old.
+        self.comments = [
+            types.SimpleNamespace(
+                author="platform",
+                created_at=self.now - 3 * self.day,
+                body="carrying packet item 26 while the ask stands; fleet-doctor nudged too",
+            )
+        ]
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.assertIs(it.get("stale"), True)
+
+    def test_owner_marker_retires_the_ask_but_only_the_owners_and_only_after(self):
+        # The biting half: the owner's explicit "Superseded by t_…" (the live t_14a12a17
+        # string) retires the ask to the stuck tier. The guards: the same words from a
+        # different author keep it, so does a marker that predates the block, and so do
+        # negated or questioned mentions (CoS round-2 note) — only a stated marker retires.
+        self.comments = [
+            types.SimpleNamespace(
+                author="platform",
+                created_at=self.now - 3 * self.day,
+                body="**Superseded by t_016854ef (census + wiring), folded and archived.**",
+            )
+        ]
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "stuck")
+        self.assertIn("t_016854ef", it["why"])
+        self.assertIn("re-block", it["why"])
+        self.comments[0].author = "liam"
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.comments[0].author = "platform"
+        self.block.id = 500  # the marker now predates the block: no pairing, no retirement
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.block.id = 11
+        self.comments[0].body = "checked: this is not superseded by t_016854ef; still waiting on Simon"
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.comments[0].body = "is this superseded by t_016854ef?"
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.comments[0].body = "never superseded by t_016854ef, the ask stands"
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+
+    def test_not_principal_marker_retires_only_that_principal(self):
+        # ``not-<principal>:`` retires the ask for the configured principal only.
+        self.block.payload = {
+            "reason": "Awaiting Simon's approval to publish",
+            "kind": "needs_input",
+            "recurrences": 1,
+        }
+        settings = mock.patch.object(
+            needs,
+            "_settings",
+            lambda: {"principal_name": "Simon", "comment_author": "simon"},
+        )
+        self.comments = [
+            types.SimpleNamespace(
+                author="platform",
+                created_at=self.now - self.day,
+                body="not-simon: Liam owns this ruling now",
+            )
+        ]
+        with settings:
+            (it,) = self.queue()
+        self.assertEqual(it["tier"], "stuck")
+        self.assertIn("not-simon:", it["why"])
+        self.comments[0].body = "not-ada: someone else owns this"
+        with settings:
+            (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+
+    def test_automated_owners_and_epoch_comments_never_retire(self):
+        # fleet-doctor / kanban-link owned cards and the epoch estimator's comments never
+        # retire an ask, marker or not.
+        self.comments = [
+            types.SimpleNamespace(
+                author="fleet-doctor",
+                created_at=self.now - self.day,
+                body="Superseded by t_016854ef",
+            )
+        ]
+        self.task = task(task_id="t_old", assignee="fleet-doctor", created_at=self.now - 9 * self.day)
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.task = task(task_id="t_old", assignee="platform", created_at=self.now - 9 * self.day)
+        self.comments[0].author = "platform"
+        self.comments[0].body = (
+            "⏱ Epoch estimate — ~0.2h. superseded-by t_016854ef [epoch:estimate run=3971]"
+        )
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+
+
+class QueueWarnings(unittest.TestCase):
+    """The queue says when its own counts could be misread (AC4)."""
+
+    def _env(self, **extra):
+        base = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "UNBL0CK_PRINCIPAL")
+        }
+        base.update(extra)
+        return base
+
+    def test_missing_principal_and_board_pins_each_warn(self):
+        with mock.patch.dict(os.environ, self._env(), clear=True):
+            (warning,) = needs._queue_warnings({})
+            self.assertIn("principal_name", warning)
+        with mock.patch.dict(
+            os.environ, self._env(HERMES_KANBAN_DB="/tmp/x.db"), clear=True
+        ):
+            (warning,) = needs._queue_warnings({"principal_name": "Ada"})
+            self.assertIn("HERMES_KANBAN_DB", warning)
+        with mock.patch.dict(
+            os.environ, self._env(HERMES_KANBAN_BOARD="factory"), clear=True
+        ):
+            (warning,) = needs._queue_warnings({"principal_name": "Ada"})
+            self.assertIn("HERMES_KANBAN_BOARD", warning)
+
+    def test_clean_environment_warns_about_nothing(self):
+        with mock.patch.dict(os.environ, self._env(), clear=True):
+            self.assertEqual(
+                needs._queue_warnings({"principal_name": "Ada", "comment_author": "ada"}),
+                [],
+            )
 
 
 if __name__ == "__main__":
