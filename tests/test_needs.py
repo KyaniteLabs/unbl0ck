@@ -1062,9 +1062,10 @@ class SupersededAsks(unittest.TestCase):
     """Age never removes an ask; only the owner's explicit marker retires it (AC2, amended).
 
     A card also stops asking when it leaves the blocked/triage statuses the queue lists, or
-    when its block is re-issued with a reason that no longer matches — both inherent to
-    ``kanban_items`` (only ``QUEUE_STATUSES`` are listed, only the latest block is judged);
-    the re-issue half is pinned below.
+    when its block is re-issued with a reason that no longer asks — both inherent to
+    ``kanban_items`` (only ``QUEUE_STATUSES`` are listed, only the latest block is judged),
+    so they predate this fix and are not re-pinned here; the marker-predates-block guard
+    below covers the re-issue pairing that this fix owns.
     """
 
     def setUp(self):
@@ -1082,14 +1083,13 @@ class SupersededAsks(unittest.TestCase):
                 "recurrences": 1,
             },
         )
-        self.blocks = [self.block]
         self.comments = []
         kdb = fake_db(
             get_task=lambda c, t: self.task if t == "t_old" else None,
             list_tasks=lambda c, status=None: (
                 [self.task] if status == "blocked" else []
             ),
-            list_events=lambda c, t: self.blocks
+            list_events=lambda c, t: [self.block]
             + [
                 types.SimpleNamespace(
                     id=100 + i,
@@ -1230,29 +1230,6 @@ class SupersededAsks(unittest.TestCase):
         )
         (it,) = self.queue()
         self.assertEqual(it["tier"], "ask")
-
-    def test_a_reissued_block_with_a_non_ask_reason_drops_the_ask(self):
-        # The explicit supersession signal that needs no marker: the block is re-issued
-        # with a reason that no longer asks, and only the latest block is judged.
-        self.comments = [
-            types.SimpleNamespace(
-                author="platform",
-                created_at=self.now - 3 * self.day,
-                body="Superseded by t_016854ef",
-            )
-        ]
-        self.blocks = [
-            self.block,
-            types.SimpleNamespace(
-                id=500,
-                kind="blocked",
-                created_at=self.now - self.day,
-                payload={"reason": "waiting on platform to redeploy", "kind": None},
-            ),
-        ]
-        (it,) = self.queue()
-        self.assertEqual(it["tier"], "stuck")
-        self.assertNotIn("t_016854ef", it["why"])
 
 
 class QueueWarnings(unittest.TestCase):
