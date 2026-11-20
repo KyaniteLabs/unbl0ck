@@ -1162,12 +1162,13 @@ class SupersededAsks(unittest.TestCase):
     def test_owner_marker_retires_the_ask_but_only_the_owners_and_only_after(self):
         # The biting half: the owner's explicit "Superseded by t_…" (the live t_14a12a17
         # string) retires the ask to the stuck tier. The guards: the same words from a
-        # different author keep it, and so does a marker that predates the block.
+        # different author keep it, so does a marker that predates the block, and so do
+        # negated or questioned mentions (CoS round-2 note) — only a stated marker retires.
         self.comments = [
             types.SimpleNamespace(
                 author="platform",
                 created_at=self.now - 3 * self.day,
-                body="Archived; Superseded by t_016854ef",
+                body="**Superseded by t_016854ef (census + wiring), folded and archived.**",
             )
         ]
         (it,) = self.queue()
@@ -1179,6 +1180,16 @@ class SupersededAsks(unittest.TestCase):
         self.assertEqual(it["tier"], "ask")
         self.comments[0].author = "platform"
         self.block.id = 500  # the marker now predates the block: no pairing, no retirement
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.block.id = 11
+        self.comments[0].body = "checked: this is not superseded by t_016854ef; still waiting on Simon"
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.comments[0].body = "is this superseded by t_016854ef?"
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.comments[0].body = "never superseded by t_016854ef, the ask stands"
         (it,) = self.queue()
         self.assertEqual(it["tier"], "ask")
 

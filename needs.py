@@ -1707,8 +1707,10 @@ def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_i
 
 
 # An owner's comment retires an ask only when it says so explicitly; age and bare nudges
-# never do (a quiet 19-day ask is the point of the panel, not noise).
+# never do (a quiet 19-day ask is the point of the panel, not noise). A negated or
+# questioned mention ("not superseded by t_x", "is this superseded by t_x?") is not one.
 SUPERSEDED_BY_MARKER = re.compile(r"\bsuperseded[\s_-]*by\b[\s:>#]*t_[0-9a-f]{4,}", re.IGNORECASE)
+_NEGATED_BEFORE = re.compile(r"\b(?:not|never)\s*$|n't\s*$")
 AUTOMATED_OWNERS = frozenset({"fleet-doctor", "kanban-link"})  # never retire an ask, marker or not
 AUTOMATED_COMMENT = re.compile(r"\u23f1 Epoch estimate\b|\[epoch:estimate\b", re.IGNORECASE)
 
@@ -1716,13 +1718,19 @@ AUTOMATED_COMMENT = re.compile(r"\u23f1 Epoch estimate\b|\[epoch:estimate\b", re
 def _superseded_marker(body: str, names: Iterable[str]) -> str | None:
     """The explicit supersession marker *body* carries, or None when it carries none.
 
-    ``superseded by t_<id>`` in any of its spellings, or ``not-<principal>:`` for a
-    configured principal, and never inside a comment an automated tool writes (the epoch
-    estimator's banner), because automation must not retire the principal's asks."""
+    ``superseded by t_<id>`` in any of its spellings — stated, not negated and not asked
+    as a question — or ``not-<principal>:`` for a configured principal, and never inside a
+    comment an automated tool writes (the epoch estimator's banner), because automation
+    must not retire the principal's asks."""
     if AUTOMATED_COMMENT.search(body):
         return None
-    hit = SUPERSEDED_BY_MARKER.search(body)
-    if hit:
+    for line in body.splitlines():
+        hit = SUPERSEDED_BY_MARKER.search(line)
+        if not hit:
+            continue
+        before, after = line[: hit.start()].lower(), line[hit.end() :]
+        if _NEGATED_BEFORE.search(before) or after.lstrip(" \t,.;:)'\"*").startswith("?"):
+            continue  # "not superseded by t_x" / "superseded by t_x?" is not an explicit signal
         return hit.group(0).strip()
     lowered = body.lower()
     for name in names:
