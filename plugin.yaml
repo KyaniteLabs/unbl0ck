@@ -72,7 +72,7 @@ config_schema:
   stale_ask_days:
     type: float
     default: 7
-    description: "How many days a Kanban ask stays counted. A block older than this with no card comments or events inside the window, or one that old whose card owner commented after the block, stops counting as needing you and is listed as stuck with its age (re-block the card to bring it back). Zero or less disables aging; anything the reader cannot convert uses 7."
+    description: "How many days a Kanban ask takes to be flagged old. Age never removes an ask: past this many days it stays counted and is marked stale with its age. An ask stops counting only when its block is re-issued with a reason that no longer asks, or when the card's owner comments 'superseded by t_<id>' or 'not-<you>:' after the block (automated authors such as fleet-doctor, kanban-link and the epoch estimator never retire an ask; re-block the card to bring one back). Zero or less disables the flagging; anything the reader cannot convert uses 7."
   outside_dirs:
     type: str
     default: ""
