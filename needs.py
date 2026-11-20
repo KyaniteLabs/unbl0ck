@@ -184,15 +184,18 @@ def chat_window_days(settings: dict[str, Any] | None = None) -> int:
     return raw
 
 
-STALE_ASK_DAYS = 7  # an ask older than this, with nothing happening on the card, goes stale
+STALE_ASK_DAYS = 7  # an ask older than this is flagged with its age; age alone never drops it
 _EPOCH_FLOOR = 1_000_000_000  # 2001-09-09: a "created_at" older than this is not a real timestamp
 
 
 def stale_ask_days(settings: dict[str, Any] | None = None) -> float:
-    """How many days an unanswered ask stays an ask (setting ``stale_ask_days``): 7 by default.
+    """How many days an ask takes to be flagged old (setting ``stale_ask_days``): 7 by default.
 
-    Zero or negative disables aging. A value the reader cannot convert uses the default,
-    like the other setting readers, so a bad value can neither hide asks nor crash the queue."""
+    Age never removes an ask: it stays counted and is marked ``stale`` with its age once it
+    passes this many days. Only the card's owner saying so explicitly (``superseded by
+    t_<id>`` or ``not-<principal>:``) steps an ask aside. Zero or negative disables the
+    flagging. A value the reader cannot convert uses the default, like the other setting
+    readers, so a bad value can neither hide asks nor crash the queue."""
     raw = (settings if settings is not None else _settings()).get("stale_ask_days")
     if isinstance(raw, str):
         text = raw.strip()
@@ -1626,20 +1629,31 @@ def _answered_since(conn: Any, kanban_db: Any, task_id: str, author: str, block_
     return False
 
 
-def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
-    """Has *author* surely posted *text* since the block began? True only with proof, so a "no"
-    at worst posts the answer twice and never hides it. Kanban writes each comment with its
-    ``commented`` event and never edits or deletes one, so the author's comments pair in order
-    with their events, apart from the notes Kanban writes with no event. When the author's
-    unlogged comments are exactly their notes, the k comments left after skipping the notes,
-    newest first, are the k their events after the block logged. Otherwise only the author's k
-    newest comments surely came after the block. Raises PlacementIncomplete past the work budget."""
+def _first_in_comments_after(
+    conn: Any,
+    kanban_db: Any,
+    task_id: str,
+    author: str,
+    block_id: int | None,
+    room: int,
+    want: Callable[[str], Any],
+) -> Any:
+    """The first non-None ``want(body)`` among *author*'s comments that surely came after the
+    block began, newest first.
+
+    Kanban writes each comment with its ``commented`` event and never edits or deletes one,
+    so the author's comments pair in order with their events, apart from the notes Kanban
+    writes with no event. When the author's unlogged comments are exactly their notes, the k
+    comments left after skipping the notes, newest first, are the k their events after the
+    block logged. Otherwise only the author's k newest comments surely came after the block.
+    None when nothing matches, when the author did not comment after the block, or when
+    nothing pairs for sure; a miss at worst leaves the card in front of you. Raises
+    PlacementIncomplete past the work budget."""
     k = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, block_id))
     if not k:
-        return False
+        return None
     unknown = [0]  # events whose author cannot be read: any one may be this author's
     logged = sum(1 for _ in _author_events_after(conn, kanban_db, task_id, author, None, unknown))
-    room = max(4 * len(text) + 1, 256)  # tells a longer body, and holds a note's opening
 
     def newest() -> Iterable[str]:
         return _author_comments_newest(conn, kanban_db, task_id, author, room)
@@ -1650,81 +1664,103 @@ def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_i
         notes += bool(UNLOGGED_COMMENT.match(body))
     unlogged = total - logged
     if unlogged < 0:
-        return False  # a comment is gone: Kanban did not do that, so nothing pairs for sure
-    wanted, left = {text, text.strip()}, k
+        return None  # a comment is gone: Kanban did not do that, so nothing pairs for sure
+    left = k
     exact = not unknown[0] and unlogged in (0, notes)  # every comment pairs, or every unlogged one is a note
     for body in newest():
         if UNLOGGED_COMMENT.match(body):
             if exact and unlogged:
                 continue  # one of Kanban's own notes
             if not exact:
-                left -= 1  # it may be a note that equals the text: never proof
+                left -= 1  # it may be a note that carries what is wanted: never proof
                 if not left:
-                    return False
+                    return None
                 continue
-        if body in wanted:
-            return True
+        found = want(body)
+        if found is not None:
+            return found
         left -= 1
         if not left:
-            return False
-    return False
-
-
-def _newest_event_at(conn: Any, kanban_db: Any, task_id: str) -> float | None:
-    """When the newest event of any kind landed on the card, or None when that cannot be read."""
-    try:
-        row = conn.execute(
-            "SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task_id,)
-        ).fetchone()
-        return float(row[0]) if row and row[0] else None
-    except Exception:  # noqa: BLE001 - schema drift: the public API
-        stamps = [
-            float(created)
-            for e in kanban_db.list_events(conn, task_id)
-            if isinstance(created := getattr(e, "created_at", None), (int, float))
-        ]
-        return max(stamps) if stamps else None
-
-
-def _stale_ask(conn: Any, kanban_db: Any, task: Any, block: Any, since: Any) -> str | None:
-    """Why an old ask no longer counts against the principal, or None while it still counts.
-
-    An ask ages out when its block is older than ``stale_ask_days`` days and nothing has
-    happened on the card inside that window; an ask that old whose owner commented after
-    the block steps aside the same way (the owner took the question over, the way a
-    healed incident is retired by the seat that reported it). Both demotions keep the
-    card listed in the stuck tier with its age, so they are visible and reversible by
-    re-blocking. A timestamp this old box cannot read never ages an ask out. Raises
-    PlacementIncomplete past the work budget."""
-    days = stale_ask_days()
-    if days <= 0:
-        return None
-    now = time.time()
-    try:
-        began = float(since)
-    except (TypeError, ValueError):
-        return None
-    if began < _EPOCH_FLOOR or now - began <= days * 86400:
-        return None  # not a readable timestamp, or the ask is still fresh
-    age = f"{(now - began) / 86400:.0f} days"
-    newest = _newest_event_at(conn, kanban_db, task.id)
-    if newest is None or now - newest > days * 86400:
-        return (
-            f"No card activity inside the {days:g}-day window and the ask is {age} old; "
-            "re-block the card if it still needs you"
-        )
-    owner = str(getattr(task, "assignee", "") or "").strip()
-    if owner and any(
-        True
-        for _ in _author_events_after(
-            conn, kanban_db, task.id, owner, block.id if block else None
-        )
-    ):
-        return (
-            f"The card's owner commented after this {age}-old ask; "
-            "re-block the card if it still needs you"
-        )
+            return None
     return None
+
+
+def _answered_with(conn: Any, kanban_db: Any, task_id: str, author: str, block_id: int | None, text: str) -> bool:
+    """Has *author* surely posted *text* since the block began? True only with proof, so a "no"
+    at worst posts the answer twice and never hides it. The comments are paired with the events
+    after the block the one way :func:`_first_in_comments_after` describes. Raises
+    PlacementIncomplete past the work budget."""
+    wanted = {text, text.strip()}
+    room = max(4 * len(text) + 1, 256)  # tells a longer body, and holds a note's opening
+    return (
+        _first_in_comments_after(
+            conn,
+            kanban_db,
+            task_id,
+            author,
+            block_id,
+            room,
+            lambda body: True if body in wanted else None,
+        )
+        is not None
+    )
+
+
+# An owner's comment retires an ask only when it says so explicitly; age and bare nudges
+# never do (a quiet 19-day ask is the point of the panel, not noise).
+SUPERSEDED_BY_MARKER = re.compile(r"\bsuperseded[\s_-]*by\b[\s:>#]*t_[0-9a-f]{4,}", re.IGNORECASE)
+AUTOMATED_OWNERS = frozenset({"fleet-doctor", "kanban-link"})  # never retire an ask, marker or not
+AUTOMATED_COMMENT = re.compile(r"\u23f1 Epoch estimate\b|\[epoch:estimate\b", re.IGNORECASE)
+
+
+def _superseded_marker(body: str, names: Iterable[str]) -> str | None:
+    """The explicit supersession marker *body* carries, or None when it carries none.
+
+    ``superseded by t_<id>`` in any of its spellings, or ``not-<principal>:`` for a
+    configured principal, and never inside a comment an automated tool writes (the epoch
+    estimator's banner), because automation must not retire the principal's asks."""
+    if AUTOMATED_COMMENT.search(body):
+        return None
+    hit = SUPERSEDED_BY_MARKER.search(body)
+    if hit:
+        return hit.group(0).strip()
+    lowered = body.lower()
+    for name in names:
+        token = str(name).strip().lower()
+        if token and f"not-{token}:" in lowered:
+            return f"not-{token}:"
+    return None
+
+
+def _superseded_ask(conn: Any, kanban_db: Any, task: Any, block: Any) -> str | None:
+    """Why an ask no longer counts although its card still sits blocked, or None while it counts.
+
+    Only the card's owner can retire an ask, and only by saying so explicitly in a comment
+    that surely came after the block: ``superseded by t_<id>`` or ``not-<principal>:``. Age
+    never retires an ask, a bare owner comment is a nudge or a packet carry, not a handover,
+    and neither an automated owner (fleet-doctor, kanban-link) nor a comment an automated
+    tool wrote (the epoch estimator) retires one either. A retired ask moves to the stuck
+    tier, so the drop is visible and reversible by re-blocking the card. Raises
+    PlacementIncomplete past the work budget."""
+    owner = str(getattr(task, "assignee", "") or "").strip()
+    if not owner or owner.lower() in AUTOMATED_OWNERS:
+        return None
+    names = principal_names()
+    marker = _first_in_comments_after(
+        conn,
+        kanban_db,
+        task.id,
+        owner,
+        block.id if block else None,
+        4096,
+        lambda body: _superseded_marker(body, names),
+    )
+    if marker is None:
+        return None
+    return (
+        f"The card's owner marked this ask superseded ({marker}); "
+        "re-block the card if it still needs you"
+    )
 
 
 class CardStatus(str, Enum):
@@ -1857,6 +1893,7 @@ def kanban_items(
                     reason = str(payload.get("reason") or "")
                     why = kanban_needs_you(reason, payload.get("kind"))
                     tier = "ask"
+                    stale = False
                     if not why:
                         # Anything blocked is a NEED to unblock. No ask for the principal was
                         # recorded, so say why it is stuck instead of dropping it silently.
@@ -1896,39 +1933,53 @@ def kanban_items(
                             continue  # answered triage card: nothing left for you to do here
                     if tier == "ask":
                         try:
-                            stale = _stale_ask(conn, kanban_db, task, block, since)
+                            superseded = _superseded_ask(conn, kanban_db, task, block)
                         except PlacementIncomplete as exc:
-                            stale = None  # the ask stays in front of you
+                            superseded = None  # the ask stays in front of you
                             if errors is not None:
                                 errors.append(f"kanban[{board}]: {task.id}: {exc}")
-                        if stale:
-                            # An aged-out or superseded ask is still a blocked card: it moves
-                            # to the stuck tier with its age instead of counting against you.
+                        if superseded:
+                            # The owner explicitly retired the ask: it moves to the stuck
+                            # tier, visible and reversible by re-blocking the card.
                             tier = "stuck"
-                            why = stale
-                    items.append(
-                        {
-                            "id": f"kanban:{board}:{task.id}",
-                            "version": version,
-                            "source": "kanban",
-                            "board": board,
-                            "task_id": task.id,
-                            "title": task.title,
-                            "ask": reason,
-                            "why": why,
-                            "tier": tier,
-                            "owner": task.assignee,
-                            "priority": task.priority,
-                            "status": task.status,
-                            "block_kind": payload.get("kind")
-                            or getattr(task, "block_kind", None),
-                            "block_recurrences": payload.get("recurrences")
-                            or getattr(task, "block_recurrences", 0),
-                            "since": since,
-                            "comments_sig": _comments_sig(conn, kanban_db, task.id),
-                            "body_sig": _digest(getattr(task, "body", "")),
-                        }
-                    )
+                            why = superseded
+                        else:
+                            # Age never removes an ask: the oldest asks are the ones that
+                            # most need the principal's eyes. Past stale_ask_days the ask
+                            # stays counted and is flagged with its age instead.
+                            days = stale_ask_days()
+                            try:
+                                began = float(since)
+                            except (TypeError, ValueError):
+                                began = 0.0
+                            age = (time.time() - began) / 86400
+                            if days > 0 and began >= _EPOCH_FLOOR and age > days:
+                                stale = True
+                                why = f"{why} ({age:.0f} days old)"
+                    item = {
+                        "id": f"kanban:{board}:{task.id}",
+                        "version": version,
+                        "source": "kanban",
+                        "board": board,
+                        "task_id": task.id,
+                        "title": task.title,
+                        "ask": reason,
+                        "why": why,
+                        "tier": tier,
+                        "owner": task.assignee,
+                        "priority": task.priority,
+                        "status": task.status,
+                        "block_kind": payload.get("kind")
+                        or getattr(task, "block_kind", None),
+                        "block_recurrences": payload.get("recurrences")
+                        or getattr(task, "block_recurrences", 0),
+                        "since": since,
+                        "comments_sig": _comments_sig(conn, kanban_db, task.id),
+                        "body_sig": _digest(getattr(task, "body", "")),
+                    }
+                    if stale:
+                        item["stale"] = True
+                    items.append(item)
         except Exception as exc:  # noqa: BLE001 - per-board failure must be visible
             if errors is not None:
                 errors.append(f"kanban[{board}]: {type(exc).__name__}: {exc}")

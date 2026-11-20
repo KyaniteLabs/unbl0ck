@@ -1058,8 +1058,15 @@ class PrincipalName(unittest.TestCase):
             needs._settings = orig
 
 
-class StaleAskAging(unittest.TestCase):
-    """Old, quiet or owner-superseded asks stop counting against the principal (AC2)."""
+class SupersededAsks(unittest.TestCase):
+    """Age never removes an ask; only the owner's explicit marker retires it (AC2, amended).
+
+    A card also stops asking when it leaves the blocked/triage statuses the queue lists, or
+    when its block is re-issued with a reason that no longer asks — both inherent to
+    ``kanban_items`` (only ``QUEUE_STATUSES`` are listed, only the latest block is judged),
+    so they predate this fix and are not re-pinned here; the marker-predates-block guard
+    below covers the re-issue pairing that this fix owns.
+    """
 
     def setUp(self):
         day = 86400
@@ -1110,53 +1117,117 @@ class StaleAskAging(unittest.TestCase):
     def queue(self):
         return needs.kanban_items(boards=["factory"])
 
-    def test_old_quiet_ask_ages_out_unless_the_card_stays_alive(self):
-        # The biting half: an 8-day-old ask with no card activity in the window stops
-        # counting and moves to the stuck tier with its age. The guards: recent activity,
-        # a zero threshold and an unreadable timestamp each keep it an ask.
-        (it,) = self.queue()
-        self.assertEqual(it["tier"], "stuck")
-        self.assertIn("No card activity", it["why"])
-        self.assertIn("7-day window", it["why"])
-        self.comments = [
-            types.SimpleNamespace(
-                author="liam", created_at=self.now - self.day, body="checking in"
-            )
-        ]
+    def test_old_ask_stays_counted_and_is_flagged_with_its_age(self):
+        # The biting half: an 8-day-old quiet ask keeps counting — age never removes an
+        # ask — and is flagged stale with its age in why. The guards: a zero threshold, a
+        # fresh block and an unreadable timestamp each leave the ask unflagged.
         (it,) = self.queue()
         self.assertEqual(it["tier"], "ask")
+        self.assertIs(it.get("stale"), True)
+        self.assertIn("days old)", it["why"])
         settings = mock.patch.object(
             needs,
             "_settings",
-            lambda: {
-                "principal_name": "Ada",
-                "comment_author": "ada",
-                "stale_ask_days": 0,
-            },
+            lambda: {"principal_name": "Ada", "comment_author": "ada", "stale_ask_days": 0},
         )
-        self.comments = []
         with settings:
             (it,) = self.queue()
         self.assertEqual(it["tier"], "ask")
+        self.assertNotIn("stale", it)
+        self.block.created_at = self.now - self.day
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.assertNotIn("stale", it)
         self.block.created_at = 100
         self.task.created_at = 100
         (it,) = self.queue()
         self.assertEqual(it["tier"], "ask")
+        self.assertNotIn("stale", it)
 
-    def test_old_ask_superseded_by_its_owner_but_a_fresh_one_still_asks(self):
-        # The biting half: an 8-day-old ask whose owner commented after the block steps
-        # aside. The guard: a fresh block with the same owner comment stays an ask.
+    def test_an_owners_bare_comment_keeps_the_ask(self):
+        # Round-1 defect, live class (t_3e48f4d6 and friends): owners comment to nudge,
+        # re-prep or carry a packet item while the ask stands. A bare comment never retires
+        # the ask, however old.
         self.comments = [
             types.SimpleNamespace(
                 author="platform",
                 created_at=self.now - 3 * self.day,
-                body="incident healed",
+                body="carrying packet item 26 while the ask stands; fleet-doctor nudged too",
+            )
+        ]
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.assertIs(it.get("stale"), True)
+
+    def test_owner_marker_retires_the_ask_but_only_the_owners_and_only_after(self):
+        # The biting half: the owner's explicit "Superseded by t_…" (the live t_14a12a17
+        # string) retires the ask to the stuck tier. The guards: the same words from a
+        # different author keep it, and so does a marker that predates the block.
+        self.comments = [
+            types.SimpleNamespace(
+                author="platform",
+                created_at=self.now - 3 * self.day,
+                body="Archived; Superseded by t_016854ef",
             )
         ]
         (it,) = self.queue()
         self.assertEqual(it["tier"], "stuck")
-        self.assertIn("owner commented", it["why"])
-        self.block.created_at = self.now - self.day
+        self.assertIn("t_016854ef", it["why"])
+        self.assertIn("re-block", it["why"])
+        self.comments[0].author = "liam"
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.comments[0].author = "platform"
+        self.block.id = 500  # the marker now predates the block: no pairing, no retirement
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+
+    def test_not_principal_marker_retires_only_that_principal(self):
+        # ``not-<principal>:`` retires the ask for the configured principal only.
+        self.block.payload = {
+            "reason": "Awaiting Simon's approval to publish",
+            "kind": "needs_input",
+            "recurrences": 1,
+        }
+        settings = mock.patch.object(
+            needs,
+            "_settings",
+            lambda: {"principal_name": "Simon", "comment_author": "simon"},
+        )
+        self.comments = [
+            types.SimpleNamespace(
+                author="platform",
+                created_at=self.now - self.day,
+                body="not-simon: Liam owns this ruling now",
+            )
+        ]
+        with settings:
+            (it,) = self.queue()
+        self.assertEqual(it["tier"], "stuck")
+        self.assertIn("not-simon:", it["why"])
+        self.comments[0].body = "not-ada: someone else owns this"
+        with settings:
+            (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+
+    def test_automated_owners_and_epoch_comments_never_retire(self):
+        # fleet-doctor / kanban-link owned cards and the epoch estimator's comments never
+        # retire an ask, marker or not.
+        self.comments = [
+            types.SimpleNamespace(
+                author="fleet-doctor",
+                created_at=self.now - self.day,
+                body="Superseded by t_016854ef",
+            )
+        ]
+        self.task = task(task_id="t_old", assignee="fleet-doctor", created_at=self.now - 9 * self.day)
+        (it,) = self.queue()
+        self.assertEqual(it["tier"], "ask")
+        self.task = task(task_id="t_old", assignee="platform", created_at=self.now - 9 * self.day)
+        self.comments[0].author = "platform"
+        self.comments[0].body = (
+            "⏱ Epoch estimate — ~0.2h. superseded-by t_016854ef [epoch:estimate run=3971]"
+        )
         (it,) = self.queue()
         self.assertEqual(it["tier"], "ask")
 
