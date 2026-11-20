@@ -46,9 +46,29 @@ replacement seat, restart an unrelated gateway, or install on a retired home.
 Keep the gateway's existing HTTPS ingress and profile credentials. No port or tunnel
 changes are needed by this patch.
 
-1. Install the dedicated subscription using `scripts/install_security_review_route.py`
-   with `HERMES_SECURITY_WEBHOOK_SECRET` set to a new random value of at least 32 bytes.
-   The installer preserves unrelated subscriptions and refuses an existing route.
+1. Use the supported public CLI on the gateway owner, after inspecting
+   `hermes webhook list` and the gateway configuration. Confirm there is no existing
+   `github-pr-security` subscription or static route: subscribe can update an existing
+   name, and a static route can shadow it. Repair a corrupt subscription store through
+   Hermes before proceeding; the plugin no longer edits that store or installs routes.
+
+   ```sh
+   review_prompt=$(cat docs/security-review-prompt.txt) &&
+   [ -n "$review_prompt" ] &&
+   hermes webhook subscribe github-pr-security \
+     --route-profile security \
+     --events security_review_requested \
+     --description "Commit-bound GitHub PR Security review requests" \
+     --prompt "$review_prompt" \
+     --deliver log
+   ```
+
+   Run this from the UNBL0CK checkout in a private terminal. The command stops if
+   the prompt file is missing, unreadable, or empty. Hermes
+   generates and prints a signing secret; securely transfer it to the repository secret
+   below, then clear the terminal output. Do not pass a secret in command-line arguments
+   or paste it into a PR. The existing Security profile and enabled webhook gateway are
+   prerequisites, not resources created by the plugin.
 2. Set repository Actions secrets `HERMES_SECURITY_WEBHOOK_URL` to the existing HTTPS
    origin plus `/p/security/webhooks/github-pr-security`, and
    `HERMES_SECURITY_WEBHOOK_SECRET` to that same secret. Never put either in a PR or log.
@@ -92,7 +112,7 @@ in the review body (substitute full actual values):
 ```
 
 Use GitHub `APPROVE` with `pass`, or `REQUEST_CHANGES` with `fail`. Stale or incomplete
-reviews must explain the missing evidence without an approval marker. The installer
+reviews must explain the missing evidence without an approval marker. The public subscription
 renders this contract into the existing Security agent's request; it does not create
 a GitHub identity or supply credentials.
 

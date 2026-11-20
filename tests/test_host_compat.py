@@ -85,12 +85,11 @@ class TheTableIsTheCode(unittest.TestCase):
         listed = {m: set(n) for m, n in needs.HOST_API.items()}
         self.assertEqual(used, listed)
 
-    def test_private_names_are_counted(self):
+    def test_no_private_host_names_remain(self):
         privates = {n for names in needs.HOST_API.values() for n in names if n.startswith("_")}
         self.assertEqual(
             privates,
-            {"_append_event", "_landing_status_after_parents", "_reclaim_dangling_run",
-             "_resume_status_from_events", "_mutate_subscriptions", "_subscriptions_path"},
+            set(),
         )
         self.assertEqual(needs.host_compat(lambda m: full_module())["private_checked"], len(privates))
 
@@ -104,19 +103,19 @@ class Report(unittest.TestCase):
         self.assertEqual((r["ok"], r["missing"], r["modules_missing"]), (True, [], []))
         self.assertEqual(needs.host_compat_note(r), "")
 
-    def test_a_renamed_private_function_is_named(self):
+    def test_a_missing_public_function_is_named(self):
         def load(module):
             mod = self.full()
             if module == "hermes_cli.kanban_db":
-                del mod.__dict__["_reclaim_dangling_run"]
+                del mod.__dict__["unblock_task"]
             return mod
 
         r = needs.host_compat(load)
-        self.assertEqual(r["missing"], ["hermes_cli.kanban_db._reclaim_dangling_run"])
+        self.assertEqual(r["missing"], ["hermes_cli.kanban_db.unblock_task"])
         self.assertFalse(r["ok"])
         note = needs.host_compat_note(r)
         self.assertIn("lacks 1 of the", note)
-        self.assertIn("_reclaim_dangling_run", note)
+        self.assertIn("unblock_task", note)
         self.assertIn("update UNBL0CK", note)
 
     def test_a_missing_module_marks_all_its_names(self):

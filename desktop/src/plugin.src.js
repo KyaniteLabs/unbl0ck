@@ -913,6 +913,14 @@ function rememberAnswerDraft(id, text, stamp) {
   while (answerDrafts.size > 100) answerDrafts.delete(answerDrafts.keys().next().value)
 }
 
+// A release failure can move a card into a different section and remount its controls.
+const actionErrors = new Map()
+const pendingReleaseActions = new Map()
+function readActionError(id) {
+  const action = actionErrors.get(id)
+  return action && Date.now() - action.at < ANSWER_DRAFT_TTL ? action.message : ''
+}
+
 // Ask conversations follow the same session-memory policy as answer drafts: they survive
 // filtering, a source outage and route remounts (the card unmounting) but never a reload,
 // and nothing is written to disk. 30 minutes, 100 conversations. The model reply of a
@@ -959,6 +967,8 @@ function endAskScope(scope) {
   if (keep.length !== ($undo.get?.() || []).length) $undo.set(keep)
   for (const key of [...askSessions.keys()]) if (key.startsWith(`${scope}|`)) askSessions.delete(key)
   for (const key of [...answerDrafts.keys()]) if (key.startsWith(`${scope}|`)) answerDrafts.delete(key)
+  for (const key of actionErrors.keys()) if (key.startsWith(`${scope}|`)) actionErrors.delete(key)
+  for (const key of pendingReleaseActions.keys()) if (key.startsWith(`${scope}|`)) pendingReleaseActions.delete(key)
   for (const key of [...askLatest.keys()]) if (key.startsWith(`${scope}|`)) askLatest.delete(key)
 }
 // The one stamp everything bound to a card compares: block version plus card text (the version does
@@ -999,6 +1009,25 @@ function withinDeadline(t0, step) {
   )
 }
 
+function actionErrorText(error) {
+  const fallback = 'Could not confirm the action. Check the refreshed card before trying again.'
+  const raw = typeof error === 'string' ? error : error?.message
+  if (typeof raw !== 'string' || !raw.trim()) return fallback
+  const message = raw.replace(/^Error invoking remote method '[^']+': Error: /, '')
+  // Desktop's REST bridge prefixes backend errors with the HTTP status.
+  const response = message.match(/^([45]\d\d):\s*([\s\S]*)$/)
+  if (response) {
+    try {
+      const detail = JSON.parse(response[2])?.detail
+      if (typeof detail === 'string' && detail.trim() && detail.length <= 350) return detail
+    } catch {
+      // An intermediary can return a non-JSON error body.
+    }
+    return `Hermes returned HTTP ${response[1]}. ${fallback}`
+  }
+  return message.length <= 350 ? message : fallback
+}
+
 function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false, scope = '' }) {
   const askId = askKey(scope, item.id)
   const ctxNow = cardStamp(item)
@@ -1011,7 +1040,12 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
     setAnswer(text)
     setAnswerStamp(stamp)
   }
-  const [busy, setBusy] = useState(false)
+  const [localBusy, setBusy] = useState(false)
+  const busy = localBusy || pendingReleaseActions.has(askId)
+  const [, setActionErrorRevision] = useState(0)
+  // A queue poll can remount this card before its action finishes. Read the current
+  // error on every render so a later refresh sees the result from the old instance.
+  const actionError = readActionError(askId)
   const [open, setOpen] = useState(false)
   const [done, setDone] = useState(false)
   const [detailOpen, setDetailOpen] = useState(false)
@@ -1145,8 +1179,17 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
 
   // onOk runs the moment the request succeeded, before the queue refresh: a slow or hung
   // refresh must not delay Undo or draft clearing, which only depend on the request result.
-  const run = async (fn, okFor, cue = 'ok', onOk = null) => {
+  const run = async (fn, okFor, cue = 'ok', onOk = null, releases = false) => {
+    if (pendingReleaseActions.has(askId)) return null
     setBusy(true)
+    const action = { message: '', at: Date.now() }
+    if (releases) pendingReleaseActions.set(askId, action)
+    const settleRelease = () => {
+      if (pendingReleaseActions.get(askId) === action) pendingReleaseActions.delete(askId)
+    }
+    actionErrors.delete(askId)
+    actionErrors.set(askId, action)
+    while (actionErrors.size > 100) actionErrors.delete(actionErrors.keys().next().value)
     try {
       const r = await fn()
       if (onOk) onOk(r)
@@ -1157,17 +1200,26 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
         host.notify({ kind: 'success', message: okFor(r) })
         await new Promise(res => setTimeout(res, reducedMotion() ? 0 : 650))
       }
+      settleRelease()
       await refresh()
       return r
     } catch (e) {
       sfx.play('err')
       petEmit('err')
+      if (actionErrors.get(askId) === action) {
+        action.message = actionErrorText(e)
+        action.at = Date.now()
+        setActionErrorRevision(revision => revision + 1)
+      }
       host.notifyError(e, 'UNBL0CK: that did not go through')
       // An answer may have been posted before its release failed. Re-read the source so
       // recovery actions and changed questions appear without waiting for the next poll.
+      settleRelease()
       await refresh()
       return null
     } finally {
+      settleRelease()
+      if (actionErrors.get(askId) === action && !action.message) actionErrors.delete(askId)
       setBusy(false)
     }
   }
@@ -1187,7 +1239,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
       'ok',
       // A source fault can remount this card and accept a newer draft while this
       // request is in flight. Its late completion owns only the submitted record.
-      r => { if (r && answerDrafts.get(askId) === submittedDraft) updateAnswer('') }
+      r => { if (r && answerDrafts.get(askId) === submittedDraft) updateAnswer('') },
+      release
     )
     return result
   }
@@ -1200,7 +1253,8 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
         method: 'POST',
         body: { board: item.board, task_id: item.task_id, text: '', release: true, version: item.version }
       }),
-      r => (r && r.released ? `Unblocked ${item.task_id}` : `Could not unblock ${item.task_id}`)
+      r => (r && r.released ? `Unblocked ${item.task_id}` : `Could not unblock ${item.task_id}`),
+      'ok', null, true
     )
   const dismiss = async (path, kind, cue, took) => {
     const seq = ++undoSeq
@@ -1638,7 +1692,10 @@ function Item({ ctx, item, n, refresh, askEnabled, capabilities, hidden = false,
           ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This message is longer than 20,000 characters. Only the beginning is shown; the end, which may hold the question, is in the original chat.' })
           : null,
         isOutside && item.truncated ? jsx('div', { className: 'ub-hint', role: 'note', children: 'This export exceeds 256 KiB. Only the beginning is shown; read the complete text in the original app.' }) : null,
-        jsx('div', { className: 'ub-act', children: actions }),
+        jsx('div', { className: 'ub-act', children: [
+          actionError ? jsx('div', { className: 'ub-fault', role: 'alert', children: actionError }) : null,
+          ...actions
+        ] }),
         helpLimit,
         detailNode || askNode ? jsxs('div', { className: 'ub-detail', children: [detailNode, askNode] }) : null
       ]
@@ -1769,7 +1826,7 @@ function Page({ ctx, refresh, scope = '' }) {
             ? jsx('details', {
                 className: 'ub-group',
                 hidden: !items.some(i => visibleIds.has(i.id)),
-                open: filtered ? true : undefined,
+                open: filtered || items.some(i => readActionError(askKey(scope, i.id))) ? true : undefined,
                 children: [jsx('summary', {
                   className: 'ub-sec',
                   style: { cursor: 'pointer', listStyle: 'none' },

@@ -63,3 +63,20 @@ class RealStore(unittest.TestCase):
             it["approve_command"].startswith("hermes -p ops pairing approve discord ")
         )
         self.assertNotIn(code, json.dumps(it))
+
+    def test_pocket_pairing_text_routes_to_the_dashboard_without_cli_instructions(self):
+        store = stock.PairingStore(profile="default")
+        code = store.generate_code("telegram", "998877", "Ana")
+        (item,) = needs.pairing_items(self.home)
+        (request,) = store.list_pending()
+        self.assertEqual(
+            item["approve_command"], f"hermes pairing approve telegram {request['request_id']}"
+        )
+
+        (card,) = needs.pocket_pack({"items": [item], "errors": []})["cards"]
+        self.assertIn("Pairing page", card["prompt"])
+        self.assertEqual(card["options"][0]["send"], "Open pairing requests")
+        self.assertNotIn("hermes pairing approve", card["prompt"])
+        self.assertNotIn("hermes pairing approve", card["short"])
+        self.assertNotIn(request["request_id"], json.dumps(card))
+        self.assertNotIn(code, json.dumps(card))

@@ -176,9 +176,7 @@ def test_incomplete_http_response_is_retried():
 
 def test_native_receiver_accepts_signature_rejects_tampering_and_renders_valid_receipt():
     from gateway.platforms.webhook import WebhookAdapter
-    spec = importlib.util.spec_from_file_location("ub_security_prompt", ROOT / "scripts/install_security_review_route.py")
-    installer = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(installer)
+    prompt = (ROOT / "docs/security-review-prompt.txt").read_text()
     receiver = Receiver()
     client(receiver).deliver(23)
     _, request = receiver.requests[-1]
@@ -188,7 +186,7 @@ def test_native_receiver_accepts_signature_rejects_tampering_and_renders_valid_r
         signed = SimpleNamespace(headers=request["headers"], match_info=match_info)
         assert adapter._validate_signature(signed, request["body"], SECRET)
         assert not adapter._validate_signature(signed, request["body"] + b" ", SECRET)
-    rendered = adapter._render_prompt(installer.PROMPT, json.loads(request["body"]), relay.EVENT, relay.ROUTE)
+    rendered = adapter._render_prompt(prompt, json.loads(request["body"]), relay.EVENT, relay.ROUTE)
     receiver.reviews = [security_review(receiver, body=rendered)]
     assert client(receiver).deliver(23)["status"] == "pass"
 
@@ -206,26 +204,6 @@ def test_reconciliation_follows_pagination_and_fails_on_the_bound():
     with pytest.raises(relay.BridgeError, match="pagination limit"):
         list(c.open_numbers())
 
-
-def test_installer_preserves_foreign_subscriptions_and_refuses_overwrite_or_corruption(tmp_path):
-    from hermes_cli import webhook
-    spec = importlib.util.spec_from_file_location("ub_security_install", ROOT / "scripts/install_security_review_route.py")
-    installer = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(installer)
-    store = tmp_path / "webhook_subscriptions.json"
-    store.write_text(json.dumps({"foreign": {"secret": "synthetic-existing-secret"}}))
-    with patch.object(webhook, "_subscriptions_path", return_value=store), patch.object(installer, "_subscriptions_path", return_value=store), patch.object(installer, "profile_exists", return_value=True), patch.object(installer, "load_config_readonly", return_value={"platforms": {"webhook": {"enabled": True}}}), patch.dict("os.environ", {"HERMES_SECURITY_WEBHOOK_SECRET": SECRET}):
-        installer.install()
-        saved = store.read_bytes()
-        assert json.loads(saved)["foreign"] == {"secret": "synthetic-existing-secret"}
-        route = json.loads(saved)["github-pr-security"]
-        assert route["profile"] == "security" and route["events"] == [relay.EVENT]
-        assert store.stat().st_mode & 0o777 == 0o600
-        with pytest.raises(RuntimeError, match="already exists"): installer.install()
-        assert store.read_bytes() == saved
-        store.write_text("{corrupt")
-        with pytest.raises(ValueError): installer.install()
-        assert store.read_text() == "{corrupt"
 
 
 def security_review(receiver, *, state="APPROVED", **overrides):
@@ -299,13 +277,3 @@ def test_retry_after_and_native_minute_window_allow_later_prs_to_progress():
     waits = []
     relay.Transport(opener=Opener([retry, Response(b'{}')]), sleep=waits.append).request(ENDPOINT)
     assert waits == [75]
-
-
-def test_installer_refuses_shadowing_static_route_before_mutation():
-    spec = importlib.util.spec_from_file_location("ub_security_install_shadow", ROOT / "scripts/install_security_review_route.py")
-    installer = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(installer)
-    config = {"platforms": {"webhook": {"enabled": True, "extra": {"routes": {relay.ROUTE: {}}}}}}
-    with patch.object(installer, "load_config_readonly", return_value=config), patch.object(installer, "_mutate_subscriptions") as mutate:
-        with pytest.raises(RuntimeError, match="shadow"): installer.install()
-        mutate.assert_not_called()
