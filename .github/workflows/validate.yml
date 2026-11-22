@@ -1,9 +1,40 @@
 name: Plugin gate
-on: [push, pull_request]
+# Branch pushes are tested by their pull_request run; only main pushes run here, and those
+# skip when the merged tree is byte-identical to a PR head that already passed this workflow.
+on:
+  push:
+    branches: [main]
+  pull_request:
 permissions:
   contents: read
+concurrency:
+  # A new push to a PR supersedes its running gate; main runs are never cancelled.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  merged-tree:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      tested: ${{ steps.decide.outputs.tested }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Was this exact tree already tested by its pull request?
+        id: decide
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/merged_tree_tested.py --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --workflow validate.yml >> "$GITHUB_OUTPUT"
   validate:
+    needs: merged-tree
+    if: ${{ !cancelled() && needs.merged-tree.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -55,6 +86,8 @@ jobs:
           name: plugin-validation
           path: receipts/
   platform-state:
+    needs: merged-tree
+    if: ${{ !cancelled() && needs.merged-tree.outputs.tested != 'true' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
@@ -77,6 +110,8 @@ jobs:
           tests/test_journal_non_posix.py
           tests/test_state_recovery.py
   lint:
+    needs: merged-tree
+    if: ${{ !cancelled() && needs.merged-tree.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -89,6 +124,8 @@ jobs:
       - name: Lint (rules and ignores live in ruff.toml)
         run: ruff check .
   typecheck:
+    needs: merged-tree
+    if: ${{ !cancelled() && needs.merged-tree.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
