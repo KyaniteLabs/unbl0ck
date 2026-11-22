@@ -11,6 +11,10 @@ Use Python 3.14 and the Hermes revision pinned in
 lockfile and run the plugin tests in that environment, with pytest 9.1.1. Use a disposable
 Hermes home containing no credentials or operator data.
 
+CI runs this gate on every pull request (a newer push cancels the older run) and on pushes to
+`main`. A `main` push skips the suite only when `.github/scripts/merged_tree_tested.py` proves its
+tree is identical to a pull request head that already passed `validate.yml`; any doubt runs it all.
+
 ```sh
 python desktop/build.py
 git diff --exit-code -- desktop design
