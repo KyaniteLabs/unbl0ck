@@ -68,9 +68,9 @@ jobs:
       - name: Hermes runtime and Desktop-to-backend tests (any skip fails)
         run: |
           set -o pipefail
-          uv pip install --python .hermes-runtime/.venv/bin/python pytest==9.1.1 hypothesis==6.135.0
+          uv pip install --python .hermes-runtime/.venv/bin/python pytest==9.1.1 hypothesis==6.135.0 pytest-xdist==3.8.0
           cd plugin
-          HERMES_HOME="$RUNNER_TEMP/hermes-test-home" ../.hermes-runtime/.venv/bin/python -m pytest -q -rs -p no:cacheprovider tests 2>&1 | tee ../test.log
+          HERMES_HOME="$RUNNER_TEMP/hermes-test-home" ../.hermes-runtime/.venv/bin/python -m pytest -n auto --dist worksteal -q -rs -p no:cacheprovider tests 2>&1 | tee ../test.log
           # Hermes is installed in this job, so the Hermes-equivalence test runs here: any skip is a failure.
           if grep -q "^SKIPPED" ../test.log; then grep "^SKIPPED" ../test.log; echo "::error::tests were skipped; the gate needs every test to run"; exit 1; fi
       - name: Each new regression test fails without its fix (pull requests only)
