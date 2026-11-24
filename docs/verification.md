@@ -40,7 +40,7 @@ does not prove focus, accessible controls or the operator journey in a browser.
 | --- | --- | --- |
 | Five-source collection | `test_needs*`, `test_cover`, `test_waits`, `test_pairing_stock`, `test_outside` | One failed source cannot claim all-clear or discard healthy sources; settings uncertainty suppresses disclosure |
 | Local CLI/slash and pack | `test_inbox_quality`, `test_outside`, `test_qa` | Messaging sees counts only; JSON stdout remains parseable while writing a pack |
-| Answer / keep blocked / release / triage | `test_needs_hermes`, `test_api_qa`, `test_hardening`, rendered operator checks | One comment; partial release retries without another comment; stale versions never submit |
+| Answer / keep blocked / release / triage | `test_needs_hermes`, `test_api_qa`, `test_hardening`, `test_desktop_release_backend` | A regrouped Desktop card prevents another release while its request is pending and shows any HTTP failure inline. Release retries through the real Hermes Kanban API without duplicating the answer, and the card disappears after refresh. Stale versions never submit. |
 | Hide / folder Done / Undo | `test_outside`, `test_failure_quality`, `test_operator_recovery`, rendered operator checks | Failed Undo retains retry; corrupt state is preserved; folder source is untouched |
 | Disclosure matrix, redaction and cache partitions | `test_disclosure_matrix`, `test_r4_stack12` | Matrix equals code and docs, and each search and cross-profile flag equals what the real readers and search do; the state inventory lists every persistent file the code names; one settings snapshot per queue response; a settings fault sends nothing end to end; synthetic secrets never reach summary or Ask input; pairing and prompt never summarized; settings fault disables model paths; caches partitioned and concurrent-safe |
 | Ask detection corpus, window and coverage | `test_ask_corpus`, `test_ask_coverage`, `test_desktop_coverage`, `test_r4_stack11` | Known false positives and negatives pinned exactly (named cases carry the configured name); window, skipped counts, read budget and snapshot, and backfill marks reported; no duplicates; coverage is counts and fixed text |
@@ -52,7 +52,7 @@ does not prove focus, accessible controls or the operator journey in a browser.
 | Ask restart recovery | `test_ask_job_recovery`, `test_desktop_ask_recovery` | Restart before send, after send, after completion (with and without answer persistence) and after failure; repeated polling; TTL, cap and settled eviction; corrupt, foreign and symlinked markers; 0600/0700 modes; no answer text on disk by default; card isolation; delete; the provider is never called by recovery |
 | Summary / Ask | `test_bluf*`, `test_ask_job`, `test_ask_privacy`, `test_state_machines`, rendered operator checks | Bounded admission; reasoning stripped; lost terminal response can be collected with no second model POST |
 | Config read failure and repair | `test_failure_quality`, independent actual Hermes parser probes | Raised, marked-dictionary and import failures fail closed, both cold and after a good config; concurrent refresh shares one settled read; another caller's repair cannot erase an in-flight fault |
-| Security relay / installer | `test_security_review`, workflow lint | Native signature/limiter compatibility; pending stays non-green; exact authenticated current review required; foreign routes preserved |
+| Security relay / setup instructions | `test_security_review`, workflow lint | Native signature/limiter compatibility; pending stays non-green; exact authenticated current review required; private installer absent; public CLI instructions supplied |
 
 ## Observed evidence: 2026-11-13
 
@@ -116,9 +116,8 @@ row is filled only from such a record plus the source commit that was tested: a 
 name the source commit, the Hermes version and release date, and the UTC time stays "not run".
 
 Interfaces taken from Hermes that are not documented plugin APIs are listed in
-`needs.HOST_API` (six of them are private helpers: four in `kanban_db`, two in the webhook
-module the installer script uses; the gateway pairing store and its `list_pending` method are
-listed too) and a test reads the syntax tree of every shipped file and keeps that list equal to
+`needs.HOST_API` (none are private helpers; the gateway pairing store and its
+`list_pending` method are listed too) and a test reads the syntax tree of every shipped file and keeps that list equal to
 what the source imports and calls. A name that appears only in a comment is not a dependency. If an upgrade removes one and
 a Kanban board then fails to read, the queue adds a single
 `host: this Hermes lacks N of the M interfaces UNBL0CK uses (...)` line to its errors instead

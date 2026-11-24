@@ -117,7 +117,7 @@ class RealHermesRelease(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = previous_home
 
-    def test_stale_answer_cannot_release_a_newer_block(self):
+    def test_reblock_after_answer_commit_refuses_release_and_keeps_answer(self):
         previous_home = os.environ.get("HERMES_HOME")
         with tempfile.TemporaryDirectory() as directory:
             os.environ["HERMES_HOME"] = directory
@@ -148,9 +148,10 @@ class RealHermesRelease(unittest.TestCase):
                         top_level_txns += 1
                     with original_write_txn(conn, allow_nested=allow_nested):
                         yield conn
-                    if top_level and top_level_txns == 1 and not interleaved:  # the answer and release are one transaction
+                    if top_level and top_level_txns == 1 and not interleaved:  # immediately after the answer commits
                         interleaved = True
                         with kanban_db_connect.connect(board="default") as other:
+                            self.assertTrue(kanban_db.unblock_task(other, task_id))
                             self.assertTrue(
                                 kanban_db.block_task(
                                     other,
@@ -165,18 +166,17 @@ class RealHermesRelease(unittest.TestCase):
 
                 kanban_db.write_txn = interleave_after_second_txn
                 try:
-                    result = needs.answer_card(
-                        "default",
-                        task_id,
-                        "Use the earlier option",
-                        release=True,
-                        version=old_version,
-                        home=Path(directory),
-                    )
+                    with self.assertRaises(needs.UnblockFailed) as failure:
+                        needs.answer_card(
+                            "default", task_id, "Use the earlier option",
+                            release=True, version=old_version, home=Path(directory),
+                        )
+                    self.assertIsInstance(failure.exception.__cause__, needs.StaleAnswer)
+                    self.assertIn("refresh", str(failure.exception).lower())
+                    self.assertNotIn("retry the release", str(failure.exception).lower())
                 finally:
                     kanban_db.write_txn = original_write_txn
 
-                self.assertTrue(result["released"])
                 self.assertTrue(interleaved)
                 self.assertNotEqual(old_version, new_version)
                 with kanban_db_connect.connect(board="default") as conn:

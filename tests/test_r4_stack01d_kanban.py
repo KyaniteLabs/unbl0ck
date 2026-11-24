@@ -112,9 +112,9 @@ class HistoricalAnswersAreNotDuplicates(KanbanAnswerCase):
         self.assertEqual(self.bodies(task), ["A", "B", "A"])
 
 
-class AnswerAndReleaseAreOneWrite(KanbanAnswerCase):
-    def test_a_reblock_after_the_comment_never_leaves_a_comment_behind_a_409(self):
-        """01-080 (class B): StaleAnswer means no comment was written."""
+class AnswerAndPublicReleaseTransactions(KanbanAnswerCase):
+    def test_reblock_after_comment_commit_is_reported_as_failed_release(self):
+        """A post-commit reblock keeps the answer, but cannot claim release."""
         task = self.card()
         version = self.version(task)
         original = kanban_db.write_txn
@@ -129,22 +129,17 @@ class AnswerAndReleaseAreOneWrite(KanbanAnswerCase):
                 yield conn
             if top and state["top"] == 1 and not state["done"]:
                 state["done"] = True
+                with self.conn() as other:
+                    self.assertTrue(kanban_db.unblock_task(other, task))
                 self.reblock(task)
 
-        raised = None
-        result = None
         with patch.object(kanban_db, "write_txn", interleave):
-            try:
-                result = self.answer(task, "Use the first", release=True, version=version)
-            except needs.StaleAnswer as exc:
-                raised = exc
+            with self.assertRaises(needs.UnblockFailed) as failure:
+                self.answer(task, "Use the first", release=True, version=version)
         self.assertTrue(state["done"])
-        if raised is not None:
-            self.assertEqual(self.bodies(task), [], "a refused answer left its comment behind")
-        else:
-            self.assertTrue(result["released"])
-            self.assertEqual(self.bodies(task), ["Use the first"])
-        # either way the newer block stays blocked
+        self.assertIsInstance(failure.exception.__cause__, needs.StaleAnswer)
+        self.assertEqual(self.bodies(task), ["Use the first"])
+        self.assertEqual(needs.load_pending_releases(self.home), {f"kanban:default:{task}": version})
         self.assertEqual(self.status(task), "blocked")
 
     def test_a_stale_version_writes_nothing(self):
@@ -178,7 +173,7 @@ class ReleaseFailuresAreReconciled(KanbanAnswerCase):
     def test_a_broken_native_helper_is_a_failed_release_not_a_generic_error(self):
         task = self.card()
         version = self.version(task)
-        with patch.object(kanban_db, "_resume_status_from_events", side_effect=AttributeError("gone")):
+        with patch.object(kanban_db, "unblock_task", side_effect=AttributeError("gone")):
             with self.assertRaises(needs.UnblockFailed):
                 self.answer(task, "Go", release=True, version=version)
         self.assertEqual(self.status(task), "blocked")
@@ -264,14 +259,14 @@ class RecoveryMarkerIsReservedFirst(KanbanAnswerCase):
         self.answer(task, "Go", release=True)
         self.assertEqual(needs.load_pending_releases(self.home), {})
 
-    def test_a_refused_answer_removes_the_marker_it_reserved(self):
+    def test_a_release_refused_after_posting_keeps_answer_and_marker(self):
         task = self.card()
         version = self.version(task)
         with patch.object(needs, "_unblock_task_at_version", side_effect=needs.StaleAnswer("newer")):
-            with self.assertRaises(needs.StaleAnswer):
+            with self.assertRaises(needs.UnblockFailed):
                 self.answer(task, "Go", release=True, version=version)
-        self.assertEqual(needs.load_pending_releases(self.home), {})
-        self.assertEqual(self.bodies(task), [])
+        self.assertEqual(needs.load_pending_releases(self.home), {f"kanban:default:{task}": version})
+        self.assertEqual(self.bodies(task), ["Go"])
 
     def test_a_refused_retry_keeps_the_marker_of_the_earlier_failed_release(self):
         task = self.card()
@@ -280,16 +275,18 @@ class RecoveryMarkerIsReservedFirst(KanbanAnswerCase):
             with self.assertRaises(needs.UnblockFailed):
                 self.answer(task, "Go", release=True, version=version)
         with patch.object(needs, "_unblock_task_at_version", side_effect=needs.StaleAnswer("x")):
-            with self.assertRaises(needs.StaleAnswer):
+            with self.assertRaises(needs.UnblockFailed):
                 self.answer(task, "Go", release=True, version=version)
         self.assertEqual(needs.load_pending_releases(self.home), {f"kanban:default:{task}": version})
 
 
 class AnswerDocs(unittest.TestCase):
-    def test_the_architecture_guide_describes_the_one_transaction_answer(self):
+    def test_the_architecture_guide_describes_public_release_race(self):
         """01-080/01-081/01-087 (class I): the documented contract is the implemented one."""
         text = (Path(__file__).resolve().parents[1] / "docs" / "architecture.md").read_text()
         self.assertIn("one Kanban write transaction", text)
+        self.assertIn("narrow race", text)
+        self.assertIn("not an", text)
         self.assertIn("with no comment", text)
         self.assertIn("reserves its marker before the answer is written", text)
         self.assertIn("only at comments made since the current block", text)
