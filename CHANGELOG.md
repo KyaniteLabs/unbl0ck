@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.2 (2026-11-23)
+
+Known gaps: real Outlook, Gmail and Plaud export fixtures, the provider wave and live accounts, a packaged Desktop run and an independent Security verdict for this exact release remain outside this repository (#38, #39, #42, #44); open queue-detection defects #90–#93 remain tracked separately.
+
+- **Kanban unblocking uses public `kanban_db.unblock_task` instead of private host transition helpers (#95).** Removes the hand-copied SQL transition and private `kanban_db._*` imports. The answer commits first, then the block version is re-checked before calling the public unblock API; the narrow legacy check-to-unblock race is documented, and failed releases preserve the answer and recovery marker.
+- **Removed the private webhook installer script (#95).** `scripts/install_security_review_route.py` (which imported private `hermes_cli.webhook._mutate_subscriptions`) is deleted; the owner-run Security review prompt is preserved and documented via `hermes webhook subscribe --route-profile security`. `needs.HOST_API` now requires zero private Hermes helpers.
+- **Desktop release feedback survives queue polls and avoids overlapping release actions (#95).** Failed release errors remain visible across regrouping and polls, overlapping release clicks on the same card are prevented, and CLI approval hints stay out of Pocket pairing cards.
+- **Ask age flags old asks instead of dropping them; supersession requires an explicit owner marker (#97).** Asks older than `stale_ask_days` stay counted with `stale: true` and age context; only a newer non-ask block or a post-block owner comment (`superseded by t_<id>` / `not-<principal>:`) retires an ask.
+- **Windows and macOS state-lock tests run in CI (#88, #98).** Platform state tests execute on `windows-latest` and `macos-latest` in GitHub Actions without duplicate runs.
+
 ## 0.6.1 (2026-11-15)
 
 Known gaps: the Windows paths (state lock, Ask journal, recovery tool) have not run on a real Windows host (#43, #35, #48); real Outlook, Gmail and Plaud export fixtures, the provider wave and live accounts, a packaged Desktop run and an independent Security verdict are still outside this repository (#38, #39, #42, #44).
