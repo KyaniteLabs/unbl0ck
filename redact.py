@@ -418,6 +418,13 @@ def _ask_secret_value_shape(value: Any) -> bool:
 def _ask_is_secret_key(key: str, value: Any = None) -> bool:
     word = _ask_secret_word(key)
     if word is None:  # a numeric code under a code key (``otp: 123456``), never a short count
+        # An exact credential key can hold a non-numeric secret too (``session_id: S``,
+        # ``otp: a1b2c3``); the numeric fallback alone would let that value through. A YAML
+        # scalar indicator (``pin: |``) or a short token is structure, not a credential.
+        if (_ask_secret_key_is_exact(key) and isinstance(value, str) and not _ask_harmless_secret_value(value)
+                and re.fullmatch(r"[\w.+/=:-]{4,}", value.strip().strip("\"' "))
+                and not _ask_path_field_value(key, value)):
+            return True
         return _ask_numeric_credential(key, value) and len(str(value).strip("\"' ")) >= 4
     if _ask_harmless_secret_value(value) and not _ask_numeric_credential(key, value):
         return False
@@ -606,17 +613,25 @@ def _ask_redact_yaml(text: str) -> str:
     fields = [_ASK_YAML_FIELD.match(view.rstrip("\r\n")) for view in views]
     paired_values: dict[int, str] = {}
     for index, field in enumerate(fields):
-        name = field["value"].strip().strip("\"'") if field and field["key"].casefold() in {"name", "key"} else ""
+        if field is None:
+            continue
+        name = field["value"].strip().strip("\"'") if field["key"].casefold() in {"name", "key"} else ""
         if not _ask_names_credential(name):
             continue
-        # The nearest value field within eight lines, unless another name or list item comes first.
+        base = _ask_yaml_indent(field)
+        # Every value field that belongs to this named entry -- its sibling (however misindented)
+        # and any ``value`` nested one level down -- not just the nearest one. A nested metadata
+        # value must not take the pairing away from the real credential on the entry's own line.
         for step in (1, -1):
-            near = (c for c in range(index + step, index + 9 * step, step) if 0 <= c < len(fields) and fields[c])
-            stop = next((c for c in near if fields[c]["key"].casefold() in {"value", "val", "default"} or (
-                _ask_yaml_indent(fields[c]) <= _ask_yaml_indent(field) and (fields[c]["dash"] or fields[c]["key"].casefold() in {"name", "key"}))), None)
-            if stop is not None and fields[stop]["key"].casefold() in {"value", "val", "default"}:
-                paired_values[stop] = name
-                break
+            for c in range(index + step, index + 9 * step, step):
+                if not (0 <= c < len(fields)) or not fields[c]:
+                    continue
+                other = fields[c]
+                key = other["key"].casefold()
+                if _ask_yaml_indent(other) <= base and (other["dash"] or key in {"name", "key"}):
+                    break  # the next entry starts here
+                if key in {"value", "val", "default"}:
+                    paired_values[c] = name
 
     out: list[str] = []
     index = 0
