@@ -612,7 +612,9 @@ def _ask_redact_yaml(text: str) -> str:
     fields = [_ASK_YAML_FIELD.match(view.rstrip("\r\n")) for view in views]
     paired_values: dict[int, str] = {}
     for index, field in enumerate(fields):
-        name = field["value"].strip().strip("\"'") if field and field["key"].casefold() in {"name", "key"} else ""
+        if field is None:
+            continue
+        name = field["value"].strip().strip("\"'") if field["key"].casefold() in {"name", "key"} else ""
         if not _ask_names_credential(name):
             continue
         base = _ask_yaml_indent(field)
