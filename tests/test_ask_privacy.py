@@ -1059,3 +1059,31 @@ def test_round10_short_values_are_redacted_across_structured_forms():
     }
     for source, expected in cases.items():
         assert needs._ask_redact(source) == expected, source
+
+
+def test_round11_named_secret_pairing_and_string_code_keys():
+    """U11-D1: a nested metadata value must not take the pairing away from the real credential.
+
+    U11-D2: an exact code key (``session_id``) with a non-numeric value is still a credential; the
+    numeric-code fallback used to let string values through into Ask and BLUF.
+    """
+    pair_sentinel = "R11_NAMED_PAIR_SENTINEL"
+    nested = f"- name: DB_PASSWORD\n  metadata:\n    value: harmless\n  value: {pair_sentinel}\n"
+    safe = needs._ask_redact(nested)
+    assert_redacted(safe, pair_sentinel)
+    assert "DB_PASSWORD" in safe  # the reader still sees what was withheld
+
+    session_sentinel = "R11_SESSION_SENTINEL"
+    for source in (
+        f"session_id: {session_sentinel}",
+        '{"session_id": "%s"}' % session_sentinel,
+        f"sessionId: {session_sentinel}",
+    ):
+        safe = needs._ask_redact(source)
+        assert_redacted(safe, session_sentinel)
+
+    # Ordinary values keep their meaning: no status prose, no counts, no harmless markers.
+    assert needs._ask_redact("session_id: n/a") == "session_id: n/a"
+    assert needs._ask_redact("The session_id is missing") == "The session_id is missing"
+    assert needs._ask_redact("attempts: 3") == "attempts: 3"
+    assert needs._ask_redact("session_id: 123456") == "session_id: [redacted]"
