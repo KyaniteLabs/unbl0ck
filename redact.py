@@ -419,11 +419,12 @@ def _ask_is_secret_key(key: str, value: Any = None) -> bool:
     word = _ask_secret_word(key)
     if word is None:  # a numeric code under a code key (``otp: 123456``), never a short count
         # An exact credential key can hold a non-numeric secret too (``session_id: S``,
-        # ``otp: a1b2c3``); the numeric fallback alone would let that value through.
-        if _ask_secret_key_is_exact(key) and isinstance(value, str) and not _ask_harmless_secret_value(value):
-            token = value.strip().strip("\"' ")
-            if token and not re.search(r"\s", token) and not _ask_path_field_value(key, value):
-                return True
+        # ``otp: a1b2c3``); the numeric fallback alone would let that value through. A YAML
+        # scalar indicator (``pin: |``) or a short token is structure, not a credential.
+        if (_ask_secret_key_is_exact(key) and isinstance(value, str) and not _ask_harmless_secret_value(value)
+                and re.fullmatch(r"[\w.+/=:-]{4,}", value.strip().strip("\"' "))
+                and not _ask_path_field_value(key, value)):
+            return True
         return _ask_numeric_credential(key, value) and len(str(value).strip("\"' ")) >= 4
     if _ask_harmless_secret_value(value) and not _ask_numeric_credential(key, value):
         return False
